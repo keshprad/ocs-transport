@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "AUDIT_PREPARATION: Primary audit expects119 totalcases/147 endpoint logs perhost, commands and metadata matching manifest, exit0, numeric size/iterations, requested-duration elapsed. Please confirm your completion JSON naming/schema (initial metadata preserved plus which suffix). After archive upload I will audit both endpoints, validate paired results and concurrent client intervals, then request cleanup. Summary latency direction labels refer to client placement, since write latency uses ping-pong.",
-  "utc": "2026-11-08T03:53:32.876021+00:00"
-}

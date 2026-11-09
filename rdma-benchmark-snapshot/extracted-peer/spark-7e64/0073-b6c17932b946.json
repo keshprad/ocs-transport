@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"099-lat-1-4096-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14198]}",
-  "utc": "2026-11-08T03:53:34.002224+00:00"
-}

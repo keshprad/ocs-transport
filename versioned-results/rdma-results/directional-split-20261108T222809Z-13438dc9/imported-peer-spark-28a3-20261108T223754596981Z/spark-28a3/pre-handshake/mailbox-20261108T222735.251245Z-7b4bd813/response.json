@@ -1,5 +1,0 @@
-{
-  "error": "URLError(ConnectionRefusedError(111, 'Connection refused'))",
-  "exit_code": 1,
-  "end_utc": "2026-11-08T22:27:35.269422+00:00"
-}

@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "{\"run\": \"matrix-v1-remaining\", \"kind\": \"DONE\", \"test\": \"076-bw-12-1048576-forward-r3\", \"exit_codes\": [0, 0]}",
-  "utc": "2026-11-08T04:26:35.832478+00:00"
-}

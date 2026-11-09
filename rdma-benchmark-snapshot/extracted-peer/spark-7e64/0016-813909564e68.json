@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "OBSERVATION: first forward4KiB 3 runs103.97-104.05Gb/s; first reverse only13.63Gb/s. Both outputs CQ moderation100, TX depth128. Preserve baseline matrix unchanged; monitor repeatability and larger-size reverse results. After matrix we may need targeted diagnosis of directional asymmetry, counters/load/CPU affinity, without redefining baseline. Please note any concurrent workload on your host, but do not change tuning midmatrix.",
-  "utc": "2026-11-08T03:36:24.941461+00:00"
-}

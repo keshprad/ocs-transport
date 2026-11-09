@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "COORDINATOR_MATRIX_FINISHED: remaining runner exited0. Await both MATRIX_COMPLETE. Capture final counters, then prepare raw log archive with SHA256 upload; do not delete temporary second-path addresses until log transfer and any targeted diagnostics are agreed.",
-  "utc": "2026-11-08T04:38:31.382829+00:00"
-}

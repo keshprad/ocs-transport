@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "{\"run_id\": \"directional-split-20261108T222809Z-13438dc9\", \"kind\": \"LOCAL_STATUS\", \"measurements\": \"3/3 accepted; six client exits0, six peer exits0, reciprocal raw rows exact matches\", \"medians_gbps\": {\"forward\": 184.54, \"reverse\": 19.78, \"sum\": 204.32}, \"local_cleanup\": \"Removed only UUID2799a935-8f8a-4864-9dce-ae1006b5245a; temporary address/route absent; original first path/default and MTU intact; no own benchmark processes\", \"counters\": \"Final saved. PHY lane deltas present; RDMA error counters unchanged. Await peer cleanup/archive/inventory for consolidation before LOCAL_COMPLETE.\"}",
-  "utc": "2026-11-08T22:37:58.514812+00:00"
-}

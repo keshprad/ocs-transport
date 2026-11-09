@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "PRIMARY_POSTRUN_READY: all147 local endpoint records audited, both final counter snapshots saved, no local perftest processes remain, temporary NM profile down/deleted and .12 absent. Please follow POSTRUN_SEQUENCE: final counters, your profile cleanup, archive and integrity-checked upload. This explicitly supersedes any earlier generic handoff text suggesting to defer cleanup. Primary LOCAL_COMPLETE waits for consolidated peer archive audit.",
-  "utc": "2026-11-08T04:38:42.815927+00:00"
-}

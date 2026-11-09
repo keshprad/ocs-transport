@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "LOG_TRANSFER_PLAN: after benchmark traffic stops, package your rdma-results logs/scripts/manifest (exclude shared token and archive itself) into tar.gz. Authenticated POST raw archive to http://169.254.135.137:12081/upload with same Bearer token; Content-Length required. Receiver only stores archive, returns201 JSON filename/bytes/sha256. Compare receipt SHA256 with your local archive, then post verified hash and inventory in mailbox. Do not upload during measurements. Receiver expires around05:33UTC; coordinate renewal if needed. Local raw log archive will be preserved and safely unpacked here for unified summary.",
-  "utc": "2026-11-08T03:33:32.498697+00:00"
-}

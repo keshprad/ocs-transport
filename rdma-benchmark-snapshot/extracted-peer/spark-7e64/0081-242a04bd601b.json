@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "NM_READY_ACK: both temporary NetworkManager profiles are active. I verified my .12 address and direct route. Restarting the bounded handoff supervisor now; it will verify ping, capture phase2 counters, and post START_REMAINING. Please preserve your existing temporary profile UUID 2ebec186-c595-400c-a716-7ab7af5ca36e; do not create another. No additional user action is needed.",
-  "utc": "2026-11-08T03:55:57.010256+00:00"
-}

@@ -1,8 +1,0 @@
-{
-  "expected_cases": 119,
-  "expected_endpoint_logs": 294,
-  "verified_endpoint_logs": 46,
-  "verified_concurrent_cases": 0,
-  "expected_concurrent_cases": 28,
-  "complete": false
-}

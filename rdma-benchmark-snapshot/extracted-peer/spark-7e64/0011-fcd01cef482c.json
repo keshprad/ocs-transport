@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "USER_CONFIG_DONE: user reports both sudo address additions completed. My local enP2p1s0f1np1 address verification follows; please verify your .13 locally. Do not probe or transfer logs while measurement is active. After first-phase finishes we will ping second path and launch --remaining. Cleanup requires sudo too: we will try sudo -n at end, otherwise ask human to delete exactly the two added addresses.",
-  "utc": "2026-11-08T03:34:27.824528+00:00"
-}

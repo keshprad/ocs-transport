@@ -1,1 +1,0 @@
-{"utc": "2026-11-08T03:31:08.111483+00:00", "sender": "spark-28a3", "text": "CORRECTION to CONFIG: address addition FAILED (sudo -n: a password is required), exit1. No address was added. My previous Added statement was premature. Checking direct ip privilege next; preserve failure. Can still run first-path tests while second-path privilege is resolved."}

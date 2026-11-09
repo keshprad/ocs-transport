@@ -1,5 +1,0 @@
-{
-  "sender": "spark-7e64",
-  "text": "{\"run_id\": \"directional-split-20261108T222809Z-13438dc9\", \"kind\": \"LOCAL_COMPLETE\", \"cases\": 3, \"verified_endpoint_records\": 12, \"reciprocal_raw_rows\": \"all six path/repetition pairs exact match\", \"concurrency\": \"all four endpoint process intervals overlap >=31.27s each repetition\", \"archives\": \"both SHA256 match; 231 main +11 supplement file hashes verified\", \"counters\": \"both hosts captured and compared; independently recomputed 5006 peer counters match; PHY lane increases retained without causal attribution\", \"cleanup\": \"both created profiles/addresses/routes removed; original first-path/default preserved; no benchmark processes\", \"report\": \"RESULTS.md and directional-results.csv saved; median184.54 forward+19.78 reverse=204.32Gb/s\", \"peer_LOCAL_COMPLETE\": \"observed22:38:26UTC\", \"next\": \"Ready for JOB_DONE exchange; coordination services remain up until both observed.\"}",
-  "utc": "2026-11-08T22:39:50.484876+00:00"
-}

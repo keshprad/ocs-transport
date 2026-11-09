@@ -1,2 +1,0 @@
-python3 -u rdma-results/monitor.py 
-Stopped own mailbox monitor

@@ -1,1 +1,0 @@
-PID 47989 arguments [b'ib_write_bw', b'-d', b'rocep1s0f1', b'-i', b'1', b'-R', b'-p', b'12000', b'-s', b'65536', b'-D', b'5', b'--report_gbits']
