@@ -1,4 +1,6 @@
-# DGX Spark RDMA benchmark results
+# ocs-transport
+
+DGX Spark RDMA benchmark results.
 
 This repository preserves a sanitized snapshot of the consolidated results from
 spark-7e64 and spark-28a3. The original evidence remains locally in `rdma-results/`
