@@ -1,0 +1,13 @@
+{
+  "command": "ip -details address show dev enP2p1s0f1np1; ip route get 192.168.201.12; ping -I enP2p1s0f1np1 -c 3 -W 2 192.168.201.12; nmcli -f connection.id,connection.uuid,connection.autoconnect,ipv4.method,ipv4.addresses,ipv4.never-default,ipv6.method connection show uuid 2ebec186-c595-400c-a716-7ab7af5ca36e",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -details address show dev enP2p1s0f1np1; ip route get 192.168.201.12; ping -I enP2p1s0f1np1 -c 3 -W 2 192.168.201.12; nmcli -f connection.id,connection.uuid,connection.autoconnect,ipv4.method,ipv4.addresses,ipv4.never-default,ipv6.method connection show uuid 2ebec186-c595-400c-a716-7ab7af5ca36e"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T03:55:23.187401+00:00",
+  "end_utc": "2026-11-08T03:55:25.232389+00:00",
+  "exit_code": 0
+}

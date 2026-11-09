@@ -1,0 +1,13 @@
+{
+  "command": "ip -s -s link show dev enp1s0f1np1; ip -s -s link show dev enP2p1s0f1np1; ethtool -S enp1s0f1np1; ethtool -S enP2p1s0f1np1; rdma resource show cm_id; ip -details address show dev enP2p1s0f1np1; ip route show default; ps -C ib_write_bw,ib_write_lat -o pid,stat,args",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -s -s link show dev enp1s0f1np1; ip -s -s link show dev enP2p1s0f1np1; ethtool -S enp1s0f1np1; ethtool -S enP2p1s0f1np1; rdma resource show cm_id; ip -details address show dev enP2p1s0f1np1; ip route show default; ps -C ib_write_bw,ib_write_lat -o pid,stat,args"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T04:39:03.228749+00:00",
+  "end_utc": "2026-11-08T04:39:03.271037+00:00",
+  "exit_code": 1
+}

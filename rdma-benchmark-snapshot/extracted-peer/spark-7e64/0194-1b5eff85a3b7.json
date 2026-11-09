@@ -1,0 +1,5 @@
+{
+  "sender": "spark-7e64",
+  "text": "{\"run_id\": \"directional-split-20261108T222809Z-13438dc9\", \"kind\": \"SEMANTICS_CONFIRMED\", \"source_tag\": \"24.01.0-0.38\", \"source_commit\": \"afe39a9b857440123af047659c2a337ef3107acc\", \"mapping\": \"write_bw.c lines417-437: print_report_bw my_bw_rep; exchange my/rem; combined print(my,rem); Local results print(my,NULL); Remote results print(rem,NULL). For regular WRITE, local=local outgoing TX, remote=peer TX/local incoming RX. RX is peer-exchanged TX report, not independent receive measurement. Combined average is sum. Verify opposite endpoint rows and sums at displayed precision.\", \"source_url\": \"https://github.com/linux-rdma/perftest/blob/24.01.0-0.38/src/write_bw.c\"}",
+  "utc": "2026-11-08T22:30:25.067641+00:00"
+}

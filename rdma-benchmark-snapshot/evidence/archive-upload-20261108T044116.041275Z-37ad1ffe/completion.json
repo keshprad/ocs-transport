@@ -1,0 +1,13 @@
+{
+  "command": "python3 rdma-results/package_upload.py",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "python3 rdma-results/package_upload.py"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T04:41:16.041389+00:00",
+  "end_utc": "2026-11-08T04:41:17.848867+00:00",
+  "exit_code": 0
+}

@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "hostnamectl"
+  ],
+  "command": "hostnamectl",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:30.830644+00:00",
+  "exit_code": 1,
+  "end_utc": "2026-11-08T00:51:30.838016+00:00"
+}

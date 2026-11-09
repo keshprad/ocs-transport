@@ -1,0 +1,111 @@
+spark-28a3
+2026-11-08T22:26:57+00:00
+Usage:
+  ib_write_bw            start a server and wait for connection
+  ib_write_bw <host>     connect to server at <host>
+
+Options:
+  -a, --all  Run sizes from 2 till 2^23
+  -b, --bidirectional  Measure bidirectional bandwidth (default unidirectional)
+  -c, --connection=<RC/XRC/UC/DC>  Connection type RC/XRC/UC/DC (default RC)
+      --log_dci_streams=<log_num_dci_stream_channels> (default 0)  Run DC initiator as DCS instead of DCI with <log_num dci_stream_channels>
+      --log_active_dci_streams=<log_num_active_dci_stream_channels> (default log_num_dci_stream_channels)
+	  --aes_xts Runs traffic with AES_XTS feature (encryption)
+	  --encrypt_on_tx Runs traffic with encryption on tx (default decryption on tx)
+	  --sig_before Puts signature on data before encrypting it (default after)
+      --aes_block_size=<512,520,4048,4096,4160> (default 512)
+	  --data_enc_keys_number=<number of data encryption keys> (default 1)
+	  --kek_path path to the key encryption key file
+	  --credentials_path path to the credentials file
+	  --data_enc_key_app_path path to the data encryption key app
+  -d, --ib-dev=<dev>  Use IB device <dev> (default first device found)
+  -D, --duration  Run test for a customized period of seconds.
+  -f, --margin  measure results within margins. (default=2sec)
+  -F, --CPU-freq  Do not show a warning even if cpufreq_ondemand module is loaded, and cpu-freq is not on max.
+  -h, --help  Show this help screen.
+  -i, --ib-port=<port>  Use port <port> of IB device (default 1)
+  -I, --inline_size=<size>  Max size of message to be sent in inline
+  -l, --post_list=<list size>
+ Post list of send WQEs of <list size> size (instead of single post)
+      --recv_post_list=<list size> Post list of receive WQEs of <list size> size (instead of single post)
+  -L, --hop_limit=<hop_limit>  Set hop limit value (ttl for IPv4 RawEth QP). Values 0-255 (default 64)
+  -m, --mtu=<mtu>  MTU size : 256 - 4096 (default port mtu)
+  -n, --iters=<iters>  Number of exchanges (at least 5, default 5000)
+  -N, --noPeak Cancel peak-bw calculation (default with peak up to iters=20000)
+  -O, --dualport  Run test in dual-port mode.
+  -p, --port=<port>  Listen on/connect to port <port> (default 18515)
+  -q, --qp=<num of qp's>  Num of qp's(default 1)
+  -Q, --cq-mod  Generate Cqe only after <--cq-mod> completion
+  -R, --rdma_cm  Connect QPs with rdma_cm and run test on those QPs
+  -s, --size=<size>  Size of message to exchange (default 65536)
+  -S, --sl=<sl>  SL (default 0)
+  -t, --tx-depth=<dep>  Size of tx queue (default 128)
+  -T, --tos=<tos value>  Set <tos_value> to RDMA-CM QPs. available only with -R flag. values 0-256 (default off)
+  -u, --qp-timeout=<timeout>  QP timeout, timeout value is 4 usec * 2 ^(timeout), default 14
+  -V, --version  Display version number
+  -w, --limit_bw=<value>  Set verifier limit for bandwidth
+  -W, --report-counters=<list of counter names>  Report performance counter change (example: "counters/port_xmit_data,hw_counters/out_of_buffer")
+  -x, --gid-index=<index>  Test uses GID with GID index
+  -y, --limit_msgrate=<value>  Set verifier limit for Msg Rate
+  -z, --comm_rdma_cm  Communicate with rdma_cm module to exchange data - use regular QPs
+
+      --out_json  Save the report in a json file
+      --out_json_file=<file>  Name of the report json file. (Default: perftest_out.json in the working directory) 
+      --cpu_util  Show CPU Utilization in report, valid only in Duration mode 
+      --dlid  Set a Destination LID instead of getting it from the other side.
+      --dont_xchg_versions  Do not exchange versions and MTU with other side 
+      --force-link=<value>  Force the link(s) to a specific type: IB or Ethernet.
+      --ipv6  Use IPv6 GID. Default is IPv4
+      --ipv6-addr=<IPv6>  Use IPv6 address for parameters negotiation. Default is IPv4
+      --bind_source_ip  Source IP of the interface used for connection establishment. By default taken from routing table.
+      --mmap=file  Use an mmap'd file as the buffer for testing P2P transfers.
+      --mmap-offset=<offset>  Use an mmap'd file as the buffer for testing P2P transfers.
+      --mr_per_qp  Create memory region for each qp.
+      --odp  Use On Demand Paging instead of Memory Registration.
+      --output=<units> Set verbosity output level: bandwidth , message_rate, latency 
+      --payload_file_path=<payload_txt_file_path> Set the payload by passing a txt file containing a pattern in the next form(little endian): '0xaaaaaaaa, 0xbbbbbbbb, ...' .
+ Latency measurement is Average calculation 
+      --use_old_post_send Use old post send flow (ibv_post_send).
+      --perform_warm_up Perform some iterations before start measuring in order to warming-up memory cache, valid in Atomic, Read and Write BW tests
+      --pkey_index=<pkey index> PKey index to use for QP
+      --report-both  Report RX & TX results separately on Bidirectional BW tests
+      --report_gbits  Report Max/Average BW of test in Gbit/sec (instead of MiB/sec)
+        Note: MiB=2^20 byte, while Gb=10^9 bits. Use these formulas for conversion:
+        Factor=10^9/(2^20*8)=119.2; MiB=Gb_result * factor; Gb=MiB_result / factor
+      --report-per-port  Report BW data on both ports when running Dualport and Duration mode
+      --reversed  Reverse traffic direction - Server send to client
+      --run_infinitely  Run test forever, print results every <duration> seconds
+      --retry_count=<value>  Set retry count value in rdma_cm mode
+      --tclass=<value>  Set the Traffic Class in GRH (if GRH is in use)
+      --flow_label=<value>  Set the flow_label in GRH (if GRH is in use)
+      --use_hugepages  Use Hugepages instead of contig, memalign allocations.
+      --use-null-mr  Allocate a null memory region for the client with ibv_alloc_null_mr.
+      --wait_destroy=<seconds>  Wait <seconds> before destroying allocated resources (QP/CQ/PD/MR..)
+      --disable_pcie_relaxed Disable PCIe relaxed ordering
+
+ Rate Limiter:
+      --burst_size=<size> Set the amount of messages to send in a burst when using rate limiter
+      --typical_pkt_size=<bytes> Set the size of packet to send in a burst. Only supports PP rate limiter
+      --rate_limit=<rate> Set the maximum rate of sent packages. default unit is [Gbps]. use --rate_units to change that.
+      --rate_units=<units> [Mgp] Set the units for rate limit to MiBps (M), Gbps (g) or pps (p). default is Gbps (g).
+        Note (1): pps not supported with HW limit.
+        Note (2): When using PP rate_units is forced to Kbps.
+      --rate_limit_type=<type> [HW/SW/PP] Limit the QP's by HW, PP or by SW. Disabled by default. When rate_limit is not specified HW limit is Default.
+        Note: in Latency under load test SW rate limit is forced
+      --write_with_imm  use write-with-immediate verb instead of write
+
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+enP7s7           DOWN           
+wlP9s9           UP             10.50.17.66/16 fe80::95f2:c99c:9d54:662b/64 
+docker_gwbridge  UP             172.18.0.1/16 fe80::bcf3:c3ff:feef:ed4f/64 
+docker0          DOWN           172.17.0.1/16 
+vethe993ca7@if14 UP             fe80::281f:b5ff:fedf:1153/64 
+enp1s0f0np0      DOWN           
+enp1s0f1np1      UP             169.254.238.243/16 fe80::4ebb:47ff:fe2d:28a5/64 
+enP2p1s0f0np0    DOWN           
+enP2p1s0f1np1    UP             
+tailscale0       UNKNOWN        fe80::2291:bbac:1b51:448/64 
+roceP2p1s0f0 port 1 ==> enP2p1s0f0np0 (Down)
+roceP2p1s0f1 port 1 ==> enP2p1s0f1np1 (Up)
+rocep1s0f0 port 1 ==> enp1s0f0np0 (Down)
+rocep1s0f1 port 1 ==> enp1s0f1np1 (Up)

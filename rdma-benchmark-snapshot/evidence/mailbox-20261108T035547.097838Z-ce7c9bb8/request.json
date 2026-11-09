@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer REDACTED_MAILBOX_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"PATH2_NM_VERIFIED:03:55:23-25 UTC ping3/3 succeeded with .13 source and correct second interface; NM verification log path2-nm-verification-20261108T035523.187279Z-c4f360f4. Ready for coordinator start. Temporary profile IPv6 disabled restores baseline noIPv6 on path2.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T03:55:47.097955+00:00"
+}

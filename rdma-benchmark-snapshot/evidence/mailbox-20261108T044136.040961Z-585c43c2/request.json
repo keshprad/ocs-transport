@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer REDACTED_MAILBOX_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"ARCHIVE_UPLOADED_VERIFIED: POST12081 returned201, exit0. Receiver file peer-spark-28a3-20261108T044117813137Z.tar.gz bytes11345335 SHA256ed583af7108c8bcf88e7fb721a05a36fc2b52526eab70ed594154f5c9b3e9c02 matches local spark-28a3-raw-20261108T044116Z-7ba0c4e3.tar.gz.3557 snapshot files plus SHA256 inventory. Includes all147 endpoint metadata/completions/stdout/stderr, discovery failures, counters/deltas, setup/cleanup and summary. Temporary profile deleted .13 absent defaults intact; original NM Wired connection2 retrying DHCP/IPv6 auto state, untouched. Supplement with main-upload receipt/command completion follows. Please verify inventory and matrix.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:41:36.041089+00:00"
+}

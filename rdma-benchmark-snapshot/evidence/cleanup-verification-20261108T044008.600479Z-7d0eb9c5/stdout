@@ -1,0 +1,58 @@
+19: enP2p1s0f1np1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 4c:bb:47:2d:28:a9 brd ff:ff:ff:ff:ff:ff promiscuity 0  allmulti 0 minmtu 68 maxmtu 9978 numtxqueues 424 numrxqueues 20 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 portname p1 switchid a4282d000347bb4c parentbus pci parentdev 0002:01:00.1 
+    inet6 fe80::e998:b33c:997c:6bc0/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+17: enp1s0f1np1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 4c:bb:47:2d:28:a5 brd ff:ff:ff:ff:ff:ff promiscuity 0  allmulti 0 minmtu 68 maxmtu 9978 numtxqueues 424 numrxqueues 20 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 portname p1 switchid a4282d000347bb4c parentbus pci parentdev 0000:01:00.1 
+    inet 169.254.238.243/16 brd 169.254.255.255 scope link noprefixroute enp1s0f1np1
+       valid_lft forever preferred_lft forever
+    inet6 fe80::4ebb:47ff:fe2d:28a5/64 scope link 
+       valid_lft forever preferred_lft forever
+default via 10.50.0.1 dev wlP9s9 proto dhcp src 10.50.17.66 metric 600 
+10.50.0.0/16 dev wlP9s9 proto kernel scope link src 10.50.17.66 metric 600 
+169.254.0.0/16 dev enp1s0f1np1 proto kernel scope link src 169.254.238.243 metric 101 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+172.18.0.0/16 dev docker_gwbridge proto kernel scope link src 172.18.0.1 
+224.0.0.0/4 dev enp1s0f1np1 proto static scope link metric 101 
+local 10.50.17.66 dev wlP9s9 table local proto kernel scope host src 10.50.17.66 
+broadcast 10.50.255.255 dev wlP9s9 table local proto kernel scope link src 10.50.17.66 
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1 
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1 
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1 
+local 169.254.238.243 dev enp1s0f1np1 table local proto kernel scope host src 169.254.238.243 
+broadcast 169.254.255.255 dev enp1s0f1np1 table local proto kernel scope link src 169.254.238.243 
+local 172.17.0.1 dev docker0 table local proto kernel scope host src 172.17.0.1 
+broadcast 172.17.255.255 dev docker0 table local proto kernel scope link src 172.17.0.1 linkdown 
+local 172.18.0.1 dev docker_gwbridge table local proto kernel scope host src 172.18.0.1 
+broadcast 172.18.255.255 dev docker_gwbridge table local proto kernel scope link src 172.18.0.1 
+fe80::/64 dev vethe993ca7 proto kernel metric 256 pref medium
+fe80::/64 dev docker_gwbridge proto kernel metric 256 pref medium
+fe80::/64 dev enp1s0f1np1 proto kernel metric 256 pref medium
+fe80::/64 dev tailscale0 proto kernel metric 256 pref medium
+fe80::/64 dev wlP9s9 proto kernel metric 1024 pref medium
+fe80::/64 dev enP2p1s0f1np1 proto kernel metric 1024 pref medium
+local ::1 dev lo table local proto kernel metric 0 pref medium
+local fe80::2291:bbac:1b51:448 dev tailscale0 table local proto kernel metric 0 pref medium
+local fe80::281f:b5ff:fedf:1153 dev vethe993ca7 table local proto kernel metric 0 pref medium
+local fe80::4ebb:47ff:fe2d:28a5 dev enp1s0f1np1 table local proto kernel metric 0 pref medium
+local fe80::95f2:c99c:9d54:662b dev wlP9s9 table local proto kernel metric 0 pref medium
+local fe80::bcf3:c3ff:feef:ed4f dev docker_gwbridge table local proto kernel metric 0 pref medium
+local fe80::e998:b33c:997c:6bc0 dev enP2p1s0f1np1 table local proto kernel metric 0 pref medium
+multicast ff00::/8 dev vethe993ca7 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev docker_gwbridge table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev enp1s0f1np1 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev tailscale0 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev wlP9s9 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev enP2p1s0f1np1 table local proto kernel metric 256 pref medium
+dbf7770a-0d05-4add-8d29-f10352681f43:Cornell-Visitor
+422c4968-c9eb-33ac-b993-958ae320e96c:netplan-enp1s0f1np1
+a8a74684-13f5-3716-80d9-997ece6ccb0d:Wired connection 2
+af60e578-e3f3-4ea9-8415-3a1552435bcb:docker_gwbridge
+5ee1a4df-b0c8-466b-ab82-74366c75dcd7:lo
+ff7b4fd2-636f-49e4-bba9-1f72fb45d280:docker0
+5f055a4c-7a53-3c58-a62d-0266971a20d2:Wired connection 1
+64c2b5db-aa0f-312c-a4cd-c07b41f9928d:Wired connection 3
+bc28ab39-1342-4654-b7f0-d2d5eccda430:eduroam [bc28ab39]
+05ec54af-9f53-3227-867e-c7e879b25c37:netplan-enp1s0f0np0
+e56412c6-e6b5-4aaf-b5ff-50b941ca76f2:pistachioden
+    PID STAT COMMAND

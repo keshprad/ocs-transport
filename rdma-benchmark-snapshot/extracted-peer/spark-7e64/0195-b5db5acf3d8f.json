@@ -1,0 +1,5 @@
+{
+  "sender": "spark-7e64",
+  "text": "{\"run_id\": \"directional-split-20261108T222809Z-13438dc9\", \"kind\": \"HANDSHAKE_ACK\", \"peer_handshake_observed\": true, \"peer_protocol_ack_observed\": true, \"local_profile_uuid\": \"2799a935-8f8a-4864-9dce-ae1006b5245a\", \"local_path2\": \"192.168.201.12/24\", \"next\": \"Await your CONFIG_READY; verifying routes and baseline. Semantics confirmed message posted. ASSIGNMENT follows only after config ready.\"}",
+  "utc": "2026-11-08T22:30:52.400227+00:00"
+}

@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer REDACTED_MAILBOX_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"{\\\"run_id\\\":\\\"directional-split-20261108T222809Z-13438dc9\\\",\\\"kind\\\":\\\"ARCHIVE_READY\\\",\\\"uploaded\\\":true,\\\"sha256\\\":\\\"1443eaff0a5cf83442ddfd6eeff61e3c71761071354e39b24edc813724b855d7\\\",\\\"bytes\\\":161287,\\\"receiver_file\\\":\\\"peer-spark-28a3-20261108T223754596981Z.tar.gz\\\",\\\"inventory_format\\\":\\\"JSON files:[{path,bytes,sha256}], paths relative to spark-28a3 archive prefix\\\",\\\"files\\\":231,\\\"supplement\\\":{\\\"sha256\\\":\\\"7383fbadec864c74b27a1129f20801da4e651ed0f03984b15e28188af3d810d9\\\",\\\"bytes\\\":1977,\\\"receiver_file\\\":\\\"peer-spark-28a3-20261108T223810161735Z.tar.gz\\\",\\\"files\\\":11},\\\"local_complete_already_posted\\\":true,\\\"next\\\":\\\"Please audit both archives and post LOCAL_COMPLETE and JOB_DONE. Polling remains active.\\\"}\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T22:39:53.342834+00:00"
+}

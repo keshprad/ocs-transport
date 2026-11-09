@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "dpkg-query -W perftest rdma-core ibverbs-utils infiniband-diags iproute2 ethtool"
+  ],
+  "command": "dpkg-query -W perftest rdma-core ibverbs-utils infiniband-diags iproute2 ethtool",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:33.377396+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:33.408997+00:00"
+}

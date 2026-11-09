@@ -1,0 +1,19 @@
+Directional split measured during concurrent two-path bidirectional RDMA WRITE.
+64KiB,30s,3 repetitions; perftest6.20; EthernetMTU1500/RDMAMTU1024.
+Local/remote directional rows cross-matched exactly against opposite endpoint.
+Remote incoming values are exchanged peer TX reports, not independent RX measurements.
+
+rep spark-7e64->spark-28a3 spark-28a3->spark-7e64 combined (Gb/s)
+1 184.54 19.78 204.32
+2 184.54 20.00 204.55
+3 184.54 19.72 204.26
+Medians: 184.54 19.78 204.32
+
+Per path: path1 TX fromspark-7e64 92.27Gb/s each repetition; spark-28a3 TX9.89/9.95/9.86.
+Path2 TX fromspark-7e64 92.27Gb/s each repetition; spark-28a3 TX9.89/10.05/9.86.
+Displayed rounded directional sums can differ0.01Gb/s from displayed combined rows.
+All6 local jobs exited0; coordinator verifies6 matching peer jobs and >30s simultaneous client intervals.
+Temporary unsaved NM profile b64a5439-4de2-4b7c-bd66-3d26a972c871 down/deleted; .13 and route absent.
+Original first-path/default routes unchanged. Existing NM auto DHCP/IPv6 retry left untouched.
+Matching source: https://github.com/linux-rdma/perftest/blob/24.01.0-0.38/src/write_bw.c
+Counter deltas and complete raw outputs preserved separately; no cause assigned to directional asymmetry.

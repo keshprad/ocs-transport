@@ -1,0 +1,11 @@
+{
+  "url": "http://169.254.135.137:12080/messages",
+  "method": "POST",
+  "headers": {
+    "Authorization": "Bearer REDACTED_MAILBOX_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"{\\\"run\\\": \\\"matrix-v1-remaining\\\", \\\"kind\\\": \\\"DONE\\\", \\\"test\\\": \\\"111-lat-2-64-reverse-r2\\\", \\\"exit_codes\\\": [0], \\\"logs\\\": [\\\"/home/keshav/Documents/ocs-transport/rdma-results/matrix-v1-remaining-spark-28a3-111-lat-2-64-reverse-r2-p2.json\\\"], \\\"results\\\": [\\\"---------------------------------------------------------------------------------------\\\\n                    RDMA_Write Latency Test\\\\n Dual-port       : OFF\\\\t\\\\tDevice         : roceP2p1s0f1\\\\n Number of qps   : 1\\\\t\\\\tTransport type : IB\\\\n Connection type : RC\\\\t\\\\tUsing SRQ      : OFF\\\\n PCIe relax order: OFF\\\\n ibv_wr* API     : ON\\\\n TX depth        : 1\\\\n Mtu             : 1024[B]\\\\n Link type       : Ethernet\\\\n GID index       : 3\\\\n Max inline data : 220[B]\\\\n rdma_cm QPs\\\\t : ON\\\\n Data ex. method : rdma_cm\\\\n---------------------------------------------------------------------------------------\\\\n local address: LID 0000 QPN 0x0369 PSN 0x6d6e38\\\\n GID: 00:00:00:00:00:00:00:00:00:00:255:255:192:168:201:13\\\\n remote address: LID 0000 QPN 0x032b PSN 0x1b2b3c\\\\n GID: 00:00:00:00:00:00:00:00:00:00:255:255:192:168:201:12\\\\n---------------------------------------------------------------------------------------\\\\n #bytes #iterations    t_min[usec]    t_max[usec]  t_typical[usec]    t_avg[usec]    t_stdev[usec]   99% percentile[usec]   99.9% percentile[usec] \\\\n 64      100000          1.39           5.43         1.46     \\\\t       1.55        \\\\t0.07   \\\\t\\\\t2.10    \\\\t\\\\t2.70   \\\\n---------------------------------------------------------------------------------------\\\\n\\\"]}\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:32:11.505117+00:00"
+}

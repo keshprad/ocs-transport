@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "for n in /sys/class/net/*; do i=${n##*/}; echo \"INTERFACE $i\"; ethtool \"$i\"; ethtool -i \"$i\"; ethtool -S \"$i\"; done"
+  ],
+  "command": "for n in /sys/class/net/*; do i=${n##*/}; echo \"INTERFACE $i\"; ethtool \"$i\"; ethtool -i \"$i\"; ethtool -S \"$i\"; done",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:54.932296+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:55.046234+00:00"
+}

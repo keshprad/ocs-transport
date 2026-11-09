@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "command -v ib_write_bw ib_read_bw ib_send_bw ib_write_lat ib_read_lat ib_send_lat raw_ethernet_bw raw_ethernet_lat"
+  ],
+  "command": "command -v ib_write_bw ib_read_bw ib_send_bw ib_write_lat ib_read_lat ib_send_lat raw_ethernet_bw raw_ethernet_lat",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:55.046407+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:55.049862+00:00"
+}

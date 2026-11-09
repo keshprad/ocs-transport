@@ -1,0 +1,5 @@
+{
+  "sender": "spark-7e64",
+  "text": "RESULT_CONTEXT:64KiB forward108.93-108.94Gb/s; reverse first13.55Gb/s. Please capture one read-only CPU/load/governor/affinity and PCIe current/max link speed/width snapshot when convenient (no tuning). Primary captured these. This is context for report; keep matrix unchanged. Avoid assuming root cause from throughput alone.",
+  "utc": "2026-11-08T03:41:50.524070+00:00"
+}

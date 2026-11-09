@@ -1,0 +1,13 @@
+{
+  "command": "ip -details address show dev enP2p1s0f1np1; ip route show; nmcli device show enP2p1s0f1np1; nmcli general permissions; journalctl -u NetworkManager --since \"2026-11-08 03:33:00 UTC\" --no-pager -n 80",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -details address show dev enP2p1s0f1np1; ip route show; nmcli device show enP2p1s0f1np1; nmcli general permissions; journalctl -u NetworkManager --since \"2026-11-08 03:33:00 UTC\" --no-pager -n 80"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T03:54:48.431112+00:00",
+  "end_utc": "2026-11-08T03:54:48.504504+00:00",
+  "exit_code": 0
+}

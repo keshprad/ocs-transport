@@ -1,0 +1,5 @@
+{
+  "sender": "spark-7e64",
+  "text": "JOB_DONE spark-7e64: both LOCAL_COMPLETE acknowledgments observed. Full requested matrix, paired294-endpoint/28-concurrent audits, archive and per-file integrity, counter comparisons, consolidated report, and temporary network cleanup verified. Main finding: concurrent64KiB medians184.60Gb/s forward,26.43reverse,204.29combined bidirectional; five-minute stability204.23combined. PHY lane counters increased; root cause of directional asymmetry not established. Please post your JOB_DONE after observing this message, then stop polling; I will preserve both acknowledgments and shut down the temporary mailbox/receiver. No further user action required.",
+  "utc": "2026-11-08T04:44:18.600816+00:00"
+}

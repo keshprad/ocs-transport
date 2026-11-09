@@ -1,0 +1,72 @@
+Usage:
+  ib_send_lat            start a server and wait for connection
+  ib_send_lat <host>     connect to server at <host>
+
+Options:
+  -a, --all  Run sizes from 2 till 2^23
+  -c, --connection=<RC/XRC/UC/UD/DC/SRD>  Connection type RC/XRC/UC/UD/DC/SRD (default RC)
+      --log_dci_streams=<log_num_dci_stream_channels> (default 0)  Run DC initiator as DCS instead of DCI with <log_num dci_stream_channels>
+      --log_active_dci_streams=<log_num_active_dci_stream_channels> (default log_num_dci_stream_channels)
+	  --aes_xts Runs traffic with AES_XTS feature (encryption)
+	  --encrypt_on_tx Runs traffic with encryption on tx (default decryption on tx)
+	  --sig_before Puts signature on data before encrypting it (default after)
+      --aes_block_size=<512,520,4048,4096,4160> (default 512)
+	  --data_enc_keys_number=<number of data encryption keys> (default 1)
+	  --kek_path path to the key encryption key file
+	  --credentials_path path to the credentials file
+	  --data_enc_key_app_path path to the data encryption key app
+  -C, --report-cycles  report times in cpu cycle units (default microseconds)
+  -d, --ib-dev=<dev>  Use IB device <dev> (default first device found)
+  -D, --duration  Run test for a customized period of seconds.
+  -e, --events  Sleep on CQ events (default poll)
+  -X, --vector=<completion vector>  Set <completion vector> used for events
+  -f, --margin  measure results within margins. (default=2sec)
+  -F, --CPU-freq  Do not show a warning even if cpufreq_ondemand module is loaded, and cpu-freq is not on max.
+  -g, --mcg  Send messages to multicast group with 1 QP attached to it.
+         When there is no multicast gid specified, a default IPv6 typed gid will be used.
+  -h, --help  Show this help screen.
+  -H, --report-histogram  Print out all results (default print summary only)
+  -i, --ib-port=<port>  Use port <port> of IB device (default 1)
+  -I, --inline_size=<size>  Max size of message to be sent in inline
+  -L, --hop_limit=<hop_limit>  Set hop limit value (ttl for IPv4 RawEth QP). Values 0-255 (default 64)
+  -m, --mtu=<mtu>  MTU size : 256 - 4096 (default port mtu)
+  -M, --MGID=<multicast_gid>  In multicast, uses <multicast_gid> as the group MGID.
+  -n, --iters=<iters>  Number of exchanges (at least 5, default 1000)
+  -p, --port=<port>  Listen on/connect to port <port> (default 18515)
+  -r, --rx-depth=<dep>  Rx queue size (default 512). If using srq, rx-depth controls max-wr size of the srq
+  -R, --rdma_cm  Connect QPs with rdma_cm and run test on those QPs
+  -s, --size=<size>  Size of message to exchange (default 2)
+  -S, --sl=<sl>  SL (default 0)
+  -T, --tos=<tos value>  Set <tos_value> to RDMA-CM QPs. available only with -R flag. values 0-256 (default off)
+  -u, --qp-timeout=<timeout>  QP timeout, timeout value is 4 usec * 2 ^(timeout), default 14
+  -U, --report-unsorted  (implies -H) print out unsorted results (default sorted)
+  -V, --version  Display version number
+  -W, --report-counters=<list of counter names>  Report performance counter change (example: "counters/port_xmit_data,hw_counters/out_of_buffer")
+  -x, --gid-index=<index>  Test uses GID with GID index
+  -z, --comm_rdma_cm  Communicate with rdma_cm module to exchange data - use regular QPs
+
+      --out_json  Save the report in a json file
+      --out_json_file=<file>  Name of the report json file. (Default: perftest_out.json in the working directory) 
+      --cpu_util  Show CPU Utilization in report, valid only in Duration mode 
+      --dlid  Set a Destination LID instead of getting it from the other side.
+      --dont_xchg_versions  Do not exchange versions and MTU with other side 
+      --force-link=<value>  Force the link(s) to a specific type: IB or Ethernet.
+      --use-srq  Use a Shared Receive Queue. --rx-depth controls max-wr size of the SRQ 
+      --ipv6  Use IPv6 GID. Default is IPv4
+      --ipv6-addr=<IPv6>  Use IPv6 address for parameters negotiation. Default is IPv4
+      --bind_source_ip  Source IP of the interface used for connection establishment. By default taken from routing table.
+      --latency_gap=<delay_time>  delay time between each post send
+      --mmap=file  Use an mmap'd file as the buffer for testing P2P transfers.
+      --mmap-offset=<offset>  Use an mmap'd file as the buffer for testing P2P transfers.
+      --odp  Use On Demand Paging instead of Memory Registration.
+      --output=<units> Set verbosity output level: bandwidth , message_rate, latency 
+      --payload_file_path=<payload_txt_file_path> Set the payload by passing a txt file containing a pattern in the next form(little endian): '0xaaaaaaaa, 0xbbbbbbbb, ...' .
+ Latency measurement is Average calculation 
+      --use_old_post_send Use old post send flow (ibv_post_send).
+      --perform_warm_up Perform some iterations before start measuring in order to warming-up memory cache, valid in Atomic, Read and Write BW tests
+      --pkey_index=<pkey index> PKey index to use for QP
+      --retry_count=<value>  Set retry count value in rdma_cm mode
+      --tclass=<value>  Set the Traffic Class in GRH (if GRH is in use)
+      --flow_label=<value>  Set the flow_label in GRH (if GRH is in use)
+      --use_hugepages  Use Hugepages instead of contig, memalign allocations.
+

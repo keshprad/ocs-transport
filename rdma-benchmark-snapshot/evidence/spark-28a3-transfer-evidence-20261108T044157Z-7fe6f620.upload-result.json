@@ -1,0 +1,26 @@
+{
+  "status": 201,
+  "headers": [
+    [
+      "Server",
+      "BaseHTTP/0.6 Python/3.12.3"
+    ],
+    [
+      "Date",
+      "Sun, 08 Nov 2026 04:41:57 GMT"
+    ],
+    [
+      "Content-Length",
+      "183"
+    ]
+  ],
+  "end_utc": "2026-11-08T04:41:57.385434+00:00",
+  "receipt": {
+    "file": "peer-spark-28a3-20261108T044157394028Z.tar.gz",
+    "bytes": 2175,
+    "sha256": "9d2fa034dbf9bc290b1f4e77b19e3600c2a6288c8397d6ef00c9caa721cca775",
+    "utc": "20261108T044157394028Z"
+  },
+  "sha256_match": true,
+  "exit_code": 0
+}

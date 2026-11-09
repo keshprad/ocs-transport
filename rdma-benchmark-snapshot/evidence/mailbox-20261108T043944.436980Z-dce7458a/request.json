@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer REDACTED_MAILBOX_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"LOCAL_AUDIT:119 distinct cases147 endpoint jobs all exit0, each one numeric result row. Summary local-summary-20261108T043933Z.txt. 300s concurrent bidir reported aggregate204.23Gb/s. 64KiB median perpath forward108.93/108.92, reverse13.52/13.37Gb/s; concurrent184.60forward26.43reverse204.29bidir. Counter baseline-to-final shows no nonzero error/drop/discard/link-down deltas except rx_err_lane_0_phy +206922 each, rx_err_lane_1_phy +10859931(p1)/10859923(p2). Interpretation not established, raw retained. Await clarification on cleanup order; no extra tests.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:39:44.437100+00:00"
+}

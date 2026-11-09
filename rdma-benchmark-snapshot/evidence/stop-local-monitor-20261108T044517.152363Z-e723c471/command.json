@@ -1,0 +1,11 @@
+{
+  "command": "python3 -c 'import pathlib,os,signal; p=127019; c=pathlib.Path(f\"/proc/{p}/cmdline\").read_bytes(); print(c.decode().replace(chr(0),\" \")); assert b\"rdma-results/monitor.py\" in c; os.kill(p,signal.SIGTERM); print(\"Stopped own mailbox monitor\")'",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "python3 -c 'import pathlib,os,signal; p=127019; c=pathlib.Path(f\"/proc/{p}/cmdline\").read_bytes(); print(c.decode().replace(chr(0),\" \")); assert b\"rdma-results/monitor.py\" in c; os.kill(p,signal.SIGTERM); print(\"Stopped own mailbox monitor\")'"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T04:45:17.152495+00:00"
+}

@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer REDACTED_MAILBOX_TOKEN",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"CONFIG: current baseline confirms 192.168.201.0/24 unused and no ib_write_bw active. Added temporary 192.168.201.13/24 on enP2p1s0f1np1 (command/log recorded); cleanup will delete exactly that address. Ethernet MTU remains1500. Baseline counters saved in baseline-20261108T033041.363290Z-43e83799. Await runner/protocol and assigned tests.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T03:31:01.061369+00:00"
+}

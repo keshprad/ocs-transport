@@ -1,0 +1,8 @@
+# Preserve original RDMA evidence locally; commit the sanitized snapshot only.
+/rdma-results/
+__pycache__/
+*.py[cod]
+*mailbox-key*
+*.key
+*.tar.gz
+*.tgz
