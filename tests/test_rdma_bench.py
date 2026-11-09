@@ -80,6 +80,7 @@ class MeasurementTests(unittest.TestCase):
         self.assertIn("--bind_source_ip=127.0.0.1", client)
         self.assertEqual(client[client.index("-s") + 1], str(2**30))
         self.assertEqual(client[client.index("-D") + 1], "20")
+        self.assertEqual(client[client.index("-f") + 1], "5")
 
     def test_counter_alerts_ignore_normal_traffic(self):
         before = {"values": {"net/tx_bytes": 0, "net/rx_errors": 0, "rdma/retry": 2}, "unavailable": []}
@@ -177,8 +178,11 @@ class IntegrationTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
                                                  "FAKE_EVENTS": str(self.root / "events.jsonl")})
         self.environment.start()
+        self.tool_directory = patch.object(rb, "PERFTEST_BIN", self.bin)
+        self.tool_directory.start()
 
     def tearDown(self):
+        self.tool_directory.stop()
         self.environment.stop()
         self.tmp.cleanup()
 
@@ -268,6 +272,32 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("injected native failure", " ".join(map(str, errors)))
         self.assertTrue((client.path / "summary.md").exists())
 
+    def test_native_bw_warmup_and_duration_margins(self):
+        config = rb.Config(sizes=(64, 2**20), repetitions=1, duration=5, perftest_port=free_port())
+        with patch.dict(os.environ, {"FAKE_REQUIRE_WARMUP": "1"}):
+            client, server, errors = self.run_sessions(config)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(client.rows), 8)
+        runs = [json.loads(line) for line in (client.path / "runs.jsonl").read_text().splitlines()]
+        for run in runs:
+            if run["job"]["mode"] == rb.MODES[2]:
+                continue
+            for role in ("client", "server"):
+                argv = run[role]["argv"]
+                self.assertIn("--perform_warm_up", argv)
+                if run["job"]["phase"] == "measured":
+                    self.assertEqual(argv[argv.index("-D") + 1], "5")
+                    self.assertEqual(argv[argv.index("-f") + 1], "1")
+                else:
+                    self.assertNotIn("-f", argv)
+        self.assertIn("1s start margin + 3s measured + 1s end margin", (client.path / "summary.md").read_text())
+        self.assertEqual(json.loads((server.path / "status.json").read_text())["status"], "complete")
+
+    def test_reject_perftest_without_native_warmup_fix(self):
+        with patch.dict(os.environ, {"FAKE_PERFTEST_VERSION": "6.20"}):
+            with self.assertRaisesRegex(rb.BenchError, "build_perftest.sh"):
+                rb.probe_tools(endpoint(), rb.Config())
+
     def test_process_execution_timeout_and_cleanup(self):
         config = rb.Config(modes=(rb.MODES[0],), sizes=(64,), perftest_port=free_port())
         e = endpoint()
@@ -320,6 +350,8 @@ class IntegrationTests(unittest.TestCase):
                 code = rb.main(["--client", "127.0.0.2", "--all", "--dry-run", "--output-dir", str(self.root / "unused")])
         self.assertEqual(code, 0)
         self.assertIn("96 measured runs", output.getvalue())
+        self.assertIn("5s start margin + 10s measured + 5s end margin", output.getvalue())
+        self.assertIn("--perform_warm_up", output.getvalue())
         connect.assert_not_called()
         self.assertFalse((self.root / "unused").exists())
         self.assertFalse((self.root / "events.jsonl").exists())
@@ -332,6 +364,7 @@ class IntegrationTests(unittest.TestCase):
             "import sys, signal\n"
             f"sys.path.insert(0, {str(Path(rb.__file__).parent)!r})\n"
             "import rdma_bench as rb\n"
+            f"rb.PERFTEST_BIN = rb.Path({str(self.bin)!r})\n"
             "ip = '127.0.0.2' if '--server' in sys.argv else '127.0.0.1'\n"
             "e = rb.Endpoint('test', 'fake0', ip, 'fake', 1, 3, '::ffff:' + ip, {'script_sha256':'same'}, {})\n"
             "rb.discover_endpoint = lambda args: e\n"

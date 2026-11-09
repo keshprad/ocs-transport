@@ -33,6 +33,7 @@ SIZES = (64, 16 * 1024, 2**20, 4 * 2**20, 16 * 2**20, 64 * 2**20, 256 * 2**20, 2
 MODES = ("unidirectional-write-bw", "bidirectional-write-bw", "write-latency")
 MAX_FRAME = 8 * 2**20
 SYSFS = Path("/sys")
+PERFTEST_BIN = Path(__file__).resolve().parent / ".perftest/bin"
 
 
 class BenchError(Exception):
@@ -92,6 +93,12 @@ class Config:
     startup_timeout: float = 30.0
     test_timeout: float = 180.0
 
+    @property
+    def bandwidth_margin(self):
+        # Preserve perftest 6.20's duration margins explicitly on both hosts,
+        # in addition to its native pre-test warm-up.
+        return self.duration // 4
+
     @classmethod
     def from_dict(cls, data):
         try:
@@ -119,6 +126,13 @@ class Config:
             raise BenchError("Timeouts must be positive and finite")
         if self.test_timeout < self.duration + 15:
             raise BenchError("Test timeout must exceed bandwidth duration by at least 15 seconds")
+
+
+def bandwidth_timing(config):
+    margin = config.bandwidth_margin
+    return (f"Bandwidth timing after native warm-up: {margin}s start margin + "
+            f"{config.duration - 2 * margin}s measured + "
+            f"{margin}s end margin per run (-D {config.duration} -f {margin}).")
 
 
 @dataclass
@@ -209,7 +223,8 @@ def probe_tools(endpoint, config):
     common = ("--ib-dev", "--ib-port", "--gid-index", "--connection", "--inline_size",
               "--size", "--port", "--bind_source_ip", "--iters")
     for name in sorted(names):
-        path = shutil.which(name)
+        bundled = PERFTEST_BIN / name
+        path = str(bundled) if bundled.is_file() else shutil.which(name)
         if not path:
             raise BenchError(f"{name} not found on PATH; install perftest before running this script")
         outputs = {}
@@ -223,13 +238,19 @@ def probe_tools(endpoint, config):
             outputs[option] = result.stdout + result.stderr
         required = list(common)
         if name == "ib_write_bw":
-            required += ["--duration", "--qp", "--tx-depth", "--report_gbits", "--noPeak", "--perform_warm_up"]
+            required += ["--duration", "--margin", "--qp", "--tx-depth", "--report_gbits",
+                         "--noPeak", "--perform_warm_up"]
             if "bidirectional-write-bw" in config.modes:
                 required += ["--bidirectional", "--report-both"]
         missing = [flag for flag in required if flag not in outputs["--help"]]
         version = re.search(r"Version:\s*(\S+)", outputs["--version"], re.I)
         if missing or not version:
             raise BenchError(f"Unsupported {path}: missing options {missing} or unreadable version")
+        if name == "ib_write_bw":
+            release = re.match(r"(\d+)\.(\d+)", version[1])
+            if not release or tuple(map(int, release.groups())) < (6, 26):
+                raise BenchError(f"{path} version {version[1]} lacks a verified native warm-up fix. "
+                                 "Run bash tools/build_perftest.sh on both hosts to build the current release.")
         endpoint.tools[name] = {"path": path, "version": version[1], "help": outputs["--help"]}
 
 
@@ -288,6 +309,8 @@ def build_command(endpoint, peer_ip, role, config, job):
         args += ["-n", str(job.iterations)]
     else:
         args += ["-D", str(config.duration)]
+        if name == "ib_write_bw":
+            args += ["-f", str(config.bandwidth_margin)]
     if role != job.listener:
         args.append(peer_ip)
     return args
@@ -618,6 +641,8 @@ class Store:
                       "Directions refer to these script roles, even when perftest roles swap.", ""]
         lines += ["Cells show median across repetitions [minimum–maximum]. Bandwidth is Gbit/s; latency is µs.",
                   "Latency summarizes perftest t_typical (half round-trip); it is not an independently measured one-way completion time.", ""]
+        if self.config and any(mode != MODES[2] for mode in self.config.modes):
+            lines += [bandwidth_timing(self.config), ""]
         specs = [
             (MODES[0], "Unidirectional write bandwidth", ("client_to_server_gbps", "server_to_client_gbps"),
              ("Client → Server", "Server → Client")),
@@ -693,6 +718,8 @@ class Session:
         return {"client": local, "server": remote}
 
     def suite(self):
+        if any(mode != MODES[2] for mode in self.config.modes):
+            log(bandwidth_timing(self.config))
         # Smoke all selected modes before any measured jobs. A failed 1 GiB test
         # must not masquerade as a completed, smaller-size-only benchmark.
         for mode in self.config.modes:
@@ -830,6 +857,8 @@ def preview(endpoint, config, role, peer):
                 log("  " + shlex.join(build_command(endpoint, peer, role, config, job)))
                 total += config.repetitions
     log(f"{total} measured runs. Each selected mode also smoke-tests its smallest/largest size (100 exchanges).")
+    if any(mode != MODES[2] for mode in config.modes):
+        log(bandwidth_timing(config))
     log("Latency has a separate warm-up before every repetition. At >=1 MiB, a 100-exchange calibration "
         "sets iterations targeting 15 seconds using perftest's average half-RTT; displayed -n 100 is a placeholder.")
     log("No sockets opened, benchmarks started, or result directories created. Peer discovery/version checks occur in a real run.")
@@ -850,7 +879,8 @@ def parser():
     p.add_argument("--all", action="store_true", help="Select all three benchmark modes")
     p.add_argument("--sizes", type=parse_size, nargs="+", default=list(SIZES), help="Message sizes in bytes or KiB/MiB/GiB")
     p.add_argument("--repetitions", type=int, default=3, help="Measured repetitions per combination")
-    p.add_argument("--duration", type=int, default=20, help="Perftest bandwidth duration in seconds")
+    p.add_argument("--duration", type=int, default=20,
+                   help="Total bandwidth run seconds, including warm-up/end margins")
     p.add_argument("--output-dir", default="results", help="Parent directory for unique run directories")
     p.add_argument("--control-port", type=int, default=18516, help="TCP coordination port; must match on both hosts")
     p.add_argument("--perftest-port", type=int, default=18515, help="TCP perftest port, negotiated by client")

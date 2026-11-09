@@ -14,16 +14,16 @@ import time
 
 
 if "--version" in sys.argv:
-    print("Version: 6.20")
+    print("Version: " + os.getenv("FAKE_PERFTEST_VERSION", "6.30"))
     sys.exit(0)
 if "--help" in sys.argv:
     print("Usage: fake_perftest\n--ib-dev --ib-port --gid-index --connection --inline_size "
-          "--size --port --bind_source_ip --iters --duration --qp --tx-depth --report_gbits "
+          "--size --port --bind_source_ip --iters --duration --margin --qp --tx-depth --report_gbits "
           "--noPeak --perform_warm_up --bidirectional --report-both")
     sys.exit(1)  # Like perftest's informational exits on some versions.
 
 p = argparse.ArgumentParser()
-for flag in ("-d", "-i", "-x", "-c", "-I", "-p", "-s", "-q", "-t", "-n", "-D", "--bind_source_ip"):
+for flag in ("-d", "-i", "-x", "-c", "-I", "-p", "-s", "-q", "-t", "-n", "-D", "-f", "--bind_source_ip"):
     p.add_argument(flag)
 for flag in ("-b", "-N", "--report_gbits", "--report-both", "--perform_warm_up"):
     p.add_argument(flag, action="store_true")
@@ -39,6 +39,9 @@ if os.getenv("FAKE_EVENTS"):
                             "argv": sys.argv[1:]}) + "\n")
 if a.D and os.getenv("FAKE_FAIL_MEASURED_SIZE") == str(size):
     print("injected native failure", file=sys.stderr, flush=True)
+    sys.exit(7)
+if os.getenv("FAKE_REQUIRE_WARMUP") and not latency and not a.perform_warm_up:
+    print("native bandwidth warm-up was not requested", file=sys.stderr, flush=True)
     sys.exit(7)
 
 # Deliberately print the banner before listening, matching native perftest.
@@ -60,7 +63,7 @@ else:
     conn.connect((a.peer, int(a.p)))
 with conn:
     conn.settimeout(5)
-    expected = json.dumps([size, iterations, bool(a.b), latency]).encode() + b"\n"
+    expected = json.dumps([size, iterations, bool(a.b), latency, a.D, a.f, a.perform_warm_up]).encode() + b"\n"
     conn.sendall(expected)
     data = b""
     while b"\n" not in data:

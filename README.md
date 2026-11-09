@@ -23,8 +23,9 @@ On both machines:
 - An active Ethernet RDMA interface with an IPv4 address and a matching RoCEv2
   GID. Each host may have a different interface, device, or GID index.
 - Matching perftest versions and the **same copy** of `rdma_bench.py` on both
-  hosts. The current local installation is Ubuntu perftest
-  `24.01.0+0.38-1build2`, which reports version `6.20`.
+  hosts. Use the current stable release **26.07.8**, which reports tool version
+  **6.30**. The older Ubuntu package reports `6.20` and has a native warm-up hang;
+  the runner rejects versions older than the upstream fix in `6.26`.
 - Permission to open the RDMA device and register the largest selected buffers.
   The runner records the locked-memory limit; native registration failures are
   reported with logs. It does not change resource limits or network settings.
@@ -35,6 +36,29 @@ On both machines:
 
 The runner expects a trusted two-host test network. It does not install packages,
 configure the link, or change MTUs, drivers, routing, or congestion settings.
+
+## Build current perftest
+
+On **both hosts**, from this updated checkout:
+
+```bash
+sudo apt-get install build-essential curl pkg-config \
+  libibverbs-dev librdmacm-dev libibumad-dev libpci-dev
+bash tools/build_perftest.sh
+```
+
+The helper pins the official [26.07.8 release](https://github.com/linux-rdma/perftest/releases/tag/26.07.8)
+(latest stable checked November 9, 2026) and verifies the release archive's
+SHA-256. It builds the two WRITE tools in `.perftest/bin/`, which the runner
+selects automatically before searching `PATH`. The build itself needs no sudo
+and does not replace `/usr/bin` binaries. Logs and release metadata are saved
+under `.perftest/`. Build independently on each host; both must use matching
+versions. `PERFTEST_BUILD_JOBS` optionally controls build parallelism (default 2).
+
+This release includes the [upstream native warm-up fix](https://github.com/linux-rdma/perftest/commit/766c13bdb5169efc38e1e5da8180ce6407f7379e):
+request completions for warm-up writes, then restore the original send flags
+before measurement. The runner keeps `--perform_warm_up` enabled, including
+smoke tests, without forcing different CQ moderation or a different posting API.
 
 ## Start the benchmark
 
@@ -99,6 +123,8 @@ python3 rdma_bench.py --client 169.254.238.243 --all \
 ```
 
 This performs eight measured runs plus smoke tests, calibration, and warm-ups.
+After native warm-up, each five-second bandwidth run excludes a one-second
+start margin, measures for three seconds, and excludes a final one-second margin.
 It validates orchestration but does not establish support for the full 1 GiB
 sweep. Restart both scripts for the full suite afterward.
 
@@ -139,8 +165,15 @@ Keep other traffic and GPU/CPU workloads idle during measurements.
 ### Bandwidth
 
 - RC, one QP, transmit depth 128, inline size zero, explicit size/device/port/GID.
-- `-D 20 --perform_warm_up --report_gbits -N`; perftest's default duration margins
-  apply. Peak calculation is disabled; report **average Gbit/s**.
+- `--perform_warm_up -D 20 -f 5 --report_gbits -N`: native warm-up, then five
+  seconds of start-margin traffic, ten seconds measured, and five seconds of
+  end-margin traffic. Both margins are excluded from the result.
+  `--duration` sets the total run length; each margin is `floor(duration / 4)`
+  seconds, explicitly matching perftest 6.20's duration default. Peak calculation
+  is disabled; report **average Gbit/s**.
+- Native warm-up uses the same QP and buffers as measurement. Smoke tests run
+  native warm-up followed by 100 exchanges; their measurements are excluded
+  from the report.
 - Bidirectional output uses `--report-both`; parse aggregate, local, and remote
   rows separately. Never divide aggregate throughput by two to infer directions.
 - Reports use script client/server identities consistently, even as native roles
@@ -158,8 +191,8 @@ Keep other traffic and GPU/CPU workloads idle during measurements.
   repetitions. Each repetition has a separate warm-up of
   `max(10, ceil(measured_count × 0.1))` exchanges.
 - Warm-ups are separate native invocations; they exercise the system path but
-  do not retain the next invocation's allocated buffers. Bandwidth's built-in
-  warm-up executes within its own invocation.
+  do not retain the next invocation's allocated buffers. Bandwidth's native
+  warm-up runs within its measured invocation and retains its buffers.
 - Preserve native min/max, typical, average, standard deviation, p99, and p99.9.
   The summary uses **t_typical** (perftest's median) and takes its median across
   repetitions. It does not merge all latency samples into one distribution.
@@ -215,13 +248,17 @@ python3 -m unittest discover -s tests -v
 Tests use temporary fake perftest executables and real local sockets. They check
 the full 96-run matrix, output parsing and units, calibration, direction mapping,
 readiness without probe connections, partial results, timeouts, and SIGTERM
-cleanup. **They do not measure or certify RDMA hardware performance.**
+cleanup. They also require native bandwidth warm-up and reject releases without
+the warm-up fix. **They do not measure or certify RDMA hardware performance.**
 
-The local hardware discovery and installed-tool dry-run were validated on
-`spark-28a3`. Real two-Spark validation requires launching the scripts on both
-machines as described above.
+The 6.30 build was validated on `spark-7e64` with hardware discovery, a dry-run,
+and six native RDMA loopback checks: 64 B/1 MiB WRITE smoke tests, five-second
+64 B unidirectional/bidirectional bandwidth runs, and 64 B/1 MiB latency tests.
+Native bandwidth warm-up stayed enabled throughout. These are functional checks
+on one host, not two-host performance results. Real two-Spark validation requires
+launching the scripts on both machines as described above.
 
 Native output semantics were checked against
-[the installed release's upstream source](https://github.com/linux-rdma/perftest/tree/24.01.0-0.38/src),
+[the selected release's upstream source](https://github.com/linux-rdma/perftest/tree/26.07.8/src),
 particularly `write_bw.c`, `perftest_parameters.c`, and
 `perftest_communication.c`.
