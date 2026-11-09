@@ -1,4 +1,4 @@
-# Preserve original RDMA evidence locally; commit the sanitized snapshot only.
+# Preserve original RDMA evidence locally; commit sanitized snapshots only.
 /rdma-results/
 __pycache__/
 *.py[cod]

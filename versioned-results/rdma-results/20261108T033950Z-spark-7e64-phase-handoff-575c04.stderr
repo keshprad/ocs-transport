@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/home/keshav/Documents/ocs-transport/rdma-results/phase_handoff.py", line 23, in <module>
+    logged('phase2-ping',['ping','-I','enP2p1s0f1np1','-c','3','-W','2','192.168.201.13'])
+  File "/home/keshav/Documents/ocs-transport/rdma-results/phase_handoff.py", line 8, in logged
+    if result.returncode: raise RuntimeError(label+' failed with '+str(result.returncode))
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: phase2-ping failed with 1

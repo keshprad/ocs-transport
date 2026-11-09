@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "-u",
+    "rdma-results/agent_mailbox.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:27:12.739350+00:00",
+  "exit_code": -15,
+  "end_utc": "2026-11-08T04:47:50.055945+00:00"
+}

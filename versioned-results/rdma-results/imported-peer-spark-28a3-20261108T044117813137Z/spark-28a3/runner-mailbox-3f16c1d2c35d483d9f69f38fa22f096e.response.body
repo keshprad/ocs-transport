@@ -1,0 +1,1 @@
+{"utc": "2026-11-08T03:48:52.225187+00:00", "sender": "spark-28a3", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"026-bw-1-1048576-bidir-r1\", \"server\": \"spark-28a3\", \"ports\": [14052]}"}

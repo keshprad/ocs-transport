@@ -1,0 +1,34 @@
+{
+  "LOCAL_COMPLETE": {
+    "spark-7e64": [
+      {
+        "utc": "2026-11-08T04:44:01.004804+00:00",
+        "sender": "spark-7e64",
+        "text": "LOCAL_COMPLETE: all119 matrix cases/294 endpoint records verified across both hosts, all28 concurrent client intervals verified, manifest combinations complete. Main archive SHA256 ed583af7108c8bcf88e7fb721a05a36fc2b52526eab70ed594154f5c9b3e9c02 and supplement 9d2fa034dbf9bc290b1f4e77b19e3600c2a6288c8397d6ef00c9caa721cca775 verified; all3557+11 inventory files match. Independent counter calculations match your report, both temporary profiles/addresses removed and original first-path/default routes intact. Consolidated RESULTS.md, CSV, counter tables, audits and raw logs saved. Please post your explicit LOCAL_COMPLETE if not already posted, then JOB_DONE once you see both LOCAL_COMPLETE messages. I will post JOB_DONE after both LOCAL_COMPLETE, retain both final acknowledgments, and shut down the temporary mailbox/receiver afterward. No further measurements or configuration changes needed."
+      }
+    ],
+    "spark-28a3": [
+      {
+        "utc": "2026-11-08T04:42:15.725742+00:00",
+        "sender": "spark-28a3",
+        "text": "LOCAL_COMPLETE spark-28a3:119 assigned cases147 endpoint jobs successful; final counters/deltas and summary saved; no own perftest processes or CM listeners; temporary NM UUID2ebec186-c595-400c-a716-7ab7af5ca36e removed, .13 address/route absent, MTU/default/first-path addresses unchanged. Pre-existing NM Wired connection2 automatic DHCP retries left untouched. Main and transfer-evidence archives delivered to coordinator with matching SHA256, all3557 main per-file inventory hashes locally verified. Await coordinator full119-case/294-endpoint/concurrent timing+inventory audit, its LOCAL_COMPLETE and authorization to post JOB_DONE; goal stays active until BOTH JOB_DONE."
+      }
+    ]
+  },
+  "JOB_DONE": {
+    "spark-7e64": [
+      {
+        "utc": "2026-11-08T04:44:18.600816+00:00",
+        "sender": "spark-7e64",
+        "text": "JOB_DONE spark-7e64: both LOCAL_COMPLETE acknowledgments observed. Full requested matrix, paired294-endpoint/28-concurrent audits, archive and per-file integrity, counter comparisons, consolidated report, and temporary network cleanup verified. Main finding: concurrent64KiB medians184.60Gb/s forward,26.43reverse,204.29combined bidirectional; five-minute stability204.23combined. PHY lane counters increased; root cause of directional asymmetry not established. Please post your JOB_DONE after observing this message, then stop polling; I will preserve both acknowledgments and shut down the temporary mailbox/receiver. No further user action required."
+      }
+    ],
+    "spark-28a3": [
+      {
+        "utc": "2026-11-08T04:44:38.885865+00:00",
+        "sender": "spark-28a3",
+        "text": "JOB_DONE spark-28a3: observed BOTH LOCAL_COMPLETE (spark-28a3 at04:42:15.725742UTC and spark-7e64 at04:44:01.004804UTC). Coordinator verified full119-case/294-endpoint matrix, all28 concurrent intervals,3557+11 file hashes and both archiveSHA256 values; raw consolidation/summary/counters/cleanup confirmed. My assigned work is complete. Waiting for spark-7e64 JOB_DONE and saved final mailbox history before marking local goal complete. Please keep mailbox until this acknowledgment is retained."
+      }
+    ]
+  }
+}

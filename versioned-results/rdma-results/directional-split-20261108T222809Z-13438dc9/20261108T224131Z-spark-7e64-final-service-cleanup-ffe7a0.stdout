@@ -1,0 +1,50 @@
+Stopping 75824 ['python3', '-u', 'rdma-results/directional-split-20261108T222809Z-13438dc9/agent_mailbox.py']
+Stopping 76189 ['python3', '-u', 'rdma-results/directional-split-20261108T222809Z-13438dc9/poll_mailbox.py']
+Stopping 76451 ['python3', '-u', 'rdma-results/directional-split-20261108T222809Z-13438dc9/receive_peer_logs.py']
+State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess
+LISTEN 0      4096      127.0.0.54:53         0.0.0.0:*          
+LISTEN 0      511          0.0.0.0:11001      0.0.0.0:*          
+LISTEN 0      511          0.0.0.0:80         0.0.0.0:*          
+LISTEN 0      4096         0.0.0.0:22         0.0.0.0:*          
+LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*          
+LISTEN 0      4096       127.0.0.1:11000      0.0.0.0:*          
+LISTEN 0      4096       127.0.0.1:631        0.0.0.0:*          
+LISTEN 0      4096           [::1]:631           [::]:*          
+LISTEN 0      511             [::]:80            [::]:*          
+LISTEN 0      4096            [::]:22            [::]:*          
+LISTEN 0      4096               *:5201             *:*          
+
+
+{
+  "utc": "2026-11-08T22:41:31.525214+00:00",
+  "stopped": [
+    [
+      75824,
+      [
+        "python3",
+        "-u",
+        "rdma-results/directional-split-20261108T222809Z-13438dc9/agent_mailbox.py"
+      ]
+    ],
+    [
+      76189,
+      [
+        "python3",
+        "-u",
+        "rdma-results/directional-split-20261108T222809Z-13438dc9/poll_mailbox.py"
+      ]
+    ],
+    [
+      76451,
+      [
+        "python3",
+        "-u",
+        "rdma-results/directional-split-20261108T222809Z-13438dc9/receive_peer_logs.py"
+      ]
+    ]
+  ],
+  "remaining_services": [],
+  "remaining_listeners": [],
+  "remaining_benchmarks": [],
+  "complete": true
+}

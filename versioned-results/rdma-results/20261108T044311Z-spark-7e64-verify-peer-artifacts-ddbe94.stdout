@@ -1,0 +1,54 @@
+{
+  "inventories": [
+    {
+      "inventory": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/spark-28a3-raw-20261108T044116Z-7ba0c4e3.inventory.json",
+      "files": 3557,
+      "mismatches": []
+    },
+    {
+      "inventory": "imported-peer-spark-28a3-20261108T044157394028Z/spark-28a3/spark-28a3-transfer-evidence-20261108T044157Z-7fe6f620.inventory.json",
+      "files": 11,
+      "mismatches": []
+    }
+  ],
+  "counter_checks": {
+    "enp1s0f1np1": {
+      "baseline": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/baseline-20261108T033041.363290Z-43e83799/stdout",
+      "final": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/final-counters-20261108T043903.228623Z-4d694fbf/stdout",
+      "checked_counters": 2450,
+      "claim_mismatches": [],
+      "nonzero_error_related_deltas": {
+        "rx_err_lane_0_phy": 206922,
+        "rx_err_lane_1_phy": 10859931
+      },
+      "decreasing_counters": []
+    },
+    "enP2p1s0f1np1": {
+      "baseline": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/baseline-20261108T033041.363290Z-43e83799/stdout",
+      "final": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/final-counters-20261108T043903.228623Z-4d694fbf/stdout",
+      "checked_counters": 2450,
+      "claim_mismatches": [],
+      "nonzero_error_related_deltas": {
+        "rx_err_lane_0_phy": 206922,
+        "rx_err_lane_1_phy": 10859923
+      },
+      "decreasing_counters": []
+    }
+  },
+  "cleanup": {
+    "cleanup-profile-down": {
+      "source": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/cleanup-profile-down-20261108T043956.816466Z-137a5664",
+      "exit_code": 0
+    },
+    "cleanup-profile-delete": {
+      "source": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/cleanup-profile-delete-20261108T044002.005828Z-f35a4f7a",
+      "exit_code": 0
+    },
+    "cleanup-verification": {
+      "source": "imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/cleanup-verification-20261108T044008.600479Z-7d0eb9c5",
+      "exit_code": 0
+    },
+    "temporary_profile_and_address_absent": true,
+    "original_first_path_and_default_intact": true
+  }
+}

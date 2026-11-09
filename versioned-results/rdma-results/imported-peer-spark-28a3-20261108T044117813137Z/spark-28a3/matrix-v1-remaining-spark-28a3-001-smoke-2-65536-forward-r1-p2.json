@@ -1,0 +1,35 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "roceP2p1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14003",
+    "-s",
+    "65536",
+    "-D",
+    "5",
+    "--report_gbits"
+  ],
+  "exact_invocation": "timeout 180 ib_write_bw -d roceP2p1s0f1 -i 1 -R -p 14003 -s 65536 -D 5 --report_gbits",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T03:56:33.732086+00:00",
+  "case": {
+    "id": "001-smoke-2-65536-forward-r1",
+    "kind": "smoke",
+    "paths": [
+      1
+    ],
+    "size": 65536,
+    "direction": "forward",
+    "rep": 1,
+    "duration": 5
+  },
+  "role": "server",
+  "port": 14003
+}

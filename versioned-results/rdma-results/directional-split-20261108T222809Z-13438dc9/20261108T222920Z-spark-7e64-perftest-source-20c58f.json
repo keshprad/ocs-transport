@@ -1,0 +1,13 @@
+{
+  "command": [
+    "curl",
+    "-fL",
+    "--max-time",
+    "30",
+    "https://raw.githubusercontent.com/linux-rdma/perftest/24.01.0/src/write_bw.c"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:29:20.261744+00:00",
+  "exit_code": 22,
+  "end_utc": "2026-11-08T22:29:20.393081+00:00"
+}

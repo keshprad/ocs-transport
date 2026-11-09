@@ -1,0 +1,16 @@
+GENERAL.DEVICE:                         enP2p1s0f1np1
+GENERAL.TYPE:                           ethernet
+GENERAL.HWADDR:                         4C:BB:47:2D:28:A9
+GENERAL.MTU:                            1500
+GENERAL.STATE:                          70 (connecting (getting IP configuration))
+GENERAL.CONNECTION:                     Wired connection 2
+GENERAL.CON-PATH:                       /org/freedesktop/NetworkManager/ActiveConnection/896
+WIRED-PROPERTIES.CARRIER:               on
+IP4.GATEWAY:                            --
+IP6.ADDRESS[1]:                         fe80::e998:b33c:997c:6bc0/64
+IP6.GATEWAY:                            --
+IP6.ROUTE[1]:                           dst = fe80::/64, nh = ::, mt = 1024
+19: enP2p1s0f1np1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 4c:bb:47:2d:28:a9 brd ff:ff:ff:ff:ff:ff promiscuity 0  allmulti 0 minmtu 68 maxmtu 9978 numtxqueues 424 numrxqueues 20 gso_max_size 65536 gso_max_segs 65535 tso_max_size 524280 tso_max_segs 65535 gro_max_size 65536 portname p1 switchid a4282d000347bb4c parentbus pci parentdev 0002:01:00.1 
+    inet6 fe80::e998:b33c:997c:6bc0/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever

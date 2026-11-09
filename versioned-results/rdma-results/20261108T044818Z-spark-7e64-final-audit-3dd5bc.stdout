@@ -1,0 +1,30 @@
+{
+  "complete": true,
+  "utc": "2026-11-08T04:48:18.805900+00:00",
+  "requirements": {
+    "matrix_coverage": true,
+    "paired_endpoints_and_concurrency": true,
+    "peer_file_integrity": true,
+    "archive_integrity": true,
+    "counter_comparisons": true,
+    "local_network_cleanup": true,
+    "peer_network_cleanup": true,
+    "services_and_benchmarks_stopped": true,
+    "both_agents_acknowledged": true,
+    "service_logs_finalized": true
+  },
+  "cases": 119,
+  "endpoint_records": 294,
+  "concurrent_cases": 28,
+  "verified_peer_files": 3568,
+  "archive_sha256": {
+    "peer-spark-28a3-20261108T044117813137Z.tar.gz": "ed583af7108c8bcf88e7fb721a05a36fc2b52526eab70ed594154f5c9b3e9c02",
+    "peer-spark-28a3-20261108T044157394028Z.tar.gz": "9d2fa034dbf9bc290b1f4e77b19e3600c2a6288c8397d6ef00c9caa721cca775"
+  },
+  "service_shutdown_note": "Intentional SIGTERM, exit -15; raw service logs finalized.",
+  "limitations": [
+    "Directional performance asymmetry remains unexplained.",
+    "PHY lane counters increased; causality and packet-loss implications are unproven."
+  ],
+  "evidence_index": "README.md"
+}

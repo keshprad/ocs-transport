@@ -1,0 +1,67 @@
+{
+  "archive": "peer-spark-28a3-20261108T223810161735Z.tar.gz",
+  "archive_sha256": "7383fbadec864c74b27a1129f20801da4e651ed0f03984b15e28188af3d810d9",
+  "destination": "/home/keshav/Documents/ocs-transport/rdma-results/directional-split-20261108T222809Z-13438dc9/imported-peer-spark-28a3-20261108T223810161735Z",
+  "files": [
+    {
+      "path": "spark-28a3/archive-inventory-verify-20261108T223810.010907Z-7ac5cbd9/command.json",
+      "bytes": 368,
+      "sha256": "6b5de6006227bb88490390e0d79d3b3cb4871b592c7ac4307bdf81e4c381a371"
+    },
+    {
+      "path": "spark-28a3/archive-inventory-verify-20261108T223810.010907Z-7ac5cbd9/completion.json",
+      "bytes": 435,
+      "sha256": "62a063bd549a3a74e9b1b915c5b9b7ffed625e60feeaca7e14ecc1263bfa841b"
+    },
+    {
+      "path": "spark-28a3/archive-inventory-verify-20261108T223810.010907Z-7ac5cbd9/stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "spark-28a3/archive-inventory-verify-20261108T223810.010907Z-7ac5cbd9/stdout",
+      "bytes": 115,
+      "sha256": "abe18035a5e619ad3998a3339aa506fb687705e3e4cefdf74ef8d86f2d630d8e"
+    },
+    {
+      "path": "spark-28a3/archive-upload-20261108T223754.503898Z-8987bcb6/command.json",
+      "bytes": 368,
+      "sha256": "92a324b79c168650f84975b2dc3704cda5ef839b785ea219f5c984e73c12a32d"
+    },
+    {
+      "path": "spark-28a3/archive-upload-20261108T223754.503898Z-8987bcb6/completion.json",
+      "bytes": 435,
+      "sha256": "195137c7f47f1368b799e55dad7c0a551731359e0f7241c32aec4b53164d8f17"
+    },
+    {
+      "path": "spark-28a3/archive-upload-20261108T223754.503898Z-8987bcb6/stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "spark-28a3/archive-upload-20261108T223754.503898Z-8987bcb6/stdout",
+      "bytes": 869,
+      "sha256": "7fc0227fb1917dbb745669f60b0861731834ef1f47ca5a7fac97540e6f341ba4"
+    },
+    {
+      "path": "spark-28a3/spark-28a3-raw-20261108T223754Z-127a77ee.upload-request.json",
+      "bytes": 716,
+      "sha256": "50270227e1a32de4d76fbad98ede80f94d932138bc835cfd5e8d7e8492deae6c"
+    },
+    {
+      "path": "spark-28a3/spark-28a3-raw-20261108T223754Z-127a77ee.upload-response.body",
+      "bytes": 185,
+      "sha256": "1fed1b4fcb5ab638cc68646eb93c435b286812dafd6389ecaba4c973a8cbc17a"
+    },
+    {
+      "path": "spark-28a3/spark-28a3-raw-20261108T223754Z-127a77ee.upload-result.json",
+      "bytes": 527,
+      "sha256": "fef7e4e6bf00f3d25a7abf5ca7d1355436858125a36f7f5584fddf129782d7a3"
+    },
+    {
+      "path": "spark-28a3/spark-28a3-transfer-evidence-20261108T223810Z-d99e013b.inventory.json",
+      "bytes": 2228,
+      "sha256": "92e87a47cc0ff8e0a869bd1d5927038b9a8992a2188c7311ac47123571628174"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "archive": "/home/keshav/Documents/ocs-transport/rdma-results/directional-split-20261108T222809Z-13438dc9/spark-28a3-raw-20261108T223754Z-127a77ee.tar.gz",
+  "bytes": 161287,
+  "sha256": "1443eaff0a5cf83442ddfd6eeff61e3c71761071354e39b24edc813724b855d7",
+  "files": 231,
+  "response": {
+    "status": 201,
+    "headers": [
+      [
+        "Server",
+        "BaseHTTP/0.6 Python/3.12.3"
+      ],
+      [
+        "Date",
+        "Sun, 08 Nov 2026 22:37:54 GMT"
+      ],
+      [
+        "Content-Length",
+        "185"
+      ]
+    ],
+    "end_utc": "2026-11-08T22:37:54.597216+00:00",
+    "receipt": {
+      "file": "peer-spark-28a3-20261108T223754596981Z.tar.gz",
+      "bytes": 161287,
+      "sha256": "1443eaff0a5cf83442ddfd6eeff61e3c71761071354e39b24edc813724b855d7",
+      "utc": "20261108T223754596981Z"
+    },
+    "sha256_match": true,
+    "exit_code": 0
+  }
+}

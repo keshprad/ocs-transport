@@ -1,0 +1,28 @@
+{
+  "test_id": "directional-split-20261108T222809Z-13438dc9-r3",
+  "paths": [
+    {
+      "path": 1,
+      "spark_7e64_tx": 92.27,
+      "spark_7e64_rx": 9.86,
+      "spark_28a3_tx": 9.86,
+      "spark_28a3_rx": 92.27,
+      "combined": 102.13,
+      "opposite_rows_exact_match": true
+    },
+    {
+      "path": 2,
+      "spark_7e64_tx": 92.27,
+      "spark_7e64_rx": 9.86,
+      "spark_28a3_tx": 9.86,
+      "spark_28a3_rx": 92.27,
+      "combined": 102.13,
+      "opposite_rows_exact_match": true
+    }
+  ],
+  "aggregate_forward": 184.54,
+  "aggregate_reverse": 19.72,
+  "aggregate_combined": 204.26,
+  "client_process_overlap_seconds": 31.278932,
+  "peer_done_observed": true
+}

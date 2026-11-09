@@ -1,0 +1,68 @@
+CA 'roceP2p1s0f0'
+	CA type: MT4129
+	Number of ports: 1
+	Firmware version: 28.45.4028
+	Hardware version: 0
+	Node GUID: 0x4cbb4703002d28a8
+	System image GUID: 0x4cbb4703002d28a4
+	Port 1:
+		State: Down
+		Physical state: Disabled
+		Rate: 40
+		Base lid: 0
+		LMC: 0
+		SM lid: 0
+		Capability mask: 0x00010000
+		Port GUID: 0x4ebb47fffe2d28a8
+		Link layer: Ethernet
+CA 'roceP2p1s0f1'
+	CA type: MT4129
+	Number of ports: 1
+	Firmware version: 28.45.4028
+	Hardware version: 0
+	Node GUID: 0x4cbb4703002d28a9
+	System image GUID: 0x4cbb4703002d28a4
+	Port 1:
+		State: Active
+		Physical state: LinkUp
+		Rate: 200
+		Base lid: 0
+		LMC: 0
+		SM lid: 0
+		Capability mask: 0x00010000
+		Port GUID: 0x4ebb47fffe2d28a9
+		Link layer: Ethernet
+CA 'rocep1s0f0'
+	CA type: MT4129
+	Number of ports: 1
+	Firmware version: 28.45.4028
+	Hardware version: 0
+	Node GUID: 0x4cbb4703002d28a4
+	System image GUID: 0x4cbb4703002d28a4
+	Port 1:
+		State: Down
+		Physical state: Disabled
+		Rate: 40
+		Base lid: 0
+		LMC: 0
+		SM lid: 0
+		Capability mask: 0x00010000
+		Port GUID: 0x4ebb47fffe2d28a4
+		Link layer: Ethernet
+CA 'rocep1s0f1'
+	CA type: MT4129
+	Number of ports: 1
+	Firmware version: 28.45.4028
+	Hardware version: 0
+	Node GUID: 0x4cbb4703002d28a5
+	System image GUID: 0x4cbb4703002d28a4
+	Port 1:
+		State: Active
+		Physical state: LinkUp
+		Rate: 200
+		Base lid: 0
+		LMC: 0
+		SM lid: 0
+		Capability mask: 0x00010000
+		Port GUID: 0x4ebb47fffe2d28a5
+		Link layer: Ethernet

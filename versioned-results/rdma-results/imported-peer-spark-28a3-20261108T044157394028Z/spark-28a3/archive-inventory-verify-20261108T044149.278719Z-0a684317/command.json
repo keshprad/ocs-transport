@@ -1,0 +1,11 @@
+{
+  "command": "python3 -c 'import tarfile,json,hashlib,pathlib; p=pathlib.Path(\"rdma-results/spark-28a3-raw-20261108T044116Z-7ba0c4e3.tar.gz\"); t=tarfile.open(p); inv=[m for m in t.getmembers() if m.name.endswith(\".inventory.json\")][0]; data=json.load(t.extractfile(inv)); bad=[r[\"path\"] for r in data[\"files\"] if hashlib.sha256(t.extractfile(\"spark-28a3/\"+r[\"path\"]).read()).hexdigest()!=r[\"sha256\"]]; print(\"files\",len(data[\"files\"]),\"bad\",bad); assert not bad'",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "python3 -c 'import tarfile,json,hashlib,pathlib; p=pathlib.Path(\"rdma-results/spark-28a3-raw-20261108T044116Z-7ba0c4e3.tar.gz\"); t=tarfile.open(p); inv=[m for m in t.getmembers() if m.name.endswith(\".inventory.json\")][0]; data=json.load(t.extractfile(inv)); bad=[r[\"path\"] for r in data[\"files\"] if hashlib.sha256(t.extractfile(\"spark-28a3/\"+r[\"path\"]).read()).hexdigest()!=r[\"sha256\"]]; print(\"files\",len(data[\"files\"]),\"bad\",bad); assert not bad'"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T04:41:49.278827+00:00"
+}

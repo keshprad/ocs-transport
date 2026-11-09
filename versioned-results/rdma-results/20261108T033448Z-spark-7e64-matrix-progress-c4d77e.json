@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "-c",
+    "import time,runpy; time.sleep(40); runpy.run_path(\"rdma-results/summarize_matrix.py\",run_name=\"__main__\")"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:34:48.057805+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:35:28.078177+00:00"
+}

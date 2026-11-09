@@ -1,0 +1,11 @@
+{
+  "command": [
+    "bash",
+    "-c",
+    "hostname; date -u --iso-8601=seconds; ip -j address; ip -j route; ss -ltn; ib_write_bw --version; ib_write_bw --help; rdma link show; nmcli -f NAME,UUID,DEVICE connection show --active"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:28:21.728996+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:28:21.761997+00:00"
+}

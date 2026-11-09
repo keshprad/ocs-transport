@@ -1,0 +1,10 @@
+{
+  "command": [
+    "ethtool",
+    "enP2p1s0f1np1"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:30:52.139796+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:30:52.143993+00:00"
+}

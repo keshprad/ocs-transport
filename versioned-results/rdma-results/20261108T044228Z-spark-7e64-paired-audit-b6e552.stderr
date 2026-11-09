@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/home/keshav/Documents/ocs-transport/rdma-results/audit_endpoints.py", line 50, in <module>
+    checks.append({'host':host,'case':case['id'],'path':path+1,'metadata':str(file.relative_to(ROOT)),'issues':issues})
+                                                                              ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 682, in relative_to
+    raise ValueError(f"{str(self)!r} is not in the subpath of {str(other)!r}")
+ValueError: 'rdma-results/imported-peer-spark-28a3-20261108T044117813137Z/spark-28a3/matrix-v1-remaining-spark-28a3-001-smoke-2-65536-forward-r1-p2.json.completion.json' is not in the subpath of '/home/keshav/Documents/ocs-transport/rdma-results'

@@ -1,0 +1,39 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "rocep1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14160",
+    "-s",
+    "1048576",
+    "-D",
+    "30",
+    "--report_gbits",
+    "-b",
+    "169.254.238.243"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:28:57.089254+00:00",
+  "case": {
+    "id": "080-bw-12-1048576-bidir-r1",
+    "kind": "bw",
+    "paths": [
+      0,
+      1
+    ],
+    "size": 1048576,
+    "direction": "bidir",
+    "rep": 1,
+    "duration": 30
+  },
+  "role": "client",
+  "port": 14160,
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:29:28.433169+00:00"
+}

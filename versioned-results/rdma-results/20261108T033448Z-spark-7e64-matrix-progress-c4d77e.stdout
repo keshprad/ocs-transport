@@ -1,0 +1,49 @@
+{
+  "completed_logs": 3,
+  "running_logs": 1,
+  "failed_logs": [],
+  "latest": [
+    {
+      "id": "004-bw-1-4096-forward-r3",
+      "kind": "bw",
+      "size": 4096,
+      "direction": "forward",
+      "rep": 3,
+      "path": "1",
+      "role": "client",
+      "exit_code": 0,
+      "log": "matrix-v1-first-spark-7e64-004-bw-1-4096-forward-r3-p1.stdout",
+      "iterations": "50767100",
+      "average_gbps": "103.97",
+      "million_messages_sec": "3.172944"
+    },
+    {
+      "id": "002-bw-1-4096-forward-r1",
+      "kind": "bw",
+      "size": 4096,
+      "direction": "forward",
+      "rep": 1,
+      "path": "1",
+      "role": "client",
+      "exit_code": 0,
+      "log": "matrix-v1-first-spark-7e64-002-bw-1-4096-forward-r1-p1.stdout",
+      "iterations": "50804800",
+      "average_gbps": "104.05",
+      "million_messages_sec": "3.175321"
+    },
+    {
+      "id": "003-bw-1-4096-forward-r2",
+      "kind": "bw",
+      "size": 4096,
+      "direction": "forward",
+      "rep": 2,
+      "path": "1",
+      "role": "client",
+      "exit_code": 0,
+      "log": "matrix-v1-first-spark-7e64-003-bw-1-4096-forward-r2-p1.stdout",
+      "iterations": "50797700",
+      "average_gbps": "104.03",
+      "million_messages_sec": "3.174863"
+    }
+  ]
+}

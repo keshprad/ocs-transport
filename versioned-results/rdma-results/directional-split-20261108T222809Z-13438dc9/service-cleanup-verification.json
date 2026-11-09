@@ -1,0 +1,33 @@
+{
+  "utc": "2026-11-08T22:41:31.525214+00:00",
+  "stopped": [
+    [
+      75824,
+      [
+        "python3",
+        "-u",
+        "rdma-results/directional-split-20261108T222809Z-13438dc9/agent_mailbox.py"
+      ]
+    ],
+    [
+      76189,
+      [
+        "python3",
+        "-u",
+        "rdma-results/directional-split-20261108T222809Z-13438dc9/poll_mailbox.py"
+      ]
+    ],
+    [
+      76451,
+      [
+        "python3",
+        "-u",
+        "rdma-results/directional-split-20261108T222809Z-13438dc9/receive_peer_logs.py"
+      ]
+    ]
+  ],
+  "remaining_services": [],
+  "remaining_listeners": [],
+  "remaining_benchmarks": [],
+  "complete": true
+}

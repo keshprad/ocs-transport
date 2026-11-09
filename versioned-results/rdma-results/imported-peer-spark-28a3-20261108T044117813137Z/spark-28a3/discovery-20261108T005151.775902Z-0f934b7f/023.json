@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "lspci -nnk"
+  ],
+  "command": "lspci -nnk",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:55.107548+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:55.123173+00:00"
+}

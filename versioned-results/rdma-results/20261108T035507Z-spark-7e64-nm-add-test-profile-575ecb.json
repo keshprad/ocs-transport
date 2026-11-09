@@ -1,0 +1,31 @@
+{
+  "command": [
+    "nmcli",
+    "connection",
+    "add",
+    "type",
+    "ethernet",
+    "ifname",
+    "enP2p1s0f1np1",
+    "con-name",
+    "rdma-benchmark-temp-20261108",
+    "autoconnect",
+    "no",
+    "save",
+    "no",
+    "ipv4.method",
+    "manual",
+    "ipv4.addresses",
+    "192.168.201.12/24",
+    "ipv4.never-default",
+    "yes",
+    "ipv6.method",
+    "disabled",
+    "802-3-ethernet.mtu",
+    "1500"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:55:07.719203+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:55:07.740254+00:00"
+}

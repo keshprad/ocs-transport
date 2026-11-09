@@ -1,0 +1,37 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "rocep1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14126",
+    "-s",
+    "4096",
+    "-D",
+    "30",
+    "--report_gbits",
+    "-b"
+  ],
+  "exact_invocation": "timeout 180 ib_write_bw -d rocep1s0f1 -i 1 -R -p 14126 -s 4096 -D 30 --report_gbits -b",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:18:10.318668+00:00",
+  "case": {
+    "id": "063-bw-12-4096-bidir-r2",
+    "kind": "bw",
+    "paths": [
+      0,
+      1
+    ],
+    "size": 4096,
+    "direction": "bidir",
+    "rep": 2,
+    "duration": 30
+  },
+  "role": "server",
+  "port": 14126
+}

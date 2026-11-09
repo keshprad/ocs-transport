@@ -1,0 +1,11 @@
+{
+  "command": [
+    "bash",
+    "-c",
+    "dpkg-query -W perftest; dpkg -L perftest; strings /usr/bin/ib_write_bw | rg -i \"local|remote|duplex|bidirectional|report.both|[RT]X\""
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:28:54.197960+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:28:54.240944+00:00"
+}

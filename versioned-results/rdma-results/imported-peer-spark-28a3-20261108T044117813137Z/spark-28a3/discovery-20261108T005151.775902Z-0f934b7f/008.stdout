@@ -1,0 +1,17 @@
+fe80::/64 dev vethe993ca7 proto kernel metric 256 pref medium
+fe80::/64 dev docker_gwbridge proto kernel metric 256 pref medium
+fe80::/64 dev enp1s0f1np1 proto kernel metric 256 pref medium
+fe80::/64 dev tailscale0 proto kernel metric 256 pref medium
+fe80::/64 dev wlP9s9 proto kernel metric 1024 pref medium
+local ::1 dev lo table local proto kernel metric 0 pref medium
+local fe80::2291:bbac:1b51:448 dev tailscale0 table local proto kernel metric 0 pref medium
+local fe80::281f:b5ff:fedf:1153 dev vethe993ca7 table local proto kernel metric 0 pref medium
+local fe80::4ebb:47ff:fe2d:28a5 dev enp1s0f1np1 table local proto kernel metric 0 pref medium
+local fe80::95f2:c99c:9d54:662b dev wlP9s9 table local proto kernel metric 0 pref medium
+local fe80::bcf3:c3ff:feef:ed4f dev docker_gwbridge table local proto kernel metric 0 pref medium
+multicast ff00::/8 dev vethe993ca7 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev docker_gwbridge table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev enp1s0f1np1 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev tailscale0 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev wlP9s9 table local proto kernel metric 256 pref medium
+multicast ff00::/8 dev enP2p1s0f1np1 table local proto kernel metric 256 pref medium

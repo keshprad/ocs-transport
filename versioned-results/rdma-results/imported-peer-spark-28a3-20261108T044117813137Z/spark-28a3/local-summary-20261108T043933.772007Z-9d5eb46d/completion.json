@@ -1,0 +1,13 @@
+{
+  "command": "python3 rdma-results/summarize.py",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "python3 rdma-results/summarize.py"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T04:39:33.772114+00:00",
+  "end_utc": "2026-11-08T04:39:33.817735+00:00",
+  "exit_code": 0
+}

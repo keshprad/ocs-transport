@@ -1,0 +1,37 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "roceP2p1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14099",
+    "-s",
+    "1048576",
+    "-D",
+    "30",
+    "--report_gbits",
+    "192.168.201.13"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:09:07.416771+00:00",
+  "case": {
+    "id": "049-bw-2-1048576-forward-r3",
+    "kind": "bw",
+    "paths": [
+      1
+    ],
+    "size": 1048576,
+    "direction": "forward",
+    "rep": 3,
+    "duration": 30
+  },
+  "role": "client",
+  "port": 14099,
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:09:38.755464+00:00"
+}

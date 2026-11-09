@@ -1,0 +1,8 @@
+NAME                 UUID                                  DEVICE          
+eduroam [f06d933d]   f06d933d-73fa-4e65-a542-de919a7955c4  wlP9s9          
+netplan-enp1s0f1np1  422c4968-c9eb-33ac-b993-958ae320e96c  enp1s0f1np1     
+rdma-split-13438dc9  2799a935-8f8a-4864-9dce-ae1006b5245a  enP2p1s0f1np1   
+lo                   2ad331fa-4356-419c-a588-a6e2051643de  lo              
+br-555bc1ec6af6      ced02aa6-8684-454e-b930-8a3afd96528b  br-555bc1ec6af6 
+docker0              ca720a1b-4166-446d-910c-adb642954f7d  docker0         
+docker_gwbridge      fdee453f-5576-4f42-88b2-f2f7ba96d739  docker_gwbridge 

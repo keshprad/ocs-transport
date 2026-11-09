@@ -1,0 +1,103 @@
+2026-11-08T03:56:02.479877+00:00 PREPARED all {'manifest_sha256': '493348804a1774b62659fbdea2460e73467b77239b05ddc60e5c491083f307a3', 'cases': 74}
+2026-11-08T03:56:40.871608+00:00 DONE 001-smoke-2-65536-forward-r1 {'exit_codes': [0]}
+2026-11-08T03:57:14.171385+00:00 DONE 029-bw-2-4096-forward-r1 {'exit_codes': [0]}
+2026-11-08T03:57:47.473146+00:00 DONE 030-bw-2-4096-forward-r2 {'exit_codes': [0]}
+2026-11-08T03:58:20.783632+00:00 DONE 031-bw-2-4096-forward-r3 {'exit_codes': [0]}
+2026-11-08T03:58:23.295396+00:00 READY 032-bw-2-4096-reverse-r1 {'server': 'spark-7e64', 'ports': [14065]}
+2026-11-08T03:59:07.124804+00:00 DONE 032-bw-2-4096-reverse-r1 {'exit_codes': [0]}
+2026-11-08T03:59:09.638423+00:00 READY 033-bw-2-4096-reverse-r2 {'server': 'spark-7e64', 'ports': [14067]}
+2026-11-08T03:59:53.480310+00:00 DONE 033-bw-2-4096-reverse-r2 {'exit_codes': [0]}
+2026-11-08T03:59:55.992909+00:00 READY 034-bw-2-4096-reverse-r3 {'server': 'spark-7e64', 'ports': [14069]}
+2026-11-08T04:00:39.813031+00:00 DONE 034-bw-2-4096-reverse-r3 {'exit_codes': [0]}
+2026-11-08T04:01:13.127636+00:00 DONE 035-bw-2-4096-bidir-r1 {'exit_codes': [0]}
+2026-11-08T04:01:46.440473+00:00 DONE 036-bw-2-4096-bidir-r2 {'exit_codes': [0]}
+2026-11-08T04:02:19.741758+00:00 DONE 037-bw-2-4096-bidir-r3 {'exit_codes': [0]}
+2026-11-08T04:02:53.068417+00:00 DONE 038-bw-2-65536-forward-r1 {'exit_codes': [0]}
+2026-11-08T04:03:26.388389+00:00 DONE 039-bw-2-65536-forward-r2 {'exit_codes': [0]}
+2026-11-08T04:03:59.703593+00:00 DONE 040-bw-2-65536-forward-r3 {'exit_codes': [0]}
+2026-11-08T04:04:02.225783+00:00 READY 041-bw-2-65536-reverse-r1 {'server': 'spark-7e64', 'ports': [14083]}
+2026-11-08T04:04:46.055123+00:00 DONE 041-bw-2-65536-reverse-r1 {'exit_codes': [0]}
+2026-11-08T04:04:48.565862+00:00 READY 042-bw-2-65536-reverse-r2 {'server': 'spark-7e64', 'ports': [14085]}
+2026-11-08T04:05:32.390552+00:00 DONE 042-bw-2-65536-reverse-r2 {'exit_codes': [0]}
+2026-11-08T04:05:32.898790+00:00 READY 043-bw-2-65536-reverse-r3 {'server': 'spark-7e64', 'ports': [14087]}
+2026-11-08T04:06:18.721835+00:00 DONE 043-bw-2-65536-reverse-r3 {'exit_codes': [0]}
+2026-11-08T04:06:52.046070+00:00 DONE 044-bw-2-65536-bidir-r1 {'exit_codes': [0]}
+2026-11-08T04:07:25.352203+00:00 DONE 045-bw-2-65536-bidir-r2 {'exit_codes': [0]}
+2026-11-08T04:07:58.661549+00:00 DONE 046-bw-2-65536-bidir-r3 {'exit_codes': [0]}
+2026-11-08T04:08:32.045092+00:00 DONE 047-bw-2-1048576-forward-r1 {'exit_codes': [0]}
+2026-11-08T04:09:05.404652+00:00 DONE 048-bw-2-1048576-forward-r2 {'exit_codes': [0]}
+2026-11-08T04:09:38.756901+00:00 DONE 049-bw-2-1048576-forward-r3 {'exit_codes': [0]}
+2026-11-08T04:09:41.278623+00:00 READY 050-bw-2-1048576-reverse-r1 {'server': 'spark-7e64', 'ports': [14101]}
+2026-11-08T04:10:25.168453+00:00 DONE 050-bw-2-1048576-reverse-r1 {'exit_codes': [0]}
+2026-11-08T04:10:25.679691+00:00 READY 051-bw-2-1048576-reverse-r2 {'server': 'spark-7e64', 'ports': [14103]}
+2026-11-08T04:11:11.559676+00:00 DONE 051-bw-2-1048576-reverse-r2 {'exit_codes': [0]}
+2026-11-08T04:11:14.074477+00:00 READY 052-bw-2-1048576-reverse-r3 {'server': 'spark-7e64', 'ports': [14105]}
+2026-11-08T04:11:57.991922+00:00 DONE 052-bw-2-1048576-reverse-r3 {'exit_codes': [0]}
+2026-11-08T04:12:31.374492+00:00 DONE 053-bw-2-1048576-bidir-r1 {'exit_codes': [0]}
+2026-11-08T04:13:04.749276+00:00 DONE 054-bw-2-1048576-bidir-r2 {'exit_codes': [0]}
+2026-11-08T04:13:38.122835+00:00 DONE 055-bw-2-1048576-bidir-r3 {'exit_codes': [0]}
+2026-11-08T04:14:11.430739+00:00 DONE 056-bw-12-4096-forward-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:14:44.735776+00:00 DONE 057-bw-12-4096-forward-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:15:18.036151+00:00 DONE 058-bw-12-4096-forward-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:15:20.551494+00:00 READY 059-bw-12-4096-reverse-r1 {'server': 'spark-7e64', 'ports': [14118, 14119]}
+2026-11-08T04:16:04.358586+00:00 DONE 059-bw-12-4096-reverse-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:16:06.872559+00:00 READY 060-bw-12-4096-reverse-r2 {'server': 'spark-7e64', 'ports': [14120, 14121]}
+2026-11-08T04:16:50.684852+00:00 DONE 060-bw-12-4096-reverse-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:16:53.198600+00:00 READY 061-bw-12-4096-reverse-r3 {'server': 'spark-7e64', 'ports': [14122, 14123]}
+2026-11-08T04:17:36.999375+00:00 DONE 061-bw-12-4096-reverse-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:18:10.292996+00:00 DONE 062-bw-12-4096-bidir-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:18:43.583316+00:00 DONE 063-bw-12-4096-bidir-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:19:16.883869+00:00 DONE 064-bw-12-4096-bidir-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:19:50.189612+00:00 DONE 065-bw-12-65536-forward-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:20:23.508338+00:00 DONE 066-bw-12-65536-forward-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:20:56.820526+00:00 DONE 067-bw-12-65536-forward-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:20:59.335553+00:00 READY 068-bw-12-65536-reverse-r1 {'server': 'spark-7e64', 'ports': [14136, 14137]}
+2026-11-08T04:21:43.170860+00:00 DONE 068-bw-12-65536-reverse-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:21:45.695169+00:00 READY 069-bw-12-65536-reverse-r2 {'server': 'spark-7e64', 'ports': [14138, 14139]}
+2026-11-08T04:22:29.495893+00:00 DONE 069-bw-12-65536-reverse-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:22:32.015499+00:00 READY 070-bw-12-65536-reverse-r3 {'server': 'spark-7e64', 'ports': [14140, 14141]}
+2026-11-08T04:23:15.829015+00:00 DONE 070-bw-12-65536-reverse-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:23:49.123928+00:00 DONE 071-bw-12-65536-bidir-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:24:22.424495+00:00 DONE 072-bw-12-65536-bidir-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:24:55.733250+00:00 DONE 073-bw-12-65536-bidir-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:25:29.100020+00:00 DONE 074-bw-12-1048576-forward-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:26:02.461662+00:00 DONE 075-bw-12-1048576-forward-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:26:35.833096+00:00 DONE 076-bw-12-1048576-forward-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:26:38.351772+00:00 READY 077-bw-12-1048576-reverse-r1 {'server': 'spark-7e64', 'ports': [14154, 14155]}
+2026-11-08T04:27:22.255622+00:00 DONE 077-bw-12-1048576-reverse-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:27:24.774313+00:00 READY 078-bw-12-1048576-reverse-r2 {'server': 'spark-7e64', 'ports': [14156, 14157]}
+2026-11-08T04:28:08.665788+00:00 DONE 078-bw-12-1048576-reverse-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:28:11.183559+00:00 READY 079-bw-12-1048576-reverse-r3 {'server': 'spark-7e64', 'ports': [14158, 14159]}
+2026-11-08T04:28:55.073655+00:00 DONE 079-bw-12-1048576-reverse-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:29:28.437395+00:00 DONE 080-bw-12-1048576-bidir-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:30:01.790990+00:00 DONE 081-bw-12-1048576-bidir-r2 {'exit_codes': [0, 0]}
+2026-11-08T04:30:35.167715+00:00 DONE 082-bw-12-1048576-bidir-r3 {'exit_codes': [0, 0]}
+2026-11-08T04:30:38.006192+00:00 DONE 101-lat-2-8-forward-r1 {'exit_codes': [0]}
+2026-11-08T04:30:40.846511+00:00 DONE 102-lat-2-8-forward-r2 {'exit_codes': [0]}
+2026-11-08T04:30:43.684597+00:00 DONE 103-lat-2-8-forward-r3 {'exit_codes': [0]}
+2026-11-08T04:30:46.203268+00:00 READY 104-lat-2-8-reverse-r1 {'server': 'spark-7e64', 'ports': [14209]}
+2026-11-08T04:30:59.535068+00:00 DONE 104-lat-2-8-reverse-r1 {'exit_codes': [0]}
+2026-11-08T04:31:02.062544+00:00 READY 105-lat-2-8-reverse-r2 {'server': 'spark-7e64', 'ports': [14211]}
+2026-11-08T04:31:15.415175+00:00 DONE 105-lat-2-8-reverse-r2 {'exit_codes': [0]}
+2026-11-08T04:31:17.930413+00:00 READY 106-lat-2-8-reverse-r3 {'server': 'spark-7e64', 'ports': [14213]}
+2026-11-08T04:31:31.302389+00:00 DONE 106-lat-2-8-reverse-r3 {'exit_codes': [0]}
+2026-11-08T04:31:34.131538+00:00 DONE 107-lat-2-64-forward-r1 {'exit_codes': [0]}
+2026-11-08T04:31:36.944937+00:00 DONE 108-lat-2-64-forward-r2 {'exit_codes': [0]}
+2026-11-08T04:31:39.776085+00:00 DONE 109-lat-2-64-forward-r3 {'exit_codes': [0]}
+2026-11-08T04:31:42.290594+00:00 READY 110-lat-2-64-reverse-r1 {'server': 'spark-7e64', 'ports': [14221]}
+2026-11-08T04:31:55.646737+00:00 DONE 110-lat-2-64-reverse-r1 {'exit_codes': [0]}
+2026-11-08T04:31:58.164105+00:00 READY 111-lat-2-64-reverse-r2 {'server': 'spark-7e64', 'ports': [14223]}
+2026-11-08T04:32:11.507050+00:00 DONE 111-lat-2-64-reverse-r2 {'exit_codes': [0]}
+2026-11-08T04:32:14.023855+00:00 READY 112-lat-2-64-reverse-r3 {'server': 'spark-7e64', 'ports': [14225]}
+2026-11-08T04:32:27.354208+00:00 DONE 112-lat-2-64-reverse-r3 {'exit_codes': [0]}
+2026-11-08T04:32:30.617119+00:00 DONE 113-lat-2-4096-forward-r1 {'exit_codes': [0]}
+2026-11-08T04:32:33.872482+00:00 DONE 114-lat-2-4096-forward-r2 {'exit_codes': [0]}
+2026-11-08T04:32:37.142053+00:00 DONE 115-lat-2-4096-forward-r3 {'exit_codes': [0]}
+2026-11-08T04:32:39.663775+00:00 READY 116-lat-2-4096-reverse-r1 {'server': 'spark-7e64', 'ports': [14233]}
+2026-11-08T04:32:53.428110+00:00 DONE 116-lat-2-4096-reverse-r1 {'exit_codes': [0]}
+2026-11-08T04:32:55.949809+00:00 READY 117-lat-2-4096-reverse-r2 {'server': 'spark-7e64', 'ports': [14235]}
+2026-11-08T04:33:09.714491+00:00 DONE 117-lat-2-4096-reverse-r2 {'exit_codes': [0]}
+2026-11-08T04:33:12.232319+00:00 READY 118-lat-2-4096-reverse-r3 {'server': 'spark-7e64', 'ports': [14237]}
+2026-11-08T04:33:26.047418+00:00 DONE 118-lat-2-4096-reverse-r3 {'exit_codes': [0]}
+2026-11-08T04:38:29.357825+00:00 DONE 119-stability-12-65536-bidir-r1 {'exit_codes': [0, 0]}
+2026-11-08T04:38:31.370123+00:00 MATRIX_COMPLETE all {'cases': 74}

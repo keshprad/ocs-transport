@@ -1,0 +1,35 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_lat",
+    "-d",
+    "rocep1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14174",
+    "-s",
+    "8",
+    "-n",
+    "100000",
+    "169.254.135.137"
+  ],
+  "exact_invocation": "timeout 180 ib_write_lat -d rocep1s0f1 -i 1 -R -p 14174 -s 8 -n 100000 169.254.135.137",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T03:51:53.137426+00:00",
+  "case": {
+    "id": "087-lat-1-8-reverse-r2",
+    "kind": "lat",
+    "paths": [
+      0
+    ],
+    "size": 8,
+    "direction": "reverse",
+    "rep": 2,
+    "duration": 0
+  },
+  "role": "client",
+  "port": 14174
+}

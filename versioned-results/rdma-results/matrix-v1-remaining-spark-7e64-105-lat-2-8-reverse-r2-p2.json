@@ -1,0 +1,35 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_lat",
+    "-d",
+    "roceP2p1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14211",
+    "-s",
+    "8",
+    "-n",
+    "100000"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:31:01.547441+00:00",
+  "case": {
+    "id": "105-lat-2-8-reverse-r2",
+    "kind": "lat",
+    "paths": [
+      1
+    ],
+    "size": 8,
+    "direction": "reverse",
+    "rep": 2,
+    "duration": 0
+  },
+  "role": "server",
+  "port": 14211,
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:31:15.413861+00:00"
+}

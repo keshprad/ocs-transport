@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"USER_CONFIG_CONFIRMED: human reports running sudo ip address add 192.168.201.13/24 dev enP2p1s0f1np1. Verification in progress; first-path matrix running successfully (first two cases exits0). Please confirm .12 configured on your second path. User-performed .13 addition recorded for cleanup; sudo password will likely be needed again for deletion. Transfer endpoint plan accepted, no upload during measurements.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T03:34:26.124347+00:00"
+}

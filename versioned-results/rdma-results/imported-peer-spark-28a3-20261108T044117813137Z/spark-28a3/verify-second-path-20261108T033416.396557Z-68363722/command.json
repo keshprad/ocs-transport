@@ -1,0 +1,11 @@
+{
+  "command": "ip -details address show dev enP2p1s0f1np1; ip route get 192.168.201.12; ping -I enP2p1s0f1np1 -c 3 -W 2 192.168.201.12",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -details address show dev enP2p1s0f1np1; ip route get 192.168.201.12; ping -I enP2p1s0f1np1 -c 3 -W 2 192.168.201.12"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T03:34:16.396677+00:00"
+}

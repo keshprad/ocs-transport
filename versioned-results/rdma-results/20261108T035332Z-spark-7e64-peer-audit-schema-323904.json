@@ -1,0 +1,12 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/agent_mailbox_client.py",
+    "spark-7e64",
+    "AUDIT_PREPARATION: Primary audit expects119 totalcases/147 endpoint logs perhost, commands and metadata matching manifest, exit0, numeric size/iterations, requested-duration elapsed. Please confirm your completion JSON naming/schema (initial metadata preserved plus which suffix). After archive upload I will audit both endpoints, validate paired results and concurrent client intervals, then request cleanup. Summary latency direction labels refer to client placement, since write latency uses ping-pong."
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:53:32.836972+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:53:32.882790+00:00"
+}

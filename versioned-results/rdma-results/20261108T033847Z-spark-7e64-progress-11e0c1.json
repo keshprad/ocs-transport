@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "-c",
+    "import pathlib,json; p=pathlib.Path(\"rdma-results\"); rows=[json.loads(f.read_text()) for f in p.glob(\"matrix-v1-first-spark-7e64-*.json\") if not f.name.endswith(\"manifest.json\")]; print(\"Completed\",sum(r.get(\"exit_code\")==0 for r in rows),\"of45\"); print(\"Running\",[r[\"case\"][\"id\"] for r in rows if \"exit_code\" not in r]); print(\"Failures\",[r for r in rows if r.get(\"exit_code\",0)!=0])"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:38:47.724238+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:38:47.738999+00:00"
+}

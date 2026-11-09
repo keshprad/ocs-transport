@@ -1,0 +1,16 @@
+{
+  "archive": "/home/keshav/Documents/ocs-transport/rdma-results/spark-28a3-raw-20261108T044116Z-7ba0c4e3.tar.gz",
+  "bytes": 11345335,
+  "sha256": "ed583af7108c8bcf88e7fb721a05a36fc2b52526eab70ed594154f5c9b3e9c02",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:41:17.784270+00:00",
+  "invocation": "python3 rdma-results/package_upload.py",
+  "method": "POST",
+  "url": "http://169.254.135.137:12081/upload",
+  "files": 3557,
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/gzip",
+    "Content-Length": "11345335"
+  }
+}

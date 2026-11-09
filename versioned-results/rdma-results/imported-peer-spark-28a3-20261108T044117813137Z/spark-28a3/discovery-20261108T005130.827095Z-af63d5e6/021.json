@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ib_read_bw --help"
+  ],
+  "command": "ib_read_bw --help",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:33.444696+00:00",
+  "exit_code": 1,
+  "end_utc": "2026-11-08T00:51:33.448092+00:00"
+}

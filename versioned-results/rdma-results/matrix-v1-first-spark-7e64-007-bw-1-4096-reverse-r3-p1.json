@@ -1,0 +1,36 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "rocep1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14014",
+    "-s",
+    "4096",
+    "-D",
+    "30",
+    "--report_gbits"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:36:33.729223+00:00",
+  "case": {
+    "id": "007-bw-1-4096-reverse-r3",
+    "kind": "bw",
+    "paths": [
+      0
+    ],
+    "size": 4096,
+    "direction": "reverse",
+    "rep": 3,
+    "duration": 30
+  },
+  "role": "server",
+  "port": 14014,
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:37:20.019711+00:00"
+}

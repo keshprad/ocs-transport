@@ -1,0 +1,5 @@
+Concurrent first-forward4KiB case
+matrix-v1-remaining-spark-7e64-056-bw-12-4096-forward-r1-p1.stdout ['4096', '44885600', '0.00', '91.93', '2.805380']
+matrix-v1-remaining-spark-7e64-056-bw-12-4096-forward-r1-p2.stdout ['4096', '44888200', '0.00', '91.93', '2.805533']
+Aggregate Gb/s 183.86
+Client overlap seconds 31.291702

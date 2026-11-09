@@ -1,0 +1,14 @@
+{
+  "command": [
+    "nmcli",
+    "--wait",
+    "20",
+    "connection",
+    "up",
+    "rdma-benchmark-temp-20261108"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:55:10.727638+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:55:10.923883+00:00"
+}

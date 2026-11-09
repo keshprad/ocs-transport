@@ -1,0 +1,4 @@
+link rocep1s0f0/1 state DOWN physical_state DISABLED netdev enp1s0f0np0 
+link rocep1s0f1/1 state ACTIVE physical_state LINK_UP netdev enp1s0f1np1 
+link roceP2p1s0f0/1 state DOWN physical_state DISABLED netdev enP2p1s0f0np0 
+link roceP2p1s0f1/1 state ACTIVE physical_state LINK_UP netdev enP2p1s0f1np1 

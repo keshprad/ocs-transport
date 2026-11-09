@@ -1,0 +1,36 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "roceP2p1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14083",
+    "-s",
+    "65536",
+    "-D",
+    "30",
+    "--report_gbits",
+    "192.168.201.12"
+  ],
+  "exact_invocation": "timeout 180 ib_write_bw -d roceP2p1s0f1 -i 1 -R -p 14083 -s 65536 -D 30 --report_gbits 192.168.201.12",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:04:14.748018+00:00",
+  "case": {
+    "id": "041-bw-2-65536-reverse-r1",
+    "kind": "bw",
+    "paths": [
+      1
+    ],
+    "size": 65536,
+    "direction": "reverse",
+    "rep": 1,
+    "duration": 30
+  },
+  "role": "client",
+  "port": 14083
+}

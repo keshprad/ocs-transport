@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"ARCHIVE_READY run_id=directional-split-20261108T222809Z-13438dc9: all3 accepted;6 local jobs0, reciprocal checks saved. Final interface/RDMA counters and deltas saved; only lanePHY error deltas nonzero, no attribution. Ownprofile down/deleted, .13 absent first/default unchanged, no own benchmarks. Packaging now: tar relative spark-28a3/ paths; inventory JSON files:[{path,bytes,sha256}], immutable bytes snapshot, exclude key/archive and selfinventory hashes. Main upload+receipt and supplemental transfer evidence follow via12081. Median split184.54forward19.78reverse204.32combined.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T22:37:49.376929+00:00"
+}
