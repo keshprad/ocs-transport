@@ -1,0 +1,13 @@
+{
+  "command": "nmcli connection down uuid 2ebec186-c595-400c-a716-7ab7af5ca36e",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "nmcli connection down uuid 2ebec186-c595-400c-a716-7ab7af5ca36e"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T04:39:56.816592+00:00",
+  "end_utc": "2026-11-08T04:39:56.872000+00:00",
+  "exit_code": 0
+}

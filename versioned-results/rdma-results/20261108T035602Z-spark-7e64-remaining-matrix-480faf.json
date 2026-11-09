@@ -1,0 +1,12 @@
+{
+  "command": [
+    "/usr/bin/python3",
+    "-u",
+    "/home/keshav/Documents/ocs-transport/rdma-results/benchmark_runner.py",
+    "--remaining"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:56:02.437638+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:38:31.377841+00:00"
+}

@@ -1,0 +1,29 @@
+20261108T223336Z-spark-7e64-post-ACCEPTED-c1cdf8 exit_code= 0
+{
+  "test_id": "directional-split-20261108T222809Z-13438dc9-r1",
+  "paths": [
+    {
+      "path": 1,
+      "spark_7e64_tx": 92.27,
+      "spark_7e64_rx": 9.89,
+      "spark_28a3_tx": 9.89,
+      "spark_28a3_rx": 92.27,
+      "combined": 102.16,
+      "opposite_rows_exact_match": true
+    },
+    {
+      "path": 2,
+      "spark_7e64_tx": 92.27,
+      "spark_7e64_rx": 9.89,
+      "spark_28a3_tx": 9.89,
+      "spark_28a3_rx": 92.27,
+      "combined": 102.16,
+      "opposite_rows_exact_match": true
+    }
+  ],
+  "aggregate_forward": 184.54,
+  "aggregate_reverse": 19.78,
+  "aggregate_combined": 204.32,
+  "client_process_overlap_seconds": 31.272952,
+  "peer_done_observed": true
+}

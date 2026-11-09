@@ -1,0 +1,39 @@
+{
+  "command": [
+    "timeout",
+    "420",
+    "ib_write_bw",
+    "-d",
+    "roceP2p1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "14239",
+    "-s",
+    "65536",
+    "-D",
+    "300",
+    "--report_gbits",
+    "-b",
+    "192.168.201.13"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:33:28.067504+00:00",
+  "case": {
+    "id": "119-stability-12-65536-bidir-r1",
+    "kind": "stability",
+    "paths": [
+      0,
+      1
+    ],
+    "size": 65536,
+    "direction": "bidir",
+    "rep": 1,
+    "duration": 300
+  },
+  "role": "client",
+  "port": 14239,
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:38:29.356539+00:00"
+}

@@ -1,0 +1,32 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "ib_write_bw",
+    "-d",
+    "rocep1s0f1",
+    "-i",
+    "1",
+    "-R",
+    "-p",
+    "18231",
+    "-s",
+    "65536",
+    "-D",
+    "30",
+    "-m",
+    "1024",
+    "-b",
+    "--report-both",
+    "--report_gbits"
+  ],
+  "exact_invocation": "timeout 180 ib_write_bw -d rocep1s0f1 -i 1 -R -p 18231 -s 65536 -D 30 -m 1024 -b --report-both --report_gbits",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T22:35:43.205132+00:00",
+  "test_id": "directional-split-20261108T222809Z-13438dc9-r3",
+  "path": 1,
+  "role": "server",
+  "port": 18231,
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:36:21.250843+00:00"
+}

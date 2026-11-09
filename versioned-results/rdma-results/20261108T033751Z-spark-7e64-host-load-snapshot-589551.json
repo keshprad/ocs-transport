@@ -1,0 +1,11 @@
+{
+  "command": [
+    "bash",
+    "-c",
+    "uptime; lscpu; ps -eo pid,comm,pcpu,psr --sort=-pcpu | head -20; for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo \"$f\"; cat \"$f\"; done; cat /proc/self/status | rg \"Cpus_allowed_list|Mems_allowed_list\""
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:37:51.207722+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:37:51.246762+00:00"
+}

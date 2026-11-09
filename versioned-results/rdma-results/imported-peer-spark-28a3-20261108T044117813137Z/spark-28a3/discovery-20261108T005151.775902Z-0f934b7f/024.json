@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "lsmod"
+  ],
+  "command": "lsmod",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:55.123355+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:55.130915+00:00"
+}

@@ -1,0 +1,9 @@
+{
+  "command": [
+    "ibv_devinfo"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:30:51.976825+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:30:51.995715+00:00"
+}

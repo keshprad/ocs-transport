@@ -1,0 +1,11 @@
+{
+  "url": "http://169.254.135.137:12080/messages",
+  "method": "GET",
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/json"
+  },
+  "body": null,
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T03:52:49.788518+00:00"
+}

@@ -1,0 +1,49 @@
+20261108T223416Z-spark-7e64-r2-p2-client-444d27 exit_code= 0
+20261108T223416Z-spark-7e64-r2-p1-client-c89d08 exit_code= 0
+20261108T223447Z-spark-7e64-post-RESULTS_DONE-bf5d9b exit_code= 0
+[
+  {
+    "path": 1,
+    "rows": [
+      {
+        "section": "combined",
+        "raw": " 65536      2815892          0.00               102.23 \t\t   0.194981",
+        "gbps": 102.23
+      },
+      {
+        "section": "local_tx",
+        "raw": " 65536      2815892          0.00               92.27  \t\t   0.175994",
+        "gbps": 92.27
+      },
+      {
+        "section": "remote_tx_local_rx",
+        "raw": " 65536      303797           0.00               9.95   \t\t   0.018987",
+        "gbps": 9.95
+      }
+    ],
+    "stdout": "20261108T223416Z-spark-7e64-r2-p1-client-c89d08.stdout",
+    "metadata": "20261108T223416Z-spark-7e64-r2-p1-client-c89d08.json"
+  },
+  {
+    "path": 2,
+    "rows": [
+      {
+        "section": "combined",
+        "raw": " 65536      2815898          0.00               102.32 \t\t   0.195163",
+        "gbps": 102.32
+      },
+      {
+        "section": "local_tx",
+        "raw": " 65536      2815898          0.00               92.27  \t\t   0.175994",
+        "gbps": 92.27
+      },
+      {
+        "section": "remote_tx_local_rx",
+        "raw": " 65536      306705           0.00               10.05  \t\t   0.019169",
+        "gbps": 10.05
+      }
+    ],
+    "stdout": "20261108T223416Z-spark-7e64-r2-p2-client-444d27.stdout",
+    "metadata": "20261108T223416Z-spark-7e64-r2-p2-client-444d27.json"
+  }
+]

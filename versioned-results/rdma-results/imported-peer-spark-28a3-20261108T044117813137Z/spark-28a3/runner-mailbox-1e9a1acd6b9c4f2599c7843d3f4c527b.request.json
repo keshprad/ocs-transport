@@ -1,0 +1,11 @@
+{
+  "url": "http://169.254.135.137:12080/messages",
+  "method": "POST",
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"{\\\"run\\\": \\\"matrix-v1-remaining\\\", \\\"kind\\\": \\\"READY\\\", \\\"test\\\": \\\"082-bw-12-1048576-bidir-r3\\\", \\\"server\\\": \\\"spark-28a3\\\", \\\"ports\\\": [14164, 14165]}\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:30:02.312254+00:00"
+}

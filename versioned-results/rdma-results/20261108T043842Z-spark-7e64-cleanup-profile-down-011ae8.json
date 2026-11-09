@@ -1,0 +1,15 @@
+{
+  "command": [
+    "nmcli",
+    "--wait",
+    "20",
+    "connection",
+    "down",
+    "uuid",
+    "f0cbbd7c-f1b6-4285-9ff1-f397645e6b7d"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:38:42.617853+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:38:42.663927+00:00"
+}

@@ -1,0 +1,4 @@
+link rocep1s0f0/- cm-idn 0 state LISTEN ps TCP pid 47989 comm ib_write_bw src-addr 0.0.0.0:12000 
+link rocep1s0f1/- cm-idn 0 state LISTEN ps TCP pid 47989 comm ib_write_bw src-addr 0.0.0.0:12000 
+link roceP2p1s0f0/- cm-idn 0 state LISTEN ps TCP pid 47989 comm ib_write_bw src-addr 0.0.0.0:12000 
+link roceP2p1s0f1/- cm-idn 0 state LISTEN ps TCP pid 47989 comm ib_write_bw src-addr 0.0.0.0:12000 

@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "-c",
+    "from pathlib import Path; import json,re,datetime; p=Path(\"rdma-results\"); metas=[json.loads(f.read_text()) for f in sorted(p.glob(\"matrix-v1-remaining-spark-7e64-056-*.json\"))]; values=[]; print(\"Concurrent first-forward4KiB case\");\nfor f in sorted(p.glob(\"matrix-v1-remaining-spark-7e64-056-*.stdout\")):\n rows=[l.split() for l in f.read_text().splitlines() if re.match(r\"^\\s*4096\\s+\\d+\",l)]; print(f.name,rows[-1]); values.append(float(rows[-1][3]))\nprint(\"Aggregate Gb/s\",sum(values)); starts=[datetime.datetime.fromisoformat(m[\"start_utc\"]) for m in metas]; ends=[datetime.datetime.fromisoformat(m[\"end_utc\"]) for m in metas]; print(\"Client overlap seconds\",(min(ends)-max(starts)).total_seconds())"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:14:36.510797+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:14:36.525696+00:00"
+}

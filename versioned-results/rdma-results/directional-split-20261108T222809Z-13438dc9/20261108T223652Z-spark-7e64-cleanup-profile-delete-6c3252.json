@@ -1,0 +1,13 @@
+{
+  "command": [
+    "nmcli",
+    "connection",
+    "delete",
+    "uuid",
+    "2799a935-8f8a-4864-9dce-ae1006b5245a"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:36:52.597446+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:36:52.618983+00:00"
+}

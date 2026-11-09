@@ -1,0 +1,98 @@
+
+=== instructions ===
+UTC: 2026-11-08T00:33:06.103475+00:00
+HOST: spark-7e64
+COMMAND: for p in /AGENTS.md /home/AGENTS.md /home/keshav/AGENTS.md /home/keshav/Documents/AGENTS.md /home/keshav/Documents/ocs-transport/AGENTS.md; do if [ -f "$p" ]; then printf "\n%s\n" "$p"; cat "$p"; fi; done
+STDOUT:
+
+STDERR:
+
+EXIT CODE: 0
+
+=== identity ===
+UTC: 2026-11-08T00:33:06.104340+00:00
+HOST: spark-7e64
+COMMAND: hostname; uname -a; cat /etc/os-release
+STDOUT:
+spark-7e64
+Linux spark-7e64 6.17.0-1021-nvidia #21-Ubuntu SMP PREEMPT_DYNAMIC Wed May 27 19:14:05 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+PRETTY_NAME="Ubuntu 24.04.4 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.4 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+
+STDERR:
+
+EXIT CODE: 0
+
+=== network ===
+UTC: 2026-11-08T00:33:06.107296+00:00
+HOST: spark-7e64
+COMMAND: ip -br address; ip route show; rdma link show; ibdev2netdev
+STDOUT:
+roceP2p1s0f0 port 1 ==> enP2p1s0f0np0 (Down)
+roceP2p1s0f1 port 1 ==> enP2p1s0f1np1 (Up)
+rocep1s0f0 port 1 ==> enp1s0f0np0 (Down)
+rocep1s0f1 port 1 ==> enp1s0f1np1 (Up)
+
+STDERR:
+Cannot open netlink socket: Operation not permitted
+Cannot open netlink socket: Operation not permitted
+Failed to open NETLINK_RDMA socket
+
+EXIT CODE: 0
+
+=== tools ===
+UTC: 2026-11-08T00:33:06.209048+00:00
+HOST: spark-7e64
+COMMAND: command -v ib_write_bw ib_write_lat ibv_devinfo rdma ethtool ssh; ib_write_bw --version; ib_write_lat --version; dpkg-query -W perftest rdma-core libibverbs1
+STDOUT:
+/usr/bin/ib_write_bw
+/usr/bin/ib_write_lat
+/usr/bin/ibv_devinfo
+/usr/bin/rdma
+/usr/sbin/ethtool
+/usr/bin/ssh
+Version: 6.20
+Version: 6.20
+libibverbs1:arm64	50.0-2ubuntu0.2
+perftest	24.01.0+0.38-1build2
+rdma-core	50.0-2ubuntu0.2
+
+STDERR:
+
+EXIT CODE: 0
+
+=== rdma-devices ===
+UTC: 2026-11-08T00:33:06.233501+00:00
+HOST: spark-7e64
+COMMAND: ibv_devinfo
+STDOUT:
+
+STDERR:
+No IB devices found
+
+EXIT CODE: 255
+
+=== ssh-peer-hints ===
+UTC: 2026-11-08T00:33:06.245899+00:00
+HOST: spark-7e64
+COMMAND: if [ -f ~/.ssh/config ]; then awk 'tolower($1) ~ /^(host|hostname|user|port|proxyjump|include)$/ {print}' ~/.ssh/config; else echo "No SSH config"; fi; cat /etc/hosts
+STDOUT:
+No SSH config
+127.0.0.1       localhost
+127.0.0.1       spark-7e64  
+
+
+STDERR:
+
+EXIT CODE: 0

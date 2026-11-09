@@ -1,0 +1,8 @@
+PING 169.254.238.243 (169.254.238.243) from 169.254.135.137 enp1s0f1np1: 56(84) bytes of data.
+64 bytes from 169.254.238.243: icmp_seq=1 ttl=64 time=0.974 ms
+64 bytes from 169.254.238.243: icmp_seq=2 ttl=64 time=1.47 ms
+64 bytes from 169.254.238.243: icmp_seq=3 ttl=64 time=1.46 ms
+
+--- 169.254.238.243 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2004ms
+rtt min/avg/max/mdev = 0.974/1.301/1.473/0.231 ms

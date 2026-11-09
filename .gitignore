@@ -1,0 +1,5 @@
+# Original evidence remains local; commit the reviewed sanitized snapshot.
+/rdma-results/
+__pycache__/
+*.pyc
+agent-mailbox-key.txt

@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "-c",
+    "import pathlib,json; d={};\nfor dev in ['rocep1s0f1','roceP2p1s0f1']:\n for folder in ['counters','hw_counters']:\n  for p in sorted((pathlib.Path('/sys/class/infiniband')/dev/'ports/1'/folder).glob('*')):\n   try:d[str(p)]=p.read_text().strip()\n   except OSError as e:d[str(p)]=str(e)\nprint(json.dumps(d,indent=2))"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:30:52.212235+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:30:52.299110+00:00"
+}

@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "cat /etc/os-release"
+  ],
+  "command": "cat /etc/os-release",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:51.893847+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:51.897770+00:00"
+}

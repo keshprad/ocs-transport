@@ -1,0 +1,12 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/agent_mailbox_client.py",
+    "spark-7e64",
+    "LOCAL_COMPLETE: all119 matrix cases/294 endpoint records verified across both hosts, all28 concurrent client intervals verified, manifest combinations complete. Main archive SHA256 ed583af7108c8bcf88e7fb721a05a36fc2b52526eab70ed594154f5c9b3e9c02 and supplement 9d2fa034dbf9bc290b1f4e77b19e3600c2a6288c8397d6ef00c9caa721cca775 verified; all3557+11 inventory files match. Independent counter calculations match your report, both temporary profiles/addresses removed and original first-path/default routes intact. Consolidated RESULTS.md, CSV, counter tables, audits and raw logs saved. Please post your explicit LOCAL_COMPLETE if not already posted, then JOB_DONE once you see both LOCAL_COMPLETE messages. I will post JOB_DONE after both LOCAL_COMPLETE, retain both final acknowledgments, and shut down the temporary mailbox/receiver afterward. No further measurements or configuration changes needed."
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:44:00.965629+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:44:01.011175+00:00"
+}

@@ -1,0 +1,35 @@
+{
+  "complete": true,
+  "verified_endpoint_records": 12,
+  "verified_repetitions": 3,
+  "inventories": [
+    {
+      "inventory": "imported-peer-spark-28a3-20261108T223754596981Z/spark-28a3/spark-28a3-raw-20261108T223754Z-127a77ee.inventory.json",
+      "verified_files": 231
+    },
+    {
+      "inventory": "imported-peer-spark-28a3-20261108T223810161735Z/spark-28a3/spark-28a3-transfer-evidence-20261108T223810Z-d99e013b.inventory.json",
+      "verified_files": 11
+    }
+  ],
+  "concurrency": [
+    {
+      "test_id": "directional-split-20261108T222809Z-13438dc9-r1",
+      "all_four_processes_overlap_seconds": 31.272952
+    },
+    {
+      "test_id": "directional-split-20261108T222809Z-13438dc9-r2",
+      "all_four_processes_overlap_seconds": 31.295937
+    },
+    {
+      "test_id": "directional-split-20261108T222809Z-13438dc9-r3",
+      "all_four_processes_overlap_seconds": 31.278932
+    }
+  ],
+  "peer_counters_verified": 5006,
+  "both_network_cleanups_verified": true,
+  "protocol_order_verified": true,
+  "report_semantics": "Local TX, Remote exchanged peer TX/local incoming; reciprocal directional rows exact; combined checked with rounding tolerance0.021Gb/s",
+  "coordination_services": "Still available pending final acknowledgment exchange"
+}
+Peer nonzero error-related {'enp1s0f1np1/rx_err_lane_0_phy': 21238, 'enp1s0f1np1/rx_err_lane_1_phy': 1774373, 'enP2p1s0f1np1/rx_err_lane_0_phy': 21238, 'enP2p1s0f1np1/rx_err_lane_1_phy': 1774400}

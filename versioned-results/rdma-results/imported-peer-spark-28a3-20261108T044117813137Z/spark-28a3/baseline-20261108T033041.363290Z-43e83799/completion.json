@@ -1,0 +1,13 @@
+{
+  "command": "ip -details address show; ip route show table all; ip -s -s link show; for i in enp1s0f1np1 enP2p1s0f1np1; do ethtool -S \"$i\"; done; rdma resource show cm_id; pgrep -a ib_write_bw",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -details address show; ip route show table all; ip -s -s link show; for i in enp1s0f1np1 enP2p1s0f1np1; do ethtool -S \"$i\"; done; rdma resource show cm_id; pgrep -a ib_write_bw"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T03:30:41.363405+00:00",
+  "end_utc": "2026-11-08T03:30:41.407986+00:00",
+  "exit_code": 1
+}

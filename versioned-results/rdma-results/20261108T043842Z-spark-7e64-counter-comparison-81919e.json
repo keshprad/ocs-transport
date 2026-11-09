@@ -1,0 +1,10 @@
+{
+  "command": [
+    "/usr/bin/python3",
+    "/home/keshav/Documents/ocs-transport/rdma-results/compare_counters.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:38:42.522676+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:38:42.545718+00:00"
+}

@@ -1,0 +1,10 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/directional-split-20261108T222809Z-13438dc9/cleanup_network.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:36:52.468815+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:36:52.793802+00:00"
+}

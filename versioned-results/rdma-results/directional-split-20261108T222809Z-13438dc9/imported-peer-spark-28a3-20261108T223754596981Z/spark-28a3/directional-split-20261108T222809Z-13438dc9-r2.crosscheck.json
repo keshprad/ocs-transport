@@ -1,0 +1,23 @@
+{
+  "run_id": "directional-split-20261108T222809Z-13438dc9",
+  "kind": "CROSSCHECK_ACK",
+  "test_id": "directional-split-20261108T222809Z-13438dc9-r2",
+  "passed": true,
+  "paths": [
+    {
+      "path": 1,
+      "spark28_tx": 9.95,
+      "spark7_tx": 92.27,
+      "combined": 102.23
+    },
+    {
+      "path": 2,
+      "spark28_tx": 10.05,
+      "spark7_tx": 92.27,
+      "combined": 102.32
+    }
+  ],
+  "aggregate_forward": 184.54,
+  "aggregate_reverse": 20.0,
+  "aggregate_combined": 204.55
+}

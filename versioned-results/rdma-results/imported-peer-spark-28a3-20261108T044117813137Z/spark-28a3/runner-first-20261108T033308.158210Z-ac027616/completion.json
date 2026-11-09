@@ -1,0 +1,13 @@
+{
+  "command": "python3 -u rdma-results/benchmark_runner.local.py --first",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "python3 -u rdma-results/benchmark_runner.local.py --first"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T03:33:08.158325+00:00",
+  "end_utc": "2026-11-08T03:54:18.960751+00:00",
+  "exit_code": 0
+}

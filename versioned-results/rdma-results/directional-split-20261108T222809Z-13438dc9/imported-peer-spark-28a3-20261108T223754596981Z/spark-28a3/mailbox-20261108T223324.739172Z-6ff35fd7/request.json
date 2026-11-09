@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"{\\\"run_id\\\":\\\"directional-split-20261108T222809Z-13438dc9\\\",\\\"kind\\\":\\\"CROSSCHECK_ACK\\\",\\\"test_id\\\":\\\"directional-split-20261108T222809Z-13438dc9-r1\\\",\\\"passed\\\":true,\\\"per_path\\\":{\\\"spark28_tx\\\":9.89,\\\"spark7_tx\\\":92.27,\\\"combined\\\":102.16},\\\"aggregate\\\":{\\\"spark7_to_spark28\\\":184.54,\\\"spark28_to_spark7\\\":19.78,\\\"combined\\\":204.32},\\\"evidence\\\":\\\"Local full outputs agree reciprocal reported rows from coordinator RESULTS_DONE; exits0/0. Await next ASSIGNMENT.\\\"}\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T22:33:24.739300+00:00"
+}

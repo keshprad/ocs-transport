@@ -1,0 +1,104 @@
+[
+  {
+    "record": {
+      "utc": "2026-11-08T22:38:26.464777+00:00",
+      "sender": "spark-28a3",
+      "text": "{\"run_id\":\"directional-split-20261108T222809Z-13438dc9\",\"kind\":\"LOCAL_COMPLETE\",\"hostname\":\"spark-28a3\",\"cases\":3,\"endpoint_jobs\":6,\"all_exit_zero\":true,\"reciprocal_crosschecks\":\"all3 saved and posted\",\"cleanup\":\"UUID b64a5439-4de2-4b7c-bd66-3d26a972c871 down/deleted; .13 and route absent; firstpath/default unchanged; no own benchmark or CM listener; original NM autoconfig untouched\",\"main_archive\":{\"receiver_file\":\"peer-spark-28a3-20261108T223754596981Z.tar.gz\",\"bytes\":161287,\"sha256\":\"1443eaff0a5cf83442ddfd6eeff61e3c71761071354e39b24edc813724b855d7\",\"inventory_files\":231,\"locally_verified\":true,\"receipt_matches\":true},\"transfer_evidence\":{\"receiver_file\":\"peer-spark-28a3-20261108T223810161735Z.tar.gz\",\"bytes\":1977,\"sha256\":\"7383fbadec864c74b27a1129f20801da4e651ed0f03984b15e28188af3d810d9\",\"files\":11,\"receipt_matches\":true},\"summary\":\"median forward184.54 reverse19.78 combined204.32Gb/s; RESULTS.txt and counter-deltas.json included\",\"next\":\"Await coordinator archive/inventory/final audit, its LOCAL_COMPLETE and both JOB_DONE before goal complete.\"}"
+    },
+    "message": {
+      "run_id": "directional-split-20261108T222809Z-13438dc9",
+      "kind": "LOCAL_COMPLETE",
+      "hostname": "spark-28a3",
+      "cases": 3,
+      "endpoint_jobs": 6,
+      "all_exit_zero": true,
+      "reciprocal_crosschecks": "all3 saved and posted",
+      "cleanup": "UUID b64a5439-4de2-4b7c-bd66-3d26a972c871 down/deleted; .13 and route absent; firstpath/default unchanged; no own benchmark or CM listener; original NM autoconfig untouched",
+      "main_archive": {
+        "receiver_file": "peer-spark-28a3-20261108T223754596981Z.tar.gz",
+        "bytes": 161287,
+        "sha256": "1443eaff0a5cf83442ddfd6eeff61e3c71761071354e39b24edc813724b855d7",
+        "inventory_files": 231,
+        "locally_verified": true,
+        "receipt_matches": true
+      },
+      "transfer_evidence": {
+        "receiver_file": "peer-spark-28a3-20261108T223810161735Z.tar.gz",
+        "bytes": 1977,
+        "sha256": "7383fbadec864c74b27a1129f20801da4e651ed0f03984b15e28188af3d810d9",
+        "files": 11,
+        "receipt_matches": true
+      },
+      "summary": "median forward184.54 reverse19.78 combined204.32Gb/s; RESULTS.txt and counter-deltas.json included",
+      "next": "Await coordinator archive/inventory/final audit, its LOCAL_COMPLETE and both JOB_DONE before goal complete."
+    }
+  },
+  {
+    "record": {
+      "utc": "2026-11-08T22:39:50.484876+00:00",
+      "sender": "spark-7e64",
+      "text": "{\"run_id\": \"directional-split-20261108T222809Z-13438dc9\", \"kind\": \"LOCAL_COMPLETE\", \"cases\": 3, \"verified_endpoint_records\": 12, \"reciprocal_raw_rows\": \"all six path/repetition pairs exact match\", \"concurrency\": \"all four endpoint process intervals overlap >=31.27s each repetition\", \"archives\": \"both SHA256 match; 231 main +11 supplement file hashes verified\", \"counters\": \"both hosts captured and compared; independently recomputed 5006 peer counters match; PHY lane increases retained without causal attribution\", \"cleanup\": \"both created profiles/addresses/routes removed; original first-path/default preserved; no benchmark processes\", \"report\": \"RESULTS.md and directional-results.csv saved; median184.54 forward+19.78 reverse=204.32Gb/s\", \"peer_LOCAL_COMPLETE\": \"observed22:38:26UTC\", \"next\": \"Ready for JOB_DONE exchange; coordination services remain up until both observed.\"}"
+    },
+    "message": {
+      "run_id": "directional-split-20261108T222809Z-13438dc9",
+      "kind": "LOCAL_COMPLETE",
+      "cases": 3,
+      "verified_endpoint_records": 12,
+      "reciprocal_raw_rows": "all six path/repetition pairs exact match",
+      "concurrency": "all four endpoint process intervals overlap >=31.27s each repetition",
+      "archives": "both SHA256 match; 231 main +11 supplement file hashes verified",
+      "counters": "both hosts captured and compared; independently recomputed 5006 peer counters match; PHY lane increases retained without causal attribution",
+      "cleanup": "both created profiles/addresses/routes removed; original first-path/default preserved; no benchmark processes",
+      "report": "RESULTS.md and directional-results.csv saved; median184.54 forward+19.78 reverse=204.32Gb/s",
+      "peer_LOCAL_COMPLETE": "observed22:38:26UTC",
+      "next": "Ready for JOB_DONE exchange; coordination services remain up until both observed."
+    }
+  },
+  {
+    "record": {
+      "utc": "2026-11-08T22:39:54.274781+00:00",
+      "sender": "spark-7e64",
+      "text": "{\"run_id\": \"directional-split-20261108T222809Z-13438dc9\", \"kind\": \"JOB_DONE\", \"hostname\": \"spark-7e64\", \"both_LOCAL_COMPLETE_observed\": true, \"measurement_audit\": \"complete\", \"results\": \"184.54Gb/s spark-7e64\\u2192spark-28a3;19.78Gb/s spark-28a3\\u2192spark-7e64;204.32Gb/s median combined\", \"next\": \"Please post JOB_DONE after observing mine, save completed handshake, and post FINAL_ACK indicating both JOB_DONE retained. I will save both, stop temporary mailbox/receiver/poller, and mark complete. No additional traffic or uploads needed.\"}"
+    },
+    "message": {
+      "run_id": "directional-split-20261108T222809Z-13438dc9",
+      "kind": "JOB_DONE",
+      "hostname": "spark-7e64",
+      "both_LOCAL_COMPLETE_observed": true,
+      "measurement_audit": "complete",
+      "results": "184.54Gb/s spark-7e64\u2192spark-28a3;19.78Gb/s spark-28a3\u2192spark-7e64;204.32Gb/s median combined",
+      "next": "Please post JOB_DONE after observing mine, save completed handshake, and post FINAL_ACK indicating both JOB_DONE retained. I will save both, stop temporary mailbox/receiver/poller, and mark complete. No additional traffic or uploads needed."
+    }
+  },
+  {
+    "record": {
+      "utc": "2026-11-08T22:40:32.417841+00:00",
+      "sender": "spark-28a3",
+      "text": "{\"run_id\":\"directional-split-20261108T222809Z-13438dc9\",\"kind\":\"JOB_DONE\",\"hostname\":\"spark-28a3\",\"both_LOCAL_COMPLETE_observed\":true,\"coordinator_JOB_DONE_observed\":true,\"audit\":\"3 repetitions12 endpoint records and reciprocal rows verified; all archive/file hashes confirmed by coordinator; counters and cleanup audited\",\"next\":\"Saving full history with both JOB_DONE, then FINAL_ACK; no further traffic or config work.\"}"
+    },
+    "message": {
+      "run_id": "directional-split-20261108T222809Z-13438dc9",
+      "kind": "JOB_DONE",
+      "hostname": "spark-28a3",
+      "both_LOCAL_COMPLETE_observed": true,
+      "coordinator_JOB_DONE_observed": true,
+      "audit": "3 repetitions12 endpoint records and reciprocal rows verified; all archive/file hashes confirmed by coordinator; counters and cleanup audited",
+      "next": "Saving full history with both JOB_DONE, then FINAL_ACK; no further traffic or config work."
+    }
+  },
+  {
+    "record": {
+      "utc": "2026-11-08T22:40:54.847398+00:00",
+      "sender": "spark-28a3",
+      "text": "{\"run_id\":\"directional-split-20261108T222809Z-13438dc9\",\"kind\":\"FINAL_ACK\",\"hostname\":\"spark-28a3\",\"both_JOB_DONE_retained\":true,\"proof\":\"COMPLETION-PROOF.json and full mailbox-20261108T224035.209983Z-08bd24d3/response.body saved\",\"next\":\"Stopping manual polling. Coordinator may close existing mailbox/receiver. Marking goal complete; no further user action needed.\"}"
+    },
+    "message": {
+      "run_id": "directional-split-20261108T222809Z-13438dc9",
+      "kind": "FINAL_ACK",
+      "hostname": "spark-28a3",
+      "both_JOB_DONE_retained": true,
+      "proof": "COMPLETION-PROOF.json and full mailbox-20261108T224035.209983Z-08bd24d3/response.body saved",
+      "next": "Stopping manual polling. Coordinator may close existing mailbox/receiver. Marking goal complete; no further user action needed."
+    }
+  }
+]

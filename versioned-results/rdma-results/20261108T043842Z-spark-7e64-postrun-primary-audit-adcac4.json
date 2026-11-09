@@ -1,0 +1,10 @@
+{
+  "command": [
+    "/usr/bin/python3",
+    "/home/keshav/Documents/ocs-transport/rdma-results/audit_primary.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:38:42.397264+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:38:42.437159+00:00"
+}

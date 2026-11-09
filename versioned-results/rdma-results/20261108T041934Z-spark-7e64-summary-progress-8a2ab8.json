@@ -1,0 +1,10 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/build_summary.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:19:34.652767+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:19:34.694551+00:00"
+}

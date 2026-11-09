@@ -1,0 +1,11 @@
+{
+  "command": [
+    "python3",
+    "-c",
+    "import pathlib,json,datetime; p=pathlib.Path(\"rdma-results\"); now=datetime.datetime.now(datetime.timezone.utc);\nfor f in sorted(p.glob(\"matrix-v1-remaining-spark-7e64-119-*.json\")):\n m=json.loads(f.read_text()); print(f.name,\"role\",m[\"role\"],\"elapsed_seconds\",round((now-datetime.datetime.fromisoformat(m[\"start_utc\"])).total_seconds()),\"exit_code\",m.get(\"exit_code\",\"running\"))"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:34:11.333766+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:34:11.360706+00:00"
+}

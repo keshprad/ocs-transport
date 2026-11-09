@@ -1,0 +1,13 @@
+{
+  "command": "ip -brief address; ip route show; nmcli -t -f UUID,NAME connection show; rdma resource show cm_id; ps -C ib_write_bw -o pid,stat,args; test -z \"$(pgrep -x ib_write_bw)\"",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -brief address; ip route show; nmcli -t -f UUID,NAME connection show; rdma resource show cm_id; ps -C ib_write_bw -o pid,stat,args; test -z \"$(pgrep -x ib_write_bw)\""
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T22:36:57.962772+00:00",
+  "end_utc": "2026-11-08T22:36:58.023356+00:00",
+  "exit_code": 0
+}

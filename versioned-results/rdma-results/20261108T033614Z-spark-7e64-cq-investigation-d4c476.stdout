@@ -1,0 +1,20 @@
+rdma-results/matrix-v1-first-spark-7e64-002-bw-1-4096-forward-r1-p1.stdout:9: TX depth        : 128
+rdma-results/matrix-v1-first-spark-7e64-002-bw-1-4096-forward-r1-p1.stdout:10: CQ Moderation   : 100
+rdma-results/matrix-v1-first-spark-7e64-002-bw-1-4096-forward-r1-p1.stdout:23: #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+rdma-results/matrix-v1-first-spark-7e64-002-bw-1-4096-forward-r1-p1.stdout:24: 4096       50804800         0.00               104.05 		   3.175321
+rdma-results/matrix-v1-first-spark-7e64-005-bw-1-4096-reverse-r1-p1.stdout:13: CQ Moderation   : 100
+rdma-results/matrix-v1-first-spark-7e64-005-bw-1-4096-reverse-r1-p1.stdout:29: #bytes     #iterations    BW peak[Gb/sec]    BW average[Gb/sec]   MsgRate[Mpps]
+rdma-results/matrix-v1-first-spark-7e64-005-bw-1-4096-reverse-r1-p1.stdout:30: 4096       6655800          0.00               13.63  		   0.415984
+  -l, --post_list=<list size>
+ Post list of send WQEs of <list size> size (instead of single post)
+      --recv_post_list=<list size> Post list of receive WQEs of <list size> size (instead of single post)
+  -L, --hop_limit=<hop_limit>  Set hop limit value (ttl for IPv4 RawEth QP). Values 0-255 (default 64)
+  -m, --mtu=<mtu>  MTU size : 256 - 4096 (default port mtu)
+--
+  -Q, --cq-mod  Generate Cqe only after <--cq-mod> completion
+  -R, --rdma_cm  Connect QPs with rdma_cm and run test on those QPs
+  -s, --size=<size>  Size of message to exchange (default 65536)
+--
+  -t, --tx-depth=<dep>  Size of tx queue (default 128)
+  -T, --tos=<tos value>  Set <tos_value> to RDMA-CM QPs. available only with -R flag. values 0-256 (default off)
+  -u, --qp-timeout=<timeout>  QP timeout, timeout value is 4 usec * 2 ^(timeout), default 14

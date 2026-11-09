@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ip -s -s link show"
+  ],
+  "command": "ip -s -s link show",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:33.470302+00:00",
+  "exit_code": 1,
+  "end_utc": "2026-11-08T00:51:33.473756+00:00"
+}

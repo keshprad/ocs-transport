@@ -1,0 +1,1 @@
+{"command": ["rdma", "resource", "show", "cm_id"], "hostname": "spark-28a3", "timestamp": "2026-11-08T22:35:43.206562+00:00", "stdout": "", "stderr": "", "exit_code": 0}

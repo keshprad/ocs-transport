@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "ibstat"
+  ],
+  "command": "ibstat",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:52.041380+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:52.048825+00:00"
+}

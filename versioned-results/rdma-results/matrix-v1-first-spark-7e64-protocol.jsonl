@@ -1,0 +1,65 @@
+{"utc": "2026-11-08T03:32:23.190754+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"PREPARED\", \"test\": \"all\", \"manifest_sha256\": \"7dbd5e2c287cea86eb2c47dc70997cdd8c1df564a1dd66c58b0c66a4a81fecfe\", \"cases\": 45}"}
+{"utc": "2026-11-08T03:33:40.543321+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"002-bw-1-4096-forward-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:34:13.846770+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"003-bw-1-4096-forward-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:35:01.137719+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"004-bw-1-4096-forward-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:35:03.645919+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"005-bw-1-4096-reverse-r1\", \"server\": \"spark-7e64\", \"ports\": [14010]}"}
+{"utc": "2026-11-08T03:35:47.427855+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"005-bw-1-4096-reverse-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:35:47.934414+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"006-bw-1-4096-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14012]}"}
+{"utc": "2026-11-08T03:36:33.727440+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"006-bw-1-4096-reverse-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:36:34.234256+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"007-bw-1-4096-reverse-r3\", \"server\": \"spark-7e64\", \"ports\": [14014]}"}
+{"utc": "2026-11-08T03:37:20.021211+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"007-bw-1-4096-reverse-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:37:53.326887+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"008-bw-1-4096-bidir-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:38:26.613694+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"009-bw-1-4096-bidir-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:38:59.897241+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"010-bw-1-4096-bidir-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:39:33.178896+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"011-bw-1-65536-forward-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:40:06.462032+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"012-bw-1-65536-forward-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:40:39.759536+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"013-bw-1-65536-forward-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:40:40.267320+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"014-bw-1-65536-reverse-r1\", \"server\": \"spark-7e64\", \"ports\": [14028]}"}
+{"utc": "2026-11-08T03:41:26.068163+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"014-bw-1-65536-reverse-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:41:26.574964+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"015-bw-1-65536-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14030]}"}
+{"utc": "2026-11-08T03:42:12.371240+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"015-bw-1-65536-reverse-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:42:14.880432+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"016-bw-1-65536-reverse-r3\", \"server\": \"spark-7e64\", \"ports\": [14032]}"}
+{"utc": "2026-11-08T03:42:58.670365+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"016-bw-1-65536-reverse-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:43:31.980275+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"017-bw-1-65536-bidir-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:44:05.274357+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"018-bw-1-65536-bidir-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:44:38.576510+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"019-bw-1-65536-bidir-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:45:25.961046+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"020-bw-1-1048576-forward-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:45:59.300058+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"021-bw-1-1048576-forward-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:46:32.645387+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"022-bw-1-1048576-forward-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:46:35.165455+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"023-bw-1-1048576-reverse-r1\", \"server\": \"spark-7e64\", \"ports\": [14046]}"}
+{"utc": "2026-11-08T03:47:19.006891+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"023-bw-1-1048576-reverse-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:47:21.517644+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"024-bw-1-1048576-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14048]}"}
+{"utc": "2026-11-08T03:48:05.357906+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"024-bw-1-1048576-reverse-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:48:05.864908+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"025-bw-1-1048576-reverse-r3\", \"server\": \"spark-7e64\", \"ports\": [14050]}"}
+{"utc": "2026-11-08T03:48:51.713694+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"025-bw-1-1048576-reverse-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:49:25.061818+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"026-bw-1-1048576-bidir-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:50:12.479817+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"027-bw-1-1048576-bidir-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:50:59.853118+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"028-bw-1-1048576-bidir-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:51:02.661304+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"083-lat-1-8-forward-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:51:05.460762+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"084-lat-1-8-forward-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:51:22.300255+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"085-lat-1-8-forward-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:51:22.808907+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"086-lat-1-8-reverse-r1\", \"server\": \"spark-7e64\", \"ports\": [14172]}"}
+{"utc": "2026-11-08T03:51:38.121473+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"086-lat-1-8-reverse-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:51:38.630548+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"087-lat-1-8-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14174]}"}
+{"utc": "2026-11-08T03:51:53.927362+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"087-lat-1-8-reverse-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:51:56.439556+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"088-lat-1-8-reverse-r3\", \"server\": \"spark-7e64\", \"ports\": [14176]}"}
+{"utc": "2026-11-08T03:52:09.738833+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"088-lat-1-8-reverse-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:52:12.542419+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"089-lat-1-64-forward-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:52:15.338791+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"090-lat-1-64-forward-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:52:18.145954+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"091-lat-1-64-forward-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:52:18.653655+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"092-lat-1-64-reverse-r1\", \"server\": \"spark-7e64\", \"ports\": [14184]}"}
+{"utc": "2026-11-08T03:52:33.955391+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"092-lat-1-64-reverse-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:52:34.463725+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"093-lat-1-64-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14186]}"}
+{"utc": "2026-11-08T03:52:49.776305+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"093-lat-1-64-reverse-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:52:52.288896+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"094-lat-1-64-reverse-r3\", \"server\": \"spark-7e64\", \"ports\": [14188]}"}
+{"utc": "2026-11-08T03:53:05.589998+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"094-lat-1-64-reverse-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:53:08.810643+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"095-lat-1-4096-forward-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:53:12.023128+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"096-lat-1-4096-forward-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:53:15.250296+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"097-lat-1-4096-forward-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:53:17.764773+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"098-lat-1-4096-reverse-r1\", \"server\": \"spark-7e64\", \"ports\": [14196]}"}
+{"utc": "2026-11-08T03:53:31.488765+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"098-lat-1-4096-reverse-r1\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:53:34.002224+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"099-lat-1-4096-reverse-r2\", \"server\": \"spark-7e64\", \"ports\": [14198]}"}
+{"utc": "2026-11-08T03:53:47.712126+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"099-lat-1-4096-reverse-r2\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:53:48.220624+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"READY\", \"test\": \"100-lat-1-4096-reverse-r3\", \"server\": \"spark-7e64\", \"ports\": [14200]}"}
+{"utc": "2026-11-08T03:54:03.937981+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"DONE\", \"test\": \"100-lat-1-4096-reverse-r3\", \"exit_codes\": [0]}"}
+{"utc": "2026-11-08T03:54:03.941216+00:00", "sender": "spark-7e64", "text": "{\"run\": \"matrix-v1-first\", \"kind\": \"MATRIX_COMPLETE\", \"test\": \"all\", \"cases\": 45}"}

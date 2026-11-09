@@ -1,0 +1,12 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/import_peer_logs.py",
+    "rdma-results/peer-spark-28a3-20261108T044117813137Z.tar.gz",
+    "ed583af7108c8bcf88e7fb721a05a36fc2b52526eab70ed594154f5c9b3e9c02"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:42:23.409545+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:42:23.870752+00:00"
+}

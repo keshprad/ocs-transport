@@ -1,0 +1,11 @@
+{
+  "command": [
+    "bash",
+    "-c",
+    "ip -j address show dev enP2p1s0f1np1; nmcli -f GENERAL.STATE,GENERAL.CONNECTION,GENERAL.AUTOCONNECT device show enP2p1s0f1np1; ip route show default; nmcli -g UUID connection show"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T04:39:09.585748+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:39:09.628772+00:00"
+}

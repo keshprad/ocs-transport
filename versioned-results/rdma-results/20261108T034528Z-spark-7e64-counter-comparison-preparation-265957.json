@@ -1,0 +1,10 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/compare_counters.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:45:28.194603+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:45:28.221217+00:00"
+}

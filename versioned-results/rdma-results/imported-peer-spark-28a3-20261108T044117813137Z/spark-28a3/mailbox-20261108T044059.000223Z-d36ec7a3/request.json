@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "url": "http://169.254.135.137:12080/messages",
+  "headers": {
+    "Authorization": "Bearer [REDACTED_MAILBOX_TOKEN]",
+    "Content-Type": "application/json"
+  },
+  "body": "{\"sender\": \"spark-28a3\", \"text\": \"CLEANUP_PROGRESS: own temporary NM profile down and deleted successfully; .13/24 and route absent, first link-local/default unchanged, no benchmark processes/CM listeners. Existing Wired connection2 automatically resumed DHCP with transient fe80::e998:b33c:997c:6bc0; observing it settle, no existing profile modified. Auto-review rejected an attempted device disconnect, so did not execute/retry; preserving original managed behavior. Main archive next after state snapshot; uploader uses immutable per-file bytes matching SHA inventory.\"}",
+  "hostname": "spark-28a3",
+  "start_utc": "2026-11-08T04:40:59.000349+00:00"
+}

@@ -1,0 +1,23 @@
+{
+  "status": 201,
+  "headers": [
+    [
+      "Server",
+      "BaseHTTP/0.6 Python/3.12.3"
+    ],
+    [
+      "Date",
+      "Sun, 08 Nov 2026 04:12:31 GMT"
+    ],
+    [
+      "Content-Type",
+      "application/json"
+    ],
+    [
+      "Content-Length",
+      "523"
+    ]
+  ],
+  "exit_code": 0,
+  "end_utc": "2026-11-08T04:12:31.409443+00:00"
+}

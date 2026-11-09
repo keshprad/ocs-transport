@@ -1,0 +1,10 @@
+{
+  "command": [
+    "python3",
+    "rdma-results/audit_primary.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:45:08.300988+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:45:08.349578+00:00"
+}

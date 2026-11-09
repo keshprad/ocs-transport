@@ -1,0 +1,5 @@
+enP2p1s0f1np1    UP             fe80::b43a:e130:6e84:e329/64 
+GENERAL.STATE:                          70 (connecting (getting IP configuration))
+GENERAL.CONNECTION:                     Wired connection 2
+GENERAL.AUTOCONNECT:                    yes
+default via 10.48.0.1 dev wlP9s9 proto dhcp src 10.48.67.140 metric 600 

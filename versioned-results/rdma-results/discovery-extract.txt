@@ -1,0 +1,37 @@
+Extracted from 20261108T003319Z-host-discovery.log
+COMMAND: ip -br address
+EXIT CODE: 0
+COMMAND: ip route show
+EXIT CODE: 0
+COMMAND: ip -d link show
+EXIT CODE: 0
+COMMAND: rdma link show
+EXIT CODE: 0
+COMMAND: ibv_devinfo
+EXIT CODE: 0
+COMMAND: ip neigh show
+EXIT CODE: 0
+COMMAND: ls -l /dev/infiniband
+EXIT CODE: 0
+COMMAND: ethtool enp1s0f1np1
+	Speed: 200000Mb/s
+	Port: Direct Attach Copper
+	Link detected: yes
+EXIT CODE: 0
+COMMAND: ethtool -i enp1s0f1np1
+driver: mlx5_core
+firmware-version: 28.45.4028 (NVD0000000087)
+EXIT CODE: 0
+COMMAND: ethtool -S enp1s0f1np1
+EXIT CODE: 0
+COMMAND: ethtool enP2p1s0f1np1
+	Speed: 200000Mb/s
+	Port: Direct Attach Copper
+	Link detected: yes
+EXIT CODE: 0
+COMMAND: ethtool -i enP2p1s0f1np1
+driver: mlx5_core
+firmware-version: 28.45.4028 (NVD0000000087)
+EXIT CODE: 0
+COMMAND: ethtool -S enP2p1s0f1np1
+EXIT CODE: 0

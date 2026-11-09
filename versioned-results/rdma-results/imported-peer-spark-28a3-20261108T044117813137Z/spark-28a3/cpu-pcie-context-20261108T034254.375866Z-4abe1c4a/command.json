@@ -1,0 +1,11 @@
+{
+  "command": "lscpu; uptime; for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq; do echo \"$f\"; cat \"$f\"; done; for d in 0000:01:00.1 0002:01:00.1; do for f in current_link_speed current_link_width max_link_speed max_link_width numa_node local_cpulist; do echo \"$d/$f\"; cat \"/sys/bus/pci/devices/$d/$f\"; done; done; for p in $(pgrep -x ib_write_bw); do taskset -pc \"$p\"; done",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "lscpu; uptime; for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq; do echo \"$f\"; cat \"$f\"; done; for d in 0000:01:00.1 0002:01:00.1; do for f in current_link_speed current_link_width max_link_speed max_link_width numa_node local_cpulist; do echo \"$d/$f\"; cat \"/sys/bus/pci/devices/$d/$f\"; done; done; for p in $(pgrep -x ib_write_bw); do taskset -pc \"$p\"; done"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T03:42:54.375976+00:00"
+}

@@ -1,0 +1,12 @@
+{
+  "command": [
+    "rdma",
+    "resource",
+    "show",
+    "cm_id"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T03:19:51.383811+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T03:19:51.384950+00:00"
+}

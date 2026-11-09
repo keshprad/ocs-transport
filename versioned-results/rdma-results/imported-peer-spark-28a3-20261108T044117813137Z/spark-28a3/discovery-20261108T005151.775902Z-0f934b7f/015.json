@@ -1,0 +1,13 @@
+{
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "for d in /sys/class/infiniband/*; do echo \"DEVICE $d\"; readlink -f \"$d/device\"; ls -l \"$d/device/net\"; for p in \"$d\"/ports/*; do echo \"PORT $p\"; for f in state phys_state rate link_layer active_mtu lid; do echo \"FILE $p/$f\"; cat \"$p/$f\"; done; for f in \"$p\"/gid_attrs/ndevs/* \"$p\"/gid_attrs/types/* \"$p\"/gids/* \"$p\"/counters/* \"$p\"/hw_counters/*; do echo \"FILE $f\"; cat \"$f\"; done; done; done"
+  ],
+  "command": "for d in /sys/class/infiniband/*; do echo \"DEVICE $d\"; readlink -f \"$d/device\"; ls -l \"$d/device/net\"; for p in \"$d\"/ports/*; do echo \"PORT $p\"; for f in state phys_state rate link_layer active_mtu lid; do echo \"FILE $p/$f\"; cat \"$p/$f\"; done; for f in \"$p\"/gid_attrs/ndevs/* \"$p\"/gid_attrs/types/* \"$p\"/gids/* \"$p\"/counters/* \"$p\"/hw_counters/*; do echo \"FILE $f\"; cat \"$f\"; done; done; done",
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T00:51:52.113127+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T00:51:54.932091+00:00"
+}

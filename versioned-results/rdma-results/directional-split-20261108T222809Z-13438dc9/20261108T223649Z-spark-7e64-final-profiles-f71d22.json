@@ -1,0 +1,14 @@
+{
+  "command": [
+    "nmcli",
+    "-f",
+    "NAME,UUID,DEVICE",
+    "connection",
+    "show",
+    "--active"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:36:49.531389+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:36:49.550950+00:00"
+}

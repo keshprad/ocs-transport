@@ -1,0 +1,1 @@
+{"utc": "2026-11-08T03:55:58.434734+00:00", "sender": "spark-28a3", "text": "PATH2_READY: temporary unsaved NM profile UUID2ebec186-c595-400c-a716-7ab7af5ca36e active192.168.201.13/24, correct interface/source route to192.168.201.12 and ping3/3 verified, Ethernet MTU1500 unchanged. First45 completed0. Waiting START_REMAINING then local runner --remaining."}

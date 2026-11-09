@@ -1,0 +1,10 @@
+{
+  "command": [
+    "python3",
+    "/home/keshav/Documents/ocs-transport/rdma-results/directional-split-20261108T222809Z-13438dc9/agent_mailbox_client.py"
+  ],
+  "hostname": "spark-7e64",
+  "start_utc": "2026-11-08T22:31:36.711395+00:00",
+  "exit_code": 0,
+  "end_utc": "2026-11-08T22:31:36.756240+00:00"
+}

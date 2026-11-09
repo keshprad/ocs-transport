@@ -1,0 +1,13 @@
+{
+  "command": "python3 rdma-results/directional-split-20261108T222809Z-13438dc9/summarize.py",
+  "invocation": [
+    "/bin/bash",
+    "-c",
+    "python3 rdma-results/directional-split-20261108T222809Z-13438dc9/summarize.py"
+  ],
+  "hostname": "spark-28a3",
+  "cwd": "/home/keshav/Documents/ocs-transport",
+  "start_utc": "2026-11-08T22:37:31.412603+00:00",
+  "end_utc": "2026-11-08T22:37:31.448893+00:00",
+  "exit_code": 0
+}
