@@ -1,4 +1,10 @@
 __pycache__/
 *.py[cod]
-results/
+results/*
+!results/20261110T021852Z-4cacd141-client/
+
+# Omit raw logs (individual per-process output and record directories).
+results/**/local/
+results/**/peer/
+
 .perftest/
