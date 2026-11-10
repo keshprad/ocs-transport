@@ -34,6 +34,42 @@ def free_port():
 
 
 class MeasurementTests(unittest.TestCase):
+    def test_path_configuration_and_ports(self):
+        config = rb.Config(path_count=2)
+        config.validate()
+        self.assertEqual(config.perftest_ports, (18515, 18517))
+        self.assertEqual(rb.Config.from_dict(rb.asdict(config)), config)
+        self.assertEqual(rb.parse_path("fake1=192.168.201.13"), ("fake1", "192.168.201.13"))
+        for invalid in (replace(config, path_count=3), replace(config, perftest_port=65534)):
+            with self.assertRaises(rb.BenchError):
+                invalid.validate()
+        job = rb.Job("lat", rb.MODES[2], 64, "measured", "pingpong", iterations=100)
+        with self.assertRaisesRegex(rb.BenchError, "one path"):
+            job.validate(config)
+        replace(job, path_index=1).validate(config)
+        with self.assertRaisesRegex(rb.BenchError, "Invalid path"):
+            replace(job, path_index=2).validate(config)
+
+    def test_combined_median_is_computed_after_trial_sums(self):
+        config = rb.Config(modes=(rb.MODES[0],), sizes=(64,), path_count=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = rb.Store(tmp, "combined", "client")
+            e = endpoint()
+            second = replace(endpoint("127.0.0.3"), interface="fake1", device="fake1")
+            store.setup(config, [e, second], [e, second])
+            for repetition, rates in enumerate(((1, 100), (100, 1), (100, 100)), 1):
+                job = rb.Job(f"trial-{repetition}", rb.MODES[0], 64, "measured", repetition=repetition)
+                bundle = {"launch_skew_seconds": 0, "paths": {str(index): {
+                    "parsed": {"aggregate": {"iterations": 100, "average_gbps": rate}},
+                    "stdout": "", "stderr": ""} for index, rate in enumerate(rates)}}
+                store.pair(job, bundle, bundle)
+            self.assertEqual([row["client_to_server_gbps"] for row in store.combined_rows], [101, 101, 200])
+            self.assertIn("101.000 [101.000–200.000] (n=3)", (store.path / "summary.md").read_text())
+            incomplete = {**bundle, "paths": {"0": bundle["paths"]["0"]}}
+            with self.assertRaisesRegex(rb.BenchError, "incomplete"):
+                store.pair(job, bundle, incomplete)
+            self.assertEqual(len(store.rows), 6)
+
     def test_default_matrix(self):
         config = rb.Config()
         self.assertEqual(config.sizes, (64, 16384, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824))
@@ -99,6 +135,15 @@ class MeasurementTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_path_order_and_duplicate_checks(self):
+        first = endpoint()
+        second = replace(endpoint("127.0.0.3"), interface="fake1", device="fake_rdma_1")
+        rb.validate_paths([first, second])
+        with self.assertRaisesRegex(rb.BenchError, "distinct"):
+            rb.validate_paths([first, first])
+        with self.assertRaisesRegex(rb.BenchError, "Path count mismatch"):
+            rb.verify_paths([first, second], [first], rb.Config(path_count=2))
+
     def test_match_interface_ip_and_rocev2_and_reject_ambiguity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -189,15 +234,19 @@ class IntegrationTests(unittest.TestCase):
     @patch.object(rb, "log")
     def run_sessions(self, config, _log):
         client, server = endpoint(), endpoint("127.0.0.2")
-        rb.probe_tools(client, config)
-        rb.probe_tools(server, config)
+        clients, servers = [client], [server]
+        if config.path_count == 2:
+            clients.append(replace(endpoint("127.0.0.3"), interface="fake1", device="fake_rdma_1"))
+            servers.append(replace(endpoint("127.0.0.4"), interface="fake1", device="fake_rdma_1"))
+        for current in clients + servers:
+            rb.probe_tools(current, config)
         a, b = socket.socketpair()
         ca, cb = rb.Channel(a), rb.Channel(b)
         cs, ss = rb.Store(self.root, rb.new_run_id(), "client"), rb.Store(self.root, rb.new_run_id(), "server")
-        cs.setup(config, client, server)
-        ss.setup(config, client, server)
-        runner = rb.Session(ca, client, server, config, cs)
-        worker = rb.Session(cb, server, client, config, ss)
+        cs.setup(config, clients, servers)
+        ss.setup(config, clients, servers)
+        runner = rb.Session(ca, clients, servers, config, cs)
+        worker = rb.Session(cb, servers, clients, config, ss)
         errors = []
         def serve():
             try:
@@ -256,10 +305,58 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(bidi[0]["client_to_server_gbps"], 180)
         self.assertEqual(bidi[0]["server_to_client_gbps"], 170)
         reverse = [r for r in runs if r["job"]["direction"] == "server_to_client"]
-        self.assertEqual(reverse[0]["server"]["argv"][-1], "127.0.0.1")
+        self.assertEqual(reverse[0]["server"]["paths"]["0"]["argv"][-1], "127.0.0.1")
         self.assertIn("summary.md", [p.name for p in client.path.iterdir()])
         self.assertEqual(len((client.path / "results.csv").read_text().splitlines()), 97)
         self.assertEqual(json.loads((server.path / "status.json").read_text())["status"], "complete")
+
+    def test_dual_path_full_matrix_and_readiness_barriers(self):
+        config = rb.Config(path_count=2, perftest_port=free_port())
+        client, server, errors = self.run_sessions(config)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(client.rows), 192)
+        self.assertEqual(len(client.combined_rows), 72)
+        self.assertEqual(sum(row["mode"] == rb.MODES[2] for row in client.rows), 48)
+        for row in client.combined_rows:
+            self.assertEqual(row["path_count"], 2)
+            if row["mode"] == rb.MODES[1]:
+                self.assertEqual((row["client_to_server_gbps"], row["server_to_client_gbps"], row["aggregate_gbps"]),
+                                 (270, 250, 520))
+            elif row["direction"] == "client_to_server":
+                self.assertEqual(row["client_to_server_gbps"], 270)
+            else:
+                self.assertEqual(row["server_to_client_gbps"], 250)
+        events = [json.loads(line) for line in (self.root / "events.jsonl").read_text().splitlines()]
+        event_times = {(event["pid"], event["event"]): event["time"] for event in events}
+        runs = [json.loads(line) for line in (client.path / "runs.jsonl").read_text().splitlines()]
+        previous_finish = 0
+        for run in runs:
+            records = [record for role in ("client", "server") for record in run[role]["paths"].values()]
+            self.assertGreaterEqual(min(event_times[(r["pid"], "start")] for r in records), previous_finish)
+            previous_finish = max(event_times[(r["pid"], "finished")] for r in records)
+            if run["job"]["mode"] == rb.MODES[2]:
+                self.assertEqual(len(records), 2)  # One client/server pair; the other path is idle.
+                continue
+            self.assertEqual(len(records), 4)
+            listener = "client" if run["job"]["direction"] == "server_to_client" else "server"
+            connector = "server" if listener == "client" else "client"
+            ready = max(event_times[(r["pid"], "listening")] for r in run[listener]["paths"].values())
+            launched = min(event_times[(r["pid"], "start")] for r in run[connector]["paths"].values())
+            self.assertGreaterEqual(launched, ready)
+            for role in ("client", "server"):
+                ports = {record["argv"][record["argv"].index("-p") + 1] for record in run[role]["paths"].values()}
+                self.assertEqual(ports, set(map(str, config.perftest_ports)))
+        self.assertEqual(json.loads((server.path / "status.json").read_text())["status"], "complete")
+
+    def test_dual_path_failure_does_not_save_half_a_trial(self):
+        config = rb.Config(modes=(rb.MODES[0],), sizes=(64, 16384), repetitions=1,
+                           duration=5, path_count=2, perftest_port=free_port())
+        with patch.dict(os.environ, {"FAKE_FAIL_MEASURED_SIZE": "16384", "FAKE_FAIL_IP": "127.0.0.3"}):
+            client, server, errors = self.run_sessions(config)
+        self.assertIn("injected native failure", " ".join(map(str, errors)))
+        self.assertEqual(len(client.rows), 4)
+        self.assertEqual(len(client.combined_rows), 2)
+        self.assertEqual(json.loads((server.path / "status.json").read_text())["status"], "failed")
 
     def test_native_failure_preserves_earlier_measurements(self):
         config = rb.Config(modes=(rb.MODES[0],), sizes=(64, 16384), repetitions=1,
@@ -283,7 +380,7 @@ class IntegrationTests(unittest.TestCase):
             if run["job"]["mode"] == rb.MODES[2]:
                 continue
             for role in ("client", "server"):
-                argv = run[role]["argv"]
+                argv = run[role]["paths"]["0"]["argv"]
                 self.assertIn("--perform_warm_up", argv)
                 if run["job"]["phase"] == "measured":
                     self.assertEqual(argv[argv.index("-D") + 1], "5")
@@ -357,6 +454,12 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse((self.root / "events.jsonl").exists())
 
     def test_full_cli_handshake_and_sigterm_cleanup(self):
+        self.cli_sigterm_cleanup(False)
+
+    def test_dual_cli_handshake_and_sigterm_cleanup(self):
+        self.cli_sigterm_cleanup(True)
+
+    def cli_sigterm_cleanup(self, dual):
         # Run the real main() in separate processes, replacing only hardware
         # discovery/route inspection. This exercises signal and peer propagation.
         wrapper = self.root / "launch.py"
@@ -366,8 +469,10 @@ class IntegrationTests(unittest.TestCase):
             "import rdma_bench as rb\n"
             f"rb.PERFTEST_BIN = rb.Path({str(self.bin)!r})\n"
             "ip = '127.0.0.2' if '--server' in sys.argv else '127.0.0.1'\n"
-            "e = rb.Endpoint('test', 'fake0', ip, 'fake', 1, 3, '::ffff:' + ip, {'script_sha256':'same'}, {})\n"
-            "rb.discover_endpoint = lambda args: e\n"
+            "def discover(args):\n"
+            "    address = args.ip or ip\n"
+            "    return rb.Endpoint('test', args.interface, address, 'fake-' + args.interface, 1, 3, '::ffff:' + address, {'script_sha256':'same'}, {})\n"
+            "rb.discover_endpoint = discover\n"
             "rb.verify_route = lambda *args: None\n"
             "signal.signal(signal.SIGTERM, rb.interrupted)\n"
             "sys.exit(rb.main())\n")
@@ -375,14 +480,16 @@ class IntegrationTests(unittest.TestCase):
         common = ["--output-dir", str(self.root / "cli"), "--control-port", str(control),
                   "--perftest-port", str(native_port), "--connect-timeout", "5"]
         env = {**os.environ, "FAKE_HANG": "1"}
+        server_path = ["--path", "fake1=127.0.0.4"] if dual else []
+        client_path = ["--path", "fake1=127.0.0.3"] if dual else []
         with (self.root / "server.log").open("w") as sl, (self.root / "client.log").open("w") as cl:
-            server = subprocess.Popen([sys.executable, str(wrapper), "--server", *common], stdout=sl, stderr=sl, env=env)
-            client = subprocess.Popen([sys.executable, str(wrapper), "--client", "127.0.0.2", "--all", *common], stdout=cl, stderr=cl, env=env)
+            server = subprocess.Popen([sys.executable, str(wrapper), "--server", *server_path, *common], stdout=sl, stderr=sl, env=env)
+            client = subprocess.Popen([sys.executable, str(wrapper), "--client", "127.0.0.2", "--all", *client_path, *common], stdout=cl, stderr=cl, env=env)
             try:
                 deadline = time.monotonic() + 8
                 while time.monotonic() < deadline:
                     events = self.root / "events.jsonl"
-                    if events.exists() and len(events.read_text().splitlines()) >= 2:
+                    if events.exists() and len({json.loads(line)["pid"] for line in events.read_text().splitlines()}) >= (4 if dual else 2):
                         break
                     if client.poll() is not None or server.poll() is not None:
                         self.fail("CLI exited early: " + (self.root / "client.log").read_text() + (self.root / "server.log").read_text())

@@ -28,7 +28,7 @@ import time
 import uuid
 
 
-PROTOCOL = 1
+PROTOCOL = 2
 SIZES = (64, 16 * 1024, 2**20, 4 * 2**20, 16 * 2**20, 64 * 2**20, 256 * 2**20, 2**30)
 MODES = ("unidirectional-write-bw", "bidirectional-write-bw", "write-latency")
 MAX_FRAME = 8 * 2**20
@@ -92,6 +92,11 @@ class Config:
     perftest_port: int = 18515
     startup_timeout: float = 30.0
     test_timeout: float = 180.0
+    path_count: int = 1
+
+    @property
+    def perftest_ports(self):
+        return tuple(self.perftest_port + 2 * index for index in range(self.path_count))
 
     @property
     def bandwidth_margin(self):
@@ -109,6 +114,8 @@ class Config:
             raise BenchError(f"Invalid test configuration: {exc}") from exc
 
     def validate(self):
+        if type(self.path_count) is not int or not 1 <= self.path_count <= 2:
+            raise BenchError("Select one or two RDMA paths")
         if not self.modes or any(m not in MODES for m in self.modes) or len(set(self.modes)) != len(self.modes):
             raise BenchError("Select at least one distinct supported benchmark mode")
         if not self.sizes or len(set(self.sizes)) != len(self.sizes):
@@ -121,6 +128,8 @@ class Config:
             raise BenchError("Bandwidth duration must be between 5 and 3600 seconds")
         if type(self.perftest_port) is not int or not 1024 <= self.perftest_port <= 65535:
             raise BenchError("Perftest port must be between 1024 and 65535")
+        if max(self.perftest_ports) > 65535:
+            raise BenchError("Perftest port range exceeds 65535")
         if any(not isinstance(t, (int, float)) or not math.isfinite(t) or t <= 0
                for t in (self.startup_timeout, self.test_timeout)):
             raise BenchError("Timeouts must be positive and finite")
@@ -146,6 +155,37 @@ class Endpoint:
     gid: str
     details: dict
     tools: dict
+
+
+def endpoint_list(value):
+    return [value] if isinstance(value, Endpoint) else list(value)
+
+
+def parse_path(value):
+    try:
+        interface, ip = value.split("=", 1)
+        if not re.fullmatch(r"[a-zA-Z0-9_.:-]+", interface):
+            raise ValueError("invalid interface")
+        return interface, str(ipaddress.IPv4Address(ip))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Use INTERFACE=IPv4, e.g. enP2p1s0f1np1=192.168.201.13") from exc
+
+
+def discover_paths(args):
+    endpoints = [discover_endpoint(args)]
+    for interface, ip in args.path:
+        extra = argparse.Namespace(**{**vars(args), "interface": interface, "ip": ip,
+                                      "device": None, "rdma_port": None, "gid_index": None})
+        endpoints.append(discover_endpoint(extra))
+    validate_paths(endpoints)
+    return endpoints
+
+
+def validate_paths(endpoints):
+    for values in ([e.interface for e in endpoints], [e.ip for e in endpoints],
+                   [(e.device, e.rdma_port) for e in endpoints]):
+        if len(values) != len(set(values)):
+            raise BenchError("Each RDMA path must have a distinct interface, IP, and device/port")
 
 
 def discover_endpoint(args):
@@ -263,6 +303,16 @@ def verify_peer(local, peer):
         raise BenchError("Runner scripts differ; copy the same rdma_bench.py to both hosts")
 
 
+def verify_paths(local, peer, config):
+    if len(local) != config.path_count or len(peer) != config.path_count:
+        raise BenchError("Path count mismatch; select the same number of paths on both hosts")
+    validate_paths(local)
+    validate_paths(peer)
+    for ours, theirs in zip(local, peer):
+        verify_peer(ours, theirs)
+        verify_route(ours, theirs.ip)
+
+
 @dataclass(frozen=True)
 class Job:
     id: str
@@ -272,12 +322,20 @@ class Job:
     direction: str = "client_to_server"
     repetition: int = 0
     iterations: int | None = None
+    path_index: int | None = None
 
     @property
     def listener(self):
         return "client" if self.direction == "server_to_client" else "server"
 
     def validate(self, config):
+        if self.path_index is not None and (type(self.path_index) is not int or
+                                           not 0 <= self.path_index < config.path_count):
+            raise BenchError("Invalid path index")
+        if self.mode == MODES[2] and config.path_count > 1 and self.path_index is None:
+            raise BenchError("Latency must select one path at a time")
+        if self.mode != MODES[2] and self.path_index is not None:
+            raise BenchError("Bandwidth must run all selected paths together")
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,120}", self.id):
             raise BenchError("Invalid job ID")
         if self.mode not in config.modes or self.size not in config.sizes:
@@ -296,10 +354,14 @@ class Job:
             raise BenchError("Latency jobs require an iteration count")
 
 
-def build_command(endpoint, peer_ip, role, config, job):
+def selected_paths(job, config):
+    return list(range(config.path_count)) if job.path_index is None else [job.path_index]
+
+
+def build_command(endpoint, peer_ip, role, config, job, path_index=0):
     name = "ib_write_lat" if job.mode == MODES[2] else "ib_write_bw"
     args = [endpoint.tools[name]["path"], "-d", endpoint.device, "-i", str(endpoint.rdma_port),
-            "-x", str(endpoint.gid_index), "-c", "RC", "-I", "0", "-p", str(config.perftest_port),
+            "-x", str(endpoint.gid_index), "-c", "RC", "-I", "0", "-p", str(config.perftest_ports[path_index]),
             "-s", str(job.size), f"--bind_source_ip={endpoint.ip}"]
     if name == "ib_write_bw":
         args += ["-q", "1", "-t", "128", "--report_gbits", "-N", "--perform_warm_up"]
@@ -541,7 +603,7 @@ class NativeProcess:
         stdout, stderr = self.out_path.read_text(errors="replace"), self.err_path.read_text(errors="replace")
         if len(stdout.encode()) + len(stderr.encode()) > MAX_FRAME // 2:
             raise BenchError(f"{self.job.id}: excessive native output; see local logs")
-        record = {"argv": self.argv, "returncode": self.process.returncode,
+        record = {"argv": self.argv, "pid": self.process.pid, "returncode": self.process.returncode,
                   "wall_seconds_diagnostic_only": time.monotonic() - self.started,
                   "parsed": parse_output(stdout, self.job), "stdout": stdout, "stderr": stderr}
         (self.directory / f"{self.job.id}.result.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -561,6 +623,48 @@ class NativeProcess:
         self.err_file.close()
 
 
+class NativeGroup:
+    """One trial: every selected path starts before any result can advance it."""
+
+    def __init__(self, endpoints, peers, role, config, directory, job):
+        self.job, self.config, self.natives = job, config, {}
+        try:
+            for index in selected_paths(job, config):
+                path_dir = directory / f"path-{index}"
+                path_dir.mkdir(exist_ok=True)
+                argv = build_command(endpoints[index], peers[index].ip, role, config, job, index)
+                self.natives[str(index)] = NativeProcess(argv, path_dir, job)
+        except BaseException:
+            self.stop()
+            raise
+
+    def check(self, require_running=False):
+        codes = [native.check(require_running) for native in self.natives.values()]
+        return 0 if all(code is not None for code in codes) else None
+
+    def wait_ready(self, channel, config):
+        deadline = time.monotonic() + config.startup_timeout
+        while time.monotonic() < deadline:
+            self.check(require_running=True)
+            missing = [index for index, native in self.natives.items()
+                       if not owns_listener(native.process.pid, config.perftest_ports[int(index)])]
+            if not missing:
+                return
+            message = channel.poll(0.05)
+            if message:
+                raise BenchError(f"Unexpected message while awaiting listeners: {message['type']}")
+        raise BenchError(f"{self.job.id}: listeners not ready on paths {missing} within {config.startup_timeout}s")
+
+    def record(self):
+        starts = [native.started for native in self.natives.values()]
+        return {"paths": {index: native.record() for index, native in self.natives.items()},
+                "launch_skew_seconds": max(starts) - min(starts)}
+
+    def stop(self):
+        for native in self.natives.values():
+            native.stop()
+
+
 def wait_native(native, channel, timeout, peer_result=False):
     deadline = time.monotonic() + timeout
     remote = None
@@ -576,10 +680,13 @@ def wait_native(native, channel, timeout, peer_result=False):
     raise BenchError(f"{native.job.id}: benchmark/peer exceeded execution timeout of {timeout}s")
 
 
-CSV_FIELDS = ("id", "mode", "size_bytes", "direction", "repetition", "iterations",
+CSV_FIELDS = ("id", "path_index", "mode", "size_bytes", "direction", "repetition", "iterations",
               "client_to_server_gbps", "server_to_client_gbps", "aggregate_gbps",
               "latency_typical_us", "latency_average_us", "latency_min_us", "latency_max_us",
               "latency_stdev_us", "latency_p99_us", "latency_p999_us")
+COMBINED_FIELDS = ("id", "mode", "size_bytes", "direction", "repetition", "path_count",
+                   "client_to_server_gbps", "server_to_client_gbps", "aggregate_gbps",
+                   "client_launch_skew_seconds", "server_launch_skew_seconds")
 
 
 def measured_row(job, client_record, server_record):
@@ -605,8 +712,9 @@ class Store:
         self.path.mkdir(parents=True, exist_ok=False)
         self.native_dir = self.path / "local"
         self.native_dir.mkdir()
-        self.rows, self.alerts, self.role = [], [], role
+        self.rows, self.combined_rows, self.alerts, self.role = [], [], [], role
         self.config, self.client, self.server = None, None, None
+        self.clients, self.servers = [], []
         self.status = "running"
         self.write("status.json", {"status": self.status, "started": utc_now()})
 
@@ -614,20 +722,46 @@ class Store:
         (self.path / name).write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
     def setup(self, config, client, server):
-        self.config, self.client, self.server = config, client, server
+        self.clients, self.servers = endpoint_list(client), endpoint_list(server)
+        self.config, self.client, self.server = config, self.clients[0], self.servers[0]
         self.write("config.json", asdict(config))
-        self.write("endpoints.json", {"client": asdict(client), "server": asdict(server)})
+        self.write("endpoints.json", {"client": asdict(self.client), "server": asdict(self.server),
+                                      "paths": [{"path_index": index, "client": asdict(c), "server": asdict(s)}
+                                                for index, (c, s) in enumerate(zip(self.clients, self.servers))]})
 
     def pair(self, job, local, remote):
+        indices = selected_paths(job, self.config)
+        expected = {str(index) for index in indices}
+        if set(local.get("paths", {})) != expected or set(remote.get("paths", {})) != expected:
+            raise BenchError(f"{job.id}: incomplete or mismatched path results")
+        rows = []
+        if job.phase == "measured":
+            for index in indices:
+                row = measured_row(job, local["paths"][str(index)], remote["paths"][str(index)])
+                rows.append({**row, "path_index": index})
+        combined = None
+        if rows and job.mode != MODES[2]:
+            combined = {key: getattr(job, key) for key in ("id", "mode", "direction", "repetition")}
+            combined.update(size_bytes=job.size, path_count=len(rows),
+                            client_launch_skew_seconds=local["launch_skew_seconds"],
+                            server_launch_skew_seconds=remote["launch_skew_seconds"])
+            for key in ("client_to_server_gbps", "server_to_client_gbps", "aggregate_gbps"):
+                if key in rows[0]:
+                    combined[key] = sum(row[key] for row in rows)
         peer_dir = self.path / "peer"
         peer_dir.mkdir(exist_ok=True)
-        (peer_dir / f"{job.id}.stdout.log").write_text(remote["stdout"])
-        (peer_dir / f"{job.id}.stderr.log").write_text(remote["stderr"])
-        self.write(f"peer/{job.id}.result.json", remote)
+        for index, record in remote["paths"].items():
+            target = peer_dir / f"path-{index}"
+            target.mkdir(exist_ok=True)
+            (target / f"{job.id}.stdout.log").write_text(record["stdout"])
+            (target / f"{job.id}.stderr.log").write_text(record["stderr"])
+            self.write(f"peer/path-{index}/{job.id}.result.json", record)
         with (self.path / "runs.jsonl").open("a") as stream:
             stream.write(json.dumps({"job": asdict(job), "client": local, "server": remote}) + "\n")
         if job.phase == "measured":
-            self.rows.append(measured_row(job, local, remote))
+            self.rows.extend(rows)
+            if combined:
+                self.combined_rows.append(combined)
             self.report()
 
     def report(self):
@@ -635,10 +769,24 @@ class Store:
             writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
             writer.writeheader()
             writer.writerows(self.rows)
-        lines = ["# RDMA benchmark results", "", f"Status: **{self.status}**. Measured runs: {len(self.rows)}.", ""]
+        with (self.path / "bandwidth-combined.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=COMBINED_FIELDS)
+            writer.writeheader()
+            writer.writerows(self.combined_rows)
+        lines = ["# RDMA benchmark results", "", f"Status: **{self.status}**. Measured path runs: {len(self.rows)}.",
+                 f"Combined bandwidth trials: {len(self.combined_rows)}.", ""]
         if self.client and self.server:
             lines += [f"Client: `{self.client.hostname}` ({self.client.ip}); server: `{self.server.hostname}` ({self.server.ip}).",
                       "Directions refer to these script roles, even when perftest roles swap.", ""]
+        for index, (client, server) in enumerate(zip(self.clients, self.servers)):
+            lines += [f"Path {index}: client `{client.interface}`/{client.ip} (`{client.device}`) → "
+                      f"server `{server.interface}`/{server.ip} (`{server.device}`)."]
+        lines += ["", "Message sizes are per path. Bandwidth trials run all paths concurrently; "
+                  "combined values sum native per-path averages within each trial before computing medians.",
+                  "All listeners are ready before connectors launch in a batch. Native sample windows are independent; "
+                  "this is a sum of concurrent averages, not a shared-clock measurement. "
+                  "Per-host launch skew is saved in bandwidth-combined.csv.",
+                  "Latency runs one path at a time with the others idle, and is never summed.", ""]
         lines += ["Cells show median across repetitions [minimum–maximum]. Bandwidth is Gbit/s; latency is µs.",
                   "Latency summarizes perftest t_typical (half round-trip); it is not an independently measured one-way completion time.", ""]
         if self.config and any(mode != MODES[2] for mode in self.config.modes):
@@ -650,16 +798,23 @@ class Store:
              ("Client → Server", "Server → Client", "Aggregate")),
             (MODES[2], "Write ping-pong latency", ("latency_typical_us",), ("Reported latency (µs)",)),
         ]
-        for mode, title, keys, labels in specs:
+        def table(mode, title, keys, labels, rows):
+            nonlocal lines
             lines += [f"## {title}", "", "| Message size | " + " | ".join(labels) + " |",
                       "|---|" + "---|" * len(keys)]
             for size in self.config.sizes if self.config else SIZES:
                 cells = []
                 for key in keys:
-                    values = [r[key] for r in self.rows if r["mode"] == mode and r["size_bytes"] == size and key in r]
+                    values = [r[key] for r in rows if r["mode"] == mode and r["size_bytes"] == size and key in r]
                     cells.append(f"{statistics.median(values):.3f} [{min(values):.3f}–{max(values):.3f}] (n={len(values)})" if values else "—")
                 lines.append(f"| {size_label(size)} | " + " | ".join(cells) + " |")
             lines.append("")
+        for mode, title, keys, labels in specs[:2]:
+            table(mode, "Combined " + title.lower(), keys, labels, self.combined_rows)
+        for index in range(self.config.path_count if self.config else 1):
+            rows = [row for row in self.rows if row["path_index"] == index]
+            for mode, title, keys, labels in specs:
+                table(mode, f"Path {index}: {title}", keys, labels, rows)
         if self.alerts:
             lines += ["## Counter observations", ""] + [f"- {a}" for a in self.alerts] + [""]
         (self.path / "summary.md").write_text("\n".join(lines) + "\n")
@@ -667,21 +822,24 @@ class Store:
     def finish(self, status, error=None):
         self.status = status
         self.write("status.json", {"status": status, "finished": utc_now(), "error": error,
-                                   "measured_runs": len(self.rows) if self.role == "client" else None})
+                                   "measured_runs": len(self.rows) if self.role == "client" else None,
+                                   "combined_bandwidth_trials": len(self.combined_rows) if self.role == "client" else None})
         if self.role == "client":
             self.report()
 
 
 class Session:
     def __init__(self, channel, endpoint, peer, config, store):
-        self.channel, self.endpoint, self.peer = channel, endpoint, peer
+        self.endpoints, self.peers = endpoint_list(endpoint), endpoint_list(peer)
+        if len(self.endpoints) != config.path_count or len(self.peers) != config.path_count:
+            raise BenchError("Session path count differs from configuration")
+        self.channel, self.endpoint, self.peer = channel, self.endpoints[0], self.peers[0]
         self.config, self.store, self.active = config, store, None
         self.sequence = 0
 
     def launch(self, job, role):
         job.validate(self.config)
-        argv = build_command(self.endpoint, self.peer.ip, role, self.config, job)
-        self.active = NativeProcess(argv, self.store.native_dir, job)
+        self.active = NativeGroup(self.endpoints, self.peers, role, self.config, self.store.native_dir, job)
         return self.active
 
     def cleanup(self):
@@ -689,12 +847,13 @@ class Session:
             self.active.stop()
             self.active = None
 
-    def run_pair(self, mode, size, phase, direction, repetition=0, iterations=None):
+    def run_pair(self, mode, size, phase, direction, repetition=0, iterations=None, path_index=None):
         self.sequence += 1
         job = Job(f"{self.sequence:04d}-{phase}-{mode}-{size}-{repetition}-{direction}",
-                  mode, size, phase, direction, repetition, iterations)
+                  mode, size, phase, direction, repetition, iterations, path_index)
         job.validate(self.config)
-        log(f"[{self.sequence:03d}] {phase}: {mode}, {size_label(size)}, {direction}, repetition {repetition or '-'}")
+        log(f"[{self.sequence:03d}] {phase}: {mode}, {size_label(size)}, {direction}, "
+            f"repetition {repetition or '-'}, paths {selected_paths(job, self.config)}")
         self.channel.send("run", job=asdict(job))
         ready = self.channel.receive("ready", self.config.startup_timeout + 5)
         if ready.get("id") != job.id:
@@ -706,12 +865,12 @@ class Session:
             self.channel.send("go", id=job.id)
             local, remote = wait_native(native, self.channel, self.config.test_timeout, peer_result=True)
             self.store.pair(job, local, remote)
-            return local["parsed"]
+            return next(iter(local["paths"].values()))["parsed"]
         finally:
             self.cleanup()
 
     def counters(self, label):
-        local = snapshot(self.endpoint)
+        local = {str(index): snapshot(endpoint) for index, endpoint in enumerate(self.endpoints)}
         self.channel.send("snapshot", label=label)
         remote = self.channel.receive("snapshot", 20)["snapshot"]
         self.store.write(f"counters-{label}.json", {"client": local, "server": remote})
@@ -725,33 +884,38 @@ class Session:
         for mode in self.config.modes:
             direction = "both" if mode == MODES[1] else "pingpong" if mode == MODES[2] else "client_to_server"
             for size in sorted({min(self.config.sizes), max(self.config.sizes)}):
-                self.run_pair(mode, size, "smoke", direction, iterations=100)
+                paths = range(self.config.path_count) if mode == MODES[2] else [None]
+                for path in paths:
+                    self.run_pair(mode, size, "smoke", direction, iterations=100, path_index=path)
         for mode in self.config.modes:
             before = self.counters(f"{mode}-before")
             for size in self.config.sizes:
                 if mode == MODES[2]:
-                    if size >= 2**20:
-                        parsed = self.run_pair(mode, size, "calibration", "pingpong", iterations=100)
-                        count = calibrated_iterations(parsed)
-                        warmup = max(10, math.ceil(count * 0.1))
-                    else:
-                        count, warmup = 10000, 1000
-                    for repetition in range(1, self.config.repetitions + 1):
-                        self.run_pair(mode, size, "warmup", "pingpong", repetition, warmup)
-                        self.run_pair(mode, size, "measured", "pingpong", repetition, count)
+                    for path in range(self.config.path_count):
+                        if size >= 2**20:
+                            parsed = self.run_pair(mode, size, "calibration", "pingpong", iterations=100, path_index=path)
+                            count = calibrated_iterations(parsed)
+                            warmup = max(10, math.ceil(count * 0.1))
+                        else:
+                            count, warmup = 10000, 1000
+                        for repetition in range(1, self.config.repetitions + 1):
+                            self.run_pair(mode, size, "warmup", "pingpong", repetition, warmup, path)
+                            self.run_pair(mode, size, "measured", "pingpong", repetition, count, path)
                 else:
                     directions = ("client_to_server", "server_to_client") if mode == MODES[0] else ("both",)
                     for direction in directions:
                         for repetition in range(1, self.config.repetitions + 1):
                             self.run_pair(mode, size, "measured", direction, repetition)
             after = self.counters(f"{mode}-after")
-            changes = {role: counter_changes(before[role], after[role]) for role in before}
+            changes = {role: {path: counter_changes(before[role][path], after[role][path])
+                              for path in before[role]} for role in before}
             self.store.write(f"counter-changes-{mode}.json", changes)
-            for role, change in changes.items():
-                for alert in change["alerts"]:
-                    self.store.alerts.append(f"{mode}, {role}: {alert}")
-                    log(f"Counter observation ({role}): {alert}")
-        expected = len(self.config.sizes) * self.config.repetitions * sum(
+            for role, paths in changes.items():
+                for path, change in paths.items():
+                    for alert in change["alerts"]:
+                        self.store.alerts.append(f"{mode}, {role}, path {path}: {alert}")
+                        log(f"Counter observation ({role}, path {path}): {alert}")
+        expected = self.config.path_count * len(self.config.sizes) * self.config.repetitions * sum(
             2 if mode == MODES[0] else 1 for mode in self.config.modes)
         if len(self.store.rows) != expected:
             raise BenchError(f"Expected {expected} measured runs, collected {len(self.store.rows)}")
@@ -777,7 +941,7 @@ class Session:
                 label = message["label"]
                 if not re.fullmatch(r"[a-z-]+-(before|after)", label):
                     raise BenchError("Invalid counter snapshot label")
-                data = snapshot(self.endpoint)
+                data = {str(index): snapshot(endpoint) for index, endpoint in enumerate(self.endpoints)}
                 self.store.write(f"counters-{label}.json", data)
                 self.channel.send("snapshot", snapshot=data)
                 continue
@@ -843,8 +1007,10 @@ def open_control(args, endpoint):
 
 
 def preview(endpoint, config, role, peer):
-    log(f"Dry run: {endpoint.hostname}, {endpoint.interface}/{endpoint.ip}, "
-        f"{endpoint.device} port {endpoint.rdma_port}, GID {endpoint.gid_index}")
+    endpoints = endpoint_list(endpoint)
+    for index, endpoint in enumerate(endpoints):
+        log(f"Dry run path {index}: {endpoint.hostname}, {endpoint.interface}/{endpoint.ip}, "
+            f"{endpoint.device} port {endpoint.rdma_port}, GID {endpoint.gid_index}")
     total = 0
     for mode in config.modes:
         directions = ("client_to_server", "server_to_client") if mode == MODES[0] else (
@@ -853,10 +1019,13 @@ def preview(endpoint, config, role, peer):
             iterations = (10000 if size < 2**20 else 100) if mode == MODES[2] else None
             for direction in directions:
                 job = Job("preview", mode, size, "measured", direction, 1, iterations)
-                log(f"{mode}: {size_label(size)}, {direction}, repeat {config.repetitions} times")
-                log("  " + shlex.join(build_command(endpoint, peer, role, config, job)))
-                total += config.repetitions
-    log(f"{total} measured runs. Each selected mode also smoke-tests its smallest/largest size (100 exchanges).")
+                log(f"{mode}: {size_label(size)}, {direction}, repeat {config.repetitions} times; "
+                    + ("paths run separately" if mode == MODES[2] else "paths run concurrently"))
+                for index, endpoint in enumerate(endpoints):
+                    destination = peer if index == 0 else f"<peer-path-{index}-ip>"
+                    log(f"  path {index}: " + shlex.join(build_command(endpoint, destination, role, config, job, index)))
+                    total += config.repetitions
+    log(f"{total} measured runs. Each selected mode also smoke-tests its smallest/largest size (100 exchanges per path).")
     if any(mode != MODES[2] for mode in config.modes):
         log(bandwidth_timing(config))
     log("Latency has a separate warm-up before every repetition. At >=1 MiB, a 100-exchange calibration "
@@ -871,6 +1040,8 @@ def parser():
     roles.add_argument("--client", metavar="SERVER_IP", help="Connect and control the selected benchmarks")
     p.add_argument("--interface", default="enp1s0f1np1", help="Interface for both control and RDMA traffic")
     p.add_argument("--ip", help="Select a local IPv4 address if the interface has multiple addresses")
+    p.add_argument("--path", action="append", type=parse_path, default=[], metavar="INTERFACE=IP",
+                   help="Add a second local RDMA path; repeat the same path order on the peer")
     p.add_argument("--device", help="RDMA device override (must match interface/IP)")
     p.add_argument("--rdma-port", type=int, help="RDMA device port override")
     p.add_argument("--gid-index", type=int, help="IPv4 RoCEv2 GID index override")
@@ -904,21 +1075,25 @@ def main(argv=None):
     if not math.isfinite(args.connect_timeout) or args.connect_timeout <= 0:
         p.error("--connect-timeout must be positive and finite")
     config = Config(selected or MODES, tuple(args.sizes), args.repetitions, args.duration,
-                    args.perftest_port, args.startup_timeout, args.test_timeout)
+                    args.perftest_port, args.startup_timeout, args.test_timeout, 1 + len(args.path))
     channel, store, session, endpoint = None, None, None, None
+    endpoints = []
     try:
         config.validate()
-        if args.control_port == config.perftest_port:
+        if args.control_port in config.perftest_ports:
             raise BenchError("Control and perftest ports must differ")
-        endpoint = discover_endpoint(args)
+        endpoints = discover_paths(args)
+        endpoint = endpoints[0]
         if args.dry_run:
-            probe_tools(endpoint, config)
-            preview(endpoint, config, "server" if args.server else "client", args.client or "<peer-interface-ip>")
+            for current in endpoints:
+                probe_tools(current, config)
+            preview(endpoints, config, "server" if args.server else "client", args.client or "<peer-interface-ip>")
             return 0
         if not args.server:
-            probe_tools(endpoint, config)
+            for current in endpoints:
+                probe_tools(current, config)
             store = Store(args.output_dir, new_run_id(), "client")
-            store.write("local-endpoint.json", asdict(endpoint))
+            store.write("local-endpoint.json", {"paths": [asdict(current) for current in endpoints]})
         channel = open_control(args, endpoint)
         peer_ip = channel.sock.getpeername()[0]
         if args.server:
@@ -926,33 +1101,39 @@ def main(argv=None):
             if hello.get("protocol") != PROTOCOL:
                 raise BenchError("Incompatible control protocol")
             config = Config.from_dict(hello["config"])
-            if config.perftest_port == args.control_port:
+            if args.control_port in config.perftest_ports:
                 raise BenchError("Control and perftest ports must differ")
-            peer = Endpoint(**hello["endpoint"])
+            peers = [Endpoint(**data) for data in hello["endpoints"]]
+            if not peers:
+                raise BenchError("Peer supplied no RDMA paths")
+            peer = peers[0]
             if peer.ip != peer_ip:
                 raise BenchError("Peer control address differs from its selected RDMA interface address")
-            verify_route(endpoint, peer.ip)
-            probe_tools(endpoint, config)
-            verify_peer(endpoint, peer)
+            for current in endpoints:
+                probe_tools(current, config)
+            verify_paths(endpoints, peers, config)
             run_id = hello["run_id"]
             if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", run_id):
                 raise BenchError("Invalid run ID")
             store = Store(args.output_dir, run_id, "server")
-            store.setup(config, peer, endpoint)
-            channel.send("hello_ack", protocol=PROTOCOL, endpoint=asdict(endpoint))
+            store.setup(config, peers, endpoints)
+            channel.send("hello_ack", protocol=PROTOCOL, endpoints=[asdict(current) for current in endpoints])
         else:
-            channel.send("hello", protocol=PROTOCOL, config=asdict(config), endpoint=asdict(endpoint),
+            channel.send("hello", protocol=PROTOCOL, config=asdict(config), endpoints=[asdict(current) for current in endpoints],
                          run_id=store.path.name.removesuffix("-client"))
             hello = channel.receive("hello_ack", 90)
             if hello.get("protocol") != PROTOCOL:
                 raise BenchError("Incompatible control protocol")
-            peer = Endpoint(**hello["endpoint"])
+            peers = [Endpoint(**data) for data in hello["endpoints"]]
+            if not peers:
+                raise BenchError("Server supplied no RDMA paths")
+            peer = peers[0]
             if peer.ip != peer_ip:
                 raise BenchError("Server control address differs from its selected RDMA interface address")
-            verify_peer(endpoint, peer)
-            store.setup(config, endpoint, peer)
+            verify_paths(endpoints, peers, config)
+            store.setup(config, endpoints, peers)
         log(f"Results: {store.path.resolve()}")
-        session = Session(channel, endpoint, peer, config, store)
+        session = Session(channel, endpoints, peers, config, store)
         if args.server:
             session.serve()
         else:
@@ -971,7 +1152,8 @@ def main(argv=None):
         if store:
             try:
                 if endpoint:
-                    store.write("counters-abort.json", snapshot(endpoint))
+                    store.write("counters-abort.json", {str(index): snapshot(current)
+                                                        for index, current in enumerate(endpoints)})
                 store.finish("failed", message)
                 log(f"Partial results: {store.path.resolve()}")
             except OSError:

@@ -62,51 +62,88 @@ smoke tests, without forcing different CQ moderation or a different posting API.
 
 ## Start the benchmark
 
-Copy `rdma_bench.py` to both machines. On the first Spark (the script server):
+The current two-path setup uses one QSFP cable with two logical PCIe paths:
+
+| Path | Interface | Server (`spark-28a3`) | Client (`spark-7e64`) |
+|---|---|---|---|
+| 0 | `enp1s0f1np1` | `192.168.200.12/24` | `192.168.200.13/24` |
+| 1 | `enP2p1s0f1np1` | `192.168.201.12/24` | `192.168.201.13/24` |
+
+Spark exposes two independent PCIe Gen 5 x4 paths to its NIC. Using only one
+logical RDMA device does not exercise the whole physical port. Both selected
+paths carry bandwidth traffic concurrently. See [NVIDIA's port mapping](https://docs.nvidia.com/dgx/dgx-spark/spark-clustering.html#full-correspondence-table).
+Keep the same path order on both hosts; peer addresses are exchanged over the
+primary path's control connection. The runner discovers each device and GID.
+
+Pull the same updated checkout on both machines. The new control protocol is
+incompatible with older runner copies. Build perftest as described above.
+
+Long runs should use user services so terminal closure cannot stop them. Once
+on each machine, enable services to survive logout:
 
 ```bash
-python3 rdma_bench.py --server --interface enp1s0f1np1
+sudo loginctl enable-linger "$USER"
 ```
 
-On the second Spark (the script client/controller), use the first Spark's IP
-on that link:
+On the **server**, from the checkout:
 
 ```bash
-python3 rdma_bench.py --client 169.254.238.243 \
-  --interface enp1s0f1np1 --all
+bash tools/run_bench_service.sh server \
+  --interface enp1s0f1np1 --ip 192.168.200.12 \
+  --path enP2p1s0f1np1=192.168.201.12 --connect-timeout 600
 ```
 
-`169.254.238.243` was the local `spark-28a3` address at initial inspection; verify
-it if the network configuration changes. Substitute the peer's interface name
-if different. You start each script once; no commands are needed between tests.
-By default, the server waits up to five minutes for the controller.
-
-Choose one or combine these flags instead of `--all`:
+Then on the **client/controller**:
 
 ```bash
-python3 rdma_bench.py --client 169.254.238.243 \
-  --interface enp1s0f1np1 \
-  --unidirectional-write-bw --bidirectional-write-bw --write-latency
+bash tools/run_bench_service.sh client 192.168.200.12 \
+  --interface enp1s0f1np1 --ip 192.168.200.13 \
+  --path enP2p1s0f1np1=192.168.201.13 --all
 ```
 
-The client selects the tests and sends settings to the server. Benchmark settings
-on the server CLI are not used; set sizes, repetitions, duration, execution
-timeouts, and perftest port on the **client**. Set the control port identically on
-both hosts. Interface/IP/device/GID overrides and output directory are local to
-each host.
+The helper returns immediately and appends output to
+`results/service-server.log` or `results/service-client.log`. Watch with
+`tail -f results/service-client.log`; closing the viewer leaves the benchmark
+running. Stop explicitly with `systemctl --user stop ocs-rdma-client` (or
+`ocs-rdma-server` on the server). A failed launch does not replace an existing
+service. Finished units are collected; the saved logs and `status.json` retain
+the outcome.
 
-The script server stays the control server throughout. For reverse
-unidirectional traffic, the runner swaps the **native perftest** listener and
-connector, so the script server becomes the RDMA writer. You do not restart
-either script. Both scripts exit when the suite completes.
+Omit `--path` on both machines to retain the original single-path baseline.
+The helper passes its arguments to `python3 rdma_bench.py`; direct foreground
+invocation remains available for short diagnostics.
+
+Choose any combination of `--unidirectional-write-bw`,
+`--bidirectional-write-bw`, and `--write-latency` instead of `--all`.
+The client selects test settings. Local interface/IP settings and output
+directories belong on each host. The control port must match on both hosts;
+native perftest uses the base port plus twice the path index (18515 and 18517
+by default). The control port must differ from all native ports.
+
+For every bandwidth trial, all selected native listeners must be ready before
+any connector starts. Writers then launch in one batch, and both paths must
+finish before the next trial. Reverse unidirectional trials swap native roles
+on both paths. No Python clock is used to calculate throughput.
+
+Each perftest process still owns its own duration timer and sampling window.
+Combined throughput is explicitly the sum of concurrent native averages, not a
+measurement over an exactly shared sampling interval. Per-host launch skew is
+retained for review; it does not measure warm-up or sampling-window skew.
+
+Latency runs one path at a time with the other path idle, with separate
+calibration and warm-up for each size/path. Latency is reported per path and
+never added together. Each process still sends the full requested message
+size; sizes are per path, not a striped total divided between them.
 
 ### Preview without benchmarking
 
 Run on either machine with the appropriate role:
 
 ```bash
-python3 rdma_bench.py --client 169.254.238.243 --all --dry-run
-python3 rdma_bench.py --server --dry-run
+python3 rdma_bench.py --client 192.168.200.12 --all \
+  --ip 192.168.200.13 --path enP2p1s0f1np1=192.168.201.13 --dry-run
+python3 rdma_bench.py --server --ip 192.168.200.12 \
+  --path enP2p1s0f1np1=192.168.201.12 --dry-run
 ```
 
 Dry-run inspects the local device and tool capabilities, prints commands and run
@@ -118,11 +155,14 @@ Large latency `-n` values are placeholders until calibration.
 For a shorter first end-to-end check, start the server normally, then run:
 
 ```bash
-python3 rdma_bench.py --client 169.254.238.243 --all \
+bash tools/run_bench_service.sh client 192.168.200.12 --all \
+  --interface enp1s0f1np1 --ip 192.168.200.13 \
+  --path enP2p1s0f1np1=192.168.201.13 \
   --sizes 64B 1MiB --repetitions 1 --duration 5
 ```
 
-This performs eight measured runs plus smoke tests, calibration, and warm-ups.
+With two paths this performs 16 measured path runs and six combined bandwidth
+trials, plus smoke tests, calibration, and warm-ups.
 After native warm-up, each five-second bandwidth run excludes a one-second
 start margin, measures for three seconds, and excludes a final one-second margin.
 It validates orchestration but does not establish support for the full 1 GiB
@@ -136,7 +176,7 @@ match that interface/address:
 
 ```bash
 python3 rdma_bench.py --server --interface enp1s0f1np1 \
-  --ip 169.254.238.243 --device rocep1s0f1 --rdma-port 1 --gid-index 3
+  --ip 192.168.200.12 --device rocep1s0f1 --rdma-port 1 --gid-index 3
 ```
 
 The local discovery currently resolves to `rocep1s0f1`, port 1, GID 3. Do not
@@ -158,8 +198,11 @@ Every mode uses these sizes:
 | 256 MiB | Both directions sequentially | Simultaneous | Ping-pong |
 | 1 GiB | Both directions sequentially | Simultaneous | Ping-pong |
 
-Three measured repetitions give **48 unidirectional + 24 bidirectional + 24
-latency = 96 measured runs**. Modes run in that order regardless of flag order.
+Three repetitions on each path give **96 measured path runs**: 48
+unidirectional, 24 bidirectional, and 24 latency. Two paths therefore produce
+**192 per-path CSV rows** (96 unidirectional, 48 bidirectional, 48 latency), plus
+**72 combined bandwidth rows** (48 unidirectional and 24 bidirectional).
+Modes run in that order regardless of flag order.
 Keep other traffic and GPU/CPU workloads idle during measurements.
 
 ### Bandwidth
@@ -213,13 +256,19 @@ Each host prints its unique directory under `results/` (override with
 
 | File | Contents |
 |---|---|
-| `summary.md` | Three tables with median, min–max range, and repetition count |
-| `results.csv` | One row per measured run, in explicit Gbit/s and µs columns |
-| `runs.jsonl` | All completed pairs, including smoke/calibration/warm-up phases |
+| `summary.md` | Combined bandwidth and per-path bandwidth/latency tables with median and min–max |
+| `results.csv` | One row per measured path run, including `path_index`, in Gbit/s and µs |
+| `bandwidth-combined.csv` | One row per complete bandwidth trial, summed across paths, with per-host launch skew |
+| `runs.jsonl` | Completed grouped trials; client/server records are under `paths` keyed by index |
 | `config.json`, `endpoints.json` | Negotiated configuration and both hosts' metadata |
 | `status.json` | Running, complete, or failed; error and measured-run count |
-| `local/`, `peer/` | Native stdout/stderr, parsed statistics, and exact command arguments |
+| `local/path-N/`, `peer/path-N/` | Per-path native logs, parsed statistics, PIDs, and exact command arguments |
 | `counters-*.json`, `counter-changes-*.json` | Before/after snapshots, deltas, and error/drop/reset observations |
+
+A failed path aborts its siblings and the peer. An incomplete bandwidth trial
+adds neither per-path nor combined CSV rows; earlier complete trials remain.
+Per-path rates are summed within each repetition before summary statistics are
+computed, rather than summing medians from different repetitions.
 
 The server keeps its own native logs and local counter snapshots. Counter
 observations do not erase measurements or impose an unestablished performance
@@ -246,9 +295,11 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests use temporary fake perftest executables and real local sockets. They check
-the full 96-run matrix, output parsing and units, calibration, direction mapping,
+the full single-path and 192-run dual-path matrices, output parsing and units,
+calibration, direction mapping, listener readiness barriers across both paths,
 readiness without probe connections, partial results, timeouts, and SIGTERM
-cleanup. They also require native bandwidth warm-up and reject releases without
+cleanup of all four native processes. They also check incomplete-path failures,
+per-trial aggregation, isolated per-path latency, native warm-up, and releases without
 the warm-up fix. **They do not measure or certify RDMA hardware performance.**
 
 The 6.30 build was validated on `spark-7e64` with hardware discovery, a dry-run,
