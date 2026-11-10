@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
 results/*
+
+# Saved benchmark results committed to the repository.
 !results/20261110T021852Z-4cacd141-client/
+!results/20261110T021852Z-4cacd141-server/
 
 # Omit raw logs (individual per-process output and record directories).
 results/**/local/

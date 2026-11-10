@@ -1,0 +1,23 @@
+{
+  "modes": [
+    "unidirectional-write-bw",
+    "bidirectional-write-bw",
+    "write-latency"
+  ],
+  "sizes": [
+    64,
+    16384,
+    1048576,
+    4194304,
+    16777216,
+    67108864,
+    268435456,
+    1073741824
+  ],
+  "repetitions": 3,
+  "duration": 20,
+  "perftest_port": 18515,
+  "startup_timeout": 30,
+  "test_timeout": 180,
+  "path_count": 2
+}
