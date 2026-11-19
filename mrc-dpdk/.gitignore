@@ -15,3 +15,4 @@
 /tests/mrc_memif_relay
 /tests/mrc_endpoint_application
 /tests/mrc_abi_application
+/tests/test_mrc_ctl_abi

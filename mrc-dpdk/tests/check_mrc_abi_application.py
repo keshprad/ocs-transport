@@ -3,9 +3,50 @@
 
 import argparse
 import json
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from memif_pair import eal_args, require, run_pair
+
+
+def check_live_profile(binary, controller):
+    with tempfile.TemporaryDirectory(prefix="mrc-abi-ev-") as store:
+        def control(operation):
+            result = subprocess.run(["unshare", "-Ur", str(controller), operation, store],
+                                    capture_output=True, text=True, timeout=4)
+            require(result.returncode == 0,
+                    f"Controller {operation} failed: {result.stdout}\n{result.stderr}")
+            return result.stdout.strip()
+
+        profile_id = control("--seed-denied")
+        require(profile_id.isdecimal() and int(profile_id) > 0,
+                f"Invalid controller test profile ID: {profile_id!r}")
+
+        def command(role, cpu, directory):
+            return eal_args(binary, role, cpu, directory) + [
+                "--", role, str(directory), "ev_profile", store, profile_id,
+            ]
+
+        def unblock(sender):
+            ready = Path(store) / "rx.profile-blocked"
+            deadline = time.monotonic() + 4
+            while not ready.exists():
+                if sender.poll() is not None:
+                    stdout, stderr = sender.communicate()
+                    raise RuntimeError(f"Sender exited before both EVs were blocked: {stdout}\n{stderr}")
+                require(time.monotonic() < deadline,
+                        "Timed out checking that denied EVs blocked completion and remote placement")
+                time.sleep(0.01)
+            control("--unblock")
+
+        tx, rx, _ = run_pair(command, sender_started=unblock)
+        require(tx["role"] == "tx" and rx["role"] == "rx" and tx["qpn"] != rx["qpn"]
+                and tx["bytes"] == rx["bytes"] == 1038
+                and tx["completions"] == rx["completions"] == 2,
+                f"Controller did not unblock the public QP: {tx}, {rx}")
+        print(json.dumps({"case": "public_qp_live_ev_update", "tx": tx, "rx": rx}))
 
 
 def main():
@@ -14,6 +55,8 @@ def main():
         "--binary", type=Path,
         default=Path(__file__).resolve().parent / "mrc_abi_application",
     )
+    parser.add_argument("--controller", type=Path,
+                        help="Path to test_mrc_ctl_abi for the live EV update case")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -47,6 +90,11 @@ def main():
             and not tx["cq_error"] and rx["cq_error"],
             f"Unexpected public async events after receiver CQ overflow: {tx}, {rx}")
     print(json.dumps({"case": "public_async_events_on_unexpected_wire_error", "tx": tx, "rx": rx}))
+
+    if args.controller:
+        controller = args.controller.resolve()
+        require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
+        check_live_profile(binary, controller)
 
 
 if __name__ == "__main__":

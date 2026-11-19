@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -167,6 +168,14 @@ static void test_process_leases_and_modes(void)
     remove_fixture(&store, directory);
 }
 
+static int deny_slot(struct mrc_ctl_store_profile *profile, void *arg)
+{
+    const uint32_t *slot = arg;
+    assert(profile->state == MRC_CTL_STORE_ONLINE);
+    profile->config.denied |= *slot;
+    return 0;
+}
+
 static void test_concurrent_writers(void)
 {
     char directory[] = "/tmp/mrc-ctl-writers.XXXXXX";
@@ -210,7 +219,10 @@ static void test_concurrent_writers(void)
             close(start[1]);
             char unused;
             assert(read(start[0], &unused, 1) == 0);
-            _exit(mrc_ctl_store_update_denied(&store, 5, UINT32_C(1) << i, 0) != 0);
+            uint32_t bit = UINT32_C(1) << i;
+            int result = i % 2 ? mrc_ctl_store_edit(&store, 5, deny_slot, &bit) :
+                                 mrc_ctl_store_update_denied(&store, 5, bit, 0);
+            _exit(result != 0);
         }
     }
     close(start[0]);
@@ -272,12 +284,179 @@ static void test_failed_update_and_corruption(void)
     remove_fixture(&store, directory);
 }
 
+static int init_typed_profile(struct mrc_ctl_store_profile *profile, void *arg)
+{
+    const uint64_t *expected_id = arg;
+    assert(profile->id == *expected_id && profile->state == MRC_CTL_STORE_INIT);
+    assert(!profile->config.mode && !profile->config.count);
+    profile->state = MRC_CTL_STORE_OFFLINE;
+    profile->config = explicit_config();
+    profile->config.format = MRC_CTL_STORE_FORMAT_STEV;
+    return 0;
+}
+
+static int replace_profile(struct mrc_ctl_store_profile *profile, void *arg)
+{
+    *profile = *(const struct mrc_ctl_store_profile *)arg;
+    return 0;
+}
+
+static int clear_profile_id(struct mrc_ctl_store_profile *profile, void *arg)
+{
+    (void)arg;
+    profile->id = 0;
+    return 0;
+}
+
+static int cancel_profile_edit(struct mrc_ctl_store_profile *profile, void *arg)
+{
+    (void)arg;
+    profile->config.format = MRC_CTL_STORE_FORMAT_UDP;
+    return -ECANCELED;
+}
+
+static void assert_mode(const struct mrc_ctl_store *store, const char *name, mode_t mode)
+{
+    struct stat status;
+    assert(fstatat(store->fd, name, &status, 0) == 0);
+    assert(S_ISREG(status.st_mode) && (status.st_mode & 07777) == mode);
+}
+
+static void test_typed_edits(void)
+{
+    char directory[] = "/tmp/mrc-ctl-edits.XXXXXX";
+    assert(mkdtemp(directory));
+    struct mrc_ctl_store store = MRC_CTL_STORE_INITIALIZER;
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+
+    size_t count = 1;
+    struct mrc_ctl_store_ref ref = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_profile recorded;
+    uint64_t id = 457;
+    assert(mrc_ctl_store_list(&store, NULL, 0, &count) == 0 && count == 0);
+    assert(mrc_ctl_store_acquire(&store, id, &ref, &recorded) == -ENOENT);
+    assert(faccessat(store.fd, "profiles.lock", F_OK, 0) == -1 && errno == ENOENT);
+
+    mode_t mask = umask(0);
+    assert(mrc_ctl_store_edit(&store, id, init_typed_profile, &id) == 0);
+    umask(mask);
+    assert_mode(&store, "profiles.lock", 0600);
+    assert_mode(&store, "profiles.v1", 0600);
+    assert(mrc_ctl_store_edit(&store, id, cancel_profile_edit, NULL) == -ECANCELED);
+    assert(mrc_ctl_store_get(&store, id, &recorded) == 0);
+    assert(recorded.config.format == MRC_CTL_STORE_FORMAT_STEV);
+
+    struct mrc_ctl_store_profile updated = recorded;
+    updated.config.format = MRC_CTL_STORE_FORMAT_STEV + 1;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == -EINVAL);
+    updated = recorded;
+    updated.id++;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == -EINVAL);
+    updated = recorded;
+    updated.state = MRC_CTL_STORE_ONLINE;
+    updated.config.populated = 1;
+    updated.config.entropy[1] = 0;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == -EINVAL);
+
+    updated = recorded;
+    updated.state = MRC_CTL_STORE_ONLINE;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == 0);
+    assert(mrc_ctl_store_acquire(&store, id, &ref, &recorded) == 0);
+    assert(recorded.config.format == MRC_CTL_STORE_FORMAT_STEV);
+    updated.config.denied = 2;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == 0);
+    assert(mrc_ctl_store_get(&store, id, &recorded) == 0 && recorded.config.denied == 2);
+    updated.config.format = MRC_CTL_STORE_FORMAT_UDP;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == -EBUSY);
+    updated.config.format = MRC_CTL_STORE_FORMAT_STEV;
+    updated.state = MRC_CTL_STORE_OFFLINE;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == -EBUSY);
+    assert(mrc_ctl_store_edit(&store, id, clear_profile_id, NULL) == -EBUSY);
+    mrc_ctl_store_release(&ref);
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == 0);
+    updated.state = MRC_CTL_STORE_ONLINE;
+    assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == 0);
+    assert(mrc_ctl_store_edit(&store, id, clear_profile_id, NULL) == 0);
+    assert(mrc_ctl_store_get(&store, id, &recorded) == -ENOENT);
+    remove_fixture(&store, directory);
+}
+
+static void write_legacy_snapshot(const struct mrc_ctl_store *store)
+{
+    enum { HEADER = 16, ENTRY = 20 + 4 * MRC_EV_MAX_PATHS };
+    uint8_t snapshot[HEADER + MRC_CTL_STORE_MAX_PROFILES * ENTRY] = {
+        'M', 'R', 'C', '-', 'E', 'V', 0, 1,
+        [HEADER + 7] = 17, /* ID, most-significant byte first. */
+        [HEADER + 8] = 2, /* ONLINE */
+        [HEADER + 9] = 2, /* EXPLICIT */
+        [HEADER + 10] = 2, [HEADER + 11] = 1,
+        [HEADER + 15] = 3, /* Slots 0 and 1 populated. */
+        [HEADER + 23] = 49, [HEADER + 27] = 57,
+    };
+    uint32_t hash = UINT32_C(2166136261);
+    for (size_t i = HEADER; i < sizeof(snapshot); i++) {
+        hash ^= snapshot[i];
+        hash *= UINT32_C(16777619);
+    }
+    for (unsigned int i = 0; i < 4; i++)
+        snapshot[8 + i] = (uint8_t)(hash >> (24 - 8 * i));
+    int fd = openat(store->fd, "profiles.v1", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0);
+    assert(write(fd, snapshot, sizeof(snapshot)) == (ssize_t)sizeof(snapshot));
+    assert(close(fd) == 0);
+    fd = openat(store->fd, "profiles.lock", O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && close(fd) == 0);
+}
+
+static void test_legacy_shared_store(void)
+{
+    char directory[] = "/tmp/mrc-ctl-shared.XXXXXX";
+    assert(mkdtemp(directory));
+    assert(chmod(directory, 02750) == 0);
+    struct mrc_ctl_store store = MRC_CTL_STORE_INITIALIZER;
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+
+    mode_t mask = umask(0077);
+    write_legacy_snapshot(&store);
+    assert_mode(&store, "profiles.lock", 0600);
+    assert_mode(&store, "profiles.v1", 0600);
+    struct mrc_ctl_store_profile record;
+    assert(mrc_ctl_store_get(&store, 17, &record) == 0);
+    assert(record.config.format == MRC_CTL_STORE_FORMAT_LEGACY && record.state == MRC_CTL_STORE_ONLINE);
+    assert(record.config.entropy[0] == 49 && record.config.entropy[1] == 57);
+    struct mrc_ctl_store_ref ref = MRC_CTL_STORE_REF_INITIALIZER;
+    assert(mrc_ctl_store_acquire(&store, 17, &ref, &record) == 0);
+    assert((fcntl(ref.fd, F_GETFL) & O_ACCMODE) == O_RDONLY);
+
+    uint32_t bit = 1;
+    assert(mrc_ctl_store_edit(&store, 17, deny_slot, &bit) == 0);
+    assert_mode(&store, "profiles.lock", 0640);
+    assert_mode(&store, "profiles.v1", 0640);
+    assert(mrc_ctl_store_get(&store, 17, &record) == 0);
+    assert(record.config.format == MRC_CTL_STORE_FORMAT_LEGACY && record.config.denied == 1);
+    assert(mrc_ctl_store_set_state(&store, 17, MRC_CTL_STORE_OFFLINE) == -EBUSY);
+    mrc_ctl_store_release(&ref);
+    assert(mrc_ctl_store_set_state(&store, 17, MRC_CTL_STORE_OFFLINE) == 0);
+
+    struct mrc_ctl_store_config config = explicit_config();
+    config.format = MRC_CTL_STORE_FORMAT_UDP;
+    config.entropy[0] = 49;
+    config.entropy[1] = 57;
+    assert(mrc_ctl_store_configure(&store, 17, &config) == 0);
+    assert(mrc_ctl_store_get(&store, 17, &record) == 0);
+    assert(record.config.format == MRC_CTL_STORE_FORMAT_UDP);
+    umask(mask);
+    remove_fixture(&store, directory);
+}
+
 int main(void)
 {
     test_lifecycle();
     test_process_leases_and_modes();
     test_concurrent_writers();
     test_failed_update_and_corruption();
+    test_typed_edits();
+    test_legacy_shared_store();
     puts("MRC controller profile store tests passed");
     return 0;
 }

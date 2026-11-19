@@ -186,6 +186,7 @@ MRC_PUBLIC struct mrc_qp *mrc_create_qp(struct mrc_context *context, struct mrc_
         goto destroy_mutex;
 
     qp->context = context;
+    qp->ev_lease.fd = -1;
     qp->init.protocol_version = MRC_PROTOCOL_VERSION_1;
     qp->verbs = (struct ibv_qp_attr){ .cap = qp->init.cap, .path_mtu = IBV_MTU_1024 };
     qp->attrs = default_qp_attrs();
@@ -211,6 +212,8 @@ MRC_PUBLIC int mrc_destroy_qp(struct mrc_qp *qp)
     int error = -mrc_provider_qp_reset(qp->provider);
     if (!error)
         error = -mrc_provider_qp_destroy(qp->provider);
+    if (!error)
+        mrc_ctl_store_release(&qp->ev_lease);
     pthread_mutex_unlock(&qp->mutex);
     if (error)
         return error;
@@ -306,8 +309,7 @@ static int validate_attrs(const struct mrc_qp_attr *attrs)
         attrs->wimm.max_wimm > MRC_ABI_MAX_WIMM || attrs->wimm.max_wimm_dest > MRC_ABI_MAX_WIMM ||
         attrs->timeout > 24 || attrs->retry.linear_cnt > 7 || attrs->retry.exp_cnt > 25)
         return EINVAL;
-    if ((attrs->cap & ~supported_caps) || attrs->profile.ev_profile_id ||
-        attrs->profile.cc_profile_id || attrs->qp_hint)
+    if ((attrs->cap & ~supported_caps) || attrs->profile.cc_profile_id || attrs->qp_hint)
         return EOPNOTSUPP;
     return 0;
 }
@@ -362,6 +364,7 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
     if (((unsigned int)vmask & ~MODIFY_VERBS) || ((unsigned int)mmask & ~MODIFY_MRC))
         return EOPNOTSUPP;
 
+    struct mrc_ctl_store_ref new_lease = MRC_CTL_STORE_REF_INITIALIZER;
     pthread_mutex_lock(&qp->mutex);
     struct mrc_provider_qp_attr provider;
     enum mrc_provider_qp_state state;
@@ -416,10 +419,29 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
         if (error)
             goto unlock;
     }
+    uint64_t ev_profile_id = state == MRC_PROVIDER_QP_RESET ? 0 : updated_attrs.profile.ev_profile_id;
+    bool change_ev = ev_profile_id != qp->attrs.profile.ev_profile_id;
+    if (change_ev && ev_profile_id) {
+        struct mrc_ctl_store store = mrc_abi_ev_store(qp->context);
+        if (store.fd < 0) {
+            error = ENODEV;
+            goto unlock;
+        }
+        struct mrc_ctl_store_profile profile;
+        error = -mrc_ctl_store_acquire(&store, ev_profile_id, &new_lease, &profile);
+        if (error)
+            goto unlock;
+    }
+
     if (state == MRC_PROVIDER_QP_RESET || state == MRC_PROVIDER_QP_ERROR)
         mrc_abi_release_route(qp);
     error = state == MRC_PROVIDER_QP_RESET ? -mrc_provider_qp_reset(qp->provider)
         : -mrc_provider_qp_transition(qp->provider, provider.state, state);
+    if (!error && change_ev) {
+        mrc_ctl_store_release(&qp->ev_lease);
+        qp->ev_lease = new_lease;
+        new_lease.fd = -1;
+    }
     if (!error && state == MRC_PROVIDER_QP_RESET) {
         qp->verbs = (struct ibv_qp_attr){ .cap = qp->init.cap, .path_mtu = IBV_MTU_1024 };
         qp->attrs = default_qp_attrs();
@@ -431,6 +453,7 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
     }
 
 unlock:
+    mrc_ctl_store_release(&new_lease);
     pthread_mutex_unlock(&qp->mutex);
     return error;
 }

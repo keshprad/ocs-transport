@@ -166,15 +166,42 @@ static uint64_t cycles_to_ns(const struct mrc_endpoint_config *transfer, uint64_
            (cycles % transfer->hz) * 1000000000 / transfer->hz;
 }
 
+uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path)
+{
+    uint32_t port = REQUESTOR_EV_PORT + path;
+    return structured ? port | ((EV_FLOW_LABEL + path) & UINT16_MAX) << 16 : port;
+}
+
+bool mrc_endpoint_ev_profile_valid(const struct mrc_endpoint_config *config)
+{
+    const struct mrc_ctl_store_config *profile = &config->profile.config;
+    if (profile->count != PATH_COUNT ||
+        (profile->format == MRC_CTL_STORE_FORMAT_STEV && config->ip_version != MRC_WIRE_IP6))
+        return false;
+    if (profile->mode == MRC_CTL_STORE_AUTO)
+        return true;
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        uint32_t entropy = profile->entropy[path];
+        if (!(uint16_t)entropy ||
+            ((config->ip_version != MRC_WIRE_IP6 || profile->format == MRC_CTL_STORE_FORMAT_UDP) &&
+             entropy > UINT16_MAX))
+            return false;
+    }
+    return profile->entropy[0] != profile->entropy[1];
+}
+
 static uint32_t path_entropy(const struct mrc_endpoint_config *transfer, unsigned int index,
                              bool requestor)
 {
-    if (requestor && transfer->profile_id && transfer->profile.config.mode != MRC_CTL_STORE_AUTO)
-        return transfer->profile.config.entropy[index];
-    uint32_t port = (requestor ? REQUESTOR_EV_PORT : RESPONDER_EV_PORT) + index;
-    if (transfer->ip_version == MRC_WIRE_IP6)
-        port |= ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16;
-    return port;
+    bool structured = transfer->ip_version == MRC_WIRE_IP6;
+    if (requestor) {
+        if (transfer->profile_id && transfer->profile.config.mode != MRC_CTL_STORE_AUTO)
+            return transfer->profile.config.entropy[index];
+        return mrc_endpoint_default_entropy(
+            structured && transfer->profile.config.format != MRC_CTL_STORE_FORMAT_UDP, index);
+    }
+    uint32_t port = RESPONDER_EV_PORT + index;
+    return structured ? port | ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16 : port;
 }
 
 static uint32_t reflect_entropy(const struct mrc_wire_packet *packet)

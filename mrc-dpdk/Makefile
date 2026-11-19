@@ -5,10 +5,10 @@ DPDK_CFLAGS = $(shell $(PKG_CONFIG) --cflags libdpdk)
 DPDK_LIBS = $(shell $(PKG_CONFIG) --libs libdpdk)
 WARNINGS = -Wall -Wextra -Werror
 MRC_INCLUDE_DIR ?=
-MRC_HEADERS = $(if $(MRC_INCLUDE_DIR),$(addprefix $(MRC_INCLUDE_DIR)/,mrc.h mrc_api_ver.h))
+MRC_HEADERS = $(if $(MRC_INCLUDE_DIR),$(addprefix $(MRC_INCLUDE_DIR)/,mrc.h mrc_api_ver.h mrc_ctl.h mrc_ctl_api_ver.h))
 MRC_ABI_CFLAGS = -isystem "$(MRC_INCLUDE_DIR)" $(shell $(PKG_CONFIG) --cflags libibverbs)
 MRC_ABI_LIBS = $(shell $(PKG_CONFIG) --libs libibverbs)
-MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_async.c src/mrc_abi_qp.c src/mrc_abi_dpdk.c $(MRC_ENDPOINT_SRC)
+MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_async.c src/mrc_abi_ctl.c src/mrc_abi_qp.c src/mrc_abi_dpdk.c $(MRC_ENDPOINT_SRC)
 MRC_ABI_DEPS = src/mrc_abi.h src/mrc_dpdk.h $(MRC_ENDPOINT_HEADERS) $(MRC_HEADERS)
 
 .PHONY: all check check-mrc-abi clean
@@ -64,6 +64,9 @@ tests/test_mrc_abi: tests/test_mrc_abi.c $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
 tests/mrc_abi_application: tests/mrc_abi_application.c src/dpdk_io.c src/dpdk_io.h src/mrc_dpdk.h libmrc-dpdk.so
 	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) -L. -Wl,-rpath,'$$ORIGIN/..' -lmrc-dpdk $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
 
+tests/test_mrc_ctl_abi: tests/test_mrc_ctl_abi.c src/mrc_dpdk.h libmrc-dpdk.so
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $< -L. -Wl,-rpath,'$$ORIGIN/..' -lmrc-dpdk $(MRC_ABI_LIBS) $(LDLIBS)
+
 check-mrc-abi: libmrc-dpdk.so tests/test_mrc_abi
 	./tests/test_mrc_abi
 
@@ -79,4 +82,4 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_ctl_store
 
 clean:
-	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/mrc_abi_application tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
+	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_ctl_abi tests/mrc_abi_application tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store

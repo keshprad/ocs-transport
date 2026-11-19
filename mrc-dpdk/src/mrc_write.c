@@ -541,17 +541,7 @@ static int open_ev_profile(struct benchmark *benchmark)
     if (result)
         return result;
 
-    const struct mrc_ctl_store_config *config = &transfer->profile.config;
-    if (config->count != PATH_COUNT)
-        return -EINVAL;
-    if (config->mode == MRC_CTL_STORE_AUTO)
-        return 0;
-    for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        uint32_t entropy = config->entropy[path];
-        if (!(uint16_t)entropy || (transfer->ip_version != MRC_WIRE_IP6 && entropy > UINT16_MAX))
-            return -EINVAL;
-    }
-    return config->entropy[0] != config->entropy[1] ? 0 : -EINVAL;
+    return mrc_endpoint_ev_profile_valid(transfer) ? 0 : -EINVAL;
 }
 
 static int register_buffer(struct benchmark *benchmark)

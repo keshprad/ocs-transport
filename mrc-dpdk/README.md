@@ -143,7 +143,31 @@ position corresponds to its Table 7-3 reason code.
 
 ### Persistent EV profiles
 
-Create a private directory on the sender and bring a profile online.
+The OCP controller ABI exposes device capabilities, built-in format queries,
+and profile configuration through `mrc_ctl.h`. This provider supports two
+rails and the AUTO and explicit EV modes. Select `MRC_DPDK_EV_FORMAT_UDP` for
+a UDP source-port EV or `MRC_DPDK_EV_FORMAT_STEV` for an IPv6 flow label and
+UDP source-port EV. The first four bytes of a controller EV hold a big-endian
+value. The remaining bytes are zero. Port numbers 1 and 2 follow the attached
+DPDK route's rail order.
+
+Point the controller and the application at the same directory with
+`mrc_dpdk_set_ev_store()`. The controller needs effective `CAP_NET_ADMIN` to
+mutate profiles. For separate service accounts, use a controller-owned
+directory with mode `02750` and the application group. Profile snapshots
+and a lock with that group get mode `0640`. Application processes take
+read-only leases. Keep the directory and lock inode stable. The store
+reads legacy snapshots and updates them to the typed format on a write.
+
+Configure the profile OFFLINE, populate both explicit EVs, and set it
+ONLINE. In the application, set `MRC_QP_EV_PROFILE_ID` when bringing the
+QP to INIT. The application retains the profile until reset or destruction.
+The controller can change GOOD and DENIED while the profile is in use.
+EV queries report administrative state. The transport tracks failure and
+congestion per QP.
+
+The benchmark CLI uses the same storage. Create a private directory on the
+sender and bring a profile online.
 
 ```sh
 mkdir -m 700 ./ev-profiles
@@ -166,9 +190,8 @@ Use `deny 42 2` and `allow 42 2` with the same directory to change path 1
 while the endpoint runs. The sender refreshes administrative state every
 10 ms and reports applied changes as `ev_admin_updates`. A profile in use
 stays online until the QP releases it. Use `offline 42` and `remove 42` to
-delete it after the run. The directory stores this benchmark's Linux
-controller state. The OCP controller ABI is tracked separately in
-[conformance](CONFORMANCE.md).
+delete it after the run. See [conformance](CONFORMANCE.md) for the
+remaining controller and routing features.
 
 ### Spark double ring
 

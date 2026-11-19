@@ -294,6 +294,15 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     error = configure_addresses(config, &qp->source_gid, &verbs->ah_attr.grh.dgid);
     if (error)
         return error;
+    if (tx && attrs->profile.ev_profile_id) {
+        config->profile_id = attrs->profile.ev_profile_id;
+        config->profile_store = mrc_abi_ev_store(qp->context);
+        error = -mrc_ctl_store_get(&config->profile_store, config->profile_id, &config->profile);
+        if (error)
+            return error;
+        if (config->profile.state != MRC_CTL_STORE_ONLINE || !mrc_endpoint_ev_profile_valid(config))
+            return EINVAL;
+    }
     for (unsigned int i = 0; i < PATH_COUNT; i++) {
         struct mrc_endpoint_path *path = &config->paths[i];
         path->port = route->ports[i];

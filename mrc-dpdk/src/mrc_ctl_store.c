@@ -11,14 +11,21 @@
 
 enum {
     HEADER_SIZE = 16,
-    ENTRY_HEADER_SIZE = 20,
-    ENTRY_SIZE = ENTRY_HEADER_SIZE + 4 * MRC_EV_MAX_PATHS,
+    LEGACY_VERSION = 1,
+    TYPED_VERSION = 2,
+    LEGACY_ENTRY_HEADER_SIZE = 20,
+    ENTRY_HEADER_SIZE = 24,
+    ENTROPY_SIZE = 4 * MRC_EV_MAX_PATHS,
+    ENTRY_SIZE = ENTRY_HEADER_SIZE + ENTROPY_SIZE,
+    LEGACY_SNAPSHOT_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES *
+        (LEGACY_ENTRY_HEADER_SIZE + ENTROPY_SIZE),
     SNAPSHOT_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * ENTRY_SIZE,
 };
 
+/* Use the existing filename and lock inode when migrating the wire version. */
 static const char snapshot_name[] = "profiles.v1";
 static const char lock_name[] = "profiles.lock";
-static const uint8_t magic[] = { 'M', 'R', 'C', '-', 'E', 'V', 0, 1 };
+static const uint8_t magic[] = { 'M', 'R', 'C', '-', 'E', 'V', 0 };
 
 struct transaction {
     int fd;
@@ -33,6 +40,7 @@ static uint32_t path_mask(unsigned int count)
 static bool config_valid(const struct mrc_ctl_store_config *config)
 {
     if (config->mode < MRC_CTL_STORE_AUTO || config->mode > MRC_CTL_STORE_GENERATED ||
+        (unsigned int)config->format > MRC_CTL_STORE_FORMAT_STEV ||
         !config->count || config->count > MRC_EV_MAX_PATHS || config->min_active > config->count)
         return false;
 
@@ -51,6 +59,37 @@ static bool config_valid(const struct mrc_ctl_store_config *config)
 static bool config_ready(const struct mrc_ctl_store_config *config)
 {
     return config->mode == MRC_CTL_STORE_AUTO || config->populated == path_mask(config->count);
+}
+
+static bool profile_valid(const struct mrc_ctl_store_profile *profile)
+{
+    const struct mrc_ctl_store_config *config = &profile->config;
+    switch (profile->state) {
+    case MRC_CTL_STORE_INIT:
+        if (config->mode || config->format || config->count || config->min_active ||
+            config->populated || config->denied)
+            return false;
+        for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
+            if (config->entropy[i])
+                return false;
+        }
+        return true;
+    case MRC_CTL_STORE_OFFLINE:
+        return config_valid(config);
+    case MRC_CTL_STORE_ONLINE:
+        return config_valid(config) && config_ready(config);
+    default:
+        return false;
+    }
+}
+
+static bool same_layout(const struct mrc_ctl_store_config *previous,
+                        const struct mrc_ctl_store_config *updated)
+{
+    return previous->mode == updated->mode && previous->format == updated->format &&
+           previous->count == updated->count && previous->min_active == updated->min_active &&
+           previous->populated == updated->populated &&
+           memcmp(previous->entropy, updated->entropy, sizeof(previous->entropy)) == 0;
 }
 
 static uint32_t read32(const uint8_t *bytes)
@@ -75,12 +114,13 @@ static uint32_t checksum(const uint8_t *bytes, size_t length)
     return hash;
 }
 
-static bool decode_profile(const uint8_t *bytes, struct mrc_ctl_store_profile *profile)
+static bool decode_profile(const uint8_t *bytes, unsigned int header_size,
+                           struct mrc_ctl_store_profile *profile)
 {
     uint64_t id = (uint64_t)read32(bytes) << 32 | read32(bytes + 4);
     if (!id || bytes[8] == MRC_CTL_STORE_INIT) {
         /* Empty slots and INIT profiles never contain configuration. */
-        for (unsigned int i = 8; i < ENTRY_SIZE; i++) {
+        for (unsigned int i = 8; i < header_size + ENTROPY_SIZE; i++) {
             if (bytes[i])
                 return false;
         }
@@ -88,17 +128,20 @@ static bool decode_profile(const uint8_t *bytes, struct mrc_ctl_store_profile *p
         return true;
     }
 
+    bool typed = header_size == ENTRY_HEADER_SIZE;
+    if (typed && (bytes[21] || bytes[22] || bytes[23]))
+        return false;
     *profile = (struct mrc_ctl_store_profile){
         .id = id, .state = bytes[8],
         .config = {
             .mode = bytes[9], .count = bytes[10], .min_active = bytes[11],
+            .format = typed ? bytes[20] : MRC_CTL_STORE_FORMAT_LEGACY,
             .populated = read32(bytes + 12), .denied = read32(bytes + 16),
         },
     };
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++)
-        profile->config.entropy[i] = read32(bytes + ENTRY_HEADER_SIZE + 4 * i);
-    return profile->state <= MRC_CTL_STORE_ONLINE && config_valid(&profile->config) &&
-           (profile->state != MRC_CTL_STORE_ONLINE || config_ready(&profile->config));
+        profile->config.entropy[i] = read32(bytes + header_size + 4 * i);
+    return profile_valid(profile);
 }
 
 static void encode_profile(uint8_t *bytes, const struct mrc_ctl_store_profile *profile)
@@ -112,6 +155,7 @@ static void encode_profile(uint8_t *bytes, const struct mrc_ctl_store_profile *p
     bytes[11] = config->min_active;
     write32(bytes + 12, config->populated);
     write32(bytes + 16, config->denied);
+    bytes[20] = (uint8_t)config->format;
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++)
         write32(bytes + ENTRY_HEADER_SIZE + 4 * i, config->entropy[i]);
 }
@@ -166,23 +210,31 @@ static int load_snapshot(const struct mrc_ctl_store *store, struct transaction *
     uint8_t bytes[SNAPSHOT_SIZE];
     struct stat status;
     int result = 0;
-    if (fstat(fd, &status) < 0)
+    size_t length = 0;
+    if (fstat(fd, &status) < 0) {
         result = -errno;
-    else if (!S_ISREG(status.st_mode) || status.st_size != SNAPSHOT_SIZE)
+    } else if (!S_ISREG(status.st_mode) ||
+               (status.st_size != LEGACY_SNAPSHOT_SIZE && status.st_size != SNAPSHOT_SIZE)) {
         result = -EBADMSG;
-    else
-        result = read_all(fd, bytes, sizeof(bytes));
+    } else {
+        length = (size_t)status.st_size;
+        result = read_all(fd, bytes, length);
+    }
     close(fd);
     if (result)
         return result;
 
-    if (memcmp(bytes, magic, sizeof(magic)) || read32(bytes + 12) ||
-        read32(bytes + 8) != checksum(bytes + HEADER_SIZE, sizeof(bytes) - HEADER_SIZE))
+    uint8_t version = bytes[sizeof(magic)];
+    unsigned int header_size = version == LEGACY_VERSION ? LEGACY_ENTRY_HEADER_SIZE : ENTRY_HEADER_SIZE;
+    unsigned int entry_size = header_size + ENTROPY_SIZE;
+    if (memcmp(bytes, magic, sizeof(magic)) || (version != LEGACY_VERSION && version != TYPED_VERSION) ||
+        length != HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * entry_size || read32(bytes + 12) ||
+        read32(bytes + 8) != checksum(bytes + HEADER_SIZE, length - HEADER_SIZE))
         return -EBADMSG;
 
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
         struct mrc_ctl_store_profile *profile = &txn->profiles[i];
-        if (!decode_profile(bytes + HEADER_SIZE + i * ENTRY_SIZE, profile))
+        if (!decode_profile(bytes + HEADER_SIZE + i * entry_size, header_size, profile))
             return -EBADMSG;
         for (unsigned int j = 0; profile->id && j < i; j++) {
             if (profile->id == txn->profiles[j].id)
@@ -203,10 +255,34 @@ static int create_temp_file(const struct mrc_ctl_store *store, char *name, size_
     return -EEXIST;
 }
 
+static int set_file_permissions(const struct mrc_ctl_store *store, const struct transaction *txn,
+                                mode_t *snapshot_mode)
+{
+    struct stat directory, lock;
+    if (fstat(store->fd, &directory) < 0 || fstat(txn->fd, &lock) < 0)
+        return -errno;
+
+    const mode_t shared = S_ISGID | S_IRGRP | S_IXGRP;
+    bool share = (directory.st_mode & shared) == shared;
+    *snapshot_mode = share ? 0640 : 0600;
+    /* A legacy lock may predate the directory's group assignment. Do not
+     * make it readable by that other group. Preserve the stable lock inode. */
+    mode_t lock_mode = share && lock.st_gid == directory.st_gid ? 0640 : 0600;
+    if ((lock.st_mode & 07777) != lock_mode && fchmod(txn->fd, lock_mode) < 0)
+        return -errno;
+    return 0;
+}
+
 static int save_snapshot(const struct mrc_ctl_store *store, const struct transaction *txn)
 {
+    mode_t mode = 0600;
+    int result = set_file_permissions(store, txn, &mode);
+    if (result)
+        return result;
+
     uint8_t bytes[SNAPSHOT_SIZE] = {0};
     memcpy(bytes, magic, sizeof(magic));
+    bytes[sizeof(magic)] = TYPED_VERSION;
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++)
         encode_profile(bytes + HEADER_SIZE + i * ENTRY_SIZE, &txn->profiles[i]);
     write32(bytes + 8, checksum(bytes + HEADER_SIZE, sizeof(bytes) - HEADER_SIZE));
@@ -216,7 +292,9 @@ static int save_snapshot(const struct mrc_ctl_store *store, const struct transac
     if (fd < 0)
         return fd;
 
-    int result = write_all(fd, bytes, sizeof(bytes));
+    result = write_all(fd, bytes, sizeof(bytes));
+    if (!result && fchmod(fd, mode) < 0)
+        result = -errno;
     if (!result)
         result = sync_file(fd);
     if (close(fd) < 0 && !result)
@@ -247,7 +325,8 @@ static int begin(const struct mrc_ctl_store *store, struct transaction *txn, boo
         return -EINVAL;
 
     *txn = (struct transaction){ .fd = -1 };
-    int fd = openat(store->fd, lock_name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    int flags = write ? O_RDWR | O_CREAT : O_RDONLY;
+    int fd = openat(store->fd, lock_name, flags | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (fd < 0)
         return -errno;
 
@@ -378,10 +457,10 @@ int mrc_ctl_store_get(const struct mrc_ctl_store *store, uint64_t id,
 int mrc_ctl_store_list(const struct mrc_ctl_store *store, struct mrc_ctl_store_profile *profiles,
                        size_t capacity, size_t *count)
 {
-    if (!count || (capacity && !profiles))
+    if (!store || store->fd < 0 || !count || (capacity && !profiles))
         return -EINVAL;
-    struct transaction txn;
-    int result = begin(store, &txn, false);
+    struct transaction txn = {0};
+    int result = load_snapshot(store, &txn);
     if (result)
         return result;
 
@@ -390,14 +469,14 @@ int mrc_ctl_store_list(const struct mrc_ctl_store *store, struct mrc_ctl_store_p
         required += txn.profiles[i].id != 0;
     *count = required;
     if (required > capacity)
-        return finish(store, &txn, -ENOSPC, false);
+        return -ENOSPC;
 
     size_t next = 0;
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
         if (txn.profiles[i].id)
             profiles[next++] = txn.profiles[i];
     }
-    return finish(store, &txn, 0, false);
+    return 0;
 }
 
 int mrc_ctl_store_configure(const struct mrc_ctl_store *store, uint64_t id,
@@ -457,6 +536,54 @@ int mrc_ctl_store_remove(const struct mrc_ctl_store *store, uint64_t id)
     if (!result)
         txn.profiles[slot] = (struct mrc_ctl_store_profile){0};
     return finish(store, &txn, result, true);
+}
+
+int mrc_ctl_store_edit(const struct mrc_ctl_store *store, uint64_t id,
+                       int (*edit)(struct mrc_ctl_store_profile *, void *), void *arg)
+{
+    if (!id || !edit)
+        return -EINVAL;
+    struct transaction txn;
+    int result = begin(store, &txn, true);
+    if (result)
+        return result;
+
+    int slot = find_profile(&txn, id);
+    struct mrc_ctl_store_profile previous = slot >= 0 ? txn.profiles[slot] :
+        (struct mrc_ctl_store_profile){ .id = id };
+    struct mrc_ctl_store_profile updated = previous;
+    result = edit(&updated, arg);
+    if (result)
+        return finish(store, &txn, result, false);
+
+    if (!updated.id) {
+        if (slot < 0)
+            return finish(store, &txn, 0, false);
+        updated = (struct mrc_ctl_store_profile){0};
+    } else if (updated.id != id || !profile_valid(&updated)) {
+        return finish(store, &txn, -EINVAL, false);
+    }
+
+    bool same = same_layout(&previous.config, &updated.config);
+    if (slot >= 0 && updated.id && same && updated.state == previous.state &&
+        updated.config.denied == previous.config.denied)
+        return finish(store, &txn, 0, false);
+    if (slot < 0) {
+        slot = find_profile(&txn, 0);
+        if (slot < 0)
+            return finish(store, &txn, -ENOSPC, false);
+    }
+
+    if (previous.state == MRC_CTL_STORE_ONLINE && updated.state == MRC_CTL_STORE_ONLINE) {
+        if (!same)
+            return finish(store, &txn, -EBUSY, false);
+    } else {
+        result = lock_reference(&txn, slot, F_WRLCK);
+        if (result)
+            return finish(store, &txn, result, false);
+    }
+    txn.profiles[slot] = updated;
+    return finish(store, &txn, 0, true);
 }
 
 int mrc_ctl_store_update_denied(const struct mrc_ctl_store *store, uint64_t id,

@@ -124,15 +124,16 @@ static void read_peer_connections(const char *directory, bool client,
 
 static void configure_qp(struct mrc_qp *qp, const struct address *address,
                           const struct connection *peer, uint32_t send_psn,
-                          bool send, bool receive)
+                          bool send, bool receive, uint64_t ev_profile_id)
 {
     struct ibv_qp_attr verbs = {
         .qp_state = IBV_QPS_INIT,
         .qp_access_flags = receive ? IBV_ACCESS_REMOTE_WRITE : 0,
         .pkey_index = 0,
     };
+    struct mrc_qp_attr attrs = { .profile.ev_profile_id = ev_profile_id };
     assert(mrc_modify_qp(qp, &verbs, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS,
-                         NULL, 0) == 0);
+                         ev_profile_id ? &attrs : NULL, ev_profile_id ? MRC_QP_EV_PROFILE_ID : 0) == 0);
 
     verbs = (struct ibv_qp_attr){
         .qp_state = IBV_QPS_RTR, .path_mtu = IBV_MTU_1024,
@@ -142,7 +143,7 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
             .grh = { .dgid = peer->gid, .sgid_index = address->gid_index, .hop_limit = 64 },
         },
     };
-    struct mrc_qp_attr attrs = { .mpr.mpr_dest = 1, .wimm.max_wimm_dest = receive ? 1 : 0 };
+    attrs = (struct mrc_qp_attr){ .mpr.mpr_dest = 1, .wimm.max_wimm_dest = receive ? 1 : 0 };
     const int rtr_verbs = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
     assert(mrc_modify_qp(qp, &verbs, rtr_verbs, &attrs, MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST) == 0);
     if (!send)
@@ -358,10 +359,37 @@ static void complete_async_error(struct mrc_context *context, struct mrc_qp *qp,
     assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
 }
 
+static void check_blocked_profile(struct mrc_qp *qp, struct mrc_cq *cq, const char *store,
+                                  bool requester, const uint8_t received[TOTAL_BYTES])
+{
+    uint64_t hz = rte_get_timer_hz();
+    uint64_t deadline = rte_get_timer_cycles() + (requester ? hz / 50 : 4 * hz);
+    char sender_blocked[PATH_MAX];
+    path_for(sender_blocked, store, "tx.profile-blocked");
+    do {
+        struct ibv_wc wc;
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+        assert(mrc_poll_cq(cq, 1, &wc) == 0);
+        rte_pause();
+    } while (rte_get_timer_cycles() < deadline &&
+             (requester || access(sender_blocked, F_OK) != 0));
+
+    if (requester) {
+        publish(store, "tx.profile-blocked", NULL, 0);
+    } else {
+        assert(access(sender_blocked, F_OK) == 0);
+        for (size_t offset = 0; offset < TOTAL_BYTES; offset++)
+            assert(received[offset] == 0);
+        publish(store, "rx.profile-blocked", NULL, 0);
+    }
+}
+
 static void run_simplex(bool requester, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                       bool wire_error)
+                       bool wire_error, const char *ev_store, uint64_t ev_profile_id)
 {
+    if (requester && ev_profile_id)
+        assert(mrc_dpdk_set_ev_store(context, ev_store) == 0);
     struct mrc_comp_channel *channel = NULL;
     if (!requester && !wire_error)
         assert(mrc_create_comp_channel(context, &channel) == 0);
@@ -404,7 +432,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     struct connection peer;
     read_peer_connections(directory, requester, &peer, 1);
     assert(local.qpn != peer.qpn);
-    configure_qp(qp, address, &peer, local.psn, requester, !requester);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, requester ? ev_profile_id : 0);
 
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
@@ -421,6 +449,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
     }
+    if (ev_profile_id)
+        check_blocked_profile(qp, cq, ev_store, requester, first_data);
     if (wire_error)
         complete_async_error(context, qp, cq, requester, local.qpn);
     else
@@ -621,7 +651,7 @@ static void run_duplex(bool client, const char *directory, const struct address 
     struct mrc_dpdk_route route = path_route(pool, client);
     route.bidirectional = true;
     for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
-        configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true);
+        configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true, 0);
         attach_qp(qps[index].qp, &route);
     }
 
@@ -652,12 +682,23 @@ int main(int argc, char **argv)
     assert(consumed >= 0);
     argc -= consumed;
     argv += consumed;
-    assert(argc == 4 && (strcmp(argv[1], "tx") == 0 || strcmp(argv[1], "rx") == 0));
+    assert(argc >= 4 && (strcmp(argv[1], "tx") == 0 || strcmp(argv[1], "rx") == 0));
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
     bool bidirectional = strcmp(argv[3], "duplex") == 0;
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
-    assert(bidirectional || wire_error || strcmp(argv[3], "simplex") == 0);
+    const char *ev_store = NULL;
+    uint64_t ev_profile_id = 0;
+    if (strcmp(argv[3], "ev_profile") == 0) {
+        assert(argc == 6);
+        ev_store = argv[4];
+        char *end;
+        errno = 0;
+        ev_profile_id = strtoull(argv[5], &end, 10);
+        assert(!errno && ev_profile_id && !*end);
+    } else {
+        assert(argc == 4 && (bidirectional || wire_error || strcmp(argv[3], "simplex") == 0));
+    }
 
     struct address address = {0};
     struct ibv_context *verbs = open_verbs(&address);
@@ -679,7 +720,7 @@ int main(int argc, char **argv)
     if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool);
     else
-        run_simplex(client, directory, &address, context, pd, pool, wire_error);
+        run_simplex(client, directory, &address, context, pd, pool, wire_error, ev_store, ev_profile_id);
 
     assert(mrc_destroy_context(context) == 0);
     assert(ibv_dealloc_pd(pd) == 0);

@@ -7,7 +7,7 @@
 
 /* Local Linux controller storage. The caller supplies the directory and
  * enforces its administrative policy. This interface is independent of the
- * upstream mrc_ctl ABI and stores only the lab's expanded 32-bit EV values. */
+ * upstream mrc_ctl ABI and stores expanded 32-bit EV values. */
 #define MRC_CTL_STORE_MAX_PROFILES 32u
 #define MRC_CTL_STORE_INITIALIZER { .fd = -1 }
 #define MRC_CTL_STORE_REF_INITIALIZER { .fd = -1 }
@@ -24,8 +24,15 @@ enum mrc_ctl_store_mode {
     MRC_CTL_STORE_GENERATED,
 };
 
+enum mrc_ctl_store_format {
+    MRC_CTL_STORE_FORMAT_LEGACY = 0,
+    MRC_CTL_STORE_FORMAT_UDP = 1,
+    MRC_CTL_STORE_FORMAT_STEV = 2,
+};
+
 struct mrc_ctl_store_config {
     enum mrc_ctl_store_mode mode;
+    enum mrc_ctl_store_format format;
     uint8_t count;
     uint8_t min_active;
     uint32_t populated; /* Bit i identifies a configured entropy slot. */
@@ -48,7 +55,11 @@ struct mrc_ctl_store_ref {
 };
 
 /* Initialize handles before use. Functions return zero or negative errno.
- * Keep the storage directory and its lock inode stable across processes. */
+ * Keep the directory and lock inode stable. The controller's files are 0600
+ * by default. A setgid directory with group read and search access enables
+ * 0640 files for the directory's group, such as a directory with mode 02750.
+ * The lock inode must have that same group. A valid writer commit upgrades
+ * legacy owner-only files in a shared directory. */
 int mrc_ctl_store_open(struct mrc_ctl_store *store, const char *directory);
 void mrc_ctl_store_close(struct mrc_ctl_store *store);
 
@@ -65,6 +76,13 @@ int mrc_ctl_store_configure(const struct mrc_ctl_store *store, uint64_t id,
 int mrc_ctl_store_set_state(const struct mrc_ctl_store *store, uint64_t id,
                             enum mrc_ctl_store_state state);
 int mrc_ctl_store_remove(const struct mrc_ctl_store *store, uint64_t id);
+/* Edit a copy under the exclusive metadata lock. A missing profile starts
+ * in INIT with the requested ID. Return an error to discard all changes,
+ * or clear the ID to remove the record. An ONLINE edit can change only
+ * the deny mask until the profile goes offline or is removed. Do not
+ * reenter this store from the callback. */
+int mrc_ctl_store_edit(const struct mrc_ctl_store *store, uint64_t id,
+                       int (*edit)(struct mrc_ctl_store_profile *, void *), void *arg);
 int mrc_ctl_store_update_denied(const struct mrc_ctl_store *store, uint64_t id,
                                uint32_t set, uint32_t clear);
 
