@@ -283,9 +283,9 @@ Both endpoints emit JSON counters. Sender goodput covers transmission through
 the final ACK. Use `--trace FILE.csv` to record packet events for comparison.
 Tracing adds per-packet work, so leave it off for timing runs.
 
-The current Spark setup exposes two logical paths over one QSFP cable.
-Use separate circuits to test a physical interruption that leaves a
-surviving path. See [the existing RoCEv2 baseline](../summary.md).
+The [original RoCEv2 baseline](../summary.md) used two logical paths over
+one QSFP cable. The current Polatis tests use the separate circuits listed
+in [Spark double ring](#spark-double-ring).
 
 ## Behavioral parity with the emulator
 

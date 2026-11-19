@@ -87,6 +87,15 @@ Receiver journals and sender unit state supplied the scoped runner
 evidence. Spark-04 journal access is needed to inspect the sender's
 individual retry and EV counters for these runs.
 
+### Negotiated WRITEIMM and Dynamic MPR
+
+A local memif run verified eight 256 KiB WRITEIMMs with an in-flight limit
+of two and provider-registered memory. The receiver lowered MPR from
+eight units to one after 65 accepted packets. Both peers applied one MPR
+update and completed all eight work requests. The targeted case passed
+with both the installed Spark snapshot revision and the development build.
+The corresponding physical run needs the scoped negotiated pair profile.
+
 ### Concurrent three-Spark verification
 
 The [Spark cycle tests](README.md#concurrent-three-spark-tests) exercise

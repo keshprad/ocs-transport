@@ -274,11 +274,14 @@ def main():
 
     change = ("--dynamic-mpr", "1", "--mpr", "8", "--mpr-change-at", "65",
               "--mpr-change-to", "1")
-    tx, rx = transfer(binary, 4194304, negotiate=True, tx_options=("--dynamic-mpr", "1"),
-                      rx_options=change)
+    tx, rx = transfer(binary, 262144, "--immediate", "99", "--max-wimm-inflight", "2",
+                      "--ack-timeout", "13", negotiate=True, work_requests=8,
+                      tx_options=("--dynamic-mpr", "1", "--mpr", "8"), rx_options=change)
     require(tx["mpr_updates"] == rx["mpr_updates"] == 1,
             f"Peers did not apply the negotiated receive-window shrink: {tx}, {rx}")
-    print(json.dumps({"case": "dynamic_mpr_shrink", "tx": tx, "rx": rx}))
+    require(tx["registered_memory"] and rx["registered_memory"] and rx["immediate_completions"] == 8,
+            f"Negotiated WRITEIMM did not complete across the receive-window change: {tx}, {rx}")
+    print(json.dumps({"case": "dynamic_mpr_shrink_during_writeimm", "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 1048576, negotiate=True, rx_options=change)
     require(tx["mpr_updates"] == rx["mpr_updates"] == 0,
