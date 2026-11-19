@@ -222,12 +222,134 @@ static void test_cq_overflow(void)
     assert(mrc_provider_cq_destroy(cq) == 0);
 }
 
+static void ready_to_send(struct mrc_provider_qp *qp)
+{
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RESET, MRC_PROVIDER_QP_INIT) == 0);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_INIT, MRC_PROVIDER_QP_RTR) == 0);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RTR, MRC_PROVIDER_QP_RTS) == 0);
+}
+
+static void test_qp_lifecycle_and_ordered_flush(void)
+{
+    struct mrc_provider_pd *pd;
+    struct mrc_provider_cq *scq, *rcq;
+    assert(mrc_provider_pd_create(1, &pd) == 0);
+    assert(mrc_provider_cq_create(4, &scq) == 0);
+    assert(mrc_provider_cq_create(2, &rcq) == 0);
+    struct mrc_provider_qp_config config = {
+        .pd = pd, .send_cq = scq, .recv_cq = rcq, .qpn = 42, .send_capacity = 4, .recv_capacity = 2,
+    };
+    struct mrc_provider_qp *qp = NULL;
+    config.qpn = 2;
+    assert(mrc_provider_qp_create(&config, &qp) == -EINVAL && !qp);
+    config.qpn = 42;
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    assert(mrc_provider_pd_destroy(pd) == -EBUSY);
+    assert(mrc_provider_cq_destroy(scq) == -EBUSY);
+    assert(mrc_provider_cq_destroy(rcq) == -EBUSY);
+    struct mrc_provider_qp_attr attr;
+    assert(mrc_provider_qp_query(qp, &attr) == 0);
+    assert(attr.state == MRC_PROVIDER_QP_RESET && attr.qpn == 42);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RESET, MRC_PROVIDER_QP_RTS) == -EINVAL);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RTR, MRC_PROVIDER_QP_RTS) == -EAGAIN);
+
+    uint64_t sequence, id;
+    assert(mrc_provider_qp_post_send(qp, 100, 64, false, &sequence) == -EINVAL);
+    assert(mrc_provider_qp_post_recv(qp, 200) == -EINVAL);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RESET, MRC_PROVIDER_QP_INIT) == 0);
+    assert(mrc_provider_qp_post_recv(qp, 200) == 0);
+    assert(mrc_provider_qp_post_recv(qp, 201) == 0);
+    assert(mrc_provider_qp_post_recv(qp, 202) == -ENOSPC);
+    assert(mrc_provider_qp_complete_recv(qp, 123, 0xf01, true, &id) == -EINVAL);
+    assert(mrc_provider_qp_destroy(qp) == -EBUSY);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_INIT, MRC_PROVIDER_QP_RESET) == -EBUSY);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_INIT, MRC_PROVIDER_QP_RTR) == 0);
+    assert(mrc_provider_cq_arm(rcq, true) == 0);
+    assert(mrc_provider_qp_complete_recv(qp, 123, 0xf01, true, &id) == 0 && id == 200);
+    struct mrc_provider_wc wc[4];
+    assert(mrc_provider_cq_poll(rcq, wc, 4) == 1);
+    assert(wc[0].status == MRC_PROVIDER_WC_SUCCESS && wc[0].qpn == 42 && wc[0].wr_id == 200);
+    assert(wc[0].with_immediate && wc[0].immediate == 0xf01 && wc[0].byte_length == 123);
+    enum mrc_provider_cq_event event;
+    assert(mrc_provider_cq_next_event(rcq, &event) == 0 && event == MRC_PROVIDER_CQ_COMPLETION);
+    assert(mrc_provider_cq_ack_events(rcq, 1) == 0);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RTR, MRC_PROVIDER_QP_RTS) == 0);
+
+    assert(mrc_provider_qp_post_send(qp, 110, 33, false, &sequence) == 0 && sequence == 1);
+    assert(mrc_provider_qp_post_send(qp, 111, 55, true, &sequence) == 0 && sequence == 2);
+    assert(mrc_provider_qp_complete_send(qp, 3) == -EINVAL);
+    assert(mrc_provider_qp_complete_send(qp, 2) == 0);
+    assert(mrc_provider_cq_poll(scq, wc, 4) == 1);
+    assert(wc[0].status == MRC_PROVIDER_WC_SUCCESS && wc[0].wr_id == 111 && wc[0].byte_length == 55);
+    assert(mrc_provider_qp_post_send(qp, 0, 77, true, &sequence) == 0 && sequence == 3);
+    assert(mrc_provider_qp_post_send(qp, 111, 88, false, &sequence) == 0 && sequence == 4);
+    assert(mrc_provider_qp_post_send(qp, 111, 99, true, &sequence) == 0 && sequence == 5);
+    assert(mrc_provider_qp_fail(qp, 2, MRC_PROVIDER_WC_REMOTE_ACCESS) == -ENOENT);
+    assert(mrc_provider_qp_query(qp, &attr) == 0);
+    assert(attr.state == MRC_PROVIDER_QP_RTS && attr.send_pending == 3 && attr.recv_pending == 1);
+    assert(mrc_provider_qp_fail(qp, 4, MRC_PROVIDER_WC_REMOTE_ACCESS) == 0);
+    assert(mrc_provider_qp_query(qp, &attr) == 0);
+    assert(attr.state == MRC_PROVIDER_QP_ERROR && attr.send_pending == 0 && attr.recv_pending == 0);
+    assert(mrc_provider_qp_post_send(qp, 9, 9, true, &sequence) == -EINVAL);
+    assert(mrc_provider_qp_post_recv(qp, 9) == -EINVAL);
+    assert(mrc_provider_cq_poll(scq, wc, 4) == 3);
+    assert(wc[0].wr_id == 0 && wc[0].status == MRC_PROVIDER_WC_FLUSHED);
+    assert(wc[1].wr_id == 111 && wc[1].status == MRC_PROVIDER_WC_REMOTE_ACCESS);
+    assert(wc[2].wr_id == 111 && wc[2].status == MRC_PROVIDER_WC_FLUSHED);
+    assert(mrc_provider_cq_poll(rcq, wc, 4) == 1);
+    assert(wc[0].wr_id == 201 && wc[0].status == MRC_PROVIDER_WC_FLUSHED);
+
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_ERROR, MRC_PROVIDER_QP_RESET) == 0);
+    ready_to_send(qp);
+    assert(mrc_provider_qp_post_send(qp, 111, 0, true, &sequence) == 0 && sequence == 6);
+    assert(mrc_provider_qp_complete_send(qp, 1) == -EINVAL);
+    assert(mrc_provider_qp_complete_send(qp, 6) == 0);
+    assert(mrc_provider_cq_poll(scq, wc, 4) == 1 && wc[0].status == MRC_PROVIDER_WC_SUCCESS);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(scq) == 0);
+    assert(mrc_provider_cq_destroy(rcq) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
+static void test_qp_cq_overrun_flushes_other_queue(void)
+{
+    struct mrc_provider_cq *send, *recv;
+    assert(mrc_provider_cq_create(1, &send) == 0);
+    assert(mrc_provider_cq_create(1, &recv) == 0);
+    struct mrc_provider_qp_config config = {
+        .send_cq = send, .recv_cq = recv, .qpn = 48, .send_capacity = 2, .recv_capacity = 1,
+        .sq_sig_all = true,
+    };
+    struct mrc_provider_qp *qp;
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    ready_to_send(qp);
+    uint64_t sequence;
+    assert(mrc_provider_qp_post_recv(qp, 201) == 0);
+    assert(mrc_provider_qp_post_send(qp, 101, 1, false, &sequence) == 0);
+    assert(mrc_provider_qp_post_send(qp, 102, 1, false, &sequence) == 0);
+    assert(mrc_provider_qp_complete_send(qp, sequence) == -EOVERFLOW);
+    struct mrc_provider_qp_attr attr;
+    assert(mrc_provider_qp_query(qp, &attr) == 0);
+    assert(attr.state == MRC_PROVIDER_QP_ERROR && !attr.send_pending && !attr.recv_pending);
+    struct mrc_provider_wc wc;
+    assert(mrc_provider_cq_poll(recv, &wc, 1) == 1);
+    assert(wc.wr_id == 201 && wc.status == MRC_PROVIDER_WC_FLUSHED);
+    enum mrc_provider_cq_event event;
+    assert(mrc_provider_cq_next_event(send, &event) == 0 && event == MRC_PROVIDER_CQ_OVERFLOW);
+    assert(mrc_provider_cq_ack_events(send, 1) == 0);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(send) == 0);
+    assert(mrc_provider_cq_destroy(recv) == 0);
+}
+
 int main(void)
 {
     test_pds_and_keys();
     test_bounds_and_permissions();
     test_cq_fifo_and_notifications();
     test_cq_overflow();
+    test_qp_lifecycle_and_ordered_flush();
+    test_qp_cq_overrun_flushes_other_queue();
     puts("MRC provider resource tests passed");
     return 0;
 }

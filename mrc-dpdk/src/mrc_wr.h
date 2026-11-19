@@ -54,6 +54,7 @@ struct mrc_wr_staged {
 struct mrc_wr_config {
     struct mrc_wr_region region;
     struct mrc_provider_pd *pd; /* If set, use this registered-memory domain. */
+    struct mrc_provider_qp *provider_qp; /* Optional, must outlive the responder. */
     uint32_t pmtu;
     uint32_t initial_psn;
     uint32_t initial_msn; /* Full 24-bit MSN; METH carries its low 16 bits. */

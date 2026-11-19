@@ -17,7 +17,8 @@ bool mrc_wr_init(struct mrc_wr_responder *responder, const struct mrc_wr_config 
         config->staged_capacity > MRC_MPR_MAX ||
         config->staged_capacity > SIZE_MAX / config->pmtu ||
         (config->staged_capacity && (!config->staged || !config->staged_payload)) ||
-        (config->recv_capacity && !config->recv_queue))
+        (config->recv_capacity && !config->recv_queue) ||
+        (config->provider_qp && (config->recv_capacity || config->recv_queue)))
         return false;
 
     if (config->pd && mrc_provider_pd_retain(config->pd))
@@ -63,8 +64,12 @@ void mrc_wr_destroy(struct mrc_wr_responder *responder)
 
 bool mrc_wr_post_receive(struct mrc_wr_responder *responder, uint64_t wr_id)
 {
+    if (responder->failed)
+        return false;
+    if (responder->config.provider_qp)
+        return !mrc_provider_qp_post_recv(responder->config.provider_qp, wr_id);
     size_t capacity = responder->config.recv_capacity;
-    if (responder->failed || responder->recv_posted == capacity)
+    if (responder->recv_posted == capacity)
         return false;
 
     size_t index = (responder->recv_head + responder->recv_posted) % capacity;
@@ -407,16 +412,24 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
         if (slot->with_imm) {
             if (slot->rqmsn != responder->next_rqmsn)
                 return fail(responder, MRC_WR_INVALID);
-            if (!responder->recv_posted)
-                return fail(responder, MRC_WR_RQ_EMPTY);
-
+            uint64_t wr_id;
+            if (responder->config.provider_qp) {
+                int completed = mrc_provider_qp_complete_recv(responder->config.provider_qp,
+                                                               slot->dmalen, slot->immediate,
+                                                               false, &wr_id);
+                if (completed)
+                    return fail(responder, completed == -ENOBUFS ? MRC_WR_RQ_EMPTY : MRC_WR_QP_ERROR);
+            } else {
+                if (!responder->recv_posted)
+                    return fail(responder, MRC_WR_RQ_EMPTY);
+                wr_id = responder->config.recv_queue[responder->recv_head];
+                responder->recv_head = (responder->recv_head + 1) % responder->config.recv_capacity;
+                responder->recv_posted--;
+            }
             *completion = (struct mrc_wr_completion) {
-                .wr_id = responder->config.recv_queue[responder->recv_head],
-                .msn = responder->next_msn, .last_psn = last,
+                .wr_id = wr_id, .msn = responder->next_msn, .last_psn = last,
                 .byte_len = slot->dmalen, .immediate = slot->immediate,
             };
-            responder->recv_head = (responder->recv_head + 1) % responder->config.recv_capacity;
-            responder->recv_posted--;
             responder->wimm_inflight--;
             responder->next_rqmsn++;
             *produced = true;

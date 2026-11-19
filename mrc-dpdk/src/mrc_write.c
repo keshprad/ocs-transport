@@ -166,6 +166,10 @@ struct counters {
     uint32_t reorder_max;
     uint32_t immediate_completions;
     uint32_t write_completions;
+    uint32_t work_errors;
+    uint32_t work_flushed;
+    enum mrc_provider_wc_status first_work_error;
+    bool qp_error;
 };
 
 struct send_record {
@@ -195,7 +199,7 @@ struct outstanding_probe {
 };
 
 struct sender {
-    struct mrc_provider_cq *cq;
+    struct mrc_provider_qp *provider_qp;
     struct mrc_cc cc;
     struct node_status node;
     struct mrc_tx_qp qp;
@@ -211,6 +215,7 @@ struct sender {
 };
 
 struct responder {
+    struct mrc_provider_qp *provider_qp;
     struct mrc_provider_cq *cq;
     struct mrc_rx_qp qp;
     struct mrc_wr_responder wr;
@@ -218,7 +223,6 @@ struct responder {
     struct node_status node;
     struct mrc_wr_slot work[WINDOW];
     struct mrc_wr_staged staged[WINDOW];
-    uint64_t receive_queue[MAX_WORK_REQUESTS];
     uint8_t slots[WINDOW];
     uint32_t unique_packets;
     struct mrc_cc_rx cc;
@@ -673,12 +677,21 @@ static int drain_completions(const struct transfer *transfer, struct mrc_provide
 
         for (int i = 0; i < count; i++) {
             const struct mrc_provider_wc *wc = &entries[i];
-            if (wc->status != MRC_PROVIDER_WC_SUCCESS || wc->opcode != opcode ||
-                wc->qpn != qpn || wc->byte_length != transfer->wr_bytes ||
-                wc->wr_id != *total + 1 || wc->with_immediate == transfer->sender ||
-                (wc->with_immediate && wc->immediate != transfer->immediate + *total))
+            if (wc->opcode != opcode || wc->qpn != qpn ||
+                wc->wr_id != *total + counts->work_errors + counts->work_flushed + 1)
                 return -EPROTO;
-            (*total)++;
+            if (wc->status == MRC_PROVIDER_WC_FLUSHED) {
+                counts->work_flushed++;
+            } else if (wc->status != MRC_PROVIDER_WC_SUCCESS) {
+                if (!counts->work_errors)
+                    counts->first_work_error = wc->status;
+                counts->work_errors++;
+            } else {
+                if (wc->byte_length != transfer->wr_bytes || wc->with_immediate == transfer->sender ||
+                    (wc->with_immediate && wc->immediate != transfer->immediate + *total))
+                    return -EPROTO;
+                (*total)++;
+            }
         }
     }
 }
@@ -696,6 +709,69 @@ static int destroy_cq(struct mrc_provider_cq *cq)
     return mrc_provider_cq_destroy(cq);
 }
 
+static int open_provider_qp(const struct transfer *transfer, struct mrc_provider_cq *cq,
+                             struct mrc_provider_qp **qp)
+{
+    const struct mrc_provider_qp_config config = {
+        .pd = transfer->pd, .qpn = transfer->sender ? transfer->requestor_qpn : transfer->responder_qpn,
+        .send_cq = transfer->sender ? cq : NULL, .recv_cq = transfer->sender ? NULL : cq,
+        .send_capacity = transfer->sender ? transfer->work_requests : 0,
+        .recv_capacity = transfer->sender ? 0 : transfer->work_requests, .sq_sig_all = true,
+    };
+    int result = mrc_provider_qp_create(&config, qp);
+    if (!result)
+        result = mrc_provider_qp_transition(*qp, MRC_PROVIDER_QP_RESET, MRC_PROVIDER_QP_INIT);
+    if (!result)
+        result = mrc_provider_qp_transition(*qp, MRC_PROVIDER_QP_INIT, MRC_PROVIDER_QP_RTR);
+    if (!result && transfer->sender)
+        result = mrc_provider_qp_transition(*qp, MRC_PROVIDER_QP_RTR, MRC_PROVIDER_QP_RTS);
+    return result;
+}
+
+static int close_provider_qp(const struct transfer *transfer, struct mrc_provider_qp *qp,
+                              struct mrc_provider_cq *cq, struct counters *counts, int result)
+{
+    if (!qp)
+        return result;
+    struct mrc_provider_qp_attr attr;
+    mrc_provider_qp_query(qp, &attr);
+    if (attr.state != MRC_PROVIDER_QP_RESET &&
+        (result || attr.send_pending || attr.recv_pending)) {
+        int flushed = 0;
+        if (attr.state != MRC_PROVIDER_QP_ERROR)
+            flushed = mrc_provider_qp_fail(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+        int drained = drain_completions(transfer, cq, counts);
+        if (!result)
+            result = flushed ? flushed : drained;
+        mrc_provider_qp_query(qp, &attr);
+        counts->qp_error = result && attr.state == MRC_PROVIDER_QP_ERROR;
+    }
+    int closed = mrc_provider_qp_destroy(qp);
+    return result ? result : closed;
+}
+
+static int fail_send(const struct transfer *transfer, struct sender *sender, uint32_t packet_index,
+                      enum mrc_provider_wc_status status, int error)
+{
+    uint64_t sequence = request_index(transfer, packet_index) + 1;
+    mrc_provider_qp_fail(sender->provider_qp, sequence, status);
+    return error;
+}
+
+static enum mrc_provider_wc_status aeth_error_status(uint8_t syndrome)
+{
+    switch (syndrome) {
+    case INVALID_REQUEST_NAK:
+        return MRC_PROVIDER_WC_REMOTE_INVALID_REQUEST;
+    case REMOTE_ACCESS_NAK:
+        return MRC_PROVIDER_WC_REMOTE_ACCESS;
+    case REMOTE_OPERATION_NAK:
+        return MRC_PROVIDER_WC_REMOTE_OPERATION;
+    default:
+        return MRC_PROVIDER_WC_BAD_RESPONSE;
+    }
+}
+
 static int apply_control(const struct transfer *transfer, struct sender *sender,
                          struct counters *counts, const struct mrc_wire_packet *packet)
 {
@@ -704,17 +780,24 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
     switch (packet->bth.opcode) {
     case MRC_TRANSPORT_ACK: {
         const struct mrc_wire_aeth *ack = &packet->body.aeth;
-        if (ack->syndrome != ACK_SYNDROME) {
-            fprintf(stderr, "Transport rejected WRITE, syndrome %#x\n", ack->syndrome);
-            return -EPROTO;
-        }
         int32_t last = mrc_psn_delta(packet->bth.psn, transfer->initial_psn);
         int32_t first = mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
         if (last < first || last >= (int32_t)sender->next)
             return 0;
+        if (ack->syndrome != ACK_SYNDROME) {
+            fprintf(stderr, "Transport rejected WRITE, syndrome %#x\n", ack->syndrome);
+            uint32_t failed = (uint32_t)last;
+            if (ack->syndrome == REMOTE_OPERATION_NAK &&
+                ack->msn >= request_index(transfer, (uint32_t)first) &&
+                ack->msn <= request_index(transfer, (uint32_t)last)) {
+                uint32_t start = ack->msn * transfer->wr_packets;
+                failed = start < (uint32_t)first ? (uint32_t)first : start;
+            }
+            return fail_send(transfer, sender, failed, aeth_error_status(ack->syndrome), -EPROTO);
+        }
         uint32_t completed = request_index(transfer, (uint32_t)last + 1);
         if (ack->msn != completed)
-            return -EPROTO;
+            return fail_send(transfer, sender, (uint32_t)last, MRC_PROVIDER_WC_BAD_RESPONSE, -EPROTO);
         for (int32_t index = first; index <= last; index++) {
             if (!retire_redundant_attempt(transfer, sender, (uint32_t)index))
                 return -EPROTO;
@@ -722,18 +805,8 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         if (!mrc_tx_apply_transport_ack(&sender->qp, packet->bth.psn))
             return 0;
         counts->transport_acks++;
-        uint32_t previous = request_index(transfer, (uint32_t)first);
-        for (uint32_t wr = previous; wr < completed; wr++) {
-            const struct mrc_provider_wc completion = {
-                .wr_id = wr + 1, .qpn = transfer->requestor_qpn,
-                .byte_length = transfer->wr_bytes,
-                .opcode = MRC_PROVIDER_WC_WRITE, .status = MRC_PROVIDER_WC_SUCCESS,
-            };
-            int result = mrc_provider_cq_push(sender->cq, &completion, false);
-            if (result)
-                return result;
-        }
-        return 0;
+        return completed > request_index(transfer, (uint32_t)first)
+               ? mrc_provider_qp_complete_send(sender->provider_qp, completed) : 0;
     }
     case MRC_RELIABILITY_SACK: {
         const struct mrc_wire_sack *wire = &packet->body.sack;
@@ -820,7 +893,8 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         if (nack->reason == MRC_NACK_UNEXP_EVENT) {
             counts->nack_received_mask |= UINT32_C(1) << nack->reason;
             fprintf(stderr, "Unexpected remote event at PSN %" PRIu32 "\n", nack->nack_psn);
-            return -EREMOTEIO;
+            uint32_t index = (uint32_t)mrc_psn_delta(nack->nack_psn, transfer->initial_psn);
+            return fail_send(transfer, sender, index, MRC_PROVIDER_WC_REMOTE_OPERATION, -EREMOTEIO);
         }
         if (state->received)
             return 0;
@@ -923,7 +997,7 @@ static int retry_due_packets(const struct transfer *transfer, struct sender *sen
             fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
                             " (first segment %u, next %u, last transmit path %u)\n",
                     psn, first, sender->next, record->path);
-            return -ETIMEDOUT;
+            return fail_send(transfer, sender, index, MRC_PROVIDER_WC_RETRY_EXCEEDED, -ETIMEDOUT);
         }
         if (!mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
             continue;
@@ -991,9 +1065,9 @@ static void update_ev_denials(struct sender *sender, uint32_t current, uint32_t 
 }
 
 static int poll_sender(const struct transfer *transfer, struct counters *counts,
-                       struct mrc_provider_cq *cq)
+                       struct mrc_provider_cq *cq, struct mrc_provider_qp *qp)
 {
-    struct sender sender = { .highest_sacked = -1, .cq = cq };
+    struct sender sender = { .highest_sacked = -1, .provider_qp = qp };
     if (!mrc_tx_init(&sender.qp, transfer->initial_psn, transfer->window, sender.slots) ||
         !mrc_cc_init(&sender.cc, NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS) ||
         !mrc_ev_init(&sender.ev, PATH_COUNT, transfer->profile.config.min_active,
@@ -1117,9 +1191,19 @@ static int poll_sender(const struct transfer *transfer, struct counters *counts,
 static int run_sender(const struct transfer *transfer, struct counters *counts)
 {
     struct mrc_provider_cq *cq = NULL;
+    struct mrc_provider_qp *qp = NULL;
     int result = mrc_provider_cq_create(transfer->work_requests, &cq);
     if (!result)
-        result = poll_sender(transfer, counts, cq);
+        result = open_provider_qp(transfer, cq, &qp);
+    for (uint32_t wr = 1; !result && wr <= transfer->work_requests; wr++) {
+        uint64_t sequence;
+        result = mrc_provider_qp_post_send(qp, wr, transfer->wr_bytes, false, &sequence);
+        if (!result && sequence != wr)
+            result = -EPROTO;
+    }
+    if (!result)
+        result = poll_sender(transfer, counts, cq, qp);
+    result = close_provider_qp(transfer, qp, cq, counts, result);
     int closed = destroy_cq(cq);
     return result ? result : closed;
 }
@@ -1203,28 +1287,15 @@ static uint8_t write_error_syndrome(enum mrc_wr_result result)
     }
 }
 
-static enum mrc_wr_result advance_writes(const struct transfer *transfer,
-                                         struct responder *receiver)
+static enum mrc_wr_result advance_writes(struct responder *receiver)
 {
     bool produced;
+    enum mrc_wr_result result;
     do {
         struct mrc_wr_completion completion;
-        enum mrc_wr_result result = mrc_wr_advance(&receiver->wr, receiver->qp.cack_psn,
-                                                   &completion, &produced);
-        if (result != MRC_WR_OK)
-            return result;
-        if (produced) {
-            const struct mrc_provider_wc wc = {
-                .wr_id = completion.wr_id, .qpn = transfer->responder_qpn,
-                .byte_length = completion.byte_len, .immediate = completion.immediate,
-                .opcode = MRC_PROVIDER_WC_RECV_WRITE_IMM,
-                .status = MRC_PROVIDER_WC_SUCCESS, .with_immediate = true,
-            };
-            if (completion.wr_id != completion.msn || mrc_provider_cq_push(receiver->cq, &wc, false))
-                return MRC_WR_QP_ERROR;
-        }
-    } while (produced);
-    return MRC_WR_OK;
+        result = mrc_wr_advance(&receiver->wr, receiver->qp.cack_psn, &completion, &produced);
+    } while (result == MRC_WR_OK && produced);
+    return result;
 }
 
 static int reject_write(const struct transfer *transfer, const struct responder *receiver,
@@ -1241,9 +1312,11 @@ static int reject_write(const struct transfer *transfer, const struct responder 
         reason = MRC_NACK_NO_PKT_BUFFER;
         break;
     case MRC_WR_QP_ERROR:
+        mrc_provider_qp_fail(receiver->provider_qp, 0, MRC_PROVIDER_WC_FLUSHED);
         reason = MRC_NACK_UNEXP_EVENT;
         break;
     default:
+        mrc_provider_qp_fail(receiver->provider_qp, 0, MRC_PROVIDER_WC_FLUSHED);
         send_ack(transfer, counts, path, ack_psn, write_error_syndrome(result),
                  mrc_wr_ack_msn(&receiver->wr));
         return -EPROTO;
@@ -1292,10 +1365,8 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
     }
 
     uint32_t index = (uint32_t)mrc_psn_delta(psn, transfer->initial_psn);
-    if (index >= transfer->packets || write->dma_len != transfer->wr_bytes) {
-        send_ack(transfer, counts, path, psn, INVALID_REQUEST_NAK, mrc_wr_ack_msn(&receiver->wr));
-        return -EPROTO;
-    }
+    if (index >= transfer->packets || write->dma_len != transfer->wr_bytes)
+        return reject_write(transfer, receiver, counts, path, packet, MRC_WR_INVALID, psn);
 
     enum mrc_wr_result result = mrc_wr_receive(&receiver->wr, psn, packet->bth.opcode, write);
     if (result != MRC_WR_OK)
@@ -1323,7 +1394,7 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
     }
     counts->received[path]++;
     bool complete = receiver->unique_packets == transfer->packets;
-    result = advance_writes(transfer, receiver);
+    result = advance_writes(receiver);
     if (result != MRC_WR_OK)
         return reject_write(transfer, receiver, counts, path, packet, result, receiver->qp.cack_psn);
 
@@ -1416,8 +1487,8 @@ static int receive_frame(const struct transfer *transfer, struct responder *rece
         if (!result && peer_matches(transfer, path, &packet) &&
             !mrc_wire_is_write(packet.bth.opcode) && packet.bth.opcode < MRC_TRANSPORT_ACK) {
             rx->matched++;
-            send_ack(transfer, counts, path, packet.bth.psn, INVALID_REQUEST_NAK, 0);
-            return -EPROTO;
+            return reject_write(transfer, receiver, counts, path, &packet,
+                                 MRC_WR_INVALID, packet.bth.psn);
         }
     }
     rx->rejected++;
@@ -1481,11 +1552,13 @@ static int run_receiver(const struct transfer *transfer, struct counters *counts
     if (!receiver || (transfer->rx_staging_capacity && !staged_payload))
         goto done;
     result = mrc_provider_cq_create(transfer->rx_cq_capacity, &receiver->cq);
+    if (!result)
+        result = open_provider_qp(transfer, receiver->cq, &receiver->provider_qp);
     if (result)
         goto done;
 
     struct mrc_wr_config config = {
-        .pd = transfer->pd,
+        .pd = transfer->pd, .provider_qp = receiver->provider_qp,
         .region = {
             .memory = transfer->data, .address = transfer->remote_address,
             .length = transfer->bytes, .r_key = transfer->remote_key,
@@ -1496,7 +1569,6 @@ static int run_receiver(const struct transfer *transfer, struct counters *counts
         .work = receiver->work, .work_capacity = transfer->rx_work_capacity,
         .staged = receiver->staged, .staged_payload = staged_payload,
         .staged_capacity = transfer->rx_staging_capacity,
-        .recv_queue = receiver->receive_queue, .recv_capacity = transfer->work_requests,
     };
     result = -EINVAL;
     if (!mrc_rx_init(&receiver->qp, transfer->initial_psn, transfer->window, receiver->slots) ||
@@ -1514,6 +1586,7 @@ static int run_receiver(const struct transfer *transfer, struct counters *counts
 done:
     if (receiver) {
         mrc_wr_destroy(&receiver->wr);
+        result = close_provider_qp(transfer, receiver->provider_qp, receiver->cq, counts, result);
         int closed = destroy_cq(receiver->cq);
         if (!result)
             result = closed;
@@ -1915,6 +1988,22 @@ static void print_diagnostics(const struct transfer *transfer, const struct coun
             counts->received[0], counts->received[1], counts->sacks,
             counts->transport_acks, counts->probe_replies,
             counts->nack_sent_mask, counts->nack_received_mask);
+    if (counts->qp_error) {
+        static const char *const statuses[] = {
+            [MRC_PROVIDER_WC_SUCCESS] = "none",
+            [MRC_PROVIDER_WC_LOCAL_LENGTH] = "local-length",
+            [MRC_PROVIDER_WC_LOCAL_PROTECTION] = "local-protection",
+            [MRC_PROVIDER_WC_LOCAL_OPERATION] = "local-operation",
+            [MRC_PROVIDER_WC_BAD_RESPONSE] = "bad-response",
+            [MRC_PROVIDER_WC_REMOTE_INVALID_REQUEST] = "remote-invalid-request",
+            [MRC_PROVIDER_WC_REMOTE_ACCESS] = "remote-access",
+            [MRC_PROVIDER_WC_REMOTE_OPERATION] = "remote-operation",
+            [MRC_PROVIDER_WC_RETRY_EXCEEDED] = "retry-exceeded",
+            [MRC_PROVIDER_WC_FLUSHED] = "flushed",
+        };
+        fprintf(stderr, "MRC QP state=ERROR work-errors=%u first-status=%s work-flushed=%u\n",
+                counts->work_errors, statuses[counts->first_work_error], counts->work_flushed);
+    }
     for (unsigned int path = 0; path < opened; path++) {
         const struct rx_counters *rx = &counts->rx[path];
         fprintf(stderr, "MRC path %u: RX frames=%" PRIu64 " matched=%" PRIu64

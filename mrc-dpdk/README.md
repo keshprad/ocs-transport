@@ -37,6 +37,16 @@ in-process path-1 blackhole, pair `--drop-path-after N` with
 `--restore-path-after M`. Recovery is driven by a correlated reliability
 probe reply.
 
+### Work completions
+
+The endpoint posts send work and WRITEIMM receive credits on a provider QP.
+A successful Transport ACK retires completed WRITE requests. Ordered
+WRITEIMM placement consumes the next posted receive and publishes the
+immediate value through the receive completion queue. A terminal wire error
+or exhausted retry budget transitions the QP to ERROR. The affected send
+gets its error status and outstanding work gets flush completions.
+Failure diagnostics report the first work error and the number flushed.
+
 ### Receiver resource limits
 
 The receiver normally reserves tracking slots, staging buffers, and work

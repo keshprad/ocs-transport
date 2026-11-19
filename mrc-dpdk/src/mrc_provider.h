@@ -7,6 +7,7 @@
 
 struct mrc_provider_pd;
 struct mrc_provider_cq;
+struct mrc_provider_qp;
 
 /*
  * Create/destroy own an object's lifetime. Retain/release protect references
@@ -130,5 +131,56 @@ int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *ent
 int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only);
 int mrc_provider_cq_next_event(struct mrc_provider_cq *cq, enum mrc_provider_cq_event *event);
 int mrc_provider_cq_ack_events(struct mrc_provider_cq *cq, size_t count);
+
+enum mrc_provider_qp_state {
+    MRC_PROVIDER_QP_RESET,
+    MRC_PROVIDER_QP_INIT,
+    MRC_PROVIDER_QP_RTR,
+    MRC_PROVIDER_QP_RTS,
+    MRC_PROVIDER_QP_ERROR,
+};
+
+struct mrc_provider_qp_config {
+    struct mrc_provider_pd *pd;
+    struct mrc_provider_cq *send_cq;
+    struct mrc_provider_cq *recv_cq;
+    size_t send_capacity;
+    size_t recv_capacity;
+    uint32_t qpn;
+    bool sq_sig_all;
+};
+
+struct mrc_provider_qp_attr {
+    enum mrc_provider_qp_state state;
+    uint32_t qpn;
+    size_t send_pending;
+    size_t recv_pending;
+};
+
+/* The data plane owns the wire state and send buffers. The provider tracks
+ * posted work and retains its CQ/PD handles until the QP is destroyed. */
+int mrc_provider_qp_create(const struct mrc_provider_qp_config *config,
+                           struct mrc_provider_qp **qp);
+int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_attr *attr);
+int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_state expected,
+                               enum mrc_provider_qp_state next);
+int mrc_provider_qp_destroy(struct mrc_provider_qp *qp);
+
+/* Send sequences start at one and are never reused during a QP's lifetime.
+ * wr_id belongs to the application and may be reused or zero. */
+int mrc_provider_qp_post_send(struct mrc_provider_qp *qp, uint64_t wr_id, uint32_t length,
+                              bool signaled, uint64_t *sequence);
+int mrc_provider_qp_post_recv(struct mrc_provider_qp *qp, uint64_t wr_id);
+
+/* Retire sends through an inclusive sequence after semantic ACK. Receive
+ * completion consumes one posted WRITEIMM credit. */
+int mrc_provider_qp_complete_send(struct mrc_provider_qp *qp, uint64_t sequence);
+int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
+                                  uint32_t immediate, bool solicited, uint64_t *wr_id);
+
+/* Enter ERROR and publish the selected send error plus flush completions in
+ * queue order. Sequence zero with status FLUSHED flushes both queues. */
+int mrc_provider_qp_fail(struct mrc_provider_qp *qp, uint64_t sequence,
+                         enum mrc_provider_wc_status status);
 
 #endif

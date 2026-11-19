@@ -127,7 +127,8 @@ def check_reliability_nacks(binary):
                       "--linear-retries", "1", "--exp-retries", "0",
                       tx_options=("--initial-psn", "128"),
                       expected_errors={"tx": "NACK-RX=0x800", "rx": "NACK-TX=0x800"})
-    require("Retry limit exhausted for PSN 128" in tx and "RX stalled after 0 of 1" in rx,
+    require("Retry limit exhausted for PSN 128" in tx and "RX stalled after 0 of 1" in rx and
+            "state=ERROR work-errors=1 first-status=retry-exceeded work-flushed=0" in tx,
             f"An out-of-window packet was accepted or the retry limit was bypassed: {tx}, {rx}")
     print(json.dumps({"case": "outside_receive_window"}))
 
@@ -135,7 +136,8 @@ def check_reliability_nacks(binary):
                      rx_options=("--rx-cq-capacity", "1"),
                      expected_errors={"tx": "Unexpected remote event at PSN",
                                       "rx": "NACK-TX=0x2000000"})
-    require("NACK-RX=0x2000000" in tx and "Retry limit exhausted" not in tx,
+    require("NACK-RX=0x2000000" in tx and "Retry limit exhausted" not in tx and
+            "state=ERROR work-errors=1 first-status=remote-operation" in tx,
             f"UNEXP_EVENT did not terminate the requester: {tx}")
     print(json.dumps({"case": "unexpected_completion_queue_overrun"}))
 
@@ -206,9 +208,18 @@ def main():
             "WRITEIMM sequence failed under receive-credit limits and out-of-order placement")
     print(json.dumps({"case": "ordered_write_imm_completions", "tx": tx, "rx": rx}))
 
-    transfer(binary, 1024, "--immediate", "23", posted_receives=0,
-             expected_errors={"tx": "syndrome 0x63", "rx": "MRC path 0: RX frames="})
+    tx, _ = transfer(binary, 1024, "--immediate", "23", posted_receives=0, work_requests=3,
+                     expected_errors={"tx": "syndrome 0x63", "rx": "MRC QP state=ERROR"})
+    require("state=ERROR work-errors=1 first-status=remote-operation work-flushed=2" in tx,
+            f"WRITEIMM without receive credit did not fail and flush the send queue: {tx}")
     print(json.dumps({"case": "write_imm_without_receive_credit"}))
+
+    tx, _ = transfer(binary, 1024, work_requests=3,
+                     tx_options=("--remote-key", "0x111111"),
+                     expected_errors={"tx": "syndrome 0x62", "rx": "MRC QP state=ERROR"})
+    require("state=ERROR work-errors=1 first-status=remote-access work-flushed=2" in tx,
+            f"Invalid rkey did not report remote access error and flush the send queue: {tx}")
+    print(json.dumps({"case": "invalid_remote_key"}))
 
     check_reliability_nacks(binary)
 
