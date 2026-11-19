@@ -37,16 +37,27 @@ int main(int argc, char **argv)
     const uint64_t local_iova = 0x200000;
     const uint64_t remote_address = 0x100000000;
     const uint32_t remote_key = 0x6d726301;
-    uint8_t memory[13 + 1025];
-    for (size_t i = 0; i < sizeof(memory); i++)
-        memory[i] = (uint8_t)(i ^ (i >> 8));
+    uint8_t first_data[13], second_data1[512], second_data2[511], second_data3[2];
+    const size_t bytes = sizeof(first_data) + sizeof(second_data1) +
+                         sizeof(second_data2) + sizeof(second_data3);
+    uint8_t *buffers[] = {first_data, second_data1, second_data2, second_data3};
+    const size_t lengths[] = {sizeof(first_data), sizeof(second_data1),
+                              sizeof(second_data2), sizeof(second_data3)};
 
     struct mrc_provider_pd *pd;
     struct mrc_provider_cq *cq;
     struct mrc_provider_qp *qp;
-    struct mrc_provider_mr_keys keys;
-    assert(mrc_provider_pd_create(1, &pd) == 0);
-    assert(mrc_provider_mr_register(pd, memory, sizeof(memory), local_iova, 0, &keys) == 0);
+    struct mrc_provider_sge sources[4];
+    assert(mrc_provider_pd_create(4, &pd) == 0);
+    size_t offset = 0;
+    for (size_t i = 0; i < 4; i++) {
+        uint64_t iova = local_iova + 0x1000 * i;
+        struct mrc_provider_mr_keys keys;
+        for (size_t j = 0; j < lengths[i]; j++, offset++)
+            buffers[i][j] = (uint8_t)(offset ^ (offset >> 8));
+        assert(mrc_provider_mr_register(pd, buffers[i], lengths[i], iova, 0, &keys) == 0);
+        sources[i] = (struct mrc_provider_sge){ .iova = iova, .length = lengths[i], .lkey = keys.lkey };
+    }
     assert(mrc_provider_cq_create(2, &cq) == 0);
     const struct mrc_provider_qp_config qp_config = {
         .qpn = 0x101, .pd = pd, .send_cq = cq, .send_capacity = 2,
@@ -55,17 +66,16 @@ int main(int argc, char **argv)
     activate(qp);
     struct mrc_provider_write first = {
         .wr_id = 0x1234, .local_iova = local_iova, .remote_address = remote_address,
-        .length = 13, .lkey = keys.lkey, .rkey = remote_key, .signaled = true,
+        .length = sizeof(first_data), .lkey = sources[0].lkey, .rkey = remote_key, .signaled = true,
     };
     struct mrc_provider_write second = {
-        .wr_id = 0xaabb, .local_iova = local_iova + first.length,
-        .remote_address = remote_address + first.length, .length = 1025,
-        .lkey = keys.lkey, .rkey = remote_key, .immediate = 84, .with_immediate = true,
+        .wr_id = 0xaabb, .remote_address = remote_address + first.length,
+        .length = bytes - first.length, .rkey = remote_key, .immediate = 84, .with_immediate = true,
         .signaled = true,
     };
 
     const struct mrc_provider_write third = {
-        .wr_id = 0x5678, .remote_address = remote_address + sizeof(memory),
+        .wr_id = 0x5678, .remote_address = remote_address + bytes,
         .rkey = remote_key, .immediate = 85, .with_immediate = true, .signaled = true,
     };
 
@@ -73,9 +83,7 @@ int main(int argc, char **argv)
     uint64_t sequence;
     struct mrc_provider_wc wc[2];
     assert(mrc_provider_qp_post_write(qp, &first, &sequence) == 0 && sequence == 1);
-    assert(mrc_provider_qp_fail(qp, 0, MRC_PROVIDER_WC_FLUSHED) == 0);
-    assert(mrc_provider_cq_poll(cq, wc, 2) == 1 && wc[0].status == MRC_PROVIDER_WC_FLUSHED);
-    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_ERROR, MRC_PROVIDER_QP_RESET) == 0);
+    assert(mrc_provider_qp_reset(qp) == 0);
     activate(qp);
     /* The application supplies connection and port attributes. The requester
      * reads the WR sizes, source buffers and remote addresses from the SQ. */
@@ -107,13 +115,16 @@ int main(int argc, char **argv)
     assert(mrc_provider_qp_post_write(qp, &first, &sequence) == 0 && sequence == 2);
     wait_for_write(requester, cq, &first);
 
-    assert(mrc_provider_qp_post_write(qp, &second, &sequence) == 0 && sequence == 3);
+    /* The first packet crosses both SGE boundaries. The second packet
+     * starts one byte into the final registration. */
+    assert(mrc_provider_qp_post_writev(qp, &second, sources + 1, 3, &sequence) == 0 && sequence == 3);
     assert(mrc_requester_progress(requester) == 0);
     assert(mrc_provider_qp_post_write(qp, &third, &sequence) == 0 && sequence == 4);
     wait_for_write(requester, cq, &second);
     wait_for_write(requester, cq, &third);
     assert(mrc_requester_progress(requester) == 0 && mrc_provider_cq_poll(cq, wc, 2) == 0);
-    assert(mrc_provider_mr_deregister(pd, keys.lkey) == 0);
+    for (size_t i = 0; i < 4; i++)
+        assert(mrc_provider_mr_deregister(pd, sources[i].lkey) == 0);
 
     mrc_requester_destroy(requester);
     for (unsigned int rail = 0; rail < PATH_COUNT; rail++)
@@ -123,6 +134,6 @@ int main(int argc, char **argv)
     assert(mrc_provider_cq_destroy(cq) == 0);
     assert(mrc_provider_pd_destroy(pd) == 0);
     rte_eal_cleanup();
-    printf("{\"bytes\":%zu,\"write_completions\":3}\n", sizeof(memory));
+    printf("{\"bytes\":%zu,\"write_completions\":3}\n", bytes);
     return 0;
 }

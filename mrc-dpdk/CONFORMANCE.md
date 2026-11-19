@@ -4,7 +4,7 @@ The conformance target is the [OCP Multipath Reliable Connection 1.0 specificati
 
 | Scope | Verified in the current slice | Remaining evidence or implementation |
 | --- | --- | --- |
-| §§6.1–6.4, 10.1.2, request and completion semantics | A QP with configurable or TCP-negotiated QPNs, PSN, static MPR, partition, and memory attributes carries mixed WRITE and WRITEIMM requests with independent lengths and receive sequence numbers. The responder validates per-WR geometry and the registered region, consumes posted receive credits, and emits WRITEIMM completions in order. With zero posted receive credits, the sender receives Remote Operational Error. Negotiated transfers use a protection-domain MR registry. Posted WRs retain their source leases through semantic acknowledgement or flush, and the responder retains destination leases through ordered completion. A local provider QP holds bounded send and receive queues, supports RESET/INIT/RTR/RTS/ERROR, and publishes ordered success, error, and flush completions. A Linux completion channel signals a pollable FD for armed CQ events across multiple CQs and waits for acknowledgement of fetched events when destroying a CQ. Verified remote access errors and WRITEIMM without receive credits over memif. The optional shared library implements the OCP context and CQ/channel signatures using a real libibverbs context, including WC field translation, blocking and nonblocking event retrieval, and parent lifetime checks. Tests bind a real verbs MR to the software PD using its original keys and verify local posting, remote lookup, and independent lease lifetimes. | Public libmrc QP ABI and MR integration, device and QP attributes, asynchronous events, and provider interoperability for out-of-band attributes. |
+| §§6.1–6.4, 10.1.2, request and completion semantics | Mixed WRITE and WRITEIMM, per-WR geometry, registered-memory leases, ordered immediate completions, remote access errors, RQ exhaustion without RNR, and typed error/flush completions are verified. The OCP library exposes verbs contexts and device queries, CQ/channel events, and public QP create, modify, query, reset, destroy, and linked WR posting. It keeps directional PSN, MPR and WIMM attributes separate, binds actual `ibv_mr` keys by verbs PD, and sends across registered scatter/gather buffers. The attached DPDK worker carries public WRs across two memif rails. | Bidirectional and multiple-QP shared RX dispatch, solicited WRITEIMM, asynchronous events, inline and extended verbs posting, QP hints and profile binding, and independent hardware interoperability for application-managed OOB attributes. |
 | §§6.2.2, 7.5.5, wire format | Independent byte vectors for IPv4/UDP, IPv6/UDP, and preserved SRv6 envelopes, iCRC, WRITE with immediate and TSETH, AETH, SETH, NETH, and PETH. Independent IPv4 pcap stimulus and response checks exercise the actual DPDK responder, including a corrupt iCRC, PSN wrap, reordering, and an out-of-window NACK. A live Python responder on two memif rails validates the DPDK requester's IPv4 output and supplies independent control messages. | Interoperability with an external MRC implementation, independent IPv6/SRv6 exchange, transit routing on an independent SRv6 fabric, and remaining edge-case packet validation. |
 | §§7.2, 7.4–7.5, packet reliability | 24-bit PSN and window checks, wrap, selective SACK bitmaps, separate AETH, duplicate suppression, retransmit marking, logical timers, SACK-driven fast loss, reliability probe request/response matching and RTT sampling (probe exchanges observed on the Spark pair), and separately classified trimmed packets with TRIM NACK recovery. Negotiated Dynamic MPR advertises each change in SACKs and gates both first transmissions and retries, while preserving outstanding receive state. Over memif, all five mandatory Table 7-3 NACK reasons were generated and handled, including retry-budget exhaustion and terminal CQ overrun. | Independent live NACK interoperability and recovery after an actual port transition. Both receiver Sparks verified a 16 MiB WRITE after an injected path-1 blackhole. An independent memif peer checks alternate-rail retry on a packet-buffer NACK and confirms that a WRITEIMM credit stays occupied until a semantic ACK. Provider QP errors and typed send completions are verified for retry exhaustion and UNEXP_EVENT. Trim NACK generation and service time are capability-gated. |
 | §§7.3, 7.4.7–7.4.8, 7.5.6, endpoint operations | ERTH/EETH byte fixtures and a two-path Port Status Update exchange using reserved QPN 2 and echoed tokens, observed over memif and the Spark pair. | Physical port transitions, out-of-order status handling, and optional EV probe initiation. |
@@ -38,6 +38,13 @@ placement and completion IDs across separate admissions, PSN wrap, and
 continued immediate receive sequencing over two memif rails.
 
 Use Spark-04 as the implementation source. After pushing the exact clean commit, run `tests/verify_spark_revisions.sh --sync "$(git rev-parse HEAD)"` to advance the detached test worktrees on Spark-02 and Spark-03. Run the same command without `--sync` immediately before each live test. The script checks that all three worktrees are clean and at the requested commit.
+
+Build `tests/mrc_abi_application` against the OCP headers and run
+`python3 tests/check_mrc_abi_application.py` to exercise both endpoints
+through the public shared library. It exchanges verbs GIDs, QPNs, PSNs
+and MR keys, checks placement across scatter/gather and PSN wrap, confirms
+signaled send CQEs and two WRITEIMM receive CQEs, and reads a completion
+channel event.
 
 ### Spark-04 to Spark-02 physical baseline
 
@@ -102,8 +109,11 @@ The [Spark cycle tests](README.md#concurrent-three-spark-tests) exercise
 three simultaneous 256 MiB WRITEs on the full double ring. The smoke
 profile checks both rails on all three edges. The recovery profile drops
 path-1 traffic on Spark-04's outgoing edge and checks that all three
-WRITEs complete and the affected EV recovers. The read-only preflight
-confirmed that all three test worktrees match the pinned revision. Live
-verification is pending installation of the scoped cycle units.
+WRITEs complete and the affected EV recovers. All three scoped runners
+matched the pinned Git revision and binary digest. The first live smoke
+attempt stopped in receiver EAL setup because systemd exported two runtime
+paths in one variable. The unit renderer and preflight now require clearing
+that variable so EAL uses the per-role runtime path. The hardware cases are
+pending the unit refresh.
 
 mlx5 setup requires `CAP_NET_RAW` and `CAP_NET_ADMIN` or an administrator-run endpoint. [DPDK mlx5 privilege documentation](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root)

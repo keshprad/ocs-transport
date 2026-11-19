@@ -8,8 +8,8 @@ MRC_INCLUDE_DIR ?=
 MRC_HEADERS = $(if $(MRC_INCLUDE_DIR),$(addprefix $(MRC_INCLUDE_DIR)/,mrc.h mrc_api_ver.h))
 MRC_ABI_CFLAGS = -isystem "$(MRC_INCLUDE_DIR)" $(shell $(PKG_CONFIG) --cflags libibverbs)
 MRC_ABI_LIBS = $(shell $(PKG_CONFIG) --libs libibverbs)
-MRC_ABI_SRC = src/mrc_abi.c src/mrc_provider.c
-MRC_ABI_DEPS = src/mrc_abi.h src/mrc_provider.h src/mrc_qp.h $(MRC_HEADERS)
+MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_qp.c src/mrc_abi_dpdk.c $(MRC_ENDPOINT_SRC)
+MRC_ABI_DEPS = src/mrc_abi.h src/mrc_dpdk.h $(MRC_ENDPOINT_HEADERS) $(MRC_HEADERS)
 
 .PHONY: all check check-mrc-abi clean
 all: mrc_bench mrc_write mrc_ctl_profile
@@ -53,13 +53,16 @@ tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/
 
 libmrc-dpdk.so: $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
 	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
-	$(PKG_CONFIG) --exists libibverbs
-	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) -pthread -fPIC -fvisibility=hidden $(LDFLAGS) -Wl,-z,defs -shared -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(LDLIBS)
+	$(PKG_CONFIG) --exists libibverbs libdpdk
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) -pthread -fPIC -fvisibility=hidden $(LDFLAGS) -Wl,-z,defs -shared -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
 
-tests/test_mrc_abi: tests/test_mrc_abi.c $(MRC_ABI_SRC) src/mrc_provider_qp.c $(MRC_ABI_DEPS)
+tests/test_mrc_abi: tests/test_mrc_abi.c $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
 	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
-	$(PKG_CONFIG) --exists libibverbs
-	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(LDLIBS)
+	$(PKG_CONFIG) --exists libibverbs libdpdk
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
+
+tests/mrc_abi_application: tests/mrc_abi_application.c src/dpdk_io.c src/dpdk_io.h src/mrc_dpdk.h libmrc-dpdk.so
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) -L. -Wl,-rpath,'$$ORIGIN/..' -lmrc-dpdk $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
 
 check-mrc-abi: libmrc-dpdk.so tests/test_mrc_abi
 	./tests/test_mrc_abi
@@ -76,4 +79,4 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_ctl_store
 
 clean:
-	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
+	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/mrc_abi_application tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store

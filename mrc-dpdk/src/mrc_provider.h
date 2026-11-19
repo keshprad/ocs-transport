@@ -188,6 +188,9 @@ int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_att
 int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_state expected,
                                enum mrc_provider_qp_state next);
 int mrc_provider_qp_destroy(struct mrc_provider_qp *qp);
+/* Enter RESET, discarding outstanding WRs without producing completions.
+ * Already published CQEs and the monotonic send sequence are preserved. */
+int mrc_provider_qp_reset(struct mrc_provider_qp *qp);
 
 /* Send sequences start at one and are never reused during a QP's lifetime.
  * wr_id belongs to the application and may be reused or zero. */
@@ -208,8 +211,17 @@ struct mrc_provider_write {
     bool signaled;
 };
 
+struct mrc_provider_sge {
+    uint64_t iova;
+    uint32_t length;
+    uint32_t lkey;
+};
+
+struct mrc_provider_write_segments;
+
 struct mrc_provider_write_view {
-    const uint8_t *data;
+    const uint8_t *data; /* Contiguous source, when available. */
+    const struct mrc_provider_write_segments *segments;
     uint64_t remote_address;
     uint32_t length;
     uint32_t rkey;
@@ -221,10 +233,21 @@ struct mrc_provider_write_view {
  * QP without a PD, the caller keeps the buffer valid over the same interval. */
 int mrc_provider_qp_post_write(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
                                uint64_t *sequence);
+/* For a registered QP, use the SGE list in order and leave the local source
+ * fields of write zero. Its length must equal the sum of the SGE lengths.
+ * The QP pins the registrations and copies the SGE metadata during posting. */
+int mrc_provider_qp_post_writev(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                                const struct mrc_provider_sge *sges, size_t count, uint64_t *sequence);
 /* A wire worker serializes use of this borrowed view with retiring the post,
  * putting the QP into ERROR, and destroying the QP. */
 int mrc_provider_qp_get_write(struct mrc_provider_qp *qp, uint64_t sequence,
                               struct mrc_provider_write_view *write);
+/* Borrow a contiguous subrange directly. For a subrange spanning multiple
+ * registrations, copy it into scratch, which must hold at least length bytes.
+ * Returns NULL for an empty or invalid subrange, or if scratch is needed
+ * but absent. Use the view only while the post is still outstanding. */
+const uint8_t *mrc_provider_write_slice(const struct mrc_provider_write_view *write,
+                                         uint32_t offset, uint32_t length, uint8_t *scratch);
 
 /* Retire sends through an inclusive sequence after semantic ACK. Receive
  * completion consumes one posted WRITEIMM credit. */

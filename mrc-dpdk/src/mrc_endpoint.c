@@ -529,13 +529,16 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
         .r_key = write.rkey,
         .dma_len = write.length,
         .imm_data = write.immediate,
-        .data = write.data ? write.data + offset : NULL,
         .data_len = length,
     };
 
     if (blackholed(transfer, sender, path)) {
         counts->dropped++;
     } else {
+        uint8_t payload[PMTU];
+        packet.body.write.data = mrc_provider_write_slice(&write, offset, length, payload);
+        if (length && !packet.body.write.data)
+            return -EPROTO;
         bool inject_trim = path == 1 && transfer->trim_after != UINT32_MAX &&
                            sender->scheduled_packets >= transfer->trim_after;
         if (!transmit_frame(transfer, path, &packet, inject_trim))

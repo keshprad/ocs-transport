@@ -425,6 +425,86 @@ static void test_posted_write_buffer_lifetime(void)
     assert(mrc_provider_pd_destroy(pd) == 0);
 }
 
+static void test_gathered_write_and_reset(void)
+{
+    struct mrc_provider_pd *pd;
+    struct mrc_provider_cq *cq;
+    assert(mrc_provider_pd_create(2, &pd) == 0);
+    assert(mrc_provider_cq_create(2, &cq) == 0);
+    unsigned char first[] = "abcdef";
+    unsigned char second[] = "ghijkl";
+    struct mrc_provider_mr_keys keys[2];
+    assert(mrc_provider_mr_register(pd, first, sizeof(first), 0x12000, 0, &keys[0]) == 0);
+    assert(mrc_provider_mr_register(pd, second, sizeof(second), 0x14000, 0, &keys[1]) == 0);
+
+    struct mrc_provider_qp *qp;
+    const struct mrc_provider_qp_config config = {
+        .pd = pd, .send_cq = cq, .recv_cq = cq, .send_capacity = 2, .recv_capacity = 1,
+        .qpn = 47, .sq_sig_all = true,
+    };
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    ready_to_send(qp);
+
+    struct mrc_provider_sge sges[] = {
+        { .iova = 0x12001, .length = 4, .lkey = keys[0].lkey },
+        {0},
+        { .iova = 0x14001, .length = 4, .lkey = keys[1].lkey },
+    };
+    const struct mrc_provider_write write = {
+        .wr_id = 301, .remote_address = 0x1000, .length = 8, .rkey = 0x65432,
+        .with_immediate = true, .immediate = 0x11223344,
+    };
+    uint64_t sequence = 0;
+    assert(mrc_provider_qp_post_writev(qp, &write, sges, 2, &sequence) == -EINVAL);
+    sges[2].iova = 0x14005;
+    assert(mrc_provider_qp_post_writev(qp, &write, sges, 3, &sequence) == -EACCES && !sequence);
+    assert(mrc_provider_mr_deregister(pd, keys[0].lkey) == 0);
+    assert(mrc_provider_mr_register(pd, first, sizeof(first), 0x12000, 0, &keys[0]) == 0);
+    sges[0].lkey = keys[0].lkey;
+    sges[2].iova = 0x14001;
+
+    assert(mrc_provider_qp_post_writev(qp, &write, sges, 3, &sequence) == 0 && sequence == 1);
+    assert(mrc_provider_mr_deregister(pd, keys[0].lkey) == -EBUSY);
+    assert(mrc_provider_mr_deregister(pd, keys[1].lkey) == -EBUSY);
+    struct mrc_provider_write_view view;
+    assert(mrc_provider_qp_get_write(qp, sequence, &view) == 0);
+    assert(!view.data && view.length == 8 && view.with_immediate);
+    assert(view.immediate == 0x11223344 && view.rkey == 0x65432);
+    uint8_t scratch[5];
+    assert(mrc_provider_write_slice(&view, 4, 2, scratch) == second + 1);
+    assert(mrc_provider_write_slice(&view, 2, 5, scratch) == scratch);
+    assert(memcmp(scratch, "dehij", sizeof(scratch)) == 0);
+    assert(mrc_provider_write_slice(&view, 2, 5, NULL) == NULL);
+    assert(mrc_provider_write_slice(&view, 6, 3, scratch) == NULL);
+    assert(mrc_provider_write_slice(&view, 8, 0, scratch) == NULL);
+    assert(mrc_provider_qp_complete_send(qp, sequence) == 0);
+
+    assert(mrc_provider_qp_post_writev(qp, &write, sges, 3, &sequence) == 0 && sequence == 2);
+    assert(mrc_provider_qp_fail(qp, sequence, MRC_PROVIDER_WC_RETRY_EXCEEDED) == 0);
+    assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_ERROR, MRC_PROVIDER_QP_RESET) == 0);
+    ready_to_send(qp);
+    assert(mrc_provider_qp_post_writev(qp, &write, sges, 3, &sequence) == 0 && sequence == 3);
+    assert(mrc_provider_qp_post_recv(qp, 302) == 0);
+    assert(mrc_provider_qp_reset(qp) == 0);
+
+    struct mrc_provider_qp_attr attr;
+    assert(mrc_provider_qp_query(qp, &attr) == 0);
+    assert(attr.state == MRC_PROVIDER_QP_RESET && !attr.send_pending && !attr.recv_pending);
+    assert(attr.send_first_sequence == sequence + 1);
+    assert(mrc_provider_qp_get_write(qp, sequence, &view) == -ENOENT);
+    struct mrc_provider_wc wc[2];
+    assert(mrc_provider_cq_poll(cq, wc, 2) == 2);
+    assert(wc[0].wr_id == write.wr_id && wc[0].status == MRC_PROVIDER_WC_SUCCESS &&
+           wc[0].byte_length == write.length);
+    assert(wc[1].wr_id == write.wr_id && wc[1].status == MRC_PROVIDER_WC_RETRY_EXCEEDED);
+    assert(mrc_provider_cq_poll(cq, wc, 2) == 0);
+    assert(mrc_provider_mr_deregister(pd, keys[0].lkey) == 0);
+    assert(mrc_provider_mr_deregister(pd, keys[1].lkey) == 0);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(cq) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
 static void test_qp_cq_overrun_flushes_other_queue(void)
 {
     struct mrc_provider_cq *send, *recv;
@@ -553,6 +633,7 @@ int main(void)
     test_cq_overflow();
     test_qp_lifecycle_and_ordered_flush();
     test_posted_write_buffer_lifetime();
+    test_gathered_write_and_reset();
     test_qp_cq_overrun_flushes_other_queue();
     test_completion_channel();
     puts("MRC provider resource tests passed");

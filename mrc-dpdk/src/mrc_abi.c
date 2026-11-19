@@ -6,12 +6,61 @@
 #include <poll.h>
 #include <stdlib.h>
 
-#define MRC_PUBLIC __attribute__((visibility("default")))
-
 static int set_errno(int error)
 {
     errno = error;
     return -1;
+}
+
+MRC_PUBLIC void mrc_query_version(uint32_t *current, uint32_t *minimum,
+                                   uint32_t *vendor, uint32_t *vendor_minimum)
+{
+    if (current)
+        *current = MRC_API_VER(1, 0, 1);
+    if (minimum)
+        *minimum = MRC_API_VER(1, 0, 0);
+    if (vendor)
+        *vendor = MRC_API_VER(1, 0, 0);
+    if (vendor_minimum)
+        *vendor_minimum = MRC_API_VER(1, 0, 0);
+}
+
+MRC_PUBLIC int mrc_query_device(struct ibv_context *verbs, struct mrc_device_attr *attr, int *supported)
+{
+    if (!verbs || !attr || !supported)
+        return set_errno(EINVAL);
+    struct ibv_device_attr device;
+    int error = ibv_query_device(verbs, &device);
+    if (error)
+        return error > 0 ? set_errno(error) : -1;
+
+    *supported = 0;
+    *attr = (struct mrc_device_attr){0};
+    for (unsigned int port = 1; port <= device.phys_port_cnt; port++) {
+        struct ibv_port_attr info;
+        if (ibv_query_port(verbs, (uint8_t)port, &info) == 0 &&
+            info.link_layer == IBV_LINK_LAYER_ETHERNET) {
+            *supported = 1;
+            break;
+        }
+    }
+    if (*supported) {
+        *attr = (struct mrc_device_attr){
+            .mrc_protocol_version = MRC_PROTOCOL_VERSION_1,
+            .wimm_attr = { .max_wimm = MRC_ABI_MAX_WIMM, .max_wimm_dest = MRC_ABI_MAX_WIMM },
+            .mpr_attr = { .max_mpr = MRC_ABI_MAX_MPR, .mpr_resolution = 1 },
+            .cap = MRC_DEVICE_CAP_TRIM_NACK | MRC_DEVICE_CAP_DYNAMIC_MPR,
+        };
+    }
+    return 0;
+}
+
+MRC_PUBLIC int mrc_query_device_ex(struct ibv_context *verbs, struct mrc_context *context,
+                                    struct mrc_device_attr *attr, int *supported)
+{
+    if (context && verbs && context->verbs != verbs)
+        return set_errno(EINVAL);
+    return mrc_query_device(verbs ? verbs : (context ? context->verbs : NULL), attr, supported);
 }
 
 static int retain_context(struct mrc_context *context)
@@ -44,7 +93,8 @@ MRC_PUBLIC struct mrc_context *mrc_create_context(struct ibv_context *vcontext,
         uint32_t api = attr->mrc_api_version_used;
         uint32_t vendor = attr->mrc_vendor_api_version_used;
         if ((api && api != UINT32_MAX &&
-             (api < MRC_API_VER(1, 0, 0) || api > MRC_API_VER(1, 0, 1))) || vendor) {
+             (api < MRC_API_VER(1, 0, 0) || api > MRC_API_VER(1, 0, 1))) ||
+            (vendor && vendor != MRC_API_VER(1, 0, 0) && vendor != UINT32_MAX)) {
             errno = EPROTONOSUPPORT;
             return NULL;
         }
@@ -74,7 +124,7 @@ MRC_PUBLIC int mrc_destroy_context(struct mrc_context *context)
     if (!context)
         return set_errno(EINVAL);
     pthread_mutex_lock(&context->mutex);
-    bool busy = context->children != 0;
+    bool busy = context->children != 0 || context->pds != NULL;
     pthread_mutex_unlock(&context->mutex);
     if (busy)
         return set_errno(EBUSY);
