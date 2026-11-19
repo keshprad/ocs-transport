@@ -128,7 +128,7 @@ MRC_PUBLIC int mrc_ctl_query_device_ex(struct ibv_context *verbs, struct mrc_con
             .ev_max_count = budget, .ev_free_count = used < budget ? budget - used : 0,
             .ev_max_count_profile = PATH_COUNT, .ev_count_align = 1, .ev_max_width = 32,
             .ev_fmt_mode_mask = MRC_CTL_EV_FMT_MODE_UDP | MRC_CTL_EV_FMT_MODE_STEV,
-            .ev_mode_mask = MRC_CTL_EV_MODE_AUTO | MRC_CTL_EV_MODE_EXP,
+            .ev_mode_mask = MRC_CTL_EV_MODE_AUTO | MRC_CTL_EV_MODE_EXP | MRC_CTL_EV_MODE_GEN,
             .ev_op_max_entries = EV_BATCH_LIMIT,
         },
         .cc = { .cc_max_profiles = MRC_CTL_STORE_MAX_CC_PROFILES, .algorithms = cc_algorithms },
@@ -302,6 +302,69 @@ static bool valid_transition(enum mrc_ctl_store_state from, enum mrc_ctl_store_s
     return false;
 }
 
+static uint32_t expand_generated_field(const struct mrc_ctl_store_ev_field *field, uint32_t value)
+{
+    uint32_t expanded = field->init_val & ~field->mask;
+    uint32_t mask = field->mask;
+    while (mask) {
+        uint32_t bit = mask & (0u - mask);
+        if (value & 1u)
+            expanded |= bit;
+        value >>= 1;
+        mask &= mask - 1;
+    }
+    return expanded;
+}
+
+static int configure_generated(struct mrc_ctl_store_config *config,
+                                const struct mrc_ctl_ev_field *fields, unsigned int count)
+{
+    if (config->format == MRC_CTL_STORE_FORMAT_LEGACY || config->count != PATH_COUNT ||
+        !count || count > MRC_CTL_STORE_MAX_EV_FIELDS)
+        return -EINVAL;
+    uint32_t spans[MRC_CTL_STORE_MAX_EV_FIELDS];
+    uint64_t combinations = 1;
+    for (unsigned int i = 0; i < count; i++) {
+        const struct mrc_ctl_ev_field *field = &fields[i];
+        struct mrc_ctl_store_ev_field *stored = &config->fields[i];
+        *stored = (struct mrc_ctl_store_ev_field){
+            .width = field->width, .init_val = field->init_val, .min_val = field->min_val,
+            .max_val = field->max_val, .mask = field->mask,
+        };
+        if (!mrc_ctl_store_ev_field_valid(stored))
+            return -EINVAL;
+        spans[i] = stored->max_val - stored->min_val + 1;
+        combinations *= spans[i];
+    }
+    const struct mrc_ctl_store_ev_field *udp = &config->fields[count - 1];
+    if (spans[count - 1] == 1 && !expand_generated_field(udp, udp->min_val))
+        return -EINVAL; /* No combination can produce a usable UDP source port. */
+
+    /* The last field (UDP) changes fastest. Skip UDP port zero and
+     * take distinct combinations in compact-value order. */
+    unsigned int generated = 0;
+    memset(config->entropy, 0, sizeof(config->entropy));
+    for (uint64_t index = 0; index < combinations && generated < config->count; index++) {
+        uint64_t digits = index;
+        uint32_t entropy = 0;
+        for (unsigned int i = count; i > 0; i--) {
+            const struct mrc_ctl_store_ev_field *field = &config->fields[i - 1];
+            uint32_t value = field->min_val + (uint32_t)(digits % spans[i - 1]);
+            entropy |= expand_generated_field(field, value) << (16 * (count - i));
+            digits /= spans[i - 1];
+        }
+        if ((uint16_t)entropy)
+            config->entropy[generated++] = entropy;
+    }
+    if (generated != config->count)
+        return -EINVAL;
+
+    config->field_count = (uint8_t)count;
+    config->populated = (UINT32_C(1) << config->count) - 1;
+    config->denied = 0;
+    return 0;
+}
+
 static int configure_profile(struct mrc_ctl_store_config *config, const struct ev_change *change)
 {
     const struct mrc_ctl_ev_profile_attr *attr = change->attr;
@@ -313,6 +376,8 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
             mode = MRC_CTL_STORE_AUTO;
         else if (attr->ev_mode == MRC_CTL_EV_MODE_EXP)
             mode = MRC_CTL_STORE_EXPLICIT;
+        else if (attr->ev_mode == MRC_CTL_EV_MODE_GEN)
+            mode = MRC_CTL_STORE_GENERATED;
         else
             return -EOPNOTSUPP;
     }
@@ -337,6 +402,8 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
         config->populated = 0;
         config->denied = 0;
         memset(config->entropy, 0, sizeof(config->entropy));
+        config->field_count = 0;
+        memset(config->fields, 0, sizeof(config->fields));
     }
     if (mask & MRC_CTL_EV_PROFILE_MIN_ACTIVE) {
         if (attr->ev_min_active > config->count)
@@ -354,6 +421,8 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
             return -E2BIG;
         if (attr->ev_fields_op.field_count != count || (count && !attr->ev_fields_op.fields))
             return -EINVAL;
+        if (mode == MRC_CTL_STORE_GENERATED)
+            return configure_generated(config, attr->ev_fields_op.fields, (unsigned int)count);
         for (int i = 0; i < count; i++) {
             const struct mrc_ctl_ev_field *field = &attr->ev_fields_op.fields[i];
             if (field->width != 16 || field->init_val || field->min_val || field->max_val ||
@@ -389,7 +458,11 @@ static int edit_profile(struct mrc_ctl_store_profile *profile, void *argument)
     const unsigned int initial = MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_COUNT;
     if (from == MRC_CTL_STORE_INIT &&
         ((mask & initial) != initial ||
-         (attr->ev_mode == MRC_CTL_EV_MODE_EXP && !(mask & MRC_CTL_EV_PROFILE_FMT_ID))))
+         ((attr->ev_mode == MRC_CTL_EV_MODE_EXP || attr->ev_mode == MRC_CTL_EV_MODE_GEN) &&
+          !(mask & MRC_CTL_EV_PROFILE_FMT_ID))))
+        return -EINVAL;
+    if (from == MRC_CTL_STORE_INIT && attr->ev_mode == MRC_CTL_EV_MODE_GEN &&
+        !(mask & MRC_CTL_EV_PROFILE_EV_FIELDS_OP))
         return -EINVAL;
     if (from == MRC_CTL_STORE_ONLINE &&
         (mask & ~(MRC_CTL_EV_PROFILE_STATE | MRC_CTL_EV_PROFILE_CUR_STATE | MRC_CTL_EV_PROFILE_EV_OP)))
@@ -540,13 +613,24 @@ MRC_PUBLIC int mrc_ctl_query_ev_profile(struct mrc_context *context, uint64_t id
         if (attr->ev_fields_op.op != MRC_CTL_EV_FIELDS_OP_QUERY_FIELDS || capacity < 0)
             return set_errno(EINVAL);
         int count = (int)profile_field_count(config);
+        if (config->mode == MRC_CTL_STORE_GENERATED && (config->field_count || !config->populated))
+            count = config->field_count;
         attr->ev_fields_op.field_count = count;
         if (capacity < count)
             return set_errno(E2BIG);
         if (count && !attr->ev_fields_op.fields)
             return set_errno(EINVAL);
-        for (int i = 0; i < count; i++)
-            attr->ev_fields_op.fields[i] = (struct mrc_ctl_ev_field){ .width = 16, .mask = UINT16_MAX };
+        for (int i = 0; i < count; i++) {
+            if (config->mode == MRC_CTL_STORE_GENERATED && config->field_count) {
+                const struct mrc_ctl_store_ev_field *field = &config->fields[i];
+                attr->ev_fields_op.fields[i] = (struct mrc_ctl_ev_field){
+                    .width = field->width, .init_val = field->init_val, .min_val = field->min_val,
+                    .max_val = field->max_val, .mask = field->mask,
+                };
+            } else {
+                attr->ev_fields_op.fields[i] = (struct mrc_ctl_ev_field){ .width = 16, .mask = UINT16_MAX };
+            }
+        }
     }
     return error ? set_errno(-error) : 0;
 }

@@ -60,7 +60,7 @@ struct connection {
     uint32_t rkey;
 };
 
-static struct ibv_context *open_verbs(struct address *address)
+static struct ibv_context *open_verbs(struct address *address, bool require_ipv6)
 {
     struct ibv_device **devices = ibv_get_device_list(NULL);
     assert(devices);
@@ -84,6 +84,12 @@ static struct ibv_context *open_verbs(struct address *address)
                     if (ibv_query_gid(context, port, index, &gid) ||
                         memcmp(gid.raw, zero.raw, sizeof(gid.raw)) == 0)
                         continue;
+                    if (require_ipv6) {
+                        struct in6_addr ip;
+                        memcpy(&ip, gid.raw, sizeof(ip));
+                        if (IN6_IS_ADDR_V4MAPPED(&ip))
+                            continue;
+                    }
                     *address = (struct address){ .gid = gid, .port = port, .gid_index = index };
                     chosen = context;
                     break;
@@ -405,9 +411,114 @@ static void check_blocked_profile(struct mrc_qp *qp, struct mrc_cq *cq, const ch
     }
 }
 
+static uint16_t wire_be16(const uint8_t *bytes)
+{
+    return ((uint16_t)bytes[0] << 8) | bytes[1];
+}
+
+static uint32_t wire_be24(const uint8_t *bytes)
+{
+    return ((uint32_t)bytes[0] << 16) | wire_be16(bytes + 1);
+}
+
+static uint32_t wire_be32(const uint8_t *bytes)
+{
+    return ((uint32_t)wire_be16(bytes) << 16) | wire_be16(bytes + 2);
+}
+
+struct observed_udp {
+    const uint8_t *header;
+    size_t bytes;
+    uint32_t entropy;
+};
+
+static struct observed_udp read_udp(struct rte_mbuf *packet, uint8_t *prefix, size_t capacity)
+{
+    size_t length = rte_pktmbuf_pkt_len(packet);
+    if (length > capacity)
+        length = capacity;
+    const uint8_t *frame = rte_pktmbuf_read(packet, 0, length, prefix);
+    assert(frame && length >= 14 + 20 + 8 + WIRE_BTH_LEN);
+    uint16_t ether_type = wire_be16(frame + 12);
+    assert(ether_type == RTE_ETHER_TYPE_IPV4 || ether_type == RTE_ETHER_TYPE_IPV6);
+    bool ipv6 = ether_type == RTE_ETHER_TYPE_IPV6;
+    size_t udp = 14 + (ipv6 ? 40 : (frame[14] & 0x0f) * 4);
+    assert(udp + 8 + WIRE_BTH_LEN <= length);
+    uint32_t entropy = wire_be16(frame + udp);
+    if (ipv6)
+        entropy |= (uint32_t)wire_be16(frame + 16) << 16;
+    return (struct observed_udp){.header = frame + udp, .bytes = length - udp, .entropy = entropy};
+}
+
+static void prepare_memif_links(void)
+{
+    uint64_t deadline = rte_get_timer_cycles() + 4 * rte_get_timer_hz();
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        struct rte_eth_link link;
+        do {
+            assert(rte_get_timer_cycles() < deadline);
+            assert(rte_eth_link_get_nowait(port, &link) == 0);
+            if (!link.link_status)
+                rte_delay_us_sleep(1000);
+        } while (!link.link_status);
+
+        /* Memif publishes server-to-client ring credits on the client's first
+         * receive poll. Neither process can send before the round barrier. */
+        struct rte_mbuf *packet;
+        assert(rte_eth_rx_burst(port, 0, &packet, 1) == 0);
+    }
+}
+
+struct generated_ev_witness {
+    bool requester;
+    uint32_t qpn;
+    uint32_t entropy[DUPLEX_RAILS];
+    unsigned int probe_ports;
+    unsigned int data_ports;
+};
+
+static uint16_t observe_generated_ev(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                      uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)queue;
+    (void)capacity;
+    struct generated_ev_witness *observed = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN + WIRE_SETH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + 8;
+        uint32_t entropy = udp.entropy;
+        bool probe;
+        if (observed->requester) {
+            if (bth[0] != WIRE_SACK)
+                continue;
+            assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_SETH_LEN);
+            const uint8_t *seth = bth + WIRE_BTH_LEN;
+            probe = (seth[1] & 0x02) != 0;
+            entropy = wire_be32(seth + 4);
+        } else {
+            probe = bth[0] == WIRE_PROBE_REQUEST;
+            if (!probe && (bth[0] < WIRE_WRITE_FIRST || bth[0] > 0xcb))
+                continue;
+        }
+        assert(wire_be24(bth + 5) == observed->qpn);
+        unsigned int bit = 1u << port;
+        if ((observed->probe_ports | observed->data_ports) & bit)
+            assert(observed->entropy[port] == entropy);
+        else
+            observed->entropy[port] = entropy;
+        if (probe)
+            observed->probe_ports |= bit;
+        else
+            observed->data_ports |= bit;
+    }
+    return count;
+}
+
 static void run_simplex(bool requester, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                       bool wire_error, const char *ev_store, uint64_t ev_profile_id)
+                       bool wire_error, const char *ev_store, uint64_t ev_profile_id,
+                       bool generated_ev)
 {
     if (requester && ev_profile_id)
         assert(mrc_dpdk_set_ev_store(context, ev_store) == 0);
@@ -460,6 +571,23 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     route.requester = requester;
     attach_qp(qp, &route);
 
+    struct generated_ev_witness observed = {.requester = requester, .qpn = local.qpn};
+    const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS] = {0};
+    if (generated_ev) {
+        prepare_memif_links();
+        if (requester) {
+            publish(directory, "tx.links-ready", NULL, 0);
+        } else {
+            char ready[PATH_MAX];
+            path_for(ready, directory, "tx.links-ready");
+            wait_for(ready);
+        }
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_generated_ev, &observed);
+            assert(callbacks[port]);
+        }
+    }
+
     if (requester) {
         char ready[PATH_MAX];
         path_for(ready, directory, "rx.ready");
@@ -471,12 +599,22 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
     }
-    if (ev_profile_id)
+    if (ev_profile_id && !generated_ev)
         check_blocked_profile(qp, cq, ev_store, requester, first_data);
     if (wire_error)
         complete_async_error(context, qp, cq, requester, local.qpn);
     else
         complete(qp, cq, channel, directory, requester, local.qpn);
+    if (generated_ev) {
+        const unsigned int both_rails = (1u << DUPLEX_RAILS) - 1;
+        assert(observed.probe_ports == both_rails && observed.data_ports);
+        if (!requester)
+            assert(observed.data_ports == both_rails);
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
+            rte_free((void *)callbacks[port]);
+        }
+    }
     if (requester) {
         publish(directory, "tx.done", NULL, 0);
     } else {
@@ -503,8 +641,11 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         printf("{\"role\":\"%s\",\"qp_fatal\":true,\"cq_error\":%s,\"qpn\":%u}\n",
                requester ? "tx" : "rx", requester ? "false" : "true", local.qpn);
     } else {
-        printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u}\n",
+        printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u",
                requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
+        if (generated_ev)
+            printf(",\"rail_entropy\":[%u,%u]", observed.entropy[0], observed.entropy[1]);
+        puts("}");
     }
 }
 
@@ -595,45 +736,6 @@ static void marker_name(char out[32], bool client, unsigned int round, const cha
 {
     int count = snprintf(out, 32, "%s.%u.%s", client ? "tx" : "rx", round, state);
     assert(count > 0 && count < 32);
-}
-
-static uint16_t wire_be16(const uint8_t *bytes)
-{
-    return ((uint16_t)bytes[0] << 8) | bytes[1];
-}
-
-static uint32_t wire_be24(const uint8_t *bytes)
-{
-    return ((uint32_t)bytes[0] << 16) | wire_be16(bytes + 1);
-}
-
-static uint32_t wire_be32(const uint8_t *bytes)
-{
-    return ((uint32_t)wire_be16(bytes) << 16) | wire_be16(bytes + 2);
-}
-
-struct observed_udp {
-    const uint8_t *header;
-    size_t bytes;
-    uint32_t entropy;
-};
-
-static struct observed_udp read_udp(struct rte_mbuf *packet, uint8_t *prefix, size_t capacity)
-{
-    size_t length = rte_pktmbuf_pkt_len(packet);
-    if (length > capacity)
-        length = capacity;
-    const uint8_t *frame = rte_pktmbuf_read(packet, 0, length, prefix);
-    assert(frame && length >= 14 + 20 + 8 + WIRE_BTH_LEN);
-    uint16_t ether_type = wire_be16(frame + 12);
-    assert(ether_type == RTE_ETHER_TYPE_IPV4 || ether_type == RTE_ETHER_TYPE_IPV6);
-    bool ipv6 = ether_type == RTE_ETHER_TYPE_IPV6;
-    size_t udp = 14 + (ipv6 ? 40 : (frame[14] & 0x0f) * 4);
-    assert(udp + 8 + WIRE_BTH_LEN <= length);
-    uint32_t entropy = wire_be16(frame + udp);
-    if (ipv6)
-        entropy |= (uint32_t)wire_be16(frame + 16) << 16;
-    return (struct observed_udp){.header = frame + udp, .bytes = length - udp, .entropy = entropy};
 }
 
 struct cc_window_witness {
@@ -890,25 +992,6 @@ static uint16_t observe_probe_replies(uint16_t port, uint16_t queue, struct rte_
         }
     }
     return count;
-}
-
-static void prepare_memif_links(void)
-{
-    uint64_t deadline = rte_get_timer_cycles() + 4 * rte_get_timer_hz();
-    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
-        struct rte_eth_link link;
-        do {
-            assert(rte_get_timer_cycles() < deadline);
-            assert(rte_eth_link_get_nowait(port, &link) == 0);
-            if (!link.link_status)
-                rte_delay_us_sleep(1000);
-        } while (!link.link_status);
-
-        /* Memif publishes server-to-client ring credits on the client's first
-         * receive poll. Neither process can send before the round barrier. */
-        struct rte_mbuf *packet;
-        assert(rte_eth_rx_burst(port, 0, &packet, 1) == 0);
-    }
 }
 
 static struct service_time_witness check_rx_flow(struct duplex_qp *qps,
@@ -1290,7 +1373,9 @@ int main(int argc, char **argv)
     bool bidirectional = cc_profile || qa_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
     enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW : DUPLEX_NORMAL;
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
-    bool ev_profile = strcmp(argv[3], "ev_profile") == 0;
+    bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0;
+    bool generated_ev = generated_stev || strcmp(argv[3], "generated_ev_udp") == 0;
+    bool ev_profile = generated_ev || strcmp(argv[3], "ev_profile") == 0;
     const char *profile_store = NULL;
     uint64_t profile_id = 0;
     if (ev_profile || cc_profile || qa_profile) {
@@ -1305,7 +1390,7 @@ int main(int argc, char **argv)
     }
 
     struct address address = {0};
-    struct ibv_context *verbs = open_verbs(&address);
+    struct ibv_context *verbs = open_verbs(&address, generated_stev);
     if (!verbs) {
         fputs("A verbs device with a usable Ethernet GID and pkey is required.\n", stderr);
         return EXIT_FAILURE;
@@ -1324,7 +1409,8 @@ int main(int argc, char **argv)
     if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else
-        run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store, profile_id);
+        run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store,
+                    profile_id, generated_ev);
 
     assert(mrc_destroy_context(context) == 0);
     assert(ibv_dealloc_pd(pd) == 0);

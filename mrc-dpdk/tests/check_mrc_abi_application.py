@@ -108,6 +108,21 @@ def main():
         controller = args.controller.resolve()
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
         check_live_profile(binary, controller)
+        for mode, seed, expected in (
+            ("generated_ev_udp", "--seed-gen", [0xC405, 0xC410]),
+            ("generated_ev_stev", "--seed-gen-stev", [0x0A00E499, 0x0A20E499]),
+        ):
+            with tempfile.TemporaryDirectory(prefix="mrc-abi-gen-") as store:
+                profile_id = control(controller, seed, store)
+                require(profile_id.isdecimal() and int(profile_id) > 0,
+                        f"Invalid generated EV profile ID: {profile_id!r}")
+                tx, rx = run_case(mode, store, profile_id)
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+                    and tx["completions"] == rx["completions"] == 2
+                    and tx["rail_entropy"] == rx["rail_entropy"] == expected,
+                    f"Unexpected generated EVs on the two rails: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
         with tempfile.TemporaryDirectory(prefix="mrc-abi-cc-") as store:
             profile_id = control(controller, "--seed-cc", store)
             require(profile_id.isdecimal() and int(profile_id) > 0,

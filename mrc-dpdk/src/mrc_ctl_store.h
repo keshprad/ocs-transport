@@ -10,6 +10,7 @@
  * enforces its administrative policy. This interface is independent of the
  * upstream mrc_ctl ABI and stores EV and congestion-control profiles. */
 #define MRC_CTL_STORE_MAX_PROFILES 32u
+#define MRC_CTL_STORE_MAX_EV_FIELDS 2u
 #define MRC_CTL_STORE_MAX_CC_PROFILES 32u
 #define MRC_CTL_STORE_INITIALIZER { .fd = -1 }
 #define MRC_CTL_STORE_REF_INITIALIZER { .fd = -1 }
@@ -32,6 +33,17 @@ enum mrc_ctl_store_format {
     MRC_CTL_STORE_FORMAT_STEV = 2,
 };
 
+struct mrc_ctl_store_ev_field {
+    uint32_t width;
+    uint32_t init_val;
+    uint32_t min_val;
+    uint32_t max_val;
+    uint32_t mask;
+};
+
+/* Validate field width, initialization, and compact generation bounds. */
+bool mrc_ctl_store_ev_field_valid(const struct mrc_ctl_store_ev_field *field);
+
 struct mrc_ctl_store_config {
     enum mrc_ctl_store_mode mode;
     enum mrc_ctl_store_format format;
@@ -40,6 +52,8 @@ struct mrc_ctl_store_config {
     uint32_t populated; /* Bit i identifies a configured entropy slot. */
     uint32_t denied; /* Administrative DENY updates are allowed while ONLINE. */
     uint32_t entropy[MRC_EV_MAX_PATHS];
+    uint8_t field_count; /* Zero for profiles with no generated field metadata. */
+    struct mrc_ctl_store_ev_field fields[MRC_CTL_STORE_MAX_EV_FIELDS];
 };
 
 struct mrc_ctl_store_profile {
@@ -80,7 +94,8 @@ int mrc_ctl_store_get(const struct mrc_ctl_store *store, uint64_t id,
 int mrc_ctl_store_list(const struct mrc_ctl_store *store, struct mrc_ctl_store_profile *profiles,
                        size_t capacity, size_t *count);
 /* Configures INIT to OFFLINE, or replaces an OFFLINE configuration. AUTO
- * uses provider-selected entropies. GENERATED stores caller-expanded values. */
+ * uses provider-selected entropies. GENERATED stores materialized entropies
+ * and can retain the fields used to generate them. */
 int mrc_ctl_store_configure(const struct mrc_ctl_store *store, uint64_t id,
                             const struct mrc_ctl_store_config *config);
 int mrc_ctl_store_set_state(const struct mrc_ctl_store *store, uint64_t id,

@@ -449,6 +449,129 @@ static void test_legacy_shared_store(void)
     remove_fixture(&store, directory);
 }
 
+static void expect_ev_snapshot_version(const struct mrc_ctl_store *store, uint8_t version)
+{
+    int fd = openat(store->fd, "profiles.v1", O_RDONLY);
+    assert(fd >= 0);
+    uint8_t saved_version;
+    assert(pread(fd, &saved_version, 1, 7) == 1 && saved_version == version);
+    if (version == 2) {
+        struct stat status;
+        assert(fstat(fd, &status) == 0);
+        assert(status.st_size == 16 + MRC_CTL_STORE_MAX_PROFILES * (24 + 4 * MRC_EV_MAX_PATHS));
+    }
+    assert(close(fd) == 0);
+}
+
+static void check_ev_fields(const struct mrc_ctl_store_config *actual,
+                             const struct mrc_ctl_store_config *expected)
+{
+    assert(actual->field_count == expected->field_count);
+    for (unsigned int i = 0; i < actual->field_count; i++) {
+        const struct mrc_ctl_store_ev_field *a = &actual->fields[i], *b = &expected->fields[i];
+        assert(a->width == b->width && a->init_val == b->init_val && a->mask == b->mask);
+        assert(a->min_val == b->min_val && a->max_val == b->max_val);
+    }
+    assert(actual->entropy[0] == expected->entropy[0] && actual->entropy[1] == expected->entropy[1]);
+}
+
+static void test_generated_fields(void)
+{
+    char directory[] = "/tmp/mrc-ctl-generated.XXXXXX";
+    assert(mkdtemp(directory));
+    struct mrc_ctl_store store = MRC_CTL_STORE_INITIALIZER;
+    struct mrc_ctl_store_ref ref = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_profile saved;
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+
+    /* A legacy generated profile only stores its materialized entropies. */
+    struct mrc_ctl_store_config preexpanded = explicit_config();
+    preexpanded.mode = MRC_CTL_STORE_GENERATED;
+    assert(mrc_ctl_store_create(&store, 10) == 0);
+    assert(mrc_ctl_store_configure(&store, 10, &preexpanded) == 0);
+    assert(mrc_ctl_store_set_state(&store, 10, MRC_CTL_STORE_ONLINE) == 0);
+    expect_ev_snapshot_version(&store, 2);
+
+    const struct mrc_ctl_store_config udp = {
+        .mode = MRC_CTL_STORE_GENERATED, .format = MRC_CTL_STORE_FORMAT_UDP,
+        .count = 2, .min_active = 1, .populated = 3, .field_count = 1,
+        .fields = { { .width = 16, .init_val = 0xc000, .min_val = 1, .max_val = 2, .mask = 0x41 } },
+        .entropy = { 0xc001, 0xc040 },
+    };
+    assert(mrc_ctl_store_create(&store, 20) == 0);
+    struct mrc_ctl_store_config invalid = udp;
+    invalid.field_count = 2;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    invalid = udp;
+    invalid.mode = MRC_CTL_STORE_EXPLICIT;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    invalid = udp;
+    invalid.fields[0].mask = 0x10000;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    invalid = udp;
+    invalid.fields[0].max_val = 4;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    invalid = udp;
+    invalid.fields[0].min_val = 3;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    assert(mrc_ctl_store_configure(&store, 20, &udp) == 0);
+    expect_ev_snapshot_version(&store, 3);
+    assert(mrc_ctl_store_set_state(&store, 20, MRC_CTL_STORE_ONLINE) == 0);
+    assert(mrc_ctl_store_acquire(&store, 20, &ref, &saved) == 0);
+    check_ev_fields(&saved.config, &udp);
+
+    struct mrc_ctl_store_profile edited = saved;
+    edited.config.fields[0].max_val = 3;
+    assert(mrc_ctl_store_edit(&store, 20, replace_profile, &edited) == -EBUSY);
+    uint32_t deny = 1;
+    assert(mrc_ctl_store_edit(&store, 20, deny_slot, &deny) == 0);
+    assert(mrc_ctl_store_get(&store, 20, &saved) == 0 && saved.config.denied == 1);
+    check_ev_fields(&saved.config, &udp);
+    mrc_ctl_store_release(&ref);
+
+    struct mrc_ctl_store_config stev = udp;
+    stev.format = MRC_CTL_STORE_FORMAT_STEV;
+    stev.field_count = 2;
+    stev.fields[1] = udp.fields[0];
+    stev.fields[0] = (struct mrc_ctl_store_ev_field){ .width = 12, .init_val = 0x17c };
+    stev.entropy[0] |= UINT32_C(0x017c0000);
+    stev.entropy[1] |= UINT32_C(0x017c0000);
+    assert(mrc_ctl_store_create(&store, 30) == 0);
+    invalid = stev;
+    invalid.field_count = 1;
+    assert(mrc_ctl_store_configure(&store, 30, &invalid) == -EINVAL);
+    invalid = stev;
+    invalid.fields[0].init_val = 0x1000;
+    assert(mrc_ctl_store_configure(&store, 30, &invalid) == -EINVAL);
+    invalid = stev;
+    invalid.fields[0].max_val = 1;
+    assert(mrc_ctl_store_configure(&store, 30, &invalid) == -EINVAL);
+    invalid = stev;
+    invalid.fields[0].width = 0;
+    assert(mrc_ctl_store_configure(&store, 30, &invalid) == -EINVAL);
+    assert(mrc_ctl_store_configure(&store, 30, &stev) == 0);
+
+    /* Reopen the mixed snapshot and verify both the original V2 data and V3 metadata. */
+    mrc_ctl_store_close(&store);
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+    assert(mrc_ctl_store_get(&store, 10, &saved) == 0 && saved.state == MRC_CTL_STORE_ONLINE);
+    check_ev_fields(&saved.config, &preexpanded);
+    assert(mrc_ctl_store_get(&store, 20, &saved) == 0 && saved.config.denied == 1);
+    check_ev_fields(&saved.config, &udp);
+    assert(mrc_ctl_store_get(&store, 30, &saved) == 0 && saved.config.format == MRC_CTL_STORE_FORMAT_STEV);
+    check_ev_fields(&saved.config, &stev);
+    assert(mrc_ctl_store_set_state(&store, 30, MRC_CTL_STORE_ONLINE) == 0);
+
+    assert(mrc_ctl_store_edit(&store, 20, clear_profile_id, NULL) == 0);
+    expect_ev_snapshot_version(&store, 3);
+    assert(mrc_ctl_store_edit(&store, 30, clear_profile_id, NULL) == 0);
+    expect_ev_snapshot_version(&store, 2);
+    assert(mrc_ctl_store_acquire(&store, 10, &ref, &saved) == 0);
+    check_ev_fields(&saved.config, &preexpanded);
+    mrc_ctl_store_release(&ref);
+    remove_fixture(&store, directory);
+}
+
 static int configure_unconfigured_cc(struct mrc_ctl_store_cc_profile *profile, void *arg)
 {
     const uint64_t *expected_id = arg;
@@ -574,6 +697,7 @@ int main(void)
     test_failed_update_and_corruption();
     test_typed_edits();
     test_legacy_shared_store();
+    test_generated_fields();
     test_cc_profiles();
     puts("MRC controller profile store tests passed");
     return 0;

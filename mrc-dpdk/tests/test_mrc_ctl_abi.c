@@ -16,9 +16,43 @@ enum {
     CC_PROFILE_ID = 8,
     DISABLED_CC_PROFILE_ID = 9,
     QA_CC_PROFILE_ID = 10,
+    GEN_UDP_PROFILE_ID = 11,
+    GEN_STEV_PROFILE_ID = 12,
     RAILS = 2,
     FIRST_EV = 0xc101,
     SECOND_EV = 0xc102,
+};
+
+struct generated_profile {
+    unsigned int id;
+    uint64_t format;
+    int field_count;
+    struct mrc_ctl_ev_field fields[2];
+    uint32_t values[RAILS];
+};
+
+static const struct generated_profile generated_udp = {
+    .id = GEN_UDP_PROFILE_ID,
+    .format = MRC_DPDK_EV_FORMAT_UDP,
+    .field_count = 1,
+    .fields = {{ .width = 16, .init_val = 0xc400, .min_val = 3, .max_val = 8, .mask = 0x35 }},
+    .values = { 0xc405, 0xc410 },
+};
+
+static const struct generated_profile generated_stev = {
+    .id = GEN_STEV_PROFILE_ID,
+    .format = MRC_DPDK_EV_FORMAT_STEV,
+    .field_count = 2,
+    .fields = {
+        { .width = 12, .init_val = 0x0a00, .max_val = 1, .mask = 0xa0 },
+        { .width = 16, .init_val = 0xe499 },
+    },
+    .values = { 0x0a00e499, 0x0a20e499 },
+};
+
+enum {
+    GENERATED_PROFILE_ATTRS = MRC_CTL_EV_PROFILE_STATE | MRC_CTL_EV_PROFILE_MODE |
+        MRC_CTL_EV_PROFILE_FMT_ID | MRC_CTL_EV_PROFILE_COUNT | MRC_CTL_EV_PROFILE_EV_FIELDS_OP,
 };
 
 static const char nscc_algorithm[] = "uet-1.0-nscc";
@@ -109,6 +143,7 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
     assert(legacy.ev.ev_max_count_profile == extended.ev.ev_max_count_profile);
     assert(extended.ev.ev_max_count_profile >= RAILS);
     assert(extended.ev.ev_mode_mask & MRC_CTL_EV_MODE_EXP);
+    assert((legacy.ev.ev_mode_mask & extended.ev.ev_mode_mask) & MRC_CTL_EV_MODE_GEN);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_UDP);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_STEV);
     assert(legacy.cc.cc_max_profiles == 32 && extended.cc.cc_max_profiles == 32);
@@ -157,7 +192,7 @@ static int configure_explicit(struct mrc_context *context)
                                      MRC_CTL_EV_PROFILE_COUNT);
 }
 
-static int set_profile_state(struct mrc_context *context, enum mrc_ctl_profile_state state)
+static int set_profile_state(struct mrc_context *context, uint64_t id, enum mrc_ctl_profile_state state)
 {
     struct mrc_ctl_ev_profile_attr attr = {
         .profile_state = state,
@@ -166,13 +201,13 @@ static int set_profile_state(struct mrc_context *context, enum mrc_ctl_profile_s
     int mask = MRC_CTL_EV_PROFILE_STATE;
     if (state == MRC_CTL_PROFILE_ONLINE)
         mask |= MRC_CTL_EV_PROFILE_MIN_ACTIVE;
-    return mrc_ctl_modify_ev_profile(context, PROFILE_ID, &attr, mask);
+    return mrc_ctl_modify_ev_profile(context, id, &attr, mask);
 }
 
-static enum mrc_ctl_profile_state profile_state(struct mrc_context *context)
+static enum mrc_ctl_profile_state profile_state(struct mrc_context *context, uint64_t id)
 {
     struct mrc_ctl_ev_profile_attr attr = {0};
-    assert(mrc_ctl_query_ev_profile(context, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_CUR_STATE) == 0);
+    assert(mrc_ctl_query_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_CUR_STATE) == 0);
     return attr.cur_profile_state;
 }
 
@@ -199,19 +234,25 @@ static int replace_evs(struct mrc_context *context, struct mrc_ctl_ev_op_entry *
     return mrc_ctl_modify_ev_profile(context, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EV_OP);
 }
 
-static void check_evs(struct mrc_context *context, uint32_t first, uint32_t second)
+static void query_evs(struct mrc_context *context, uint64_t id, enum mrc_ctl_ev_mode mode,
+                      uint64_t format, struct mrc_ctl_ev_op_entry entries[RAILS])
 {
-    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
     struct mrc_ctl_ev_profile_attr attr = {
         .ev_op = { .op = MRC_CTL_EV_OP_QUERY_EV_ARRAY, .entries = entries, .entry_count = 1 },
     };
     const int mask = MRC_CTL_EV_PROFILE_EV_OP | MRC_CTL_EV_PROFILE_COUNT |
                      MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_FMT_ID;
-    assert(mrc_ctl_query_ev_profile(context, PROFILE_ID, &attr, mask) == -1 && errno == E2BIG);
+    assert(mrc_ctl_query_ev_profile(context, id, &attr, mask) == -1 && errno == E2BIG);
     assert(attr.ev_op.entry_count == RAILS);
-    assert(mrc_ctl_query_ev_profile(context, PROFILE_ID, &attr, mask) == 0);
+    assert(mrc_ctl_query_ev_profile(context, id, &attr, mask) == 0);
     assert(attr.ev_op.entry_count == RAILS && attr.ev_count == RAILS);
-    assert(attr.ev_mode == MRC_CTL_EV_MODE_EXP && attr.ev_fmt_profile_id == MRC_DPDK_EV_FORMAT_UDP);
+    assert(attr.ev_mode == mode && attr.ev_fmt_profile_id == format);
+}
+
+static void check_evs(struct mrc_context *context, uint32_t first, uint32_t second)
+{
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
+    query_evs(context, PROFILE_ID, MRC_CTL_EV_MODE_EXP, MRC_DPDK_EV_FORMAT_UDP, entries);
     assert(entries[0].ev.port == 1 && ev_value(&entries[0].ev) == first);
     assert(entries[1].ev.port == 2 && ev_value(&entries[1].ev) == second);
 }
@@ -224,42 +265,44 @@ static void populate_evs(struct mrc_context *controller)
     };
     assert(replace_evs(controller, entries, RAILS) == -1 && errno == ENOENT);
     check_evs(controller, FIRST_EV, 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
-    assert(profile_state(controller) == MRC_CTL_PROFILE_OFFLINE);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_OFFLINE);
 
     entries[1].ev = ev(2, 0);
     assert(replace_evs(controller, &entries[1], 1) == 0);
     check_evs(controller, FIRST_EV, SECOND_EV);
 }
 
-static void set_ev_state(struct mrc_context *context, enum mrc_ctl_ev_state state)
+static void set_ev_state(struct mrc_context *context, uint64_t id, struct mrc_ctl_ev value,
+                         enum mrc_ctl_ev_state state)
 {
-    struct mrc_ctl_ev_op_entry entry = { .ev = ev(2, SECOND_EV), .state = state };
+    struct mrc_ctl_ev_op_entry entry = { .ev = value, .state = state };
     struct mrc_ctl_ev_profile_attr attr = {
         .ev_op = { .op = MRC_CTL_EV_OP_MODIFY_EV_STATE, .entries = &entry, .entry_count = 1 },
     };
-    assert(mrc_ctl_modify_ev_profile(context, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EV_OP) == 0);
+    assert(mrc_ctl_modify_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_EV_OP) == 0);
 }
 
-static enum mrc_ctl_ev_state get_ev_state(struct mrc_context *context)
+static enum mrc_ctl_ev_state get_ev_state(struct mrc_context *context, uint64_t id,
+                                          struct mrc_ctl_ev value)
 {
-    struct mrc_ctl_ev_op_entry entry = { .ev = ev(2, SECOND_EV) };
+    struct mrc_ctl_ev_op_entry entry = { .ev = value };
     struct mrc_ctl_ev_profile_attr attr = {
         .ev_op = { .op = MRC_CTL_EV_OP_QUERY_EV_STATE, .entries = &entry, .entry_count = 1 },
     };
-    assert(mrc_ctl_query_ev_profile(context, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EV_OP) == 0);
+    assert(mrc_ctl_query_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_EV_OP) == 0);
     return entry.state;
 }
 
-static void select_profile(struct mrc_qp *qp)
+static void select_profile(struct mrc_qp *qp, uint64_t id)
 {
     struct ibv_qp_attr verbs = { .qp_state = IBV_QPS_INIT };
-    struct mrc_qp_attr attrs = { .profile.ev_profile_id = PROFILE_ID };
+    struct mrc_qp_attr attrs = { .profile.ev_profile_id = id };
     assert(mrc_modify_qp(qp, &verbs, IBV_QP_STATE, &attrs, MRC_QP_EV_PROFILE_ID) == 0);
 
     attrs = (struct mrc_qp_attr){0};
     assert(mrc_query_qp(qp, &verbs, IBV_QP_STATE, &attrs, MRC_QP_EV_PROFILE_ID, NULL) == 0);
-    assert(verbs.qp_state == IBV_QPS_INIT && attrs.profile.ev_profile_id == PROFILE_ID);
+    assert(verbs.qp_state == IBV_QPS_INIT && attrs.profile.ev_profile_id == id);
 }
 
 static void test_auto_profile(struct mrc_context *controller)
@@ -269,7 +312,7 @@ static void test_auto_profile(struct mrc_context *controller)
     };
     assert(mrc_ctl_modify_ev_profile(controller, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_STATE |
                                      MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_COUNT) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
     struct mrc_ctl_ev_op_entry entries[RAILS];
     attr = (struct mrc_ctl_ev_profile_attr){
         .ev_op = { .op = MRC_CTL_EV_OP_QUERY_EV_ARRAY, .entries = entries, .entry_count = RAILS },
@@ -282,8 +325,8 @@ static void test_auto_profile(struct mrc_context *controller)
         assert(entries[i].ev.port == i + 1 && ev_value(&entries[i].ev));
         assert(entries[i].state == MRC_CTL_EV_GOOD);
     }
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_INIT) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_INIT) == 0);
 }
 
 static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context *controller,
@@ -291,12 +334,12 @@ static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context
 {
     test_controller_discovery(verbs, controller);
     test_auto_profile(controller);
-    assert(profile_state(controller) == MRC_CTL_PROFILE_INIT);
+    assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
     assert(configure_explicit(controller) == 0);
-    assert(profile_state(controller) == MRC_CTL_PROFILE_OFFLINE);
+    assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_OFFLINE);
     check_evs(controller, 0, 0);
     populate_evs(controller);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
 
     struct mrc_context *client = open_store(verbs, directory);
     struct ibv_pd *pd = ibv_alloc_pd(verbs);
@@ -308,32 +351,178 @@ static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context
     struct mrc_qp *qp = mrc_create_qp(client, &init);
     assert(qp);
 
-    select_profile(qp);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
-    set_ev_state(controller, MRC_CTL_EV_DENIED);
-    assert(get_ev_state(client) == MRC_CTL_EV_DENIED);
+    select_profile(qp, PROFILE_ID);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    set_ev_state(controller, PROFILE_ID, ev(2, SECOND_EV), MRC_CTL_EV_DENIED);
+    assert(get_ev_state(client, PROFILE_ID, ev(2, SECOND_EV)) == MRC_CTL_EV_DENIED);
 
     assert(mrc_destroy_context(controller) == 0);
     controller = open_store(verbs, directory);
-    assert(profile_state(controller) == MRC_CTL_PROFILE_ONLINE);
+    assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_ONLINE);
     check_evs(controller, FIRST_EV, SECOND_EV);
-    assert(get_ev_state(controller) == MRC_CTL_EV_DENIED);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
-    set_ev_state(controller, MRC_CTL_EV_GOOD);
-    assert(get_ev_state(client) == MRC_CTL_EV_GOOD);
+    assert(get_ev_state(controller, PROFILE_ID, ev(2, SECOND_EV)) == MRC_CTL_EV_DENIED);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    set_ev_state(controller, PROFILE_ID, ev(2, SECOND_EV), MRC_CTL_EV_GOOD);
+    assert(get_ev_state(client, PROFILE_ID, ev(2, SECOND_EV)) == MRC_CTL_EV_GOOD);
 
     struct ibv_qp_attr reset = { .qp_state = IBV_QPS_RESET };
     assert(mrc_modify_qp(qp, &reset, IBV_QP_STATE, NULL, 0) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
 
-    select_profile(qp);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    select_profile(qp, PROFILE_ID);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
     assert(mrc_destroy_qp(qp) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_INIT) == 0);
-    assert(profile_state(controller) == MRC_CTL_PROFILE_INIT);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_INIT) == 0);
+    assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
 
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(ibv_dealloc_pd(pd) == 0);
+    assert(mrc_destroy_context(client) == 0);
+    assert(mrc_destroy_context(controller) == 0);
+}
+
+static struct mrc_ctl_ev_profile_attr generated_attributes(uint64_t format,
+                                                           struct mrc_ctl_ev_field *fields, int count)
+{
+    return (struct mrc_ctl_ev_profile_attr){
+        .profile_state = MRC_CTL_PROFILE_OFFLINE, .ev_mode = MRC_CTL_EV_MODE_GEN,
+        .ev_fmt_profile_id = format, .ev_count = RAILS,
+        .ev_fields_op = { .op = MRC_CTL_EV_FIELDS_OP_MODIFY_FIELDS, .fields = fields, .field_count = count },
+    };
+}
+
+static int configure_generated(struct mrc_context *context, struct generated_profile profile)
+{
+    struct mrc_ctl_ev_profile_attr attr =
+        generated_attributes(profile.format, profile.fields, profile.field_count);
+    return mrc_ctl_modify_ev_profile(context, profile.id, &attr, GENERATED_PROFILE_ATTRS);
+}
+
+static void check_generated(struct mrc_context *context, const struct generated_profile *expected)
+{
+    struct mrc_ctl_ev_field fields[2] = {0};
+    struct mrc_ctl_ev_profile_attr attr = {
+        .ev_fields_op = {
+            .op = MRC_CTL_EV_FIELDS_OP_QUERY_FIELDS, .fields = fields, .field_count = expected->field_count - 1,
+        },
+    };
+    assert(mrc_ctl_query_ev_profile(context, expected->id, &attr,
+                                    MRC_CTL_EV_PROFILE_EV_FIELDS_OP) == -1 && errno == E2BIG);
+    assert(attr.ev_fields_op.field_count == expected->field_count);
+    assert(mrc_ctl_query_ev_profile(context, expected->id, &attr, MRC_CTL_EV_PROFILE_EV_FIELDS_OP) == 0);
+    assert(attr.ev_fields_op.field_count == expected->field_count);
+    for (int i = 0; i < expected->field_count; i++) {
+        const struct mrc_ctl_ev_field *field = &expected->fields[i];
+        assert(fields[i].width == field->width && fields[i].init_val == field->init_val &&
+               fields[i].min_val == field->min_val && fields[i].max_val == field->max_val &&
+               fields[i].mask == field->mask);
+    }
+
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
+    query_evs(context, expected->id, MRC_CTL_EV_MODE_GEN, expected->format, entries);
+    for (unsigned int i = 0; i < RAILS; i++) {
+        assert(entries[i].ev.port == i + 1 && ev_value(&entries[i].ev) == expected->values[i]);
+        assert(entries[i].state == MRC_CTL_EV_GOOD);
+    }
+}
+
+static void check_generated_errors(struct mrc_context *context)
+{
+    struct mrc_ctl_ev_field fields[2] = { generated_udp.fields[0] };
+    struct mrc_ctl_ev_profile_attr attr = generated_attributes(generated_udp.format, fields, 1);
+    static const int required[] = {
+        MRC_CTL_EV_PROFILE_MODE, MRC_CTL_EV_PROFILE_FMT_ID, MRC_CTL_EV_PROFILE_COUNT,
+        MRC_CTL_EV_PROFILE_EV_FIELDS_OP,
+    };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++)
+        assert(mrc_ctl_modify_ev_profile(context, GEN_UDP_PROFILE_ID, &attr,
+                                         GENERATED_PROFILE_ATTRS & ~required[i]) == -1 && errno == EINVAL);
+    attr.ev_fields_op.field_count = 2;
+    assert(mrc_ctl_modify_ev_profile(context, GEN_UDP_PROFILE_ID, &attr,
+                                     GENERATED_PROFILE_ATTRS) == -1 && errno == E2BIG);
+    attr.ev_fields_op.field_count = 1;
+
+    static const struct mrc_ctl_ev_field invalid[] = {
+        { .width = 17, .init_val = 0xc400, .max_val = 1, .mask = 1 },
+        { .width = 16, .init_val = 0x10000, .max_val = 1, .mask = 1 },
+        { .width = 16, .init_val = 0xc400, .max_val = 1, .mask = 0x10000 },
+        { .width = 16, .init_val = 0xc400, .min_val = 2, .max_val = 1, .mask = 3 },
+        { .width = 16, .init_val = 0xc400, .max_val = 2, .mask = 1 },
+        /* Two encodings, but zero is an invalid UDP source port. */
+        { .width = 16, .max_val = 1, .mask = 1 },
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        fields[0] = invalid[i];
+        assert(mrc_ctl_modify_ev_profile(context, GEN_UDP_PROFILE_ID, &attr,
+                                         GENERATED_PROFILE_ATTRS) == -1 && errno == EINVAL);
+        assert(profile_state(context, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_INIT);
+    }
+}
+
+static void check_generation_order(struct mrc_context *context)
+{
+    struct generated_profile skip_zero = generated_udp;
+    skip_zero.fields[0] = (struct mrc_ctl_ev_field){ .width = 16, .max_val = 2, .mask = 3 };
+    skip_zero.values[0] = 1;
+    skip_zero.values[1] = 2;
+    assert(configure_generated(context, skip_zero) == 0);
+    check_generated(context, &skip_zero);
+    assert(set_profile_state(context, skip_zero.id, MRC_CTL_PROFILE_INIT) == 0);
+
+    struct generated_profile mixed = generated_stev;
+    mixed.fields[1] = (struct mrc_ctl_ev_field){
+        .width = 16, .init_val = 0xe498, .min_val = 1, .max_val = 2, .mask = 3,
+    };
+    mixed.values[1] = 0x0a00e49a;
+    assert(configure_generated(context, mixed) == 0);
+    check_generated(context, &mixed);
+    assert(set_profile_state(context, mixed.id, MRC_CTL_PROFILE_INIT) == 0);
+}
+
+static void test_generated_profiles(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *controller = open_store(verbs, directory);
+    check_generated_errors(controller);
+    check_generation_order(controller);
+    assert(configure_generated(controller, generated_udp) == 0);
+    assert(configure_generated(controller, generated_stev) == 0);
+    assert(set_profile_state(controller, GEN_UDP_PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(set_profile_state(controller, GEN_STEV_PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(mrc_destroy_context(controller) == 0);
+    controller = open_store(verbs, directory);
+    assert(profile_state(controller, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_ONLINE);
+    assert(profile_state(controller, GEN_STEV_PROFILE_ID) == MRC_CTL_PROFILE_ONLINE);
+    check_generated(controller, &generated_udp);
+    check_generated(controller, &generated_stev);
+
+    struct mrc_ctl_ev_field field = generated_udp.fields[0];
+    field.init_val = 0xc500;
+    struct mrc_ctl_ev_profile_attr attr = generated_attributes(generated_udp.format, &field, 1);
+    assert(mrc_ctl_modify_ev_profile(controller, GEN_UDP_PROFILE_ID, &attr,
+                                     MRC_CTL_EV_PROFILE_EV_FIELDS_OP) == -1 && errno == EBUSY);
+    check_generated(controller, &generated_udp);
+
+    struct mrc_context *client = open_store(verbs, directory);
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    struct mrc_cq *cq = mrc_create_cq(client, 4, NULL, NULL, 0);
+    assert(pd && cq);
+    struct mrc_qp_init_attr init = {
+        .send_cq = cq, .pd = pd, .cap = { .max_send_wr = 1, .max_send_sge = 1 },
+    };
+    struct mrc_qp *qp = mrc_create_qp(client, &init);
+    assert(qp);
+    select_profile(qp, GEN_STEV_PROFILE_ID);
+    assert(set_profile_state(controller, GEN_STEV_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    struct mrc_ctl_ev varied = ev(2, generated_stev.values[1]);
+    set_ev_state(controller, GEN_STEV_PROFILE_ID, varied, MRC_CTL_EV_DENIED);
+    assert(get_ev_state(client, GEN_STEV_PROFILE_ID, varied) == MRC_CTL_EV_DENIED);
+    set_ev_state(controller, GEN_STEV_PROFILE_ID, varied, MRC_CTL_EV_GOOD);
+    assert(get_ev_state(client, GEN_STEV_PROFILE_ID, varied) == MRC_CTL_EV_GOOD);
+
+    assert(mrc_destroy_qp(qp) == 0);
+    assert(set_profile_state(controller, GEN_STEV_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
     assert(mrc_destroy_cq(cq) == 0);
     assert(ibv_dealloc_pd(pd) == 0);
     assert(mrc_destroy_context(client) == 0);
@@ -504,7 +693,7 @@ static void seed_denied_profile(struct mrc_context *controller)
         { .ev = ev(2, 0), .ev_new = ev(2, SECOND_EV), .state = MRC_CTL_EV_DENIED },
     };
     assert(replace_evs(controller, entries, RAILS) == 0);
-    assert(set_profile_state(controller, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
     printf("%u\n", (unsigned int)PROFILE_ID);
 }
 
@@ -515,9 +704,14 @@ int main(int argc, char **argv)
     bool unblock = argc == 3 && strcmp(argv[1], "--unblock") == 0;
     bool seed_cc = argc == 3 && strcmp(argv[1], "--seed-cc") == 0;
     bool seed_qa = argc == 3 && strcmp(argv[1], "--seed-qa") == 0;
-    if (argc != 1 && !expect_no_cap && !seed && !unblock && !seed_cc && !seed_qa) {
+    const struct generated_profile *generated = NULL;
+    if (argc == 3 && strcmp(argv[1], "--seed-gen") == 0)
+        generated = &generated_udp;
+    else if (argc == 3 && strcmp(argv[1], "--seed-gen-stev") == 0)
+        generated = &generated_stev;
+    if (argc != 1 && !expect_no_cap && !seed && !unblock && !seed_cc && !seed_qa && !generated) {
         fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | "
-                        "--seed-cc DIR | --seed-qa DIR]\n", argv[0]);
+                        "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR]\n", argv[0]);
         return EXIT_FAILURE;
     }
     struct ibv_context *verbs = open_supported_device();
@@ -525,13 +719,17 @@ int main(int argc, char **argv)
         fputs("The MRC controller ABI test needs an accessible Ethernet verbs device.\n", stderr);
         return EXIT_FAILURE;
     }
-    if (seed || unblock || seed_cc || seed_qa) {
+    if (seed || unblock || seed_cc || seed_qa || generated) {
         struct mrc_context *controller = open_store(verbs, argv[2]);
         if (seed) {
             seed_denied_profile(controller);
         } else if (unblock) {
-            assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
-            set_ev_state(controller, MRC_CTL_EV_GOOD);
+            assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+            set_ev_state(controller, PROFILE_ID, ev(2, SECOND_EV), MRC_CTL_EV_GOOD);
+        } else if (generated) {
+            assert(configure_generated(controller, *generated) == 0);
+            assert(set_profile_state(controller, generated->id, MRC_CTL_PROFILE_ONLINE) == 0);
+            printf("%u\n", generated->id);
         } else {
             unsigned int id = seed_qa ? QA_CC_PROFILE_ID : CC_PROFILE_ID;
             const struct mrc_ctl_cc_nscc_cfg *config = seed_qa ? &qa_config : &nscc_config;
@@ -549,7 +747,9 @@ int main(int argc, char **argv)
     struct mrc_context *controller = open_store(verbs, directory);
     if (expect_no_cap) {
         assert(configure_explicit(controller) == -1 && errno == EPERM);
-        assert(profile_state(controller) == MRC_CTL_PROFILE_INIT);
+        assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
+        assert(configure_generated(controller, generated_udp) == -1 && errno == EPERM);
+        assert(profile_state(controller, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_INIT);
         struct mrc_ctl_cc_profile_attr cc = {0};
         assert(mrc_ctl_query_cc_profile(controller, CC_PROFILE_ID, &cc,
                                         MRC_CTL_CC_PROFILE_CUR_STATE) == -1 && errno == EPERM);
@@ -559,6 +759,8 @@ int main(int argc, char **argv)
     } else {
         test_profile_lifecycle(verbs, controller, directory);
         puts("OCP controller EV profiles, live EV state, persistence, and QP leases passed");
+        test_generated_profiles(verbs, directory);
+        puts("OCP controller UDP and STEV generation, persistence, and QP leases passed");
         test_cc_lifecycle(verbs, directory);
         puts("OCP controller CC profiles, persistence, and QP leases passed");
         test_qa_lifecycle(verbs, directory);

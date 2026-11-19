@@ -157,7 +157,7 @@ position corresponds to its Table 7-3 reason code.
 
 The OCP controller ABI exposes device capabilities, built-in format queries,
 and profile configuration through `mrc_ctl.h`. This provider supports two
-rails and the AUTO and explicit EV modes. Select `MRC_DPDK_EV_FORMAT_UDP` for
+rails and the AUTO, explicit, and generated EV modes. Select `MRC_DPDK_EV_FORMAT_UDP` for
 a UDP source-port EV or `MRC_DPDK_EV_FORMAT_STEV` for an IPv6 flow label and
 UDP source-port EV. The first four bytes of a controller EV hold a big-endian
 value. The remaining bytes are zero. Port numbers 1 and 2 follow the attached
@@ -177,6 +177,20 @@ QP to INIT. The application retains the profile until reset or destruction.
 The controller can change GOOD and DENIED while the profile is in use.
 EV queries report administrative state. The transport tracks failure and
 congestion per QP.
+
+For generated mode, use `MRC_CTL_EV_MODE_GEN` with the built-in format
+ID, a count of two, and `MRC_CTL_EV_FIELDS_OP_MODIFY_FIELDS` when moving
+to OFFLINE. UDP uses one field. STEV uses two fields in flow-label suffix
+and UDP source-port order. Each occupies a 16-bit slot, and narrower
+fields are zero-padded. In each field, the compact values between
+`min_val` and `max_val` overwrite the masked bits of `init_val`.
+Use a zero mask and zero bounds for a fixed field.
+
+The provider chooses the first two valid combinations in increasing
+compact-value order, varying the UDP field fastest and skipping UDP
+source port zero. It assigns one EV to each rail and persists both the
+field definitions and the generated values. Query fields or the EV array
+before setting the profile ONLINE.
 
 The benchmark CLI uses the same storage. Create a private directory on the
 sender and bring a profile online.
