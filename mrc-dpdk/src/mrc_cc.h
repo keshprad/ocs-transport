@@ -48,6 +48,7 @@ struct mrc_cc_delay_window {
 
 struct mrc_cc_nscc {
     uint32_t max_wnd;
+    uint32_t saved_cwnd;
     uint64_t adjust_period_ns;
     uint32_t adjust_bytes_threshold;
     double eta;
@@ -97,6 +98,11 @@ struct mrc_cc_tx_sample {
     uint32_t retransmissions;
 };
 
+struct mrc_cc_receiver_flow {
+    uint8_t penalty;
+    bool restore;
+};
+
 struct mrc_cc_feedback {
     uint32_t newly_received_bytes;
     bool rtt_valid;
@@ -135,12 +141,13 @@ bool mrc_cc_ack_request(const struct mrc_cc *cc, uint32_t ack_trigger_bytes);
  * Use NULL for missing TX state or a probe response without a local timestamp.
  * ECN is the SACK SKIP mark, separate from an ALWAYS_SKIP path decision.
  * Fresh RTT/ECN feedback drives UE 1.0.1 §3.6.13 window updates. Quick adapt
- * and receiver window penalties are optional OCP signals outside this API.
- * The caller handles the recommended probe for obtaining an unloaded RTT.
+ * is optional. Pass receiver flow-control feedback even when the RTT
+ * sample is unavailable. The caller handles the recommended probe for
+ * obtaining an unloaded RTT.
  */
 bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
                     uint64_t arrive_ns, const struct mrc_cc_tx_sample *sample,
-                    struct mrc_cc_feedback *feedback);
+                    const struct mrc_cc_receiver_flow *flow, struct mrc_cc_feedback *feedback);
 
 /*
  * Declare each transmission lost at most once. Pass 0 to mrc_cc_on_nack if

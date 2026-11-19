@@ -246,6 +246,15 @@ controller can move the profile OFFLINE once all leases are released.
 An unset ID uses the built-in NSCC defaults. A CC query's configuration
 pointer is borrowed until the next configuration query on the same thread.
 
+An attached responder can use
+`mrc_dpdk_set_rx_flow_control(qp, penalty, restore)` to signal receiver
+congestion in its next SACKs. The penalty defaults to zero on each QP.
+Values from 1 through 127 reduce the NSCC requester's window according
+to the newly acknowledged byte count. Set the penalty back to zero to
+disable it. A zero penalty with `restore=true` asks the requester to
+restore the saved window. The application chooses when to set or clear
+the penalty.
+
 ### Concurrent three-Spark tests
 
 The cycle uses Spark-04 → Spark-02 → Spark-03 → Spark-04 on both Polatis

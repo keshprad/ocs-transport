@@ -8,7 +8,7 @@ The conformance target is the [OCP Multipath Reliable Connection 1.0 specificati
 | §§6.2.2, 7.5.5, wire format | Independent byte vectors for IPv4/UDP, IPv6/UDP, and preserved SRv6 envelopes, iCRC, WRITE with immediate and TSETH, AETH, SETH, NETH, and PETH. Independent pcap replays and live Python feedback verify IPv4, IPv6, and preserved SRv6 with or without a final SRH. Checks cover iCRC, structured EV reflection, CE marking, PSN wrap, packet rejection and receiver QP ERROR for valid requests with an unsupported opcode. Independent packet-buffer and TRIM NACKs trigger alternate-rail retry. | Interoperability with an external MRC implementation, transit routing on an independent SRv6 fabric, and remaining edge-case packet validation. |
 | §§7.2, 7.4–7.5, packet reliability | 24-bit PSN and window checks, wrap, selective SACK bitmaps, separate AETH, duplicate suppression, retransmit marking, logical timers, SACK-driven fast loss, reliability probe request/response matching and RTT sampling (probe exchanges observed on the Spark pair), and separately classified trimmed packets with TRIM NACK recovery. Negotiated Dynamic MPR advertises each change in SACKs and gates both first transmissions and retries, while preserving outstanding receive state. Over memif, all five mandatory Table 7-3 NACK reasons were generated and handled, including retry-budget exhaustion and terminal CQ overrun. | Independent live NACK interoperability and recovery after an actual port transition. Both receiver Sparks verified a 16 MiB WRITE after an injected path-1 blackhole. An independent memif peer checks alternate-rail retry on a packet-buffer NACK and confirms that a WRITEIMM credit stays occupied until a semantic ACK. Provider QP errors and typed send completions are verified for retry exhaustion and UNEXP_EVENT. Trim NACK generation and service time are capability-gated. |
 | §§7.3, 7.4.7–7.4.8, 7.5.6, endpoint operations | ERTH/EETH byte fixtures and two-rail Port Status Updates observed over memif and the Spark pair. An independent peer verifies reserved QPN 2, Control traffic class, echoed opaque 16-bit identifiers, fresh reports after a lost response, single-rail gating after a second report, and expiry when reports stop. | Physical port transitions and optional EV probe initiation. |
-| §8, congestion control | Nominal per-packet accounting, modulo 24-bit feedback, congestion-window admission and RTT/ECN-driven NSCC adjustments. The public QP binds an immutable ONLINE NSCC or disabled CC profile. Unit tests drive the configured maximum window, base RTT, target delay, thresholds, and increase and decrease parameters. | Deployment measurements, link-rate-derived tuning for custom profiles, and optional receiver penalty and quick adaptation. Verify ECN and trimming on a packet-switching fabric or with controlled injection. |
+| §§7.5.1, 8, congestion control | Nominal per-packet accounting, modulo 24-bit feedback, congestion-window admission and RTT/ECN-driven NSCC adjustments. The public QP binds an immutable ONLINE NSCC or disabled CC profile. Unit tests drive the configured maximum window, base RTT, target delay, thresholds, and increase and decrease parameters. The NSCC requester applies receiver-window penalties and restores the saved window on explicit feedback. Responder penalties can be set and cleared independently per QP. | Deployment measurements, link-rate-derived tuning for custom profiles, and optional quick adaptation. Verify ECN and trimming on a packet-switching fabric or with controlled injection. |
 | §§9–10, EVs and APIs | Two paths with configurable UDP source-port EVs, IPv6 flow-label reflection, preserved or already decapsulated SRv6 receive, and alternate-path retransmission. The OCP controller ABI queries device EV capacity and built-in UDP/STEV formats, applies persistent AUTO or explicit profile lifecycle and GOOD/DENIED operations, and gates mutations on CAP_NET_ADMIN. Public QPs lease ONLINE EV and CC profiles. The controller can update administrative EV state during transfer and query and configure CC profiles with CAP_NET_ADMIN. Active-only rotation distinguishes denied, congestion-skipped, and failed EVs. A fresh correlated probe can restore a failed EV. | Programmable EV formats, generated and SRv6 EV profiles, controller EV events and probes, and remaining controller operations. |
 
 ## Specification questions for interoperability
@@ -35,7 +35,11 @@ withholds a local report response, verifies a fresh periodic report,
 and gates the next WRITE with a zero mask. It exercises both an
 advertised path restoring progress and progress resuming after a
 refreshed zero mask expires. Replacement reports use a numerically
-lower identifier to exercise identifier opacity.
+lower identifier to exercise identifier opacity. Use
+`--flow-control-only` to isolate the receiver flow-control case.
+The peer applies a maximum penalty, withholds feedback to verify
+single-packet admission, then clears the penalty with restore and verifies
+that multiple packets can leave before the next SACK.
 
 `make tests/mrc_endpoint_application` and `python3 tests/check_mrc_application.py`
 verify that an application can start a DPDK requester on an empty provider
@@ -54,7 +58,10 @@ signaled send CQEs and two WRITEIMM receive CQEs. It verifies the
 solicited WRITEIMM wakes the completion channel and a subsequent ordinary
 WRITEIMM leaves a solicited-only arm pending. Its shared-port case crosses two bidirectional QPs per
 peer with separate registered destinations and completion IDs, then resets
-one QP and exchanges further WRITEIMM traffic on the surviving QP.
+one QP and exchanges further WRITEIMM traffic on the surviving QP. A
+separate two-QP case observes the penalty and restore bits in ordinary
+SACKs across four live settings and checks that changing one responder
+QP leaves the other's settings independent.
 
 `make check-mrc-abi` also verifies asynchronous event ordering and
 acknowledgement, nonblocking retrieval, object destruction, and the effect

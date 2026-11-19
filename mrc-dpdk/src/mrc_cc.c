@@ -230,7 +230,7 @@ static uint64_t add_bytes(uint64_t total, uint32_t additional)
 }
 
 static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
-                                 const struct mrc_cc_feedback *feedback)
+                                 const struct mrc_cc_feedback *feedback, bool receiver_limited)
 {
     struct mrc_cc_nscc *state = &cc->nscc;
     const uint64_t delay = feedback->queue_delay_ns;
@@ -286,7 +286,8 @@ static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
         double increase = state->inc_bytes / cc->cwnd;
         if (period_elapsed) {
             state->last_adjust_ns = now_ns;
-            increase += state->eta;
+            if (!receiver_limited)
+                increase += state->eta;
         }
         cc->cwnd = bounded_window(cc->cwnd + increase, mtu, state->max_wnd);
         state->inc_bytes = 0;
@@ -294,11 +295,32 @@ static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
     }
 }
 
+static void apply_receiver_flow(struct mrc_cc *cc, const struct mrc_cc_receiver_flow *flow,
+                                uint32_t newly_received)
+{
+    struct mrc_cc_nscc *state = &cc->nscc;
+    if (flow->penalty) {
+        if (!state->saved_cwnd)
+            state->saved_cwnd = cc->cwnd;
+        const int64_t inflight = cc->inflight;
+        const int64_t outstanding = inflight < cc->cwnd ? inflight : (int64_t)cc->cwnd;
+        const int64_t penalty = ((uint64_t)flow->penalty * newly_received) >> 7;
+        cc->cwnd = bounded_window(outstanding - penalty, cc->nominal_mtu, state->max_wnd);
+        /* Growth accrued before this feedback must not undo the limit. */
+        state->inc_bytes = 0;
+        state->fast_bytes = 0;
+        state->increase_mode = false;
+    } else if (flow->restore && state->saved_cwnd) {
+        cc->cwnd = bounded_window(state->saved_cwnd, cc->nominal_mtu, state->max_wnd);
+        state->saved_cwnd = 0;
+    }
+}
+
 bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
                     uint64_t arrive_ns, const struct mrc_cc_tx_sample *sample,
-                    struct mrc_cc_feedback *feedback)
+                    const struct mrc_cc_receiver_flow *flow, struct mrc_cc_feedback *feedback)
 {
-    if (rcvd_bytes > MRC_CC_RECVD_MASK)
+    if (rcvd_bytes > MRC_CC_RECVD_MASK || (flow && flow->penalty > 127))
         return false;
 
     struct mrc_cc_feedback result = {0};
@@ -317,15 +339,19 @@ bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
     }
 
     if (cc->algorithm == MRC_CC_NSCC) {
+        const bool receiver_limited = flow && flow->penalty;
+        if (flow)
+            apply_receiver_flow(cc, flow, result.newly_received_bytes);
         cc->nscc.received_bytes = add_bytes(cc->nscc.received_bytes, result.newly_received_bytes);
         if (!cc->nscc.clock_started || arrive_ns >= cc->nscc.last_ack_ns)
             result.rtt_ns = measure_rtt(cc, arrive_ns, sample, rtx);
         if (result.rtt_ns) {
             result.rtt_valid = true;
             result.queue_delay_ns = result.rtt_ns - cc->base_rtt_ns;
-            result.adjustment = classify_adjustment(ecn, result.queue_delay_ns,
-                                                    cc->target_queue_delay_ns);
-            apply_ack_adjustment(cc, arrive_ns, &result);
+            if (ecn || !receiver_limited)
+                result.adjustment = classify_adjustment(ecn, result.queue_delay_ns,
+                                                       cc->target_queue_delay_ns);
+            apply_ack_adjustment(cc, arrive_ns, &result, receiver_limited);
         }
     }
     if (feedback)

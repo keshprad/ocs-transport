@@ -50,12 +50,12 @@ def check_live_profile(binary, controller):
         print(json.dumps({"case": "public_qp_live_ev_update", "tx": tx, "rx": rx}))
 
 
-def check_duplex(tx, rx):
+def check_duplex(tx, rx, completions=3):
     require(len(set(tx["qpns"] + rx["qpns"])) == 4,
             f"The connected QPs need distinct QPNs: {tx}, {rx}")
     for result in (tx, rx):
-        require(result["bytes"] == 3 * 2049 and result["send_completions"] == 3
-                and result["recv_completions"] == 3 and result["reset_qpn"] == result["qpns"][0],
+        require(result["bytes"] == completions * 2049 and result["send_completions"] == completions
+                and result["recv_completions"] == completions and result["reset_qpn"] == result["qpns"][0],
                 f"Unexpected public bidirectional QP results: {result}")
 
 
@@ -89,6 +89,10 @@ def main():
     tx, rx = run_case("duplex")
     check_duplex(tx, rx)
     print(json.dumps({"case": "public_bidirectional_qps_over_shared_dpdk_ports", "tx": tx, "rx": rx}))
+
+    tx, rx = run_case("rx_flow_control")
+    check_duplex(tx, rx, completions=8)
+    print(json.dumps({"case": "public_qp_receiver_flow_control", "tx": tx, "rx": rx}))
 
     tx, rx = run_case("wire_error")
     require(tx["qpn"] != rx["qpn"] and tx["qp_fatal"] and rx["qp_fatal"]

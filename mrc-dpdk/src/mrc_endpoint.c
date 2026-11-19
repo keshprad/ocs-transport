@@ -103,6 +103,7 @@ struct mrc_responder {
     uint8_t slots[WINDOW];
     uint32_t unique_packets;
     struct mrc_cc_rx cc;
+    struct mrc_cc_receiver_flow flow;
 };
 
 static uint32_t request_index(const struct mrc_endpoint_config *transfer, uint32_t packet)
@@ -712,8 +713,11 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
                 rtt_sample = &sample;
             }
         }
+        const struct mrc_cc_receiver_flow flow = {
+            .penalty = wire->rcv_cwnd_pen, .restore = wire->restore_cwnd,
+        };
         if (!mrc_cc_on_sack(&sender->cc, wire->rcvd_bytes, wire->mark == MRC_SACK_SKIP,
-                            packet->bth.retransmit, now, rtt_sample, NULL))
+                            packet->bth.retransmit, now, rtt_sample, &flow, NULL))
             return -EPROTO;
 
         int32_t highest = mrc_psn_delta(sack.cack_psn, transfer->initial_psn);
@@ -963,6 +967,7 @@ static void send_sack(const struct mrc_endpoint_config *transfer, struct mrc_res
         .sack_offset = state.sack_offset,
         .bitmap = state.bitmap, .ooo_count = state.ooo_count,
         .rcvd_bytes = mrc_cc_rx_wire_count(&receiver->cc),
+        .rcv_cwnd_pen = receiver->flow.penalty, .restore_cwnd = receiver->flow.restore,
     };
     if (probe && request->body.probe.timestamp)
         packet.body.sack.tx_timestamp = request->body.probe.tx_timestamp;
@@ -1583,6 +1588,14 @@ static int responder_step(struct mrc_responder *receiver)
                 receiver->qp.cack_psn, receiver->qp.max_rcv_psn);
         return -ETIMEDOUT;
     }
+    return 0;
+}
+
+int mrc_responder_set_flow_control(struct mrc_responder *responder, uint8_t penalty, bool restore)
+{
+    if (!responder || penalty > 127)
+        return -EINVAL;
+    responder->flow = (struct mrc_cc_receiver_flow){ .penalty = penalty, .restore = restore };
     return 0;
 }
 

@@ -402,6 +402,18 @@ unlock:
     return error;
 }
 
+MRC_PUBLIC int mrc_dpdk_set_rx_flow_control(struct mrc_qp *qp, uint8_t penalty, bool restore)
+{
+    if (!qp || penalty > 127)
+        return EINVAL;
+    pthread_mutex_lock(&qp->mutex);
+    int error = ENOTCONN;
+    if (qp->route && qp->route->response)
+        error = -mrc_responder_set_flow_control(qp->route->response, penalty, restore);
+    pthread_mutex_unlock(&qp->mutex);
+    return error;
+}
+
 MRC_PUBLIC int mrc_dpdk_progress_qp(struct mrc_qp *qp)
 {
     if (!qp)

@@ -49,4 +49,10 @@ struct mrc_dpdk_route {
 int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route);
 int mrc_dpdk_progress_qp(struct mrc_qp *qp);
 
+/* Advertise a 0-127 receiver window penalty in subsequent SACKs for this
+ * attached responder QP. Zero disables the penalty. Set restore with zero
+ * to request restoration of the peer's saved congestion window. This call
+ * returns zero or a positive errno. */
+int mrc_dpdk_set_rx_flow_control(struct mrc_qp *qp, uint8_t penalty, bool restore);
+
 #endif

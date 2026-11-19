@@ -30,6 +30,9 @@ enum {
     SECOND_IMMEDIATE = 0x12345678,
     DUPLEX_QPS = 2,
     DUPLEX_BYTES = 2049,
+    RX_FLOW_ROUNDS = 4,
+    RX_FLOW_RESTORE = 0x80,
+    RX_FLOW_PENALTY_MASK = 0x7f,
 };
 
 struct address {
@@ -567,6 +570,22 @@ static void marker_name(char out[32], bool client, unsigned int round, const cha
     assert(count > 0 && count < 32);
 }
 
+static const uint8_t *read_tx_udp(struct rte_mbuf *packet, uint8_t *prefix,
+                                  size_t capacity, size_t *udp_bytes)
+{
+    size_t length = rte_pktmbuf_pkt_len(packet);
+    if (length > capacity)
+        length = capacity;
+    const uint8_t *frame = rte_pktmbuf_read(packet, 0, length, prefix);
+    assert(frame && length >= 14 + 20 + 8 + 12);
+    uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
+    assert(ether_type == RTE_ETHER_TYPE_IPV4 || ether_type == RTE_ETHER_TYPE_IPV6);
+    size_t udp = 14 + (ether_type == RTE_ETHER_TYPE_IPV4 ? (frame[14] & 0x0f) * 4 : 40);
+    assert(udp + 8 + 12 <= length);
+    *udp_bytes = length - udp;
+    return frame + udp;
+}
+
 struct cc_window_witness {
     unsigned int writes;
     uint8_t first_flags;
@@ -582,23 +601,16 @@ static uint16_t observe_write_frames(uint16_t port, uint16_t queue, struct rte_m
     for (uint16_t i = 0; i < count; i++) {
         /* Ethernet + IPv6 + UDP + BTH, enough for either plain IP family. */
         uint8_t prefix[14 + 40 + 8 + 12];
-        size_t length = rte_pktmbuf_pkt_len(packets[i]);
-        if (length > sizeof(prefix))
-            length = sizeof(prefix);
-        const uint8_t *frame = rte_pktmbuf_read(packets[i], 0, length, prefix);
-        assert(frame && length >= 14 + 20 + 8 + 12);
-        uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
-        assert(ether_type == RTE_ETHER_TYPE_IPV4 || ether_type == RTE_ETHER_TYPE_IPV6);
-        size_t udp = 14 + (ether_type == RTE_ETHER_TYPE_IPV4 ? (frame[14] & 0x0f) * 4 : 40);
-        assert(udp + 8 + 12 <= length);
-        const uint8_t *bth = frame + udp + 8;
+        size_t udp_bytes;
+        const uint8_t *udp = read_tx_udp(packets[i], prefix, sizeof(prefix), &udp_bytes);
+        const uint8_t *bth = udp + 8;
         /* Observe each original WRITE and ignore probes, ACKs, and retries. */
         if (bth[0] < 0xc6 || bth[0] > 0xcb || (bth[8] & 0x20))
             continue;
         if (++observed->writes == 1) {
             assert(bth[0] == 0xc6);
             observed->first_flags = bth[8];
-            observed->first_udp_length = ((uint16_t)frame[udp + 4] << 8) | frame[udp + 5];
+            observed->first_udp_length = ((uint16_t)udp[4] << 8) | udp[5];
         }
     }
     return count;
@@ -698,9 +710,93 @@ static void duplex_round(struct duplex_qp *qps, const struct connection *local,
     } while (!done || access(their_done, F_OK) != 0);
 }
 
+struct rx_flow_witness {
+    const struct connection *peer;
+    uint8_t expected[DUPLEX_QPS];
+    unsigned int data_sacks;
+};
+
+static uint16_t observe_sack_frames(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                     uint16_t count, void *argument)
+{
+    (void)port;
+    (void)queue;
+    struct rx_flow_witness *observed = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        /* Ethernet + IPv6 + UDP + BTH + SETH + CC State. */
+        uint8_t prefix[14 + 40 + 8 + 12 + 28 + 8];
+        size_t udp_bytes;
+        const uint8_t *udp = read_tx_udp(packets[i], prefix, sizeof(prefix), &udp_bytes);
+        const uint8_t *bth = udp + 8;
+        if (bth[0] != 0xdc)
+            continue;
+
+        assert(udp_bytes >= 8 + 12 + 28 + 8);
+        uint32_t qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
+        unsigned int index = 0;
+        while (index < DUPLEX_QPS && observed->peer[index].qpn != qpn)
+            index++;
+        assert(index < DUPLEX_QPS);
+
+        const uint8_t *seth = bth + 12;
+        const uint8_t *cc_state = seth + 28;
+        bool probe = (seth[1] & 0x02) != 0;
+        if (cc_state[4] != observed->expected[index]) {
+            fprintf(stderr, "QPN %u %sSACK CC State byte was 0x%02x, expected 0x%02x\n",
+                    qpn, probe ? "probe " : "", cc_state[4], observed->expected[index]);
+            abort();
+        }
+        if (!probe)
+            observed->data_sacks |= 1u << index;
+    }
+    return count;
+}
+
+static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
+                          const struct connection *peer, struct mrc_cq *send_cq,
+                          struct mrc_cq *recv_cq, const char *directory, bool client)
+{
+    static const uint8_t settings[RX_FLOW_ROUNDS][DUPLEX_QPS] = {
+        {RX_FLOW_RESTORE | RX_FLOW_PENALTY_MASK, 0},
+        {RX_FLOW_RESTORE | RX_FLOW_PENALTY_MASK, 31},
+        {RX_FLOW_RESTORE, 31},
+        {0, 0},
+    };
+    const unsigned int both_qps = (1u << DUPLEX_QPS) - 1;
+    struct rx_flow_witness observed = {.peer = peer};
+    const struct rte_eth_rxtx_callback *callbacks[2];
+    for (uint16_t port = 0; port < 2; port++) {
+        callbacks[port] = rte_eth_add_tx_callback(port, 0, observe_sack_frames, &observed);
+        assert(callbacks[port]);
+    }
+
+    assert(mrc_dpdk_set_rx_flow_control(NULL, 0, false) == EINVAL);
+    for (unsigned int round = 0; round < RX_FLOW_ROUNDS; round++) {
+        observed.data_sacks = 0;
+        for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
+            uint8_t setting = settings[round][index];
+            if (setting == observed.expected[index])
+                continue;
+            assert(mrc_dpdk_set_rx_flow_control(qps[index].qp, setting & RX_FLOW_PENALTY_MASK,
+                                               (setting & RX_FLOW_RESTORE) != 0) == 0);
+            observed.expected[index] = setting;
+        }
+        if (round == 0)
+            assert(mrc_dpdk_set_rx_flow_control(qps[0].qp, 128, false) == EINVAL);
+        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, round, 0, false);
+        assert(observed.data_sacks == both_qps);
+    }
+
+    for (uint16_t port = 0; port < 2; port++) {
+        assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
+        /* This thread is the only TX poller, so no callback can still be running. */
+        rte_free((void *)callbacks[port]);
+    }
+}
+
 static void run_duplex(bool client, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                       const char *profile_store, uint64_t cc_profile_id)
+                       const char *profile_store, uint64_t cc_profile_id, bool rx_flow)
 {
     if (client && cc_profile_id)
         assert(mrc_dpdk_set_ev_store(context, profile_store) == 0);
@@ -741,16 +837,26 @@ static void run_duplex(bool client, const char *directory, const struct address 
     for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
         configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true, 0,
                      client ? cc_profile_id : 0);
+        if (rx_flow)
+            assert(mrc_dpdk_set_rx_flow_control(qps[index].qp, 1, false) == ENOTCONN);
         attach_qp(qps[index].qp, &route);
     }
 
-    duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0, cc_profile_id != 0);
+    if (rx_flow)
+        check_rx_flow(qps, local, peer, send_cq, recv_cq, directory, client);
+    else
+        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0, cc_profile_id != 0);
+
     struct ibv_qp_attr reset = { .qp_state = IBV_QPS_RESET };
     assert(mrc_modify_qp(qps[0].qp, &reset, IBV_QP_STATE, NULL, 0) == 0);
     assert(mrc_dpdk_progress_qp(qps[0].qp) == ENOTCONN);
-    duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 1, 1, false);
-    for (size_t offset = 0; offset < sizeof(qps[0].received); offset++)
-        assert(qps[0].received[offset] == duplex_pattern(offset, 0, 0, !client));
+    if (rx_flow) {
+        assert(mrc_dpdk_set_rx_flow_control(qps[0].qp, 1, false) == ENOTCONN);
+    } else {
+        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 1, 1, false);
+        for (size_t offset = 0; offset < sizeof(qps[0].received); offset++)
+            assert(qps[0].received[offset] == duplex_pattern(offset, 0, 0, !client));
+    }
 
     for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
         assert(mrc_destroy_qp(qps[index].qp) == 0);
@@ -759,9 +865,10 @@ static void run_duplex(bool client, const char *directory, const struct address 
     }
     assert(mrc_destroy_cq(send_cq) == 0);
     assert(mrc_destroy_cq(recv_cq) == 0);
-    printf("{\"role\":\"%s\",\"bytes\":%u,\"send_completions\":3,\"recv_completions\":3,"
+    unsigned int completions = rx_flow ? RX_FLOW_ROUNDS * DUPLEX_QPS : 3;
+    printf("{\"role\":\"%s\",\"bytes\":%u,\"send_completions\":%u,\"recv_completions\":%u,"
            "\"qpns\":[%u,%u],\"reset_qpn\":%u}\n",
-           client ? "tx" : "rx", (unsigned int)(3 * DUPLEX_BYTES),
+           client ? "tx" : "rx", completions * DUPLEX_BYTES, completions, completions,
            local[0].qpn, local[1].qpn, local[0].qpn);
 }
 
@@ -775,7 +882,8 @@ int main(int argc, char **argv)
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
-    bool bidirectional = cc_profile || strcmp(argv[3], "duplex") == 0;
+    bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
+    bool bidirectional = cc_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
     bool ev_profile = strcmp(argv[3], "ev_profile") == 0;
     const char *profile_store = NULL;
@@ -809,7 +917,7 @@ int main(int argc, char **argv)
     }
 
     if (bidirectional)
-        run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id);
+        run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, rx_flow);
     else
         run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store, profile_id);
 

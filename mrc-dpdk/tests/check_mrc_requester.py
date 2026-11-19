@@ -56,6 +56,9 @@ def payload(offset, length):
 
 
 class ReferenceResponder:
+    write_lengths = WRITE_LENGTHS
+    opcodes = OPCODES
+
     def __init__(self, wire, mode, nack_reason):
         self.wire = wire
         self.nack_reason = nack_reason
@@ -68,7 +71,7 @@ class ReferenceResponder:
                    for mac in macs]
             for role, macs in MACS.items()
         }
-        self.memory = bytearray(sum(WRITE_LENGTHS))
+        self.memory = bytearray(sum(self.write_lengths))
         self.received = set()
         self.cumulative = -1
         self.received_bytes = 0
@@ -94,7 +97,7 @@ class ReferenceResponder:
                                 original_udp_size=original_udp_size)
         self.wire.send(bytes([rail]) + frame)
 
-    def sack(self, rail, packet, index=None, probe_id=None, timestamp=0):
+    def sack(self, rail, packet, index=None, probe_id=None, timestamp=0, *, penalty=0, restore=False):
         # The first bitmap bit represents CACK + 1.
         bitmap = 0
         for received in self.received:
@@ -108,7 +111,8 @@ class ReferenceResponder:
                            packet.entropy, *PDC_IDS)
         body += struct.pack("!IBBhQ", cack, 0, 0, 1, bitmap)
         wire_bytes = ((self.received_bytes + 255) // 256) & PSN_MASK
-        body += struct.pack("!HHI", timestamp, ooo_count, wire_bytes)
+        flow_control = (0x80 if restore else 0) | penalty
+        body += struct.pack("!HHI", timestamp, ooo_count, flow_control << 24 | wire_bytes)
         number = 0 if probe_id is not None else cack
         self.reply(rail, 0xDC, number, body, packet.bth.flags & RTX)
 
@@ -118,7 +122,7 @@ class ReferenceResponder:
 
     def write(self, rail, packet):
         index = (packet.bth.psn - INITIAL_PSN) & PSN_MASK
-        require(index < len(OPCODES) and packet.bth.opcode == OPCODES[index],
+        require(index < len(self.opcodes) and packet.bth.opcode == self.opcodes[index],
                 f"Unexpected WRITE opcode {packet.bth.opcode:#x} for packet {index}")
         is_retry = bool(packet.bth.flags & RTX)
         require(not (packet.bth.flags & 0x10), "Unexpected TSETH on benchmark WRITE")
@@ -126,11 +130,11 @@ class ReferenceResponder:
         require(wr == 0 or self.first_write_acked,
                 "WRITEIMM used its receive credit after only a reliability SACK")
         rqmsn, msn, address, rkey, length = struct.unpack_from("!HHQII", packet.body)
-        offset = index * 1024 if wr == 0 else WRITE_LENGTHS[0]
-        remaining = WRITE_LENGTHS[wr] - (offset if wr == 0 else 0)
-        data_length = min(remaining, 1024)
+        segment = index if wr == 0 else index - FIRST_WRITE_END - 1
+        offset = segment * 1024 + (self.write_lengths[0] if wr else 0)
+        data_length = min(self.write_lengths[wr] - segment * 1024, 1024)
         require((rqmsn, msn, address, rkey, length) ==
-                (wr + 1, wr + 1, ADDRESS + offset, RKEY, WRITE_LENGTHS[wr]),
+                (wr + 1, wr + 1, ADDRESS + offset, RKEY, self.write_lengths[wr]),
                 f"Incorrect METH or RETH on WRITE packet {index}")
         at = 20
         if packet.bth.opcode in (0xC9, 0xCB):
@@ -169,10 +173,16 @@ class ReferenceResponder:
         self.received_bytes += packet.udp_size + 40
         while self.cumulative + 1 in self.received:
             self.cumulative += 1
+        self.acknowledge_write(rail, packet, index)
+
+    def acknowledge_write(self, rail, packet, index):
         self.sack(rail, packet, index=index)
-        if self.cumulative == len(OPCODES) - 1:
+        if self.cumulative == len(self.opcodes) - 1:
             self.transport_ack(rail, 2)
             self.finished = True
+
+    def acknowledge_probe(self, rail, packet, token, timestamp):
+        self.sack(rail, packet, probe_id=token, timestamp=timestamp)
 
     def port_status_request(self, rail, token, mask):
         self.reply(rail, ENDPOINT_RESPONSE, token, bytes(36))
@@ -181,6 +191,9 @@ class ReferenceResponder:
         raise RuntimeError(f"Unexpected Port Status response on rail {rail} for identifier {token:#06x}")
 
     def tick(self, now):
+        pass
+
+    def idle(self):
         pass
 
     def receive(self, message):
@@ -218,7 +231,7 @@ class ReferenceResponder:
                     "Invalid PETH identifiers")
             token, = struct.unpack_from("!H", packet.body, 4)
             timestamp, = struct.unpack_from("!H", packet.body, 12)
-            self.sack(rail, packet, probe_id=token, timestamp=timestamp)
+            self.acknowledge_probe(rail, packet, token, timestamp)
         else:
             self.write(rail, packet)
 
@@ -300,7 +313,65 @@ class PortStatusResponder(ReferenceResponder):
             self.advertise(self.BLOCK_TOKEN, 0)
 
 
-def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=None):
+class FlowControlResponder(ReferenceResponder):
+    write_lengths = (WRITE_LENGTHS[0], 7169)
+    opcodes = OPCODES[:FIRST_WRITE_END + 1] + (0xC6,) + (0xC7,) * 6 + (0xC9,)
+    PENALTY = 127
+
+    def __init__(self, wire, mode):
+        super().__init__(wire, mode, nack_reason=None)
+        self.held_packet = None
+        self.restore_at = None
+        self.restricted_stages = 0
+        self.restored_full_packets = 0
+
+    def acknowledge_probe(self, rail, packet, token, timestamp):
+        # A probe response would also return byte credits during the observation.
+        if not self.first_write_acked:
+            super().acknowledge_probe(rail, packet, token, timestamp)
+
+    def acknowledge_write(self, rail, packet, index):
+        if index <= FIRST_WRITE_END:
+            if self.cumulative == FIRST_WRITE_END:
+                self.sack(rail, packet, index=index, penalty=self.PENALTY, restore=True)
+                # Both messages use the same rail, so the penalty precedes the credit.
+                self.transport_ack(rail, 1)
+                self.first_write_acked = True
+            else:
+                super().acknowledge_write(rail, packet, index)
+        elif self.restore_at is None:
+            require(self.held_packet is None and index == FIRST_WRITE_END + 1 + self.restricted_stages,
+                    f"Receiver penalty allowed more than one outstanding WRITE packet at index {index}")
+            require(packet.bth.flags & 0x80, f"Flow-controlled WRITE packet {index} did not request an ACK")
+            self.held_packet = (rail, packet, index)
+        else:
+            if self.restored_full_packets < 2:
+                if index < len(self.opcodes) - 1:
+                    self.restored_full_packets += 1
+                if self.restored_full_packets < 2:
+                    return
+            super().acknowledge_write(rail, packet, index)
+
+    def idle(self):
+        if self.held_packet is None:
+            return
+        # Poll to a quiet interval before returning any credit for this packet.
+        rail, packet, index = self.held_packet
+        self.held_packet = None
+        self.restricted_stages += 1
+        if self.restricted_stages == 1:
+            self.sack(rail, packet, index=index, penalty=self.PENALTY)
+        else:
+            self.restore_at = time.monotonic()
+            self.sack(rail, packet, index=index, restore=True)
+
+    def tick(self, now):
+        if self.restore_at is not None and now - self.restore_at > 0.4:
+            require(self.restored_full_packets == 2,
+                    "Zero penalty with restore did not reopen room for multiple outstanding WRITE packets")
+
+
+def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=None, flow_control=False):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -323,14 +394,20 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=N
                 time.sleep(0.01)
             wire.connect(str(relay_socket))
             command = eal_args(binary, "tx", cpus[1], directory)
-            responder = (ReferenceResponder(wire, mode, nack_reason) if port_status is None else
-                         PortStatusResponder(wire, mode, expire=port_status == "expire"))
-            command += ["--", "tx", "4111@0xffffffff,7@0x6b",
+            if flow_control:
+                responder = FlowControlResponder(wire, mode)
+            elif port_status is not None:
+                responder = PortStatusResponder(wire, mode, expire=port_status == "expire")
+            else:
+                responder = ReferenceResponder(wire, mode, nack_reason)
+            writes = ",".join(f"{length}@{immediate:#x}"
+                              for length, immediate in zip(responder.write_lengths, WRITE_IMMEDIATES))
+            command += ["--", "tx", writes,
                         str(responder.addresses["tx"]), str(responder.addresses["rx"]),
                         "0", MACS["rx"][0], "1", MACS["rx"][1], "--initial-psn", str(INITIAL_PSN),
                         "--requestor-qpn", hex(REQUESTOR), "--responder-qpn", hex(RESPONDER),
                         "--p-key", hex(PKEY), "--remote-address", hex(ADDRESS), "--remote-key", hex(RKEY),
-                        "--ack-timeout", "16" if port_status is None else "20",
+                        "--ack-timeout", "16" if nack_reason is not None else "20",
                         "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
             if responder.srv6:
                 command += ["--srv6-local", str(SIDS["tx"]), "--srv6-peer", str(SIDS["rx"])]
@@ -350,26 +427,34 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=N
                     if relay.poll() is not None:
                         _, error = relay.communicate()
                         raise RuntimeError(f"memif relay exited during exchange\n{error}")
+                    responder.idle()
                     continue
                 responder.receive(message)
 
             counters = collect(requester)
-            require(responder.memory == payload(0, sum(WRITE_LENGTHS)), "Incomplete peer memory placement")
-            require(counters["bytes"] == sum(WRITE_LENGTHS) and counters["packets"] == len(OPCODES) and
-                    counters["probe_replies"] > 0 and counters["transport_acks"] == 2 and
+            total = sum(responder.write_lengths)
+            require(responder.memory == payload(0, total), "Incomplete peer memory placement")
+            require(counters["bytes"] == total and counters["packets"] == len(responder.opcodes) and
+                    (flow_control or counters["probe_replies"] > 0) and counters["transport_acks"] == 2 and
                     counters["write_completions"] == 2,
                     f"Unexpected requester counters: {counters}")
-            if port_status is None:
+            if nack_reason is not None:
                 require(responder.retry_rail is not None and responder.first_write_acked,
                         "Fixture did not exercise both retransmission and delayed semantic completion")
                 require(counters["nack_received_mask"] == 1 << nack_reason and
                         counters["trim_nacks"] == (nack_reason == TRIM),
                         f"Unexpected NACK counters: {counters}")
-            else:
+            elif port_status is not None:
                 require(counters["port_status_updates"] == 2 and counters["port_status_replies"] == 1,
                         f"Unexpected Port Status counters: {counters}")
                 counters["status_report_interval_ms"] = round(1000 * responder.report_interval)
                 counters["status_resume_delay_ms"] = round(1000 * responder.resume_delay)
+            else:
+                require(responder.restricted_stages == 2 and responder.restored_full_packets == 2
+                        and not any(counters["retries"]) and counters["nack_received_mask"] == 0,
+                        f"Unexpected receiver flow-control observations: {counters}")
+                counters["single_packet_stages"] = responder.restricted_stages
+                counters["restored_full_packets_before_feedback"] = responder.restored_full_packets
             wire.send(b"")
             _, error = relay.communicate(timeout=3)
             require(relay.returncode == 0, f"memif relay failed\n{error}")
@@ -388,19 +473,25 @@ def main():
     parser.add_argument("--binary", type=Path, default=root / "mrc_write")
     parser.add_argument("--relay", type=Path, default=root / "tests" / "mrc_memif_relay")
     parser.add_argument("--mode", choices=MODES, action="append", help="Run only this mode")
-    parser.add_argument("--port-status-only", action="store_true", help="Run only the Port Status cases")
+    focused = parser.add_mutually_exclusive_group()
+    focused.add_argument("--port-status-only", action="store_true", help="Run only the Port Status cases")
+    focused.add_argument("--flow-control-only", action="store_true", help="Run only the responder flow-control case")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
     binary, relay = args.binary.resolve(), args.relay.resolve()
-    if not args.port_status_only:
+    if not args.port_status_only and not args.flow_control_only:
         for mode in args.mode or MODES:
             for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim")):
                 counters = run_requester(binary, relay, mode, reason)
                 print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
     mode = (args.mode or ("ipv6",))[0]
-    for case in ("replace", "expire"):
-        counters = run_requester(binary, relay, mode, port_status=case)
-        print(json.dumps({"mode": mode, "port_status": case, **counters}))
+    if not args.flow_control_only:
+        for case in ("replace", "expire"):
+            counters = run_requester(binary, relay, mode, port_status=case)
+            print(json.dumps({"mode": mode, "port_status": case, **counters}))
+    if not args.port_status_only:
+        counters = run_requester(binary, relay, mode, flow_control=True)
+        print(json.dumps({"mode": mode, "flow_control": "penalty_and_restore", **counters}))
 
 
 if __name__ == "__main__":
