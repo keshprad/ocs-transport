@@ -11,7 +11,7 @@ from memif_pair import MACS, eal_args, require, run_pair
 
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
              trim_after=None, ipv6=False, work_requests=1, posted_receives=None,
-             expected_errors=None, negotiate=False, srv6=False):
+             expected_errors=None, negotiate=False, srv6=False, tx_options=(), rx_options=()):
     oob_port = None
     if negotiate:
         with socket.socket() as reserve:
@@ -47,7 +47,7 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
             args += ["--drop-final-acks", str(drop_final_acks)]
         if not tx and posted_receives is not None:
             args += ["--posted-receives", str(posted_receives)]
-        return args
+        return args + list(tx_options if tx else rx_options)
 
     tx, rx, _ = run_pair(command, expected_errors=expected_errors)
     if expected_errors:
@@ -84,7 +84,8 @@ def main():
     print(json.dumps({"case": "write_imm_lost_transport_ack", "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 4194304)
-    require(tx["sent"] == [2048, 2048], f"Healthy striping mismatch: {tx}")
+    require(all(sent >= 1920 for sent in tx["sent"]),
+            f"Healthy traffic was not distributed over both paths: {tx}")
     require(tx["sacks"] > 0 and tx["retries"] == [0, 0], "Healthy transfer did not receive SACKs")
     require(rx["port_status_updates"] > 0 and tx["port_status_replies"] > 0,
             "Node-scoped port status was not acknowledged")
@@ -94,7 +95,8 @@ def main():
 
     tx, rx = transfer(binary, 4194301, "--immediate", "305419896",
                       "--initial-psn", "16777214", drop_after=512)
-    require(tx["dropped"] > 0 and tx["retries"][0] >= tx["dropped"],
+    require(tx["dropped"] > 0 and tx["retries"][0] >= tx["dropped"] and
+            tx["retries"][1] == 0 and tx["ev_failed"] > 0 and tx["ev_recovered"] == 0,
             "Blackhole did not recover the dropped segments through path 0")
     require(rx["reorder_max"] > 0 and rx["immediate_completed"],
             "Reordered WRITEIMM did not complete after placement")
@@ -131,6 +133,32 @@ def main():
     require(rx["trimmed"] > 0 and tx["trim_nacks"] > 0 and rx["immediate_completed"],
             f"Preserved SRv6 wrapper or outer trim recovery failed: {tx}, {rx}")
     print(json.dumps({"case": "srv6_write_imm_trim_nack", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 1048576, tx_options=("--deny-path-mask", "2"))
+    require(tx["sent"] == [1024, 0] and rx["received"] == [1024, 0],
+            f"Data was sent on a denied entropy value: {tx}, {rx}")
+    require(tx["probe_sent"][0] > 0 and tx["probe_sent"][1] == 0,
+            "The denied entropy value was probed or no active path was probed")
+    print(json.dumps({"case": "denied_ev", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 16777216, "--ack-timeout", "13", drop_after=512,
+                      tx_options=("--restore-path-after", "2048"))
+    require(tx["ev_failed"] > 0 and tx["ev_recovered"] > 0 and rx["received"][1] > 256,
+            f"Path 1 did not rejoin the active set after a correlated probe: {tx}, {rx}")
+    print(json.dumps({"case": "recovered_ev", "tx": tx, "rx": rx}))
+
+    change = ("--dynamic-mpr", "1", "--mpr", "8", "--mpr-change-at", "65",
+              "--mpr-change-to", "1")
+    tx, rx = transfer(binary, 4194304, negotiate=True, tx_options=("--dynamic-mpr", "1"),
+                      rx_options=change)
+    require(tx["mpr_updates"] == rx["mpr_updates"] == 1,
+            f"Peers did not apply the negotiated receive-window shrink: {tx}, {rx}")
+    print(json.dumps({"case": "dynamic_mpr_shrink", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 1048576, negotiate=True, rx_options=change)
+    require(tx["mpr_updates"] == rx["mpr_updates"] == 0,
+            "The receive window changed without bilateral capability negotiation")
+    print(json.dumps({"case": "dynamic_mpr_not_negotiated", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":

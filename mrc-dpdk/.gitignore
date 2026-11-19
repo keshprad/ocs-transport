@@ -5,3 +5,6 @@
 /tests/test_mrc_cc
 /tests/test_mrc_wr
 /tests/test_mrc_connect
+/tests/test_mrc_ev
+/tests/test_mrc_mpr
+/tests/test_mrc_provider

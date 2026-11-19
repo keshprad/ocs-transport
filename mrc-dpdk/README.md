@@ -26,7 +26,16 @@ to bind. On the sender, it is the receiver's management address. The peers
 exchange QPN, initial PSN, receive limits, P_Key, trim capability, and
 registered-memory information before the data transfer. The exchange record
 is specific to this benchmark. OCP leaves the out-of-band encoding to the
-application.
+application. To exercise Dynamic MPR, pass `--dynamic-mpr 1` on both peers
+with TCP setup enabled. On the receiver, `--mpr-change-at PACKETS` and
+`--mpr-change-to UNITS` advertise a new limit after accepting that many
+segments. The new limit uses units of 128 packets, like `--mpr`.
+
+The sender uses `--deny-path-mask MASK` to exclude configured paths from its
+EV profile. Bit 0 selects path 0 and bit 1 selects path 1. For a transient
+in-process path-1 blackhole, pair `--drop-path-after N` with
+`--restore-path-after M`. Recovery is driven by a correlated reliability
+probe reply.
 
 ### Spark double ring
 
