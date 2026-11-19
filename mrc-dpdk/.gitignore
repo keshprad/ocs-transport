@@ -2,3 +2,4 @@
 /mrc_write
 /tests/test_mrc_qp
 /tests/test_mrc_wire
+/tests/test_mrc_cc

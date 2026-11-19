@@ -8,7 +8,7 @@ from pathlib import Path
 from memif_pair import MACS, eal_args, require, run_pair
 
 
-def transfer(binary, size, *options, drop_after=None, drop_final_acks=None):
+def transfer(binary, size, *options, drop_after=None, drop_final_acks=None, trim_after=None):
     def command(role, cpu, directory):
         tx = role == "tx"
         peer = "rx" if tx else "tx"
@@ -19,6 +19,8 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None):
                  "1", MACS[peer][1], "--ack-timeout", "16", *options]
         if tx and drop_after is not None:
             args += ["--drop-path-after", str(drop_after)]
+        if tx and trim_after is not None:
+            args += ["--trim-path-after", str(trim_after)]
         if not tx and drop_final_acks is not None:
             args += ["--drop-final-acks", str(drop_final_acks)]
         return args
@@ -64,6 +66,13 @@ def main():
     require(rx["reorder_max"] > 0 and rx["immediate_completed"],
             "Reordered WRITEIMM did not complete after placement")
     print(json.dumps({"case": "write_imm_wrap_blackhole", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 1048576, trim_after=64)
+    require(rx["trimmed"] > 0 and rx["trim_nacks"] > 0 and tx["trim_nacks"] > 0,
+            f"Trim traffic did not generate NACKs: {tx}, {rx}")
+    require(tx["retries"][0] >= rx["trimmed"] and rx["duplicates"] == 0,
+            "Trimmed packets were placed or did not recover over the surviving link")
+    print(json.dumps({"case": "write_trim_nack", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":

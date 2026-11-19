@@ -1,4 +1,5 @@
 #include "dpdk_io.h"
+#include "mrc_cc.h"
 #include "mrc_qp.h"
 #include "mrc_wire.h"
 
@@ -13,6 +14,7 @@
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
+#include <rte_ip.h>
 #include <rte_mbuf.h>
 #include <rte_pause.h>
 
@@ -23,6 +25,11 @@ enum {
     BURST = 32,
     FRAME_CAPACITY = 1514,
     SACK_THRESHOLD = 4096,
+    UDP_HEADER_LEN = 8,
+    NOMINAL_MTU = PMTU + UDP_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN +
+                  MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
+    INITIAL_CWND = 128 * NOMINAL_MTU,
+    TARGET_QUEUE_NS = 20000,
     FAST_LOSS_GAP = 16,
     REQUESTOR_QPN = 0x101,
     RESPONDER_QPN = 0x102,
@@ -30,6 +37,7 @@ enum {
     REMOTE_KEY = 0x6d726301,
     DATA_DSCP = 0,
     CONTROL_DSCP = 48,
+    TRIM_DSCP = 49,
     ACK_SYNDROME = 0x1f,
     INVALID_REQUEST_NAK = 0x61,
     REMOTE_ACCESS_NAK = 0x62,
@@ -53,8 +61,10 @@ struct transfer {
     uint32_t local_ip;
     uint32_t peer_ip;
     uint32_t drop_after;
+    uint32_t trim_after;
     uint32_t final_ack_drops;
     uint16_t udp_port;
+    uint8_t trim_dscp;
     unsigned int timeout_exponent;
     unsigned int linear_retries;
     unsigned int exponential_retries;
@@ -71,6 +81,8 @@ struct counters {
     uint32_t received[PATH_COUNT];
     uint32_t retries[PATH_COUNT];
     uint32_t dropped;
+    uint32_t trimmed;
+    uint32_t trim_nacks;
     uint32_t fast_retries;
     uint32_t sacks;
     uint32_t transport_acks;
@@ -84,9 +96,12 @@ struct send_record {
     unsigned int path;
     bool fast_retransmitted;
     bool nacked;
+    bool counted_inflight;
+    bool redundant_attempt;
 };
 
 struct sender {
+    struct mrc_cc cc;
     struct mrc_tx_qp qp;
     struct mrc_tx_packet slots[WINDOW];
     struct send_record metadata[WINDOW];
@@ -94,13 +109,14 @@ struct sender {
     uint64_t blocked_since[PATH_COUNT];
     uint32_t next;
     int32_t highest_sacked;
+    uint16_t probe_id;
 };
 
 struct responder {
     struct mrc_rx_qp qp;
     uint8_t slots[WINDOW];
     uint32_t unique_packets;
-    uint64_t nominal_bytes;
+    struct mrc_cc_rx cc;
     uint32_t immediate;
 };
 
@@ -126,6 +142,28 @@ static uint8_t expected_opcode(const struct transfer *transfer, uint32_t index)
     return MRC_WRITE_MIDDLE;
 }
 
+static uint32_t nominal_size(uint8_t opcode, size_t data_length, bool timestamp)
+{
+    size_t body = MRC_BTH_LEN + MRC_METH_LEN + MRC_RETH_LEN + data_length;
+    if (timestamp)
+        body += MRC_TSETH_LEN;
+    if (opcode == MRC_WRITE_LAST_IMM || opcode == MRC_WRITE_ONLY_IMM)
+        body += MRC_IMMDT_LEN;
+    return mrc_cc_nominal_size((uint16_t)(UDP_HEADER_LEN + ((body + 3) & ~(size_t)3) +
+                                          MRC_ICRC_LEN));
+}
+
+static uint32_t nominal_at(const struct transfer *transfer, uint32_t index)
+{
+    return nominal_size(expected_opcode(transfer, index), length_at(transfer, index), false);
+}
+
+static uint64_t cycles_to_ns(const struct transfer *transfer, uint64_t cycles)
+{
+    return (cycles / transfer->hz) * 1000000000 +
+           (cycles % transfer->hz) * 1000000000 / transfer->hz;
+}
+
 static struct mrc_wire_packet packet_for(const struct transfer *transfer, unsigned int index,
                                           uint8_t opcode, uint32_t psn)
 {
@@ -136,6 +174,7 @@ static struct mrc_wire_packet packet_for(const struct transfer *transfer, unsign
             .src_port = (uint16_t)((transfer->sender ? 0xc000 : 0xd000) + index),
             .dst_port = transfer->udp_port,
             .dscp = mrc_wire_is_write(opcode) ? DATA_DSCP : CONTROL_DSCP,
+            .ecn = mrc_wire_is_write(opcode) ? 2 : 0,
         },
         .bth = {
             .opcode = opcode, .psn = psn, .p_key = PARTITION_KEY,
@@ -147,8 +186,8 @@ static struct mrc_wire_packet packet_for(const struct transfer *transfer, unsign
     return packet;
 }
 
-static bool transmit(const struct transfer *transfer, unsigned int path,
-                     const struct mrc_wire_packet *packet)
+static bool transmit_frame(const struct transfer *transfer, unsigned int path,
+                           const struct mrc_wire_packet *packet, bool inject_trim)
 {
     struct rte_mbuf *mbuf = rte_pktmbuf_alloc(transfer->pool);
     if (!mbuf)
@@ -156,31 +195,62 @@ static bool transmit(const struct transfer *transfer, unsigned int path,
     uint8_t *frame = rte_pktmbuf_mtod(mbuf, uint8_t *);
     size_t length;
     int result = mrc_wire_encode(frame, rte_pktmbuf_tailroom(mbuf), packet, &length);
-    if (result || !rte_pktmbuf_append(mbuf, (uint16_t)length)) {
+    if (result) {
+        rte_pktmbuf_free(mbuf);
+        return false;
+    }
+    if (inject_trim) {
+        /* Recreate switch trimming, preserving original UDP Length and omitting iCRC. */
+        struct rte_ipv4_hdr ip;
+        memcpy(&ip, frame + RTE_ETHER_HDR_LEN, sizeof(ip));
+        length = MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN;
+        ip.type_of_service = (uint8_t)((transfer->trim_dscp << 2) | (ip.type_of_service & 3));
+        ip.total_length = rte_cpu_to_be_16((uint16_t)(length - RTE_ETHER_HDR_LEN));
+        ip.hdr_checksum = 0;
+        ip.hdr_checksum = rte_ipv4_cksum(&ip);
+        memcpy(frame + RTE_ETHER_HDR_LEN, &ip, sizeof(ip));
+    }
+    if (!rte_pktmbuf_append(mbuf, (uint16_t)length)) {
         rte_pktmbuf_free(mbuf);
         return false;
     }
     return mrc_dpdk_transmit(transfer->paths[path].port, mbuf);
 }
 
+static bool transmit(const struct transfer *transfer, unsigned int path,
+                     const struct mrc_wire_packet *packet)
+{
+    return transmit_frame(transfer, path, packet, false);
+}
+
+static const uint8_t *read_frame(const struct rte_mbuf *mbuf,
+                                  uint8_t scratch[FRAME_CAPACITY], size_t *length)
+{
+    *length = rte_pktmbuf_pkt_len(mbuf);
+    if (*length > FRAME_CAPACITY)
+        return NULL;
+    return rte_pktmbuf_read(mbuf, 0, (uint32_t)*length, scratch);
+}
+
+static bool peer_matches(const struct transfer *transfer, unsigned int index,
+                         const struct mrc_wire_ipv4 *ipv4, const struct mrc_wire_bth *bth)
+{
+    const struct path *path = &transfer->paths[index];
+    return ipv4->dst_ip == transfer->local_ip && ipv4->src_ip == transfer->peer_ip &&
+           ipv4->dst_port == transfer->udp_port && bth->p_key == PARTITION_KEY &&
+           bth->dqp == (transfer->sender ? REQUESTOR_QPN : RESPONDER_QPN) &&
+           memcmp(ipv4->src_mac, path->peer.addr_bytes, MRC_MAC_LEN) == 0 &&
+           memcmp(ipv4->dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
+}
+
 static bool decode(const struct transfer *transfer, unsigned int index,
                    const struct rte_mbuf *mbuf, uint8_t scratch[FRAME_CAPACITY],
                    struct mrc_wire_packet *packet)
 {
-    uint32_t length = rte_pktmbuf_pkt_len(mbuf);
-    if (length > FRAME_CAPACITY)
-        return false;
-    const uint8_t *frame = rte_pktmbuf_read(mbuf, 0, length, scratch);
-    if (!frame || mrc_wire_decode(frame, length, packet))
-        return false;
-    const struct path *path = &transfer->paths[index];
-    return packet->ipv4.dst_ip == transfer->local_ip &&
-           packet->ipv4.src_ip == transfer->peer_ip &&
-           packet->ipv4.dst_port == transfer->udp_port &&
-           packet->bth.p_key == PARTITION_KEY &&
-           packet->bth.dqp == (transfer->sender ? REQUESTOR_QPN : RESPONDER_QPN) &&
-           memcmp(packet->ipv4.src_mac, path->peer.addr_bytes, MRC_MAC_LEN) == 0 &&
-           memcmp(packet->ipv4.dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
+    size_t length;
+    const uint8_t *frame = read_frame(mbuf, scratch, &length);
+    return frame && !mrc_wire_decode(frame, length, packet) &&
+           peer_matches(transfer, index, &packet->ipv4, &packet->bth);
 }
 
 static bool send_write(const struct transfer *transfer, struct sender *sender,
@@ -189,9 +259,13 @@ static bool send_write(const struct transfer *transfer, struct sender *sender,
 {
     struct mrc_wire_packet packet = packet_for(transfer, path, expected_opcode(transfer, index),
         mrc_psn_add(transfer->initial_psn, (int32_t)index));
+    struct mrc_cc after_send = sender->cc;
+    if (!mrc_cc_on_send(&after_send, nominal_at(transfer, index)))
+        return false;
     packet.bth.retransmit = retry;
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
-                             index + 1 == transfer->packets;
+                             index + 1 == transfer->packets ||
+                             mrc_cc_ack_request(&after_send, SACK_THRESHOLD);
     packet.body.write = (struct mrc_wire_write){
         .rqmsn = transfer->with_immediate ? 1 : 0,
         .msn = 1,
@@ -205,10 +279,14 @@ static bool send_write(const struct transfer *transfer, struct sender *sender,
 
     if (path == 1 && sender->next >= transfer->drop_after) {
         counts->dropped++;
-    } else if (!transmit(transfer, path, &packet)) {
-        return false;
+    } else {
+        bool inject_trim = path == 1 && sender->next >= transfer->trim_after;
+        if (!transmit_frame(transfer, path, &packet, inject_trim))
+            return false;
+        counts->trimmed += inject_trim;
     }
 
+    sender->cc = after_send;
     if (retry)
         counts->retries[path]++;
     else
@@ -216,9 +294,25 @@ static bool send_write(const struct transfer *transfer, struct sender *sender,
     return true;
 }
 
+static bool retire_redundant_attempt(const struct transfer *transfer, struct sender *sender,
+                                      uint32_t index)
+{
+    struct send_record *record = &sender->metadata[index % WINDOW];
+    if (!record->counted_inflight || !record->redundant_attempt)
+        return true;
+
+    /* A retry of already delivered data never increments the responder's byte counter. */
+    if (!mrc_cc_on_nack(&sender->cc, nominal_at(transfer, index), false, false, 0, NULL))
+        return false;
+    record->counted_inflight = false;
+    return true;
+}
+
 static int apply_control(const struct transfer *transfer, struct sender *sender,
                          struct counters *counts, const struct mrc_wire_packet *packet)
 {
+    uint64_t now_cycles = rte_get_timer_cycles();
+    uint64_t now = cycles_to_ns(transfer, now_cycles);
     switch (packet->bth.opcode) {
     case MRC_TRANSPORT_ACK: {
         const struct mrc_wire_aeth *ack = &packet->body.aeth;
@@ -229,6 +323,14 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         uint32_t last_psn = mrc_psn_add(transfer->initial_psn, (int32_t)transfer->packets - 1);
         if (packet->bth.psn == last_psn && ack->msn != 1)
             return 0;
+        int32_t last = mrc_psn_delta(packet->bth.psn, transfer->initial_psn);
+        int32_t first = mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
+        if (last < first || last >= (int32_t)sender->next)
+            return 0;
+        for (int32_t index = first; index <= last; index++) {
+            if (!retire_redundant_attempt(transfer, sender, (uint32_t)index))
+                return -EPROTO;
+        }
         if (mrc_tx_apply_transport_ack(&sender->qp, packet->bth.psn))
             counts->transport_acks++;
         return 0;
@@ -245,6 +347,30 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         if (!mrc_tx_apply_sack(&sender->qp, &sack, wire->probe_response))
             return 0;
         counts->sacks++;
+        if (wire->mark != MRC_SACK_NONE && wire->entropy >= 0xc000 &&
+            wire->entropy < 0xc000 + PATH_COUNT)
+            sender->path_retry_at[wire->entropy - 0xc000] =
+                now_cycles + 10 * transfer->initial_rto;
+        struct mrc_cc_tx_sample sample;
+        struct mrc_cc_tx_sample *rtt_sample = NULL;
+        if (!wire->probe_response) {
+            uint32_t ack_psn = mrc_psn_add(wire->cack_psn, wire->ack_psn_offset);
+            const struct mrc_tx_packet *sent = mrc_tx_packet(&sender->qp, ack_psn);
+            if (sent) {
+                uint32_t index = (uint32_t)mrc_psn_delta(ack_psn, transfer->initial_psn);
+                if (packet->bth.retransmit &&
+                    !retire_redundant_attempt(transfer, sender, index))
+                    return -EPROTO;
+                sample = (struct mrc_cc_tx_sample){
+                    .sent_at_ns = cycles_to_ns(transfer, sent->sent_at),
+                    .retransmissions = sent->retransmissions,
+                };
+                rtt_sample = &sample;
+            }
+        }
+        if (!mrc_cc_on_sack(&sender->cc, wire->rcvd_bytes, wire->mark == MRC_SACK_SKIP,
+                            packet->bth.retransmit, now, rtt_sample, NULL))
+            return -EPROTO;
 
         int32_t highest = mrc_psn_delta(sack.cack_psn, transfer->initial_psn);
         int32_t cack = highest;
@@ -279,7 +405,22 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         case MRC_NACK_NO_RESOURCE:
         case MRC_NACK_PSN_OOR_WINDOW: {
             uint32_t index = (uint32_t)mrc_psn_delta(nack->nack_psn, transfer->initial_psn);
-            sender->metadata[index % WINDOW].nacked = true;
+            struct send_record *record = &sender->metadata[index % WINDOW];
+            if (record->counted_inflight &&
+                packet->bth.retransmit == (state->retransmissions != 0)) {
+                struct mrc_cc_tx_sample sample = {
+                    .sent_at_ns = cycles_to_ns(transfer, state->sent_at),
+                    .retransmissions = state->retransmissions,
+                };
+                bool trimmed = nack->reason == MRC_NACK_TRIMMED ||
+                               nack->reason == MRC_NACK_TRIMMED_LASTHOP;
+                if (!mrc_cc_on_nack(&sender->cc, nominal_at(transfer, index), trimmed,
+                                    packet->bth.retransmit, now, &sample))
+                    return -EPROTO;
+                record->counted_inflight = false;
+                record->nacked = true;
+                counts->trim_nacks += trimmed;
+            }
             return 0;
         }
         default:
@@ -341,6 +482,16 @@ static int retry_due_packets(const struct transfer *transfer, struct sender *sen
             return -ETIMEDOUT;
         }
 
+        if (!retire_redundant_attempt(transfer, sender, index))
+            return -EPROTO;
+        if (!packet->received && record->counted_inflight) {
+            if (!mrc_cc_on_inferred_loss(&sender->cc, nominal_at(transfer, index)))
+                return -EPROTO;
+            record->counted_inflight = false;
+        }
+        if (!mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
+            continue;
+
         unsigned int path = 1 - record->path;
         if (now < sender->path_retry_at[path] && now >= sender->path_retry_at[record->path])
             path = record->path;
@@ -354,6 +505,8 @@ static int retry_due_packets(const struct transfer *transfer, struct sender *sen
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
         record->path = path;
+        record->counted_inflight = true;
+        record->redundant_attempt = packet->received;
         record->nacked = false;
         record->fast_retransmitted |= fast;
         counts->fast_retries += fast;
@@ -361,14 +514,28 @@ static int retry_due_packets(const struct transfer *transfer, struct sender *sen
     return 0;
 }
 
+static void request_probe(const struct transfer *transfer, struct sender *sender,
+                           unsigned int path)
+{
+    uint16_t probe_id = (uint16_t)(sender->probe_id + 1);
+    struct mrc_wire_packet packet = packet_for(transfer, path, MRC_RELIABILITY_PROBE, 0);
+    packet.body.probe = (struct mrc_wire_probe){
+        .probe_id = probe_id, .spdcid = REQUESTOR_QPN, .dpdcid = RESPONDER_QPN,
+    };
+    if (transmit(transfer, path, &packet))
+        sender->probe_id = probe_id;
+}
+
 static int run_sender(const struct transfer *transfer, struct counters *counts)
 {
     struct sender sender = { .highest_sacked = -1 };
-    if (!mrc_tx_init(&sender.qp, transfer->initial_psn, WINDOW, sender.slots))
+    if (!mrc_tx_init(&sender.qp, transfer->initial_psn, WINDOW, sender.slots) ||
+        !mrc_cc_init(&sender.cc, NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS))
         return -EINVAL;
 
     uint64_t last_progress = rte_get_timer_cycles();
     uint64_t next_retry_scan = last_progress;
+    uint64_t next_probe = last_progress + transfer->initial_rto;
     for (;;) {
         uint32_t previous_psn = sender.qp.first_psn;
         int result = receive_control(transfer, &sender, counts);
@@ -381,17 +548,30 @@ static int run_sender(const struct transfer *transfer, struct counters *counts)
         uint32_t first = (uint32_t)mrc_psn_delta(sender.qp.first_psn, transfer->initial_psn);
         if (first == transfer->packets)
             return 0;
-        if (now - last_progress >= transfer->idle_timeout)
+        if (now - last_progress >= transfer->idle_timeout) {
+            fprintf(stderr, "TX stalled at segment %u, next %u, inflight %d, cwnd %u, "
+                            "SACKs %u, ACKs %u, retries [%u,%u], drops %u\n",
+                    first, sender.next, sender.cc.inflight, sender.cc.cwnd, counts->sacks,
+                    counts->transport_acks, counts->retries[0], counts->retries[1], counts->dropped);
             return -ETIMEDOUT;
+        }
         if (now >= next_retry_scan) {
             result = retry_due_packets(transfer, &sender, counts, first, now);
             if (result)
                 return result;
             next_retry_scan = now + transfer->initial_rto / 32 + 1;
         }
+        if (now >= next_probe && sender.next < transfer->packets &&
+            !mrc_cc_can_send(&sender.cc, nominal_at(transfer, sender.next))) {
+            for (unsigned int path = 0; path < PATH_COUNT; path++)
+                request_probe(transfer, &sender, path);
+            next_probe = now + transfer->initial_rto;
+        }
         for (unsigned int i = 0; i < BURST && sender.next < transfer->packets &&
              sender.next - first < WINDOW; i++) {
             uint32_t index = sender.next;
+            if (!mrc_cc_can_send(&sender.cc, nominal_at(transfer, index)))
+                break;
             unsigned int path = index % PATH_COUNT;
             if (now < sender.path_retry_at[path] && now >= sender.path_retry_at[1 - path])
                 path = 1 - path;
@@ -406,7 +586,9 @@ static int run_sender(const struct transfer *transfer, struct counters *counts)
             uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
             if (!mrc_tx_track(&sender.qp, psn, now))
                 return -EPROTO;
-            sender.metadata[index % WINDOW] = (struct send_record){ .path = path };
+            sender.metadata[index % WINDOW] = (struct send_record){
+                .path = path, .counted_inflight = true,
+            };
             sender.next++;
         }
         rte_pause();
@@ -448,7 +630,7 @@ static void send_sack(const struct transfer *transfer, struct responder *receive
         .spdcid = REQUESTOR_QPN, .dpdcid = RESPONDER_QPN,
         .cack_psn = state.cack_psn, .sack_offset = state.sack_offset,
         .bitmap = state.bitmap, .ooo_count = state.ooo_count,
-        .rcvd_bytes = (uint32_t)((receiver->nominal_bytes + 255) / 256) & MRC_PSN_MASK,
+        .rcvd_bytes = mrc_cc_rx_wire_count(&receiver->cc),
     };
     if (probe && request->body.probe.timestamp)
         packet.body.sack.tx_timestamp = request->body.probe.tx_timestamp;
@@ -516,13 +698,8 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
                          (packet->ipv4.ecn == 3 ? MRC_RX_ECN : 0);
     bool sack_due;
     mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags, SACK_THRESHOLD, &sack_due);
-    /* UDP, BTH, METH, RETH, optional headers, payload, pad, iCRC, and nominal 40 bytes. */
-    size_t body = MRC_BTH_LEN + MRC_METH_LEN + MRC_RETH_LEN + write->data_len;
-    if (packet->bth.timestamp)
-        body += MRC_TSETH_LEN;
-    if (packet->bth.opcode == MRC_WRITE_LAST_IMM || packet->bth.opcode == MRC_WRITE_ONLY_IMM)
-        body += MRC_IMMDT_LEN;
-    receiver->nominal_bytes += 8 + ((body + 3) & ~(size_t)3) + MRC_ICRC_LEN + 40;
+    uint32_t nominal = nominal_size(packet->bth.opcode, write->data_len, packet->bth.timestamp);
+    mrc_cc_rx_record(&receiver->cc, nominal, true, false);
     receiver->unique_packets++;
     counts->received[path]++;
     bool complete = receiver->unique_packets == transfer->packets;
@@ -532,6 +709,68 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
         send_sack(transfer, receiver, counts, path, packet, false);
     if (previous_cack != receiver->qp.cack_psn && (sack_due || complete))
         send_ack(transfer, counts, path, receiver->qp.cack_psn, ACK_SYNDROME, complete);
+    return 0;
+}
+
+static void receive_trimmed(const struct transfer *transfer, const struct responder *receiver,
+                            struct counters *counts, unsigned int path,
+                            const struct mrc_wire_trimmed *trimmed)
+{
+    if (mrc_rx_classify(&receiver->qp, trimmed->bth.psn) != MRC_RX_NEW ||
+        !mrc_cc_nominal_size(trimmed->original_udp_len))
+        return;
+
+    counts->trimmed++;
+    struct mrc_wire_packet nack = packet_for(transfer, path, MRC_RELIABILITY_NACK,
+                                              trimmed->bth.psn);
+    nack.bth.retransmit = trimmed->bth.retransmit;
+    nack.body.nack = (struct mrc_wire_nack){
+        .reason = MRC_NACK_TRIMMED,
+        .entropy = trimmed->ipv4.src_port,
+        .spdcid = REQUESTOR_QPN, .dpdcid = RESPONDER_QPN,
+        .nack_psn = trimmed->bth.psn,
+        .tx_timestamp = trimmed->tx_timestamp,
+        .original_udp_len = trimmed->original_udp_len,
+    };
+    if (transmit(transfer, path, &nack))
+        counts->trim_nacks++;
+}
+
+static int receive_frame(const struct transfer *transfer, struct responder *receiver,
+                         struct counters *counts, unsigned int path,
+                         const struct rte_mbuf *mbuf, uint64_t *last_frame)
+{
+    uint8_t scratch[FRAME_CAPACITY];
+    size_t length;
+    const uint8_t *frame = read_frame(mbuf, scratch, &length);
+    if (!frame)
+        return 0;
+
+    struct mrc_wire_trimmed trimmed;
+    int result = mrc_wire_decode_trimmed(frame, length, transfer->trim_dscp, &trimmed);
+    if (result != -EPROTONOSUPPORT) {
+        if (!result && peer_matches(transfer, path, &trimmed.ipv4, &trimmed.bth)) {
+            *last_frame = rte_get_timer_cycles();
+            receive_trimmed(transfer, receiver, counts, path, &trimmed);
+        }
+        return 0;
+    }
+
+    struct mrc_wire_packet packet;
+    result = mrc_wire_decode(frame, length, &packet);
+    if (!result && peer_matches(transfer, path, &packet.ipv4, &packet.bth)) {
+        *last_frame = rte_get_timer_cycles();
+        return receive_write(transfer, receiver, counts, path, &packet);
+    }
+
+    struct mrc_wire_ipv4 ipv4;
+    struct mrc_wire_bth bth;
+    if (result == -EPROTONOSUPPORT && !mrc_wire_decode_header(frame, length, &ipv4, &bth) &&
+        peer_matches(transfer, path, &ipv4, &bth) && !mrc_wire_is_write(bth.opcode) &&
+        bth.opcode < MRC_TRANSPORT_ACK) {
+        send_ack(transfer, counts, path, bth.psn, INVALID_REQUEST_NAK, 0);
+        return -EPROTO;
+    }
     return 0;
 }
 
@@ -548,12 +787,9 @@ static int run_receiver(const struct transfer *transfer, struct counters *counts
             struct rte_mbuf *packets[BURST];
             uint16_t n = rte_eth_rx_burst(transfer->paths[path].port, 0, packets, BURST);
             for (uint16_t i = 0; i < n; i++) {
-                uint8_t scratch[FRAME_CAPACITY];
-                struct mrc_wire_packet packet;
-                if (!result && decode(transfer, path, packets[i], scratch, &packet)) {
-                    result = receive_write(transfer, &receiver, counts, path, &packet);
-                    last_frame = rte_get_timer_cycles();
-                }
+                if (!result)
+                    result = receive_frame(transfer, &receiver, counts, path, packets[i],
+                                           &last_frame);
                 rte_pktmbuf_free(packets[i]);
             }
         }
@@ -601,6 +837,7 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     transfer->sender = strcmp(argv[1], "tx") == 0;
     transfer->packets = transfer->bytes ? (transfer->bytes + PMTU - 1) / PMTU : 1;
     transfer->drop_after = UINT32_MAX;
+    transfer->trim_after = UINT32_MAX;
 
     struct in_addr ip;
     if (inet_pton(AF_INET, argv[3], &ip) != 1)
@@ -619,13 +856,16 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     if (transfer->paths[0].port == transfer->paths[1].port)
         return false;
 
-    uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT;
+    uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
     for (int i = 9; i < argc; i += 2) {
         const char *key = argv[i], *value = argv[i + 1];
         if (!strcmp(key, "--udp-port") && number(value, 1, UINT16_MAX, &udp_port))
             continue;
         if (!strcmp(key, "--initial-psn") && number(value, 0, MRC_PSN_MASK, &transfer->initial_psn))
+            continue;
+        if (!strcmp(key, "--trim-dscp") && number(value, 1, 63, &trim_dscp) &&
+            trim_dscp != CONTROL_DSCP)
             continue;
         if (!strcmp(key, "--ack-timeout") && number(value, 0, 24, &exponent))
             continue;
@@ -645,10 +885,16 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
         if (transfer->sender && !strcmp(key, "--drop-path-after") &&
             number(value, 0, transfer->packets - 1, &transfer->drop_after))
             continue;
+        if (transfer->sender && !strcmp(key, "--trim-path-after") &&
+            number(value, 0, transfer->packets - 1, &transfer->trim_after))
+            continue;
         return false;
     }
 
+    if (transfer->drop_after != UINT32_MAX && transfer->trim_after != UINT32_MAX)
+        return false;
     transfer->udp_port = (uint16_t)udp_port;
+    transfer->trim_dscp = (uint8_t)trim_dscp;
     transfer->timeout_exponent = exponent;
     transfer->linear_retries = linear_retries;
     transfer->exponential_retries = exponential_retries;
@@ -676,7 +922,7 @@ int main(int argc, char **argv)
                         "       PORT0 PEER_MAC0 PORT1 PEER_MAC1 [--initial-psn N] [--udp-port N]\n"
                         "       [--immediate N] [--ack-timeout N] [--linear-retries N]\n"
                         "       [--exp-retries N] [--timeout-ms N] [--drop-path-after N (tx)]\n"
-                        "       [--drop-final-acks N (rx)]\n",
+                        "       [--trim-dscp N] [--trim-path-after N (tx)] [--drop-final-acks N (rx)]\n",
                 argv[0]);
         goto done;
     }
@@ -701,13 +947,14 @@ int main(int argc, char **argv)
     if (!result)
         printf("{\"role\":\"%s\",\"bytes\":%u,\"packets\":%u,\"sent\":[%u,%u],"
                "\"received\":[%u,%u],\"retries\":[%u,%u],\"dropped\":%u,\"sacks\":%u,"
-               "\"transport_acks\":%u,\"dropped_transport_acks\":%u,"
+               "\"trimmed\":%u,\"trim_nacks\":%u,\"transport_acks\":%u,"
+               "\"dropped_transport_acks\":%u,"
                "\"duplicates\":%u,\"fast_retries\":%u,"
                "\"reorder_max\":%u,\"immediate_completed\":%s}\n",
                transfer.sender ? "tx" : "rx", transfer.bytes, transfer.packets,
                counts.sent[0], counts.sent[1], counts.received[0], counts.received[1],
                counts.retries[0], counts.retries[1], counts.dropped, counts.sacks,
-               counts.transport_acks, counts.dropped_transport_acks,
+               counts.trimmed, counts.trim_nacks, counts.transport_acks, counts.dropped_transport_acks,
                counts.duplicates, counts.fast_retries,
                counts.reorder_max, counts.immediate_completed ? "true" : "false");
 
