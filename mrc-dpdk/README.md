@@ -51,14 +51,21 @@ On the direct Spark-04 to Spark-02 pair, use the following route mapping:
 Use EAL `-a` for each selected PCI address and `--iova-mode=va --no-huge`
 for the private mlx5 runtime. Start Spark-02 as `rx` and Spark-04 as `tx`.
 The configured IP pair identifies the QP across both circuits, while each
-circuit uses its corresponding peer MAC. First run with both paths healthy.
-Use `--drop-path-after N` on the sender for an in-process path-1 blackhole
-that leaves the Polatis configuration untouched.
+circuit uses its corresponding peer MAC. Use `--udp-port 4971` on both peers
+for this lab. Port 4791 timed out with RoCE enabled on these ConnectX-7
+ports. Port 4971 completed the same transfer on both rails.
+
+For the healthy baseline, run a 4 MiB WRITE (4194304 bytes) with both paths
+active. For a controlled recovery run, use 16777216 bytes and
+`--ack-timeout 13` on both peers. Add `--drop-path-after 512
+--restore-path-after 2048` on the sender. This injects a temporary path-1
+blackhole in the endpoint. Check for retransmissions, a failed EV, a
+recovered EV, and traffic resuming on path 1. The test uses the existing
+Polatis circuits.
 
 On failure, the endpoint prints per-path application RX and DPDK port counter
 deltas, together with protocol progress. Pass `--port-stats 1` to include the
-same diagnostics on success. Use the same `--udp-port` on both peers when
-comparing the documented RoCEv2 port 4791 with the OCP prose value 4971.
+same diagnostics on success.
 
 ## Original multipath prototype
 
