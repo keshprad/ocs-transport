@@ -5,6 +5,7 @@ results/*
 # Saved benchmark results committed to the repository.
 !results/20261110T021852Z-4cacd141-client/
 !results/20261110T021852Z-4cacd141-server/
+!results/20261112T023026Z-7a1c5c7f-client/
 
 # Omit raw logs (individual per-process output and record directories).
 results/**/local/
