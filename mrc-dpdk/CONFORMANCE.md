@@ -9,7 +9,7 @@ The conformance target is the [OCP Multipath Reliable Connection 1.0 specificati
 | §§7.2, 7.4–7.5, packet reliability | 24-bit PSN and window checks, wrap, selective SACK bitmaps, separate AETH, duplicate suppression, retransmit marking, logical timers, SACK-driven fast loss, reliability probe RTT sampling and startup retry per rail (probe exchanges observed on the Spark pair), and separately classified trimmed packets with TRIM NACK recovery. Negotiated Dynamic MPR advertises each change in SACKs and gates both first transmissions and retries, while preserving outstanding receive state. Over memif, all five mandatory Table 7-3 NACK reasons were generated and handled, including retry-budget exhaustion and terminal CQ overrun. | Independent live NACK interoperability and recovery after an actual port transition. Both receiver Sparks verified a 16 MiB WRITE after an injected path-1 blackhole. An independent memif peer checks alternate-rail retry on a packet-buffer NACK and confirms that a WRITEIMM credit stays occupied until a semantic ACK. Provider QP errors and typed send completions are verified for retry exhaustion and UNEXP_EVENT. Trim NACK generation and requester Service Time compensation are capability-gated. The responder reports DPDK RX-to-feedback preparation time or adjusts a 128 ns request timestamp. |
 | §§7.3, 7.4.7–7.4.8, 7.5.6, endpoint operations | ERTH/EETH byte fixtures and two-rail Port Status Updates observed over memif and the Spark pair. An independent peer verifies reserved QPN 2, Control traffic class, echoed opaque 16-bit identifiers, fresh reports after a lost response, single-rail gating after a second report, and expiry when reports stop. | Physical port transitions and optional EV probe initiation. |
 | §§7.5.1, 8, congestion control | Nominal per-packet accounting, modulo 24-bit feedback, congestion-window admission and RTT/ECN-driven NSCC adjustments. The public QP binds an immutable ONLINE NSCC or disabled CC profile. Unit tests drive the configured maximum window, base RTT, target delay, thresholds, and increase and decrease parameters. The NSCC requester applies receiver-window penalties and restores the saved window on explicit feedback. Responder penalties can be set and cleared independently per QP. A controller profile can enable Quick Adapt. Unit tests exercise averaged-delay and trim triggers, the achieved-byte gate, the old-flight byte accounting phase, and interaction with receiver window limits. | Deployment measurements and link-rate-derived tuning for custom profiles. Verify ECN and trimming on a packet-switching fabric or with controlled injection. |
-| §§9–10, EVs and APIs | Two paths with configurable UDP source-port EVs, IPv6 flow-label reflection, preserved or already decapsulated SRv6 receive, and alternate-path retransmission. The OCP controller ABI queries device EV capacity and built-in UDP/STEV formats, applies persistent AUTO, explicit, or generated UDP/STEV profile lifecycle and GOOD/DENIED operations, and gates mutations on CAP_NET_ADMIN. Public QPs lease ONLINE EV and CC profiles. Public DPDK routes carry per-rail SRv6 SIDs and an optional additional SRH container. The controller can update administrative EV state during transfer and query and configure CC profiles with CAP_NET_ADMIN. Active-only rotation distinguishes denied, congestion-skipped, and failed EVs. A fresh correlated probe can restore a failed EV. | Programmable EV formats, SRv6 EV profiles, controller EV events and probes, and remaining controller operations. |
+| §§9–10, EVs and APIs | Two paths with configurable UDP source-port EVs, IPv6 flow-label reflection, preserved or already decapsulated SRv6 receive, and alternate-path retransmission. The OCP controller ABI queries device EV capacity and built-in UDP, STEV, and SRv6 formats. It persists AUTO, explicit, and generated profiles and GOOD/DENIED state and gates mutations on CAP_NET_ADMIN. Public QPs lease ONLINE EV and CC profiles. Explicit and generated SRv6 profiles supply per-rail outgoing uSID destinations with optional additional SRH containers on requester QPs. The controller can update administrative EV state during transfer and query and configure CC profiles with CAP_NET_ADMIN. Active-only rotation distinguishes denied, congestion-skipped, and failed EVs. A fresh correlated probe can restore a failed EV. | Programmable EV formats, controller EV events and probes, and independent SRv6 fabric verification. |
 
 ## Specification questions for interoperability
 
@@ -106,8 +106,10 @@ It also verifies disabled CC selection and rejects controller CC queries and
 mutations without the required capability. Generated profile tests cover
 field bounds, sparse masks, fixed fields, skipped UDP port zero, stable
 ordering and persistence, and live administrative state under a lease.
-The portable store tests also verify older snapshots and migration to the
-snapshot layout that retains field definitions. Build the ABI test
+SRv6 controller tests check both container widths, explicit values,
+generated combinations, rejection of unusable containers, and per-port
+EV identity. The portable store tests verify older snapshots and a
+mixed snapshot with both numeric and SRv6 values. Build the ABI test
 with `make MRC_INCLUDE_DIR=/path/to/headers tests/test_mrc_ctl_abi`. Run
 `./tests/test_mrc_ctl_abi --expect-no-cap` without CAP_NET_ADMIN and
 `unshare -Ur ./tests/test_mrc_ctl_abi` for the isolated positive case.
@@ -120,7 +122,13 @@ the WRITE and WRITEIMM operations complete with verified data. Two additional
 public QP cases bind generated UDP and STEV profiles. The fixture observes
 the expected values on each rail in WRITE and PETH requests and in the
 corresponding SACKs, then verifies payload placement and completions.
-The STEV fixture uses an IPv6 verbs GID. A separate NSCC case programs a one-packet window and observes both DPDK TX rails
+The STEV fixture uses an IPv6 verbs GID. The two controller SRv6 cases
+observe the leased uSID values in requests on both rails and verify
+the reflected inner entropy and both peers' completions. The explicit
+case enables initially denied rails through the controller. The generated
+case observes the initial destination and the additional SRH container
+and simulates the remaining segment transition before DPDK receive.
+A separate NSCC case programs a one-packet window and observes both DPDK TX rails
 while the peer withholds feedback. It sees one full-sized WRITE with
 BTH ACK Request before the peer resumes and validates payload placement
 and completions in both directions. The Quick Adapt case uses an enabled

@@ -109,6 +109,12 @@ container, set `initial_dst`. An optional `srh_segment` supplies one more
 that container, or leave it at 0 to carry the segment for telemetry.
 The application supplies packed wire-order containers.
 
+For a controller-managed SRv6 route, attach the QP with the same local
+and peer SIDs. The requester's selected EV profile supplies the outer
+destination and any SRH on each rail. The responder uses its application
+route for replies. The inner entropy still identifies the requesting
+rail in reliability feedback.
+
 SRv6 attachments accept IPv4 or IPv6 inner GIDs. The receiver validates
 the SIDs on preserved encapsulation and accepts already decapsulated
 frames after checking the inner peer, P_Key, and QPN. The fabric advances
@@ -178,6 +184,13 @@ UDP source-port EV. The first four bytes of a controller EV hold a big-endian
 value. The remaining bytes are zero. Port numbers 1 and 2 follow the attached
 DPDK route's rail order.
 
+Select `MRC_DPDK_EV_FORMAT_SRV6` for a uSID destination in the first 16
+bytes, or `MRC_DPDK_EV_FORMAT_SRV6_SRH` for a uSID destination followed
+by a second 16-byte container. Supply packed IPv6 addresses in wire
+order and leave unused bytes zero. Both formats support explicit and
+generated profiles. Equal containers start with Segments Left 0 for
+telemetry. Different containers start with Segments Left 1.
+
 Point the controller and the application at the same directory with
 `mrc_dpdk_set_profile_store()`. The controller needs effective `CAP_NET_ADMIN` to
 mutate profiles. For separate service accounts, use a controller-owned
@@ -207,6 +220,12 @@ source port zero. It assigns one EV to each rail and persists both the
 field definitions and the generated values. Query fields or the EV array
 before setting the profile ONLINE.
 
+Generated SRv6 uses eight or sixteen 16-bit slots in wire order, with
+the last field varying fastest. Fields narrower than their slot are
+zero-padded on the left. The provider skips unspecified and multicast
+destinations and SRH segments. It assigns the first two distinct usable
+values to rails 1 and 2.
+
 The benchmark CLI uses the same storage. Create a private directory on the
 sender and bring a profile online.
 
@@ -219,13 +238,17 @@ mkdir -m 700 ./ev-profiles
 ```
 
 Pass `--profile-dir ./ev-profiles --profile-id 42` to `mrc_write tx`.
-The benchmark uses two distinct EVs, in path order. For IPv4, an EV is a
-nonzero UDP source port. For IPv6, its upper 16 bits give the lower 16 bits
-of the flow label and its lower 16 bits give the UDP source port.
+The CLI's numeric profiles use two distinct EVs in path order. For IPv4,
+an EV is a nonzero UDP source port. For IPv6, its upper 16 bits give the
+lower 16 bits of the flow label and its lower 16 bits give the UDP source port.
 `configure ID auto 2 MIN_ACTIVE` uses the benchmark's default EVs.
 `generated` accepts values already expanded by the caller, in the same
 form as `explicit`. The minimum active setting limits automatic failure
 demotion. Administrative denials still apply.
+
+To use an SRv6 profile created with the OCP controller API, also pass the
+benchmark's `--srv6-local` and `--srv6-peer` SIDs. `show` displays
+the stored destination and any SRH container for each rail.
 
 Use `deny 42 2` and `allow 42 2` with the same directory to change path 1
 while the endpoint runs. The sender refreshes administrative state every

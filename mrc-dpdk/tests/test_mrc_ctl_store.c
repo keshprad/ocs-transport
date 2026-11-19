@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -347,7 +348,7 @@ static void test_typed_edits(void)
     assert(recorded.config.format == MRC_CTL_STORE_FORMAT_STEV);
 
     struct mrc_ctl_store_profile updated = recorded;
-    updated.config.format = MRC_CTL_STORE_FORMAT_STEV + 1;
+    updated.config.format = MRC_CTL_STORE_FORMAT_SRV6_SRH + 1;
     assert(mrc_ctl_store_edit(&store, id, replace_profile, &updated) == -EINVAL);
     updated = recorded;
     updated.id++;
@@ -455,10 +456,11 @@ static void expect_ev_snapshot_version(const struct mrc_ctl_store *store, uint8_
     assert(fd >= 0);
     uint8_t saved_version;
     assert(pread(fd, &saved_version, 1, 7) == 1 && saved_version == version);
-    if (version == 2) {
+    if (version == 2 || version == 3) {
         struct stat status;
         assert(fstat(fd, &status) == 0);
-        assert(status.st_size == 16 + MRC_CTL_STORE_MAX_PROFILES * (24 + 4 * MRC_EV_MAX_PATHS));
+        size_t entry_size = 24 + 4 * MRC_EV_MAX_PATHS + (version == 3 ? 2 * 20 : 0);
+        assert(status.st_size == (off_t)(16 + MRC_CTL_STORE_MAX_PROFILES * entry_size));
     }
     assert(close(fd) == 0);
 }
@@ -569,6 +571,101 @@ static void test_generated_fields(void)
     assert(mrc_ctl_store_acquire(&store, 10, &ref, &saved) == 0);
     check_ev_fields(&saved.config, &preexpanded);
     mrc_ctl_store_release(&ref);
+    remove_fixture(&store, directory);
+}
+
+static void test_srv6_profiles(void)
+{
+    char directory[] = "/tmp/mrc-ctl-srv6.XXXXXX";
+    assert(mkdtemp(directory));
+    struct mrc_ctl_store store = MRC_CTL_STORE_INITIALIZER;
+    struct mrc_ctl_store_ref ref = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_profile saved;
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+
+    const struct mrc_ctl_store_config udp = {
+        .mode = MRC_CTL_STORE_GENERATED, .format = MRC_CTL_STORE_FORMAT_UDP,
+        .count = 2, .min_active = 1, .populated = 3, .field_count = 1,
+        .fields = {{ .width = 16, .init_val = 0xc000, .min_val = 1, .max_val = 2, .mask = 3 }},
+        .entropy = { 0xc001, 0xc002 },
+    };
+    assert(mrc_ctl_store_create(&store, 10) == 0);
+    assert(mrc_ctl_store_configure(&store, 10, &udp) == 0);
+    assert(mrc_ctl_store_set_state(&store, 10, MRC_CTL_STORE_ONLINE) == 0);
+    expect_ev_snapshot_version(&store, 3);
+
+    const struct mrc_ctl_store_config explicit = {
+        .mode = MRC_CTL_STORE_EXPLICIT, .format = MRC_CTL_STORE_FORMAT_SRV6,
+        .count = 2, .min_active = 1, .populated = 3,
+        .srv6 = {{ 0x20, 1, [15] = 1 }, { 0x20, 1, [15] = 2 }},
+    };
+    assert(mrc_ctl_store_create(&store, 20) == 0);
+    struct mrc_ctl_store_config invalid = explicit;
+    invalid.populated = 1;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    memset(invalid.srv6[1], 0, sizeof(invalid.srv6[1]));
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == 0);
+    assert(mrc_ctl_store_set_state(&store, 20, MRC_CTL_STORE_ONLINE) == -EINVAL);
+    invalid = explicit;
+    invalid.srv6[0][16] = 0x20;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    invalid = explicit;
+    invalid.srv6[0][0] = 0xff;
+    assert(mrc_ctl_store_configure(&store, 20, &invalid) == -EINVAL);
+    assert(mrc_ctl_store_configure(&store, 20, &explicit) == 0);
+    assert(mrc_ctl_store_set_state(&store, 20, MRC_CTL_STORE_ONLINE) == 0);
+
+    struct mrc_ctl_store_config generated = {
+        .mode = MRC_CTL_STORE_GENERATED, .format = MRC_CTL_STORE_FORMAT_SRV6_SRH,
+        .count = 2, .min_active = 1, .populated = 3, .field_count = 16,
+        .srv6 = {
+            { 0x20, 1, [15] = 7, [16] = 0x20, [17] = 2, [31] = 1 },
+            { 0x20, 1, [15] = 7, [16] = 0x20, [17] = 2, [31] = 2 },
+        },
+    };
+    for (unsigned int i = 0; i < generated.field_count; i++) {
+        const uint8_t *word = generated.srv6[0] + 2 * i;
+        generated.fields[i] = (struct mrc_ctl_store_ev_field){
+            .width = 16, .init_val = (uint32_t)word[0] << 8 | word[1],
+        };
+    }
+    generated.fields[15] = (struct mrc_ctl_store_ev_field){
+        .width = 16, .min_val = 1, .max_val = 2, .mask = 3,
+    };
+    assert(mrc_ctl_store_create(&store, 30) == 0);
+    invalid = generated;
+    memset(invalid.srv6[0] + 16, 0, MRC_CTL_STORE_SRV6_SID_BYTES);
+    assert(mrc_ctl_store_configure(&store, 30, &invalid) == -EINVAL);
+    invalid = generated;
+    invalid.field_count = 8;
+    assert(mrc_ctl_store_configure(&store, 30, &invalid) == -EINVAL);
+    assert(mrc_ctl_store_configure(&store, 30, &generated) == 0);
+    assert(mrc_ctl_store_set_state(&store, 30, MRC_CTL_STORE_ONLINE) == 0);
+    expect_ev_snapshot_version(&store, 4);
+
+    mrc_ctl_store_close(&store);
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+    assert(mrc_ctl_store_get(&store, 10, &saved) == 0 && saved.state == MRC_CTL_STORE_ONLINE);
+    check_ev_fields(&saved.config, &udp);
+    assert(mrc_ctl_store_get(&store, 20, &saved) == 0 && saved.config.format == explicit.format);
+    assert(memcmp(saved.config.srv6, explicit.srv6, sizeof(explicit.srv6)) == 0);
+    assert(mrc_ctl_store_acquire(&store, 30, &ref, &saved) == 0);
+    assert(saved.config.format == generated.format);
+    check_ev_fields(&saved.config, &generated);
+    assert(memcmp(saved.config.srv6, generated.srv6, sizeof(generated.srv6)) == 0);
+
+    struct mrc_ctl_store_profile edited = saved;
+    edited.config.srv6[0][15] ^= 1;
+    assert(mrc_ctl_store_edit(&store, 30, replace_profile, &edited) == -EBUSY);
+    assert(mrc_ctl_store_update_denied(&store, 30, 2, 0) == 0);
+    assert(mrc_ctl_store_get(&store, 30, &saved) == 0 && saved.config.denied == 2);
+    assert(memcmp(saved.config.srv6, generated.srv6, sizeof(generated.srv6)) == 0);
+    mrc_ctl_store_release(&ref);
+    assert(mrc_ctl_store_edit(&store, 20, clear_profile_id, NULL) == 0);
+    assert(mrc_ctl_store_edit(&store, 30, clear_profile_id, NULL) == 0);
+    expect_ev_snapshot_version(&store, 3);
+    assert(mrc_ctl_store_get(&store, 10, &saved) == 0 && saved.state == MRC_CTL_STORE_ONLINE);
+    check_ev_fields(&saved.config, &udp);
     remove_fixture(&store, directory);
 }
 
@@ -698,6 +795,7 @@ int main(void)
     test_typed_edits();
     test_legacy_shared_store();
     test_generated_fields();
+    test_srv6_profiles();
     test_cc_profiles();
     puts("MRC controller profile store tests passed");
     return 0;

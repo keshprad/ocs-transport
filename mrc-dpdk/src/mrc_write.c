@@ -556,7 +556,7 @@ static int open_ev_profile(struct benchmark *benchmark)
     if (result)
         return result;
 
-    return mrc_endpoint_ev_profile_valid(transfer) ? 0 : -EINVAL;
+    return mrc_endpoint_apply_ev_profile(transfer) ? 0 : -EINVAL;
 }
 
 static int register_buffer(struct benchmark *benchmark)

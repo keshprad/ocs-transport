@@ -17,10 +17,14 @@ int mrc_dpdk_unbind_mr(struct mrc_context *context, const struct ibv_mr *mr);
  * mrc_get_async_event fails with errno EAGAIN when the queue is empty. */
 int mrc_dpdk_get_async_fd(struct mrc_context *context, int *fd);
 
-/* Built-in controller EV formats. EV values use big-endian uint32 in the
- * first four bytes of mrc_ctl_ev_t, with remaining bytes zero. */
+/* Built-in controller EV formats. UDP and STEV use a big-endian uint32
+ * in the first four bytes of mrc_ctl_ev_t. SRv6 values contain an IPv6
+ * destination followed by the single SRH container when applicable.
+ * Unused bytes are zero. */
 #define MRC_DPDK_EV_FORMAT_UDP UINT64_C(1)
 #define MRC_DPDK_EV_FORMAT_STEV UINT64_C(2)
+#define MRC_DPDK_EV_FORMAT_SRV6 UINT64_C(3)
+#define MRC_DPDK_EV_FORMAT_SRV6_SRH UINT64_C(4)
 
 /* Select a stable EV and CC profile directory once per MRC context.
  * Both the controller and application contexts use the same storage. */
@@ -46,7 +50,9 @@ struct mrc_dpdk_route {
 
 /* Per-rail IPv6 outer addresses and optional single-segment SRH. An all-zero
  * initial destination selects peer_sid. An all-zero SRH segment omits the
- * header. An SRH may start with zero or one segment left. */
+ * header. An SRH may start with zero or one segment left. An SRv6 EV
+ * profile selected by the requester supplies its outgoing destination
+ * and SRH in place of these per-rail defaults. */
 struct mrc_dpdk_srv6_path {
     uint8_t local_sid[16];
     uint8_t peer_sid[16];

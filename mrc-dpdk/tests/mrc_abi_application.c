@@ -477,6 +477,8 @@ enum simplex_wire_mode {
     SIMPLEX_GENERATED_EV,
     SIMPLEX_SRV6,
     SIMPLEX_SRV6_TRANSIT,
+    SIMPLEX_SRV6_EXPLICIT_EV,
+    SIMPLEX_SRV6_GENERATED_EV,
 };
 
 static void test_sid(uint8_t sid[16], uint16_t port, uint8_t endpoint)
@@ -517,7 +519,7 @@ static void attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route
 
 struct simplex_wire_witness {
     bool requester;
-    bool transit;
+    enum simplex_wire_mode mode;
     const struct connection *local;
     const struct connection *peer;
     const struct mrc_dpdk_srv6_path *srv6;
@@ -530,33 +532,74 @@ struct simplex_wire_witness {
     bool wrong_sid_injected;
 };
 
+enum srv6_ingress_action {
+    SRV6_PRESERVE,
+    SRV6_DECAPSULATE,
+    SRV6_ADVANCE,
+};
+
+struct srv6_wire_path {
+    uint8_t destination[16];
+    uint8_t segment[16];
+    bool has_srh;
+    enum srv6_ingress_action action;
+};
+
+static struct srv6_wire_path expected_srv6_path(const struct simplex_wire_witness *observed,
+                                                 uint16_t port)
+{
+    const uint8_t *local = observed->srv6[port].local_sid;
+    struct srv6_wire_path path = {.has_srh = port == 1};
+    memcpy(path.destination, local, sizeof(path.destination));
+    memcpy(path.segment, local, sizeof(path.segment));
+
+    if (observed->requester) {
+        /* Replies use the responder's own route, independent of the request profile. */
+        path.action = port == 1 ? SRV6_DECAPSULATE : SRV6_PRESERVE;
+    } else if (observed->mode == SIMPLEX_SRV6_EXPLICIT_EV ||
+               observed->mode == SIMPLEX_SRV6_GENERATED_EV) {
+        /* The controller fixture seeds these containers. Attach inputs specify
+         * different destinations and an SRH only on rail 1. */
+        test_sid(path.destination, 0, port + 1);
+        test_sid(path.segment, 1, 0x42);
+        path.has_srh = observed->mode == SIMPLEX_SRV6_GENERATED_EV;
+        path.action = SRV6_ADVANCE;
+    } else if (observed->mode == SIMPLEX_SRV6_TRANSIT) {
+        if (port == 1) {
+            test_sid(path.destination, port, 0x33);
+            path.action = SRV6_ADVANCE;
+        }
+    } else {
+        path.action = SRV6_DECAPSULATE;
+    }
+    return path;
+}
+
 static struct observed_udp read_srv6_udp(struct rte_mbuf *packet, uint8_t *prefix, size_t capacity,
-                                          uint16_t port, const struct simplex_wire_witness *observed)
+                                          const struct mrc_dpdk_srv6_path *endpoint,
+                                          const struct srv6_wire_path *path,
+                                          const struct simplex_wire_witness *observed)
 {
     const size_t packet_length = rte_pktmbuf_pkt_len(packet);
     const size_t length = packet_length < capacity ? packet_length : capacity;
-    const size_t encapsulation = WIRE_IPV6_LEN + (port == 1 ? WIRE_SINGLE_SRH_LEN : 0);
+    const size_t encapsulation = WIRE_IPV6_LEN + (path->has_srh ? WIRE_SINGLE_SRH_LEN : 0);
     const size_t udp_offset = RTE_ETHER_HDR_LEN + encapsulation + WIRE_IPV6_LEN;
     assert(length >= udp_offset + WIRE_UDP_LEN + WIRE_BTH_LEN);
     const uint8_t *frame = rte_pktmbuf_read(packet, 0, length, prefix);
     assert(frame && wire_be16(frame + 12) == RTE_ETHER_TYPE_IPV6);
-    const struct mrc_dpdk_srv6_path *path = &observed->srv6[port];
     const uint8_t *outer = frame + RTE_ETHER_HDR_LEN;
-    bool transit = observed->transit && !observed->requester && port == 1;
-    uint8_t transit_sid[16];
-    test_sid(transit_sid, port, 0x33);
     assert((outer[0] >> 4) == 6 && outer[7] > 0);
     assert(wire_be16(outer + 4) == packet_length - RTE_ETHER_HDR_LEN - WIRE_IPV6_LEN);
-    assert(memcmp(outer + 8, path->peer_sid, 16) == 0);
-    assert(memcmp(outer + 24, transit ? transit_sid : path->local_sid, 16) == 0);
-    if (port == 0) {
+    assert(memcmp(outer + 8, endpoint->peer_sid, 16) == 0);
+    assert(memcmp(outer + 24, path->destination, 16) == 0);
+    if (!path->has_srh) {
         assert(outer[6] == IPPROTO_IPV6);
     } else {
         const uint8_t *srh = outer + WIRE_IPV6_LEN;
         assert(outer[6] == IPPROTO_ROUTING);
         assert(srh[0] == IPPROTO_IPV6 && srh[1] == 2 && srh[2] == 4 &&
-               srh[3] == transit && srh[4] == 0);
-        assert(memcmp(srh + 8, path->local_sid, 16) == 0);
+               srh[3] == (path->action == SRV6_ADVANCE) && srh[4] == 0);
+        assert(memcmp(srh + 8, path->segment, 16) == 0);
     }
 
     const uint8_t *inner = outer + encapsulation;
@@ -570,16 +613,17 @@ static struct observed_udp read_srv6_udp(struct rte_mbuf *packet, uint8_t *prefi
     return (struct observed_udp){.header = udp, .bytes = length - udp_offset, .entropy = entropy};
 }
 
-static void finish_srv6_receive(struct rte_mbuf *packet, uint16_t port,
+static void finish_srv6_receive(struct rte_mbuf *packet, uint16_t port, const struct srv6_wire_path *path,
                                  struct simplex_wire_witness *observed)
 {
-    if (port == 0 && (observed->requester || observed->transit))
+    if (path->action == SRV6_PRESERVE)
         return;
-    if (!observed->requester && observed->transit) {
-        /* Emulate the final segment transition before the public RX path. */
+    if (path->action == SRV6_ADVANCE) {
+        /* Emulate the fabric's terminal delivery before the public RX path. */
         uint8_t *outer = rte_pktmbuf_mtod_offset(packet, uint8_t *, RTE_ETHER_HDR_LEN);
         memcpy(outer + 24, observed->srv6[port].local_sid, 16);
-        outer[WIRE_IPV6_LEN + 3] = 0;
+        if (path->has_srh)
+            outer[WIRE_IPV6_LEN + 3] = 0;
         observed->advanced_ports |= 1u << port;
         return;
     }
@@ -588,7 +632,7 @@ static void finish_srv6_receive(struct rte_mbuf *packet, uint16_t port,
      * preserving Ethernet and the intact inner iCRC-protected packet. */
     struct rte_ether_hdr ethernet;
     memcpy(&ethernet, rte_pktmbuf_mtod(packet, const uint8_t *), sizeof(ethernet));
-    uint16_t envelope = WIRE_IPV6_LEN + (port == 1 ? WIRE_SINGLE_SRH_LEN : 0);
+    uint16_t envelope = WIRE_IPV6_LEN + (path->has_srh ? WIRE_SINGLE_SRH_LEN : 0);
     char *inner_frame = rte_pktmbuf_adj(packet, envelope);
     assert(inner_frame);
     memcpy(inner_frame, &ethernet, sizeof(ethernet));
@@ -637,12 +681,15 @@ static uint16_t observe_simplex_wire(uint16_t port, uint16_t queue, struct rte_m
 {
     (void)queue;
     struct simplex_wire_witness *observed = argument;
+    struct srv6_wire_path path;
+    if (observed->srv6)
+        path = expected_srv6_path(observed, port);
     struct rte_mbuf *foreign = NULL;
     for (uint16_t i = 0; i < count; i++) {
         uint8_t prefix[RTE_ETHER_HDR_LEN + 2 * WIRE_IPV6_LEN + WIRE_SINGLE_SRH_LEN +
                        WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_SETH_LEN];
         struct observed_udp udp = observed->srv6 ?
-            read_srv6_udp(packets[i], prefix, sizeof(prefix), port, observed) :
+            read_srv6_udp(packets[i], prefix, sizeof(prefix), &observed->srv6[port], &path, observed) :
             read_udp(packets[i], prefix, sizeof(prefix));
         observe_simplex_header(observed, port, &udp);
         if (!observed->srv6)
@@ -655,11 +702,13 @@ static uint16_t observe_simplex_wire(uint16_t port, uint16_t queue, struct rte_m
              * replies once even after seeing this other rail's SID. */
             foreign = rte_pktmbuf_copy(packets[i], packets[i]->pool, 0, UINT32_MAX);
             assert(foreign);
-            uint8_t *destination = rte_pktmbuf_mtod_offset(foreign, uint8_t *, RTE_ETHER_HDR_LEN + 24);
-            memcpy(destination, observed->srv6[1].local_sid, 16);
+            uint8_t *outer = rte_pktmbuf_mtod_offset(foreign, uint8_t *, RTE_ETHER_HDR_LEN);
+            memcpy(outer + 24, observed->srv6[1].local_sid, 16);
+            if (path.has_srh)
+                outer[WIRE_IPV6_LEN + 3] = 0;
             observed->wrong_sid_injected = true;
         }
-        finish_srv6_receive(packets[i], port, observed);
+        finish_srv6_receive(packets[i], port, &path, observed);
     }
     if (foreign) {
         memmove(packets + 1, packets, count * sizeof(*packets));
@@ -675,7 +724,9 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                        enum simplex_wire_mode wire_mode)
 {
     const bool generated_ev = wire_mode == SIMPLEX_GENERATED_EV;
-    const bool srv6 = wire_mode == SIMPLEX_SRV6 || wire_mode == SIMPLEX_SRV6_TRANSIT;
+    const bool srv6_ev = wire_mode == SIMPLEX_SRV6_EXPLICIT_EV ||
+                         wire_mode == SIMPLEX_SRV6_GENERATED_EV;
+    const bool srv6 = srv6_ev || wire_mode == SIMPLEX_SRV6 || wire_mode == SIMPLEX_SRV6_TRANSIT;
     const bool transit = wire_mode == SIMPLEX_SRV6_TRANSIT;
     if (requester && ev_profile_id)
         assert(mrc_dpdk_set_ev_store(context, ev_store) == 0);
@@ -727,13 +778,15 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
     struct mrc_dpdk_srv6_path paths[DUPLEX_RAILS] = {0};
+    if (requester && srv6_ev)
+        assert(mrc_dpdk_attach_qp(qp, &route) == EINVAL);
     if (srv6)
         attach_srv6_qp(qp, &route, paths, transit);
     else
         attach_qp(qp, &route);
 
     struct simplex_wire_witness observed = {
-        .requester = requester, .transit = transit, .local = &local, .peer = &peer,
+        .requester = requester, .mode = wire_mode, .local = &local, .peer = &peer,
         .srv6 = srv6 ? paths : NULL,
     };
     const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS] = {0};
@@ -763,7 +816,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
     }
-    if (ev_profile_id && !generated_ev)
+    if (ev_profile_id && !generated_ev && wire_mode != SIMPLEX_SRV6_GENERATED_EV)
         check_blocked_profile(qp, cq, ev_store, requester, first_data);
     if (wire_error)
         complete_async_error(context, qp, cq, requester, local.qpn);
@@ -777,9 +830,10 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         if (srv6) {
             /* The final case can only complete its WRITEs after the
              * responder accepts independently decapsulated traffic. */
-            unsigned int decapped_ports = requester ? 1u << 1 : (transit ? 0 : both_rails);
+            unsigned int decapped_ports = requester ? 1u << 1 : (wire_mode == SIMPLEX_SRV6 ? both_rails : 0);
+            unsigned int advanced_ports = requester ? 0 : (srv6_ev ? both_rails : transit ? 1u << 1 : 0);
             assert(observed.decapped_ports == decapped_ports);
-            assert(observed.advanced_ports == (!requester && transit ? 1u << 1 : 0));
+            assert(observed.advanced_ports == advanced_ports);
             assert(observed.wrong_sid_injected == !requester);
         }
         for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
@@ -824,6 +878,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                    (unsigned int)__builtin_popcount(observed.decapped_ports),
                    (unsigned int)__builtin_popcount(observed.advanced_ports),
                    (unsigned int)observed.wrong_sid_injected);
+        if (srv6_ev)
+            printf(",\"rail_entropy\":[%u,%u]", observed.entropy[0], observed.entropy[1]);
         puts("}");
     }
 }
@@ -1554,12 +1610,18 @@ int main(int argc, char **argv)
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
     bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0;
     bool generated_ev = generated_stev || strcmp(argv[3], "generated_ev_udp") == 0;
-    bool ev_profile = generated_ev || strcmp(argv[3], "ev_profile") == 0;
     bool srv6_transit = strcmp(argv[3], "srv6_transit") == 0;
-    bool srv6 = srv6_transit || strcmp(argv[3], "srv6") == 0;
+    bool explicit_srv6 = strcmp(argv[3], "explicit_ev_srv6") == 0;
+    bool generated_srv6 = strcmp(argv[3], "generated_ev_srv6_srh") == 0;
+    bool srv6 = explicit_srv6 || generated_srv6 || srv6_transit || strcmp(argv[3], "srv6") == 0;
+    bool ev_profile = generated_ev || explicit_srv6 || generated_srv6 || strcmp(argv[3], "ev_profile") == 0;
     enum simplex_wire_mode wire_mode = SIMPLEX_WIRE_NONE;
     if (generated_ev)
         wire_mode = SIMPLEX_GENERATED_EV;
+    else if (explicit_srv6)
+        wire_mode = SIMPLEX_SRV6_EXPLICIT_EV;
+    else if (generated_srv6)
+        wire_mode = SIMPLEX_SRV6_GENERATED_EV;
     else if (srv6)
         wire_mode = srv6_transit ? SIMPLEX_SRV6_TRANSIT : SIMPLEX_SRV6;
     const char *profile_store = NULL;

@@ -10,8 +10,10 @@
  * enforces its administrative policy. This interface is independent of the
  * upstream mrc_ctl ABI and stores EV and congestion-control profiles. */
 #define MRC_CTL_STORE_MAX_PROFILES 32u
-#define MRC_CTL_STORE_MAX_EV_FIELDS 2u
+#define MRC_CTL_STORE_MAX_EV_FIELDS 16u
 #define MRC_CTL_STORE_MAX_CC_PROFILES 32u
+#define MRC_CTL_STORE_SRV6_SID_BYTES 16u
+#define MRC_CTL_STORE_SRV6_EV_BYTES (2u * MRC_CTL_STORE_SRV6_SID_BYTES)
 #define MRC_CTL_STORE_INITIALIZER { .fd = -1 }
 #define MRC_CTL_STORE_REF_INITIALIZER { .fd = -1 }
 
@@ -31,7 +33,19 @@ enum mrc_ctl_store_format {
     MRC_CTL_STORE_FORMAT_LEGACY = 0,
     MRC_CTL_STORE_FORMAT_UDP = 1,
     MRC_CTL_STORE_FORMAT_STEV = 2,
+    MRC_CTL_STORE_FORMAT_SRV6 = 3,
+    MRC_CTL_STORE_FORMAT_SRV6_SRH = 4,
 };
+
+static inline bool mrc_ctl_store_format_is_srv6(enum mrc_ctl_store_format format)
+{
+    return format == MRC_CTL_STORE_FORMAT_SRV6 || format == MRC_CTL_STORE_FORMAT_SRV6_SRH;
+}
+
+/* A populated SRv6 EV contains the initial destination, followed by a
+ * single SRH segment for SRV6_SRH or zero padding for SRV6. */
+bool mrc_ctl_store_srv6_ev_valid(enum mrc_ctl_store_format format,
+                                const uint8_t value[MRC_CTL_STORE_SRV6_EV_BYTES]);
 
 struct mrc_ctl_store_ev_field {
     uint32_t width;
@@ -52,6 +66,7 @@ struct mrc_ctl_store_config {
     uint32_t populated; /* Bit i identifies a configured entropy slot. */
     uint32_t denied; /* Administrative DENY updates are allowed while ONLINE. */
     uint32_t entropy[MRC_EV_MAX_PATHS];
+    uint8_t srv6[MRC_EV_MAX_PATHS][MRC_CTL_STORE_SRV6_EV_BYTES]; /* Network byte order. */
     uint8_t field_count; /* Zero for profiles with no generated field metadata. */
     struct mrc_ctl_store_ev_field fields[MRC_CTL_STORE_MAX_EV_FIELDS];
 };

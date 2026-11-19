@@ -370,7 +370,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         error = -mrc_ctl_store_get(&config->profile_store, config->profile_id, &config->profile);
         if (error)
             return error;
-        if (config->profile.state != MRC_CTL_STORE_ONLINE || !mrc_endpoint_ev_profile_valid(config))
+        if (config->profile.state != MRC_CTL_STORE_ONLINE)
             return EINVAL;
     }
     for (unsigned int i = 0; i < PATH_COUNT; i++) {
@@ -383,6 +383,8 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         if (error)
             return error;
     }
+    if (config->profile_id && !mrc_endpoint_apply_ev_profile(config))
+        return EINVAL;
     return 0;
 }
 

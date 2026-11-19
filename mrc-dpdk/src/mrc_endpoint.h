@@ -171,7 +171,7 @@ struct mrc_requester;
 struct mrc_responder;
 
 uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path);
-bool mrc_endpoint_ev_profile_valid(const struct mrc_endpoint_config *config);
+bool mrc_endpoint_apply_ev_profile(struct mrc_endpoint_config *config);
 bool mrc_endpoint_route_matches(const struct mrc_endpoint_config *config, unsigned int path,
                                 const struct mrc_wire_srv6 *route);
 bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *config, unsigned int path,

@@ -1,5 +1,6 @@
 #include "mrc_ctl_store.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -40,8 +41,18 @@ static void show(const struct mrc_ctl_store_profile *profile)
            profile->id, states[profile->state], modes[config->mode],
            (unsigned int)config->count, (unsigned int)config->min_active, config->denied);
     for (unsigned int path = 0; path < config->count; path++) {
-        if (config->populated & (UINT32_C(1) << path))
+        if (!(config->populated & (UINT32_C(1) << path)))
+            continue;
+        if (mrc_ctl_store_format_is_srv6(config->format)) {
+            const uint8_t *value = config->srv6[path];
+            char destination[INET6_ADDRSTRLEN], segment[INET6_ADDRSTRLEN];
+            printf(" ev[%u]=%s", path, inet_ntop(AF_INET6, value, destination, sizeof(destination)));
+            if (config->format == MRC_CTL_STORE_FORMAT_SRV6_SRH)
+                printf("/%s", inet_ntop(AF_INET6, value + MRC_CTL_STORE_SRV6_SID_BYTES,
+                                        segment, sizeof(segment)));
+        } else {
             printf(" ev[%u]=0x%08" PRIx32, path, config->entropy[path]);
+        }
     }
     putchar('\n');
 }

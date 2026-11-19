@@ -15,13 +15,17 @@ enum {
     LEGACY_VERSION = 1,
     TYPED_VERSION = 2,
     GENERATED_FIELDS_VERSION = 3,
+    SRV6_VERSION = 4,
     LEGACY_ENTRY_HEADER_SIZE = 20,
     ENTRY_HEADER_SIZE = 24,
     ENTROPY_SIZE = 4 * MRC_EV_MAX_PATHS,
     ENTRY_SIZE = ENTRY_HEADER_SIZE + ENTROPY_SIZE,
     EV_FIELD_SIZE = 20,
-    GENERATED_FIELDS_ENTRY_SIZE = ENTRY_SIZE + MRC_CTL_STORE_MAX_EV_FIELDS * EV_FIELD_SIZE,
-    SNAPSHOT_MAX_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * GENERATED_FIELDS_ENTRY_SIZE,
+    GENERATED_FIELDS_SLOTS = 2,
+    GENERATED_FIELDS_ENTRY_SIZE = ENTRY_SIZE + GENERATED_FIELDS_SLOTS * EV_FIELD_SIZE,
+    SRV6_VALUES_OFFSET = ENTRY_SIZE + MRC_CTL_STORE_MAX_EV_FIELDS * EV_FIELD_SIZE,
+    SRV6_ENTRY_SIZE = SRV6_VALUES_OFFSET + MRC_EV_MAX_PATHS * MRC_CTL_STORE_SRV6_EV_BYTES,
+    SNAPSHOT_MAX_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * SRV6_ENTRY_SIZE,
 };
 
 /* Use the existing filename and lock inode when migrating the wire version. */
@@ -53,6 +57,26 @@ static uint32_t path_mask(unsigned int count)
     return count == 32 ? UINT32_MAX : (UINT32_C(1) << count) - 1;
 }
 
+static bool bytes_are_zero(const uint8_t *bytes, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (bytes[i])
+            return false;
+    }
+    return true;
+}
+
+bool mrc_ctl_store_srv6_ev_valid(enum mrc_ctl_store_format format,
+                                const uint8_t value[MRC_CTL_STORE_SRV6_EV_BYTES])
+{
+    if (!value || !mrc_ctl_store_format_is_srv6(format) || value[0] == 0xff ||
+        bytes_are_zero(value, MRC_CTL_STORE_SRV6_SID_BYTES))
+        return false;
+    const uint8_t *segment = value + MRC_CTL_STORE_SRV6_SID_BYTES;
+    bool empty = bytes_are_zero(segment, MRC_CTL_STORE_SRV6_SID_BYTES);
+    return format == MRC_CTL_STORE_FORMAT_SRV6 ? empty : !empty && segment[0] != 0xff;
+}
+
 bool mrc_ctl_store_ev_field_valid(const struct mrc_ctl_store_ev_field *field)
 {
     if (!field || !field->width || field->width > 16)
@@ -63,15 +87,30 @@ bool mrc_ctl_store_ev_field_valid(const struct mrc_ctl_store_ev_field *field)
            field->min_val <= field->max_val && field->max_val <= compact_mask;
 }
 
-static bool ev_fields_valid(const struct mrc_ctl_store_config *config)
+static bool ev_fields_valid(const struct mrc_ctl_store_config *config, bool srv6)
 {
     if (!config->field_count)
-        return true;
-    if (config->mode != MRC_CTL_STORE_GENERATED ||
-        !((config->format == MRC_CTL_STORE_FORMAT_UDP && config->field_count == 1) ||
-          (config->format == MRC_CTL_STORE_FORMAT_STEV && config->field_count == 2)))
+        return !srv6 || config->mode != MRC_CTL_STORE_GENERATED || !config->populated;
+    unsigned int count;
+    switch (config->format) {
+    case MRC_CTL_STORE_FORMAT_UDP:
+        count = 1;
+        break;
+    case MRC_CTL_STORE_FORMAT_STEV:
+        count = 2;
+        break;
+    case MRC_CTL_STORE_FORMAT_SRV6:
+        count = MRC_CTL_STORE_SRV6_SID_BYTES / 2;
+        break;
+    case MRC_CTL_STORE_FORMAT_SRV6_SRH:
+        count = MRC_CTL_STORE_SRV6_EV_BYTES / 2;
+        break;
+    default:
         return false;
-    for (unsigned int i = 0; i < config->field_count; i++) {
+    }
+    if (config->mode != MRC_CTL_STORE_GENERATED || config->field_count != count)
+        return false;
+    for (unsigned int i = 0; i < count; i++) {
         if (!mrc_ctl_store_ev_field_valid(&config->fields[i]))
             return false;
     }
@@ -80,10 +119,12 @@ static bool ev_fields_valid(const struct mrc_ctl_store_config *config)
 
 static bool config_valid(const struct mrc_ctl_store_config *config)
 {
+    bool srv6 = mrc_ctl_store_format_is_srv6(config->format);
     if (config->mode < MRC_CTL_STORE_AUTO || config->mode > MRC_CTL_STORE_GENERATED ||
-        (unsigned int)config->format > MRC_CTL_STORE_FORMAT_STEV ||
+        (unsigned int)config->format > MRC_CTL_STORE_FORMAT_SRV6_SRH ||
+        (srv6 && config->mode == MRC_CTL_STORE_AUTO) ||
         !config->count || config->count > MRC_EV_MAX_PATHS || config->min_active > config->count ||
-        !ev_fields_valid(config))
+        !ev_fields_valid(config, srv6))
         return false;
 
     uint32_t paths = path_mask(config->count);
@@ -92,8 +133,15 @@ static bool config_valid(const struct mrc_ctl_store_config *config)
         return false;
 
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
-        if (!(config->populated & (UINT32_C(1) << i)) && config->entropy[i])
+        bool populated = config->populated & (UINT32_C(1) << i);
+        if ((srv6 || !populated) && config->entropy[i])
             return false;
+        if (srv6 && populated) {
+            if (!mrc_ctl_store_srv6_ev_valid(config->format, config->srv6[i]))
+                return false;
+        } else if (!bytes_are_zero(config->srv6[i], sizeof(config->srv6[i]))) {
+            return false;
+        }
     }
     return true;
 }
@@ -112,7 +160,7 @@ static bool profile_valid(const struct mrc_ctl_store_profile *profile)
             config->populated || config->denied || config->field_count)
             return false;
         for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
-            if (config->entropy[i])
+            if (config->entropy[i] || !bytes_are_zero(config->srv6[i], sizeof(config->srv6[i])))
                 return false;
         }
         return true;
@@ -145,7 +193,8 @@ static bool same_layout(const struct mrc_ctl_store_config *previous,
     return previous->mode == updated->mode && previous->format == updated->format &&
            previous->count == updated->count && previous->min_active == updated->min_active &&
            previous->populated == updated->populated && same_fields(previous, updated) &&
-           memcmp(previous->entropy, updated->entropy, sizeof(previous->entropy)) == 0;
+           memcmp(previous->entropy, updated->entropy, sizeof(previous->entropy)) == 0 &&
+           memcmp(previous->srv6, updated->srv6, sizeof(previous->srv6)) == 0;
 }
 
 static uint32_t read32(const uint8_t *bytes)
@@ -179,14 +228,16 @@ static unsigned int ev_entry_size(uint8_t version)
         return ENTRY_SIZE;
     case GENERATED_FIELDS_VERSION:
         return GENERATED_FIELDS_ENTRY_SIZE;
+    case SRV6_VERSION:
+        return SRV6_ENTRY_SIZE;
     default:
         return 0;
     }
 }
 
-static bool decode_ev_fields(const uint8_t *bytes, struct mrc_ctl_store_config *config)
+static bool decode_ev_fields(const uint8_t *bytes, unsigned int slots, struct mrc_ctl_store_config *config)
 {
-    if (config->field_count > MRC_CTL_STORE_MAX_EV_FIELDS)
+    if (config->field_count > slots)
         return false;
     for (unsigned int i = 0; i < config->field_count; i++, bytes += EV_FIELD_SIZE) {
         config->fields[i] = (struct mrc_ctl_store_ev_field){
@@ -195,12 +246,8 @@ static bool decode_ev_fields(const uint8_t *bytes, struct mrc_ctl_store_config *
         };
     }
 
-    unsigned int unused = (MRC_CTL_STORE_MAX_EV_FIELDS - config->field_count) * EV_FIELD_SIZE;
-    for (unsigned int i = 0; i < unused; i++) {
-        if (bytes[i])
-            return false;
-    }
-    return true;
+    unsigned int unused = (slots - config->field_count) * EV_FIELD_SIZE;
+    return bytes_are_zero(bytes, unused);
 }
 
 static void encode_ev_fields(uint8_t *bytes, const struct mrc_ctl_store_config *config)
@@ -230,7 +277,8 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
     }
 
     bool typed = version != LEGACY_VERSION;
-    bool fields = version == GENERATED_FIELDS_VERSION;
+    bool srv6 = version == SRV6_VERSION;
+    bool fields = version == GENERATED_FIELDS_VERSION || srv6;
     unsigned int header_size = typed ? ENTRY_HEADER_SIZE : LEGACY_ENTRY_HEADER_SIZE;
     if (typed && ((!fields && bytes[21]) || bytes[22] || bytes[23]))
         return false;
@@ -245,8 +293,12 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
     };
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++)
         profile->config.entropy[i] = read32(bytes + header_size + 4 * i);
-    return (!fields || decode_ev_fields(bytes + ENTRY_SIZE, &profile->config)) &&
-           profile_valid(profile);
+    if (srv6)
+        memcpy(profile->config.srv6, bytes + SRV6_VALUES_OFFSET, sizeof(profile->config.srv6));
+    else if (mrc_ctl_store_format_is_srv6(profile->config.format))
+        return false;
+    unsigned int slots = srv6 ? MRC_CTL_STORE_MAX_EV_FIELDS : GENERATED_FIELDS_SLOTS;
+    return (!fields || decode_ev_fields(bytes + ENTRY_SIZE, slots, &profile->config)) && profile_valid(profile);
 }
 
 static void encode_profile(uint8_t *bytes, uint8_t version, const struct mrc_ctl_store_profile *profile)
@@ -263,10 +315,12 @@ static void encode_profile(uint8_t *bytes, uint8_t version, const struct mrc_ctl
     bytes[20] = (uint8_t)config->format;
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++)
         write32(bytes + ENTRY_HEADER_SIZE + 4 * i, config->entropy[i]);
-    if (version == GENERATED_FIELDS_VERSION) {
+    if (version >= GENERATED_FIELDS_VERSION) {
         bytes[21] = config->field_count;
         encode_ev_fields(bytes + ENTRY_SIZE, config);
     }
+    if (version == SRV6_VERSION)
+        memcpy(bytes + SRV6_VALUES_OFFSET, config->srv6, sizeof(config->srv6));
 }
 
 static int read_all(int fd, uint8_t *bytes, size_t length)
@@ -424,10 +478,13 @@ static int save_snapshot(const struct mrc_ctl_store *store, const struct transac
 {
     uint8_t version = TYPED_VERSION;
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
-        if (txn->profiles[i].config.field_count) {
-            version = GENERATED_FIELDS_VERSION;
+        const struct mrc_ctl_store_config *config = &txn->profiles[i].config;
+        if (mrc_ctl_store_format_is_srv6(config->format)) {
+            version = SRV6_VERSION;
             break;
         }
+        if (config->field_count)
+            version = GENERATED_FIELDS_VERSION;
     }
 
     uint8_t bytes[SNAPSHOT_MAX_SIZE] = {0};

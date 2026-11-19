@@ -19,6 +19,19 @@ def control(controller, operation, store):
     return result.stdout.strip()
 
 
+def unblock_profile(controller, operation, store, sender):
+    ready = Path(store) / "rx.profile-blocked"
+    deadline = time.monotonic() + 4
+    while not ready.exists():
+        if sender.poll() is not None:
+            stdout, stderr = sender.communicate()
+            raise RuntimeError(f"Sender exited before both EVs were blocked: {stdout}\n{stderr}")
+        require(time.monotonic() < deadline,
+                "Timed out checking that denied EVs blocked completion and remote placement")
+        time.sleep(0.01)
+    control(controller, operation, store)
+
+
 def check_live_profile(binary, controller):
     with tempfile.TemporaryDirectory(prefix="mrc-abi-ev-") as store:
         profile_id = control(controller, "--seed-denied", store)
@@ -31,16 +44,7 @@ def check_live_profile(binary, controller):
             ]
 
         def unblock(sender):
-            ready = Path(store) / "rx.profile-blocked"
-            deadline = time.monotonic() + 4
-            while not ready.exists():
-                if sender.poll() is not None:
-                    stdout, stderr = sender.communicate()
-                    raise RuntimeError(f"Sender exited before both EVs were blocked: {stdout}\n{stderr}")
-                require(time.monotonic() < deadline,
-                        "Timed out checking that denied EVs blocked completion and remote placement")
-                time.sleep(0.01)
-            control(controller, "--unblock", store)
+            unblock_profile(controller, "--unblock", store, sender)
 
         tx, rx, _ = run_pair(command, sender_started=unblock)
         require(tx["role"] == "tx" and rx["role"] == "rx" and tx["qpn"] != rx["qpn"]
@@ -59,6 +63,16 @@ def check_duplex(tx, rx, completions=3):
                 f"Unexpected public bidirectional QP results: {result}")
 
 
+def check_srv6(tx, rx, rx_decapped, rx_advanced):
+    require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+            and tx["completions"] == rx["completions"] == 2
+            and tx["srv6_probe_rails"] == rx["srv6_probe_rails"] == 2
+            and tx["srv6_decapped_rails"] == 1 and rx["srv6_decapped_rails"] == rx_decapped
+            and tx["srv6_advanced_rails"] == 0 and rx["srv6_advanced_rails"] == rx_advanced
+            and tx["srv6_wrong_sid_probes"] == 0 and rx["srv6_wrong_sid_probes"] == 1,
+            f"Unexpected public SRv6 QP results: {tx}, {rx}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -71,11 +85,11 @@ def main():
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
 
-    def run_case(mode, *options):
+    def run_case(mode, *options, sender_started=None):
         def command(role, cpu, directory):
             return eal_args(binary, role, cpu, directory) + ["--", role, str(directory), mode, *options]
 
-        tx, rx, _ = run_pair(command)
+        tx, rx, _ = run_pair(command, sender_started=sender_started)
         require(tx["role"] == "tx" and rx["role"] == "rx",
                 f"Unexpected endpoint roles: {tx}, {rx}")
         return tx, rx
@@ -88,15 +102,8 @@ def main():
 
     for mode in ("srv6", "srv6_transit"):
         tx, rx = run_case(mode)
-        require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
-                and tx["completions"] == rx["completions"] == 2
-                and tx["srv6_probe_rails"] == rx["srv6_probe_rails"] == 2
-                and tx["srv6_decapped_rails"] == 1
-                and rx["srv6_decapped_rails"] == (2 if mode == "srv6" else 0)
-                and tx["srv6_advanced_rails"] == 0
-                and rx["srv6_advanced_rails"] == (mode == "srv6_transit")
-                and tx["srv6_wrong_sid_probes"] == 0 and rx["srv6_wrong_sid_probes"] == 1,
-                f"Unexpected public SRv6 QP results: {tx}, {rx}")
+        check_srv6(tx, rx, rx_decapped=2 if mode == "srv6" else 0,
+                   rx_advanced=int(mode == "srv6_transit"))
         print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
 
     tx, rx = run_case("duplex")
@@ -134,6 +141,25 @@ def main():
                     and tx["completions"] == rx["completions"] == 2
                     and tx["rail_entropy"] == rx["rail_entropy"] == expected,
                     f"Unexpected generated EVs on the two rails: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+        for mode, seed in (
+            ("explicit_ev_srv6", "--seed-explicit-srv6"),
+            ("generated_ev_srv6_srh", "--seed-generated-srv6-srh"),
+        ):
+            with tempfile.TemporaryDirectory(prefix="mrc-abi-srv6-") as store:
+                profile_id = control(controller, seed, store)
+                require(profile_id.isdecimal() and int(profile_id) > 0,
+                        f"Invalid SRv6 EV profile ID: {profile_id!r}")
+
+                def unblock(sender):
+                    unblock_profile(controller, "--unblock-explicit-srv6", store, sender)
+
+                tx, rx = run_case(mode, store, profile_id,
+                                  sender_started=unblock if mode == "explicit_ev_srv6" else None)
+            check_srv6(tx, rx, rx_decapped=0, rx_advanced=2)
+            require(tx["rail_entropy"] == rx["rail_entropy"] == [0x0100C000, 0x0101C001],
+                    f"Unexpected reflected tokens for SRv6 profile: {tx}, {rx}")
             print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
 
         with tempfile.TemporaryDirectory(prefix="mrc-abi-cc-") as store:

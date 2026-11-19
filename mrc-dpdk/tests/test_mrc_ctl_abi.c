@@ -18,6 +18,13 @@ enum {
     QA_CC_PROFILE_ID = 10,
     GEN_UDP_PROFILE_ID = 11,
     GEN_STEV_PROFILE_ID = 12,
+    EXP_SRV6_PROFILE_ID = 13,
+    EXP_SRV6_SRH_PROFILE_ID = 14,
+    GEN_SRV6_PROFILE_ID = 15,
+    GEN_SRV6_SRH_PROFILE_ID = 16,
+    SRV6_SID_BYTES = 16,
+    SRV6_SID_FIELDS = SRV6_SID_BYTES / 2,
+    SRV6_MAX_FIELDS = MRC_CTL_EV_MAX_BYTES / 2,
     RAILS = 2,
     FIRST_EV = 0xc101,
     SECOND_EV = 0xc102,
@@ -146,6 +153,8 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
     assert((legacy.ev.ev_mode_mask & extended.ev.ev_mode_mask) & MRC_CTL_EV_MODE_GEN);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_UDP);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_STEV);
+    assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_SRV6);
+    assert(extended.ev.ev_max_fmt_profiles == 4 && extended.ev.ev_max_width == 256);
     assert(legacy.cc.cc_max_profiles == 32 && extended.cc.cc_max_profiles == 32);
     assert(legacy.cc.algorithms && legacy.cc.algorithms[0] &&
            strcmp(legacy.cc.algorithms[0], nscc_algorithm) == 0 && !legacy.cc.algorithms[1]);
@@ -160,34 +169,37 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
     } formats[] = {
         { MRC_DPDK_EV_FORMAT_UDP, MRC_CTL_EV_FMT_MODE_UDP, 16 },
         { MRC_DPDK_EV_FORMAT_STEV, MRC_CTL_EV_FMT_MODE_STEV, 32 },
+        { MRC_DPDK_EV_FORMAT_SRV6, MRC_CTL_EV_FMT_MODE_SRV6, 128 },
+        { MRC_DPDK_EV_FORMAT_SRV6_SRH, MRC_CTL_EV_FMT_MODE_SRV6, 256 },
     };
     for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
-        struct mrc_ctl_ev_fmt_field fields[2] = {0};
+        struct mrc_ctl_ev_fmt_field fields[SRV6_MAX_FIELDS] = {0};
         struct mrc_ctl_ev_fmt_profile_attr attr = {
             .ev_fmt_op = {
-                .op = MRC_CTL_EV_FMT_OP_QUERY_FIELDS, .fmt_fields = fields, .fmt_field_count = 2,
+                .op = MRC_CTL_EV_FMT_OP_QUERY_FIELDS, .fmt_fields = fields, .fmt_field_count = 0,
             },
         };
         assert(mrc_ctl_query_ev_fmt_profile(context, formats[i].id, &attr,
+                                          MRC_CTL_EV_FMT_PROFILE_OP) == -1 && errno == E2BIG);
+        assert(attr.ev_fmt_op.fmt_field_count == (int)formats[i].width / 16);
+        assert(mrc_ctl_query_ev_fmt_profile(context, formats[i].id, &attr,
                                           MRC_CTL_EV_FMT_PROFILE_MODE | MRC_CTL_EV_FMT_PROFILE_OP) == 0);
         assert(attr.ev_fmt_mode == formats[i].mode);
-        assert(attr.ev_fmt_op.fmt_field_count > 0 && attr.ev_fmt_op.fmt_field_count <= 2);
-        unsigned int width = 0;
+        assert(attr.ev_fmt_op.fmt_field_count == (int)formats[i].width / 16);
         for (int field = 0; field < attr.ev_fmt_op.fmt_field_count; field++)
-            width += fields[field].width;
-        assert(width == formats[i].width);
+            assert(fields[field].width == 16);
     }
 }
 
-static int configure_explicit(struct mrc_context *context)
+static int configure_explicit(struct mrc_context *context, uint64_t id, uint64_t format)
 {
     struct mrc_ctl_ev_profile_attr attr = {
         .profile_state = MRC_CTL_PROFILE_OFFLINE,
         .ev_mode = MRC_CTL_EV_MODE_EXP,
-        .ev_fmt_profile_id = MRC_DPDK_EV_FORMAT_UDP,
+        .ev_fmt_profile_id = format,
         .ev_count = RAILS,
     };
-    return mrc_ctl_modify_ev_profile(context, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_STATE |
+    return mrc_ctl_modify_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_STATE |
                                      MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_FMT_ID |
                                      MRC_CTL_EV_PROFILE_COUNT);
 }
@@ -226,12 +238,12 @@ static uint32_t ev_value(const struct mrc_ctl_ev *entry)
     return ntohl(network);
 }
 
-static int replace_evs(struct mrc_context *context, struct mrc_ctl_ev_op_entry *entries, int count)
+static int replace_evs(struct mrc_context *context, uint64_t id, struct mrc_ctl_ev_op_entry *entries, int count)
 {
     struct mrc_ctl_ev_profile_attr attr = {
         .ev_op = { .op = MRC_CTL_EV_OP_REPLACE_EV, .entries = entries, .entry_count = count },
     };
-    return mrc_ctl_modify_ev_profile(context, PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EV_OP);
+    return mrc_ctl_modify_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_EV_OP);
 }
 
 static void query_evs(struct mrc_context *context, uint64_t id, enum mrc_ctl_ev_mode mode,
@@ -263,13 +275,13 @@ static void populate_evs(struct mrc_context *controller)
         { .ev = ev(1, 0), .ev_new = ev(1, FIRST_EV), .state = MRC_CTL_EV_GOOD },
         { .ev = ev(2, FIRST_EV), .ev_new = ev(2, SECOND_EV), .state = MRC_CTL_EV_GOOD },
     };
-    assert(replace_evs(controller, entries, RAILS) == -1 && errno == ENOENT);
+    assert(replace_evs(controller, PROFILE_ID, entries, RAILS) == -1 && errno == ENOENT);
     check_evs(controller, FIRST_EV, 0);
     assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
     assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_OFFLINE);
 
     entries[1].ev = ev(2, 0);
-    assert(replace_evs(controller, &entries[1], 1) == 0);
+    assert(replace_evs(controller, PROFILE_ID, &entries[1], 1) == 0);
     check_evs(controller, FIRST_EV, SECOND_EV);
 }
 
@@ -335,7 +347,7 @@ static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context
     test_controller_discovery(verbs, controller);
     test_auto_profile(controller);
     assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
-    assert(configure_explicit(controller) == 0);
+    assert(configure_explicit(controller, PROFILE_ID, MRC_DPDK_EV_FORMAT_UDP) == 0);
     assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_OFFLINE);
     check_evs(controller, 0, 0);
     populate_evs(controller);
@@ -400,26 +412,31 @@ static int configure_generated(struct mrc_context *context, struct generated_pro
     return mrc_ctl_modify_ev_profile(context, profile.id, &attr, GENERATED_PROFILE_ATTRS);
 }
 
-static void check_generated(struct mrc_context *context, const struct generated_profile *expected)
+static void check_generated_fields(struct mrc_context *context, uint64_t id,
+                                     const struct mrc_ctl_ev_field *expected, int count)
 {
-    struct mrc_ctl_ev_field fields[2] = {0};
+    struct mrc_ctl_ev_field fields[SRV6_MAX_FIELDS] = {0};
     struct mrc_ctl_ev_profile_attr attr = {
         .ev_fields_op = {
-            .op = MRC_CTL_EV_FIELDS_OP_QUERY_FIELDS, .fields = fields, .field_count = expected->field_count - 1,
+            .op = MRC_CTL_EV_FIELDS_OP_QUERY_FIELDS, .fields = fields, .field_count = count - 1,
         },
     };
-    assert(mrc_ctl_query_ev_profile(context, expected->id, &attr,
+    assert(mrc_ctl_query_ev_profile(context, id, &attr,
                                     MRC_CTL_EV_PROFILE_EV_FIELDS_OP) == -1 && errno == E2BIG);
-    assert(attr.ev_fields_op.field_count == expected->field_count);
-    assert(mrc_ctl_query_ev_profile(context, expected->id, &attr, MRC_CTL_EV_PROFILE_EV_FIELDS_OP) == 0);
-    assert(attr.ev_fields_op.field_count == expected->field_count);
-    for (int i = 0; i < expected->field_count; i++) {
-        const struct mrc_ctl_ev_field *field = &expected->fields[i];
+    assert(attr.ev_fields_op.field_count == count);
+    assert(mrc_ctl_query_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_EV_FIELDS_OP) == 0);
+    assert(attr.ev_fields_op.field_count == count);
+    for (int i = 0; i < count; i++) {
+        const struct mrc_ctl_ev_field *field = &expected[i];
         assert(fields[i].width == field->width && fields[i].init_val == field->init_val &&
                fields[i].min_val == field->min_val && fields[i].max_val == field->max_val &&
                fields[i].mask == field->mask);
     }
+}
 
+static void check_generated(struct mrc_context *context, const struct generated_profile *expected)
+{
+    check_generated_fields(context, expected->id, expected->fields, expected->field_count);
     struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
     query_evs(context, expected->id, MRC_CTL_EV_MODE_GEN, expected->format, entries);
     for (unsigned int i = 0; i < RAILS; i++) {
@@ -527,6 +544,197 @@ static void test_generated_profiles(struct ibv_context *verbs, const char *direc
     assert(ibv_dealloc_pd(pd) == 0);
     assert(mrc_destroy_context(client) == 0);
     assert(mrc_destroy_context(controller) == 0);
+}
+
+static struct mrc_ctl_ev srv6_fixture_ev(uint8_t rail, bool srh)
+{
+    struct mrc_ctl_ev value = {
+        .port = rail, .val = {0x20, 0x01, 0x0d, 0xb8, 0, 1, [15] = rail},
+    };
+    if (srh) {
+        const uint8_t segment[SRV6_SID_BYTES] = {0x20, 0x01, 0x0d, 0xb8, 0, 2, [15] = 0x42};
+        memcpy(value.val + SRV6_SID_BYTES, segment, sizeof(segment));
+    }
+    return value;
+}
+
+static int fixture_srv6_fields(struct mrc_ctl_ev_field fields[SRV6_MAX_FIELDS], bool srh)
+{
+    int count = srh ? SRV6_MAX_FIELDS : SRV6_SID_FIELDS;
+    struct mrc_ctl_ev fixture = srv6_fixture_ev(1, srh);
+    for (int i = 0; i < count; i++) {
+        uint32_t word = (uint32_t)fixture.val[2 * i] << 8 | fixture.val[2 * i + 1];
+        fields[i] = (struct mrc_ctl_ev_field){ .width = 16, .init_val = word };
+    }
+    fields[SRV6_SID_FIELDS - 1] = (struct mrc_ctl_ev_field){
+        .width = 8, .min_val = 1, .max_val = RAILS, .mask = UINT8_MAX,
+    };
+    return count;
+}
+
+static void prepare_generated_srv6(struct mrc_context *context, bool srh)
+{
+    struct mrc_ctl_ev_field fields[SRV6_MAX_FIELDS];
+    int count = fixture_srv6_fields(fields, srh);
+    uint64_t id = srh ? GEN_SRV6_SRH_PROFILE_ID : GEN_SRV6_PROFILE_ID;
+    uint64_t format = srh ? MRC_DPDK_EV_FORMAT_SRV6_SRH : MRC_DPDK_EV_FORMAT_SRV6;
+    struct mrc_ctl_ev_profile_attr attr = generated_attributes(format, fields, count);
+    assert(mrc_ctl_modify_ev_profile(context, id, &attr, GENERATED_PROFILE_ATTRS) == 0);
+    assert(set_profile_state(context, id, MRC_CTL_PROFILE_ONLINE) == 0);
+}
+
+static void prepare_explicit_srv6(struct mrc_context *context, enum mrc_ctl_ev_state state)
+{
+    assert(configure_explicit(context, EXP_SRV6_PROFILE_ID, MRC_DPDK_EV_FORMAT_SRV6) == 0);
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {
+        { .ev = { .port = 1 }, .ev_new = srv6_fixture_ev(1, false), .state = state },
+        { .ev = { .port = 2 }, .ev_new = srv6_fixture_ev(2, false), .state = state },
+    };
+    assert(replace_evs(context, EXP_SRV6_PROFILE_ID, entries, RAILS) == 0);
+    assert(set_profile_state(context, EXP_SRV6_PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
+}
+
+static void unblock_explicit_srv6(struct mrc_context *context)
+{
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {
+        { .ev = srv6_fixture_ev(1, false), .state = MRC_CTL_EV_GOOD },
+        { .ev = srv6_fixture_ev(2, false), .state = MRC_CTL_EV_GOOD },
+    };
+    struct mrc_ctl_ev_profile_attr attr = {
+        .ev_op = { .op = MRC_CTL_EV_OP_MODIFY_EV_STATE, .entries = entries, .entry_count = RAILS },
+    };
+    assert(set_profile_state(context, EXP_SRV6_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    assert(mrc_ctl_modify_ev_profile(context, EXP_SRV6_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EV_OP) == 0);
+}
+
+static void check_srv6_fixture(struct mrc_context *context, uint64_t id, enum mrc_ctl_ev_mode mode,
+                               bool srh, enum mrc_ctl_ev_state state)
+{
+    assert(profile_state(context, id) == MRC_CTL_PROFILE_ONLINE);
+    uint64_t format = srh ? MRC_DPDK_EV_FORMAT_SRV6_SRH : MRC_DPDK_EV_FORMAT_SRV6;
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
+    query_evs(context, id, mode, format, entries);
+    for (uint8_t i = 0; i < RAILS; i++) {
+        struct mrc_ctl_ev expected = srv6_fixture_ev(i + 1, srh);
+        assert(entries[i].ev.port == expected.port);
+        assert(!memcmp(entries[i].ev.val, expected.val, sizeof(expected.val)));
+        assert(entries[i].state == state);
+        assert(get_ev_state(context, id, expected) == state);
+    }
+    if (mode == MRC_CTL_EV_MODE_GEN) {
+        struct mrc_ctl_ev_field fields[SRV6_MAX_FIELDS];
+        int count = fixture_srv6_fields(fields, srh);
+        check_generated_fields(context, id, fields, count);
+    }
+}
+
+static void test_explicit_srv6_values(struct mrc_context *context)
+{
+    uint64_t id = EXP_SRV6_SRH_PROFILE_ID;
+    uint64_t format = MRC_DPDK_EV_FORMAT_SRV6_SRH;
+    struct mrc_ctl_ev_profile_attr auto_attr = {
+        .profile_state = MRC_CTL_PROFILE_OFFLINE, .ev_mode = MRC_CTL_EV_MODE_AUTO,
+        .ev_fmt_profile_id = format, .ev_count = RAILS,
+    };
+    int mask = MRC_CTL_EV_PROFILE_STATE | MRC_CTL_EV_PROFILE_MODE |
+        MRC_CTL_EV_PROFILE_FMT_ID | MRC_CTL_EV_PROFILE_COUNT;
+    assert(mrc_ctl_modify_ev_profile(context, id, &auto_attr, mask) == -1 && errno == EINVAL);
+    assert(configure_explicit(context, id, format) == 0);
+    struct mrc_ctl_ev_op_entry entry = {
+        .ev = { .port = 1 }, .ev_new = srv6_fixture_ev(1, false), .state = MRC_CTL_EV_GOOD,
+    };
+    assert(get_ev_state(context, id, entry.ev) == MRC_CTL_EV_UNKNOWN);
+    assert(replace_evs(context, id, &entry, 1) == -1 && errno == EINVAL);
+    entry.ev_new = srv6_fixture_ev(1, true);
+    entry.ev_new.val[0] = 0xff;
+    assert(replace_evs(context, id, &entry, 1) == -1 && errno == EINVAL);
+    entry.ev_new.val[0] = 0x20;
+    entry.ev_new.val[SRV6_SID_BYTES] = 0xff;
+    assert(replace_evs(context, id, &entry, 1) == -1 && errno == EINVAL);
+
+    /* The same route can be keyed by either rail, including a telemetry
+     * copy of the first container as the SRH entry. */
+    memcpy(entry.ev_new.val + SRV6_SID_BYTES, entry.ev_new.val, SRV6_SID_BYTES);
+    assert(replace_evs(context, id, &entry, 1) == 0);
+    struct mrc_ctl_ev first = entry.ev_new;
+    assert(set_profile_state(context, id, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    entry.ev.port = entry.ev_new.port = 2;
+    entry.state = MRC_CTL_EV_DENIED;
+    assert(replace_evs(context, id, &entry, 1) == 0);
+    assert(set_profile_state(context, id, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(get_ev_state(context, id, first) == MRC_CTL_EV_GOOD);
+    assert(get_ev_state(context, id, entry.ev_new) == MRC_CTL_EV_DENIED);
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
+    query_evs(context, id, MRC_CTL_EV_MODE_EXP, format, entries);
+    for (uint8_t i = 0; i < RAILS; i++) {
+        assert(entries[i].ev.port == i + 1);
+        assert(!memcmp(entries[i].ev.val, first.val, sizeof(first.val)));
+    }
+
+    entry.ev = first;
+    entry.ev.val[MRC_CTL_EV_MAX_BYTES - 1] ^= 1;
+    struct mrc_ctl_ev_profile_attr query = {
+        .ev_op = { .op = MRC_CTL_EV_OP_QUERY_EV_STATE, .entries = &entry, .entry_count = 1 },
+    };
+    assert(mrc_ctl_query_ev_profile(context, id, &query, MRC_CTL_EV_PROFILE_EV_OP) == -1 && errno == ENOENT);
+}
+
+static void test_generated_srv6_bounds(struct mrc_context *context)
+{
+    struct mrc_ctl_ev_field fields[SRV6_MAX_FIELDS];
+    for (int i = 0; i < SRV6_MAX_FIELDS; i++) {
+        fields[i] = (struct mrc_ctl_ev_field){
+            .width = 16, .max_val = UINT16_MAX, .mask = UINT16_MAX,
+        };
+    }
+    struct mrc_ctl_ev_profile_attr attr =
+        generated_attributes(MRC_DPDK_EV_FORMAT_SRV6_SRH, fields, SRV6_MAX_FIELDS);
+    const uint64_t id = GEN_SRV6_SRH_PROFILE_ID;
+    fields[0].width = 17;
+    assert(mrc_ctl_modify_ev_profile(context, id, &attr, GENERATED_PROFILE_ATTRS) == -1 && errno == EINVAL);
+    fields[0].width = 16;
+
+    /* The first container has 2^128 raw combinations. Prove an
+     * impossible second container can be rejected independently. */
+    struct mrc_ctl_ev_field saved = fields[SRV6_SID_FIELDS];
+    fields[SRV6_SID_FIELDS] = (struct mrc_ctl_ev_field){ .width = 16, .init_val = 0xff00 };
+    assert(mrc_ctl_modify_ev_profile(context, id, &attr, GENERATED_PROFILE_ATTRS) == -1 && errno == EINVAL);
+    fields[SRV6_SID_FIELDS] = saved;
+    assert(mrc_ctl_modify_ev_profile(context, id, &attr, GENERATED_PROFILE_ATTRS) == 0);
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
+    query_evs(context, id, MRC_CTL_EV_MODE_GEN, MRC_DPDK_EV_FORMAT_SRV6_SRH, entries);
+    for (uint8_t i = 0; i < RAILS; i++) {
+        /* Each container skips its all-zero minimum. The rightmost field
+         * increments first, so the valid primary container stays fixed. */
+        uint8_t expected[MRC_CTL_EV_MAX_BYTES] = { [15] = 1, [31] = i + 1 };
+        assert(entries[i].ev.port == i + 1 && entries[i].state == MRC_CTL_EV_GOOD);
+        assert(!memcmp(entries[i].ev.val, expected, sizeof(expected)));
+    }
+    assert(set_profile_state(context, id, MRC_CTL_PROFILE_INIT) == 0);
+}
+
+static void test_srv6_profiles(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *context = open_store(verbs, directory);
+    test_explicit_srv6_values(context);
+    test_generated_srv6_bounds(context);
+    prepare_explicit_srv6(context, MRC_CTL_EV_DENIED);
+    prepare_generated_srv6(context, false);
+    prepare_generated_srv6(context, true);
+    assert(mrc_destroy_context(context) == 0);
+
+    context = open_store(verbs, directory);
+    check_srv6_fixture(context, EXP_SRV6_PROFILE_ID, MRC_CTL_EV_MODE_EXP, false, MRC_CTL_EV_DENIED);
+    check_srv6_fixture(context, GEN_SRV6_PROFILE_ID, MRC_CTL_EV_MODE_GEN, false, MRC_CTL_EV_GOOD);
+    check_srv6_fixture(context, GEN_SRV6_SRH_PROFILE_ID, MRC_CTL_EV_MODE_GEN, true, MRC_CTL_EV_GOOD);
+    struct mrc_ctl_ev route = srv6_fixture_ev(2, true);
+    set_ev_state(context, GEN_SRV6_SRH_PROFILE_ID, route, MRC_CTL_EV_DENIED);
+    assert(get_ev_state(context, GEN_SRV6_SRH_PROFILE_ID, route) == MRC_CTL_EV_DENIED);
+    assert(mrc_destroy_context(context) == 0);
+
+    context = open_store(verbs, directory);
+    assert(get_ev_state(context, GEN_SRV6_SRH_PROFILE_ID, route) == MRC_CTL_EV_DENIED);
+    assert(mrc_destroy_context(context) == 0);
 }
 
 static int configure_cc_algorithm(struct mrc_context *controller, uint64_t id,
@@ -687,12 +895,12 @@ static void test_qa_lifecycle(struct ibv_context *verbs, const char *directory)
 
 static void seed_denied_profile(struct mrc_context *controller)
 {
-    assert(configure_explicit(controller) == 0);
+    assert(configure_explicit(controller, PROFILE_ID, MRC_DPDK_EV_FORMAT_UDP) == 0);
     struct mrc_ctl_ev_op_entry entries[RAILS] = {
         { .ev = ev(1, 0), .ev_new = ev(1, FIRST_EV), .state = MRC_CTL_EV_DENIED },
         { .ev = ev(2, 0), .ev_new = ev(2, SECOND_EV), .state = MRC_CTL_EV_DENIED },
     };
-    assert(replace_evs(controller, entries, RAILS) == 0);
+    assert(replace_evs(controller, PROFILE_ID, entries, RAILS) == 0);
     assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
     printf("%u\n", (unsigned int)PROFILE_ID);
 }
@@ -704,14 +912,20 @@ int main(int argc, char **argv)
     bool unblock = argc == 3 && strcmp(argv[1], "--unblock") == 0;
     bool seed_cc = argc == 3 && strcmp(argv[1], "--seed-cc") == 0;
     bool seed_qa = argc == 3 && strcmp(argv[1], "--seed-qa") == 0;
+    bool seed_srv6 = argc == 3 && strcmp(argv[1], "--seed-explicit-srv6") == 0;
+    bool unblock_srv6 = argc == 3 && strcmp(argv[1], "--unblock-explicit-srv6") == 0;
+    bool seed_srv6_srh = argc == 3 && strcmp(argv[1], "--seed-generated-srv6-srh") == 0;
     const struct generated_profile *generated = NULL;
     if (argc == 3 && strcmp(argv[1], "--seed-gen") == 0)
         generated = &generated_udp;
     else if (argc == 3 && strcmp(argv[1], "--seed-gen-stev") == 0)
         generated = &generated_stev;
-    if (argc != 1 && !expect_no_cap && !seed && !unblock && !seed_cc && !seed_qa && !generated) {
+    bool fixture = seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 || seed_srv6_srh;
+    if (argc != 1 && !expect_no_cap && !fixture) {
         fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | "
-                        "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR]\n", argv[0]);
+                        "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR | "
+                        "--seed-explicit-srv6 DIR | --unblock-explicit-srv6 DIR | --seed-generated-srv6-srh DIR]\n",
+                        argv[0]);
         return EXIT_FAILURE;
     }
     struct ibv_context *verbs = open_supported_device();
@@ -719,13 +933,21 @@ int main(int argc, char **argv)
         fputs("The MRC controller ABI test needs an accessible Ethernet verbs device.\n", stderr);
         return EXIT_FAILURE;
     }
-    if (seed || unblock || seed_cc || seed_qa || generated) {
+    if (fixture) {
         struct mrc_context *controller = open_store(verbs, argv[2]);
         if (seed) {
             seed_denied_profile(controller);
         } else if (unblock) {
             assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
             set_ev_state(controller, PROFILE_ID, ev(2, SECOND_EV), MRC_CTL_EV_GOOD);
+        } else if (seed_srv6) {
+            prepare_explicit_srv6(controller, MRC_CTL_EV_DENIED);
+            printf("%u\n", (unsigned int)EXP_SRV6_PROFILE_ID);
+        } else if (unblock_srv6) {
+            unblock_explicit_srv6(controller);
+        } else if (seed_srv6_srh) {
+            prepare_generated_srv6(controller, true);
+            printf("%u\n", (unsigned int)GEN_SRV6_SRH_PROFILE_ID);
         } else if (generated) {
             assert(configure_generated(controller, *generated) == 0);
             assert(set_profile_state(controller, generated->id, MRC_CTL_PROFILE_ONLINE) == 0);
@@ -746,7 +968,7 @@ int main(int argc, char **argv)
     assert(mkdtemp(directory));
     struct mrc_context *controller = open_store(verbs, directory);
     if (expect_no_cap) {
-        assert(configure_explicit(controller) == -1 && errno == EPERM);
+        assert(configure_explicit(controller, PROFILE_ID, MRC_DPDK_EV_FORMAT_UDP) == -1 && errno == EPERM);
         assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
         assert(configure_generated(controller, generated_udp) == -1 && errno == EPERM);
         assert(profile_state(controller, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_INIT);
@@ -761,6 +983,8 @@ int main(int argc, char **argv)
         puts("OCP controller EV profiles, live EV state, persistence, and QP leases passed");
         test_generated_profiles(verbs, directory);
         puts("OCP controller UDP and STEV generation, persistence, and QP leases passed");
+        test_srv6_profiles(verbs, directory);
+        puts("OCP controller explicit and generated SRv6 EVs, wire byte order, and persistence passed");
         test_cc_lifecycle(verbs, directory);
         puts("OCP controller CC profiles, persistence, and QP leases passed");
         test_qa_lifecycle(verbs, directory);

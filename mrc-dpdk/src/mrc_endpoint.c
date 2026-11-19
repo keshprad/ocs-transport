@@ -193,14 +193,33 @@ uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path)
     return structured ? port | ((EV_FLOW_LABEL + path) & UINT16_MAX) << 16 : port;
 }
 
-bool mrc_endpoint_ev_profile_valid(const struct mrc_endpoint_config *config)
+bool mrc_endpoint_apply_ev_profile(struct mrc_endpoint_config *config)
 {
     const struct mrc_ctl_store_config *profile = &config->profile.config;
     if (profile->count != PATH_COUNT ||
         (profile->format == MRC_CTL_STORE_FORMAT_STEV && config->ip_version != MRC_WIRE_IP6))
         return false;
     if (profile->mode == MRC_CTL_STORE_AUTO)
+        return !mrc_ctl_store_format_is_srv6(profile->format);
+    if (mrc_ctl_store_format_is_srv6(profile->format)) {
+        if (!config->sender || !config->srv6)
+            return false;
+        for (unsigned int path = 0; path < PATH_COUNT; path++) {
+            if (!mrc_ctl_store_srv6_ev_valid(profile->format, profile->srv6[path]))
+                return false;
+        }
+        for (unsigned int path = 0; path < PATH_COUNT; path++) {
+            struct mrc_endpoint_srv6_path *route = &config->paths[path].srv6;
+            const uint8_t *value = profile->srv6[path];
+            const uint8_t *segment = value + MRC_CTL_STORE_SRV6_SID_BYTES;
+            memcpy(route->initial_dst, value, sizeof(route->initial_dst));
+            memcpy(route->segments[0], segment, sizeof(route->segments[0]));
+            route->segment_count = profile->format == MRC_CTL_STORE_FORMAT_SRV6_SRH;
+            route->segments_left = route->segment_count &&
+                memcmp(value, segment, MRC_CTL_STORE_SRV6_SID_BYTES) != 0;
+        }
         return true;
+    }
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
         uint32_t entropy = profile->entropy[path];
         if (!(uint16_t)entropy ||
@@ -216,10 +235,14 @@ static uint32_t path_entropy(const struct mrc_endpoint_config *transfer, unsigne
 {
     bool structured = transfer->ip_version == MRC_WIRE_IP6;
     if (requestor) {
-        if (transfer->profile_id && transfer->profile.config.mode != MRC_CTL_STORE_AUTO)
-            return transfer->profile.config.entropy[index];
+        const struct mrc_ctl_store_config *profile = &transfer->profile.config;
+        /* An SRv6 profile selects the route; the inner entropy still
+         * carries a unique per-rail identifier for SACK/NACK reflection. */
+        if (transfer->profile_id && profile->mode != MRC_CTL_STORE_AUTO &&
+            !mrc_ctl_store_format_is_srv6(profile->format))
+            return profile->entropy[index];
         return mrc_endpoint_default_entropy(
-            structured && transfer->profile.config.format != MRC_CTL_STORE_FORMAT_UDP, index);
+            structured && profile->format != MRC_CTL_STORE_FORMAT_UDP, index);
     }
     uint32_t port = RESPONDER_EV_PORT + index;
     return structured ? port | ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16 : port;
