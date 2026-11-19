@@ -108,9 +108,11 @@ def captured_requests(replay):
     duplicate = write_request(replay, 0, 0xC9, 1, 2, 1, 1037, 1025,
                               tail_write, 0xFEC01234, flags=0xA0)
     head = write_request(replay, 1, 0xC6, 0, 2, 1, 13, 1025, data[13:1037])
-    # PETH token, PDC identifiers, and a type-1 timestamp extension.
-    probe = request(replay, 0, 0xDE, 0, struct.pack("!7HBB", 0, 0, 0x91BC, 0, *PDC_IDS,
-                                                  0x1731, 0, 1))
+    # Only the PETH token identifies the probe. The BTH PSN is reserved.
+    probe = request(replay, 0, 0xDE, 0x7FED03, struct.pack("!7HBB", 0, 0, 0x91BC, 0, *PDC_IDS,
+                                                         0x1731, 0, 1))
+    wrong_context = request(replay, 0, 0xDE, 0, struct.pack("!7HBB", 0, 0, 0x92CD, 0,
+                                                           PDC_IDS[0], PDC_IDS[1] ^ 1, 0, 0, 0))
 
     rejected = [corrupt]
     if replay.srh is not None:
@@ -120,7 +122,7 @@ def captured_requests(replay):
         transit = bytearray(first)
         transit[14 + 40 + 3] = 1  # SRH Segments Left
         rejected.append(bytes(transit))
-    rail = [outside_write, probe, *rejected]
+    rail = [outside_write, wrong_context, probe, *rejected]
     trim_size = None
     if replay.srh:
         trim, trim_size = trimmed_request(replay, data[:13])
@@ -183,9 +185,14 @@ def check_responses(replay, output_paths, outside, trim_size):
 
     sacks = [(packet.bth.psn, packet.bth.flags, packet.body)
              for packet in responses[0] if packet.bth.opcode == 0xDC]
-    require(any(body[1] & 2 and struct.unpack_from("!H", body, 2)[0] == 0x91BC and
-                struct.unpack_from("!H", body, 28)[0] == 0x1731 for _, _, body in sacks),
-            "Probe response did not echo its token and timestamp")
+    probes = [(psn, body) for psn, _, body in sacks if body[1] & 2]
+    require(len(probes) == 1, "Expected a reply only to the probe with matching PDC identifiers")
+    probe_psn, probe = probes[0]
+    require(probe_psn == 0 and struct.unpack_from("!H", probe, 2)[0] == 0x91BC and
+            struct.unpack_from("!H", probe, 28)[0] == 0x1731 and
+            int.from_bytes(probe[13:16], "big") == ((INITIAL_PSN - 1) & 0xFFFFFF) and
+            int.from_bytes(probe[33:36], "big") == 0,
+            "Probe response did not echo PETH or changed the initial packet delivery state")
     require(any(psn == INITIAL_PSN and not body[1] & 2 and
                 struct.unpack_from("!h", body, 2)[0] == 2 and
                 struct.unpack_from("!Q", body, 20)[0] and
@@ -260,6 +267,7 @@ def run_replay(binary, replay):
         trimmed = int(trim_size is not None)
         require(counters["bytes"] == 1038 and counters["received"] == [2, 1] and
                 counters["duplicates"] == 1 and counters["immediate_completions"] == 1 and
+                counters["probe_requests"] == 1 and
                 counters["trimmed"] == counters["trim_nacks"] == trimmed and
                 counters["nack_sent_mask"] == ((1 << 0x0B) | (trimmed << 1)) and
                 f"decode-rejected={rejected} other-peer=0" in result.stderr,

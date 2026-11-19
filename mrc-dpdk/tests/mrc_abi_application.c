@@ -29,6 +29,14 @@ enum {
     FIRST_IMMEDIATE = 0x01020304,
     SECOND_IMMEDIATE = 0x12345678,
     DUPLEX_QPS = 2,
+    DUPLEX_RAILS = 2,
+    WIRE_PROBE_REQUEST = 0xde,
+    WIRE_SACK = 0xdc,
+    WIRE_WRITE_FIRST = 0xc6,
+    WIRE_BTH_LEN = 12,
+    WIRE_PETH_LEN = 16,
+    WIRE_SETH_LEN = 28,
+    WIRE_CC_STATE_LEN = 8,
     DUPLEX_BYTES = 2049,
     RX_FLOW_ROUNDS = 4,
     RX_FLOW_RESTORE = 0x80,
@@ -536,6 +544,15 @@ static void post_duplex_write(struct duplex_qp *qp, const struct connection *pee
     assert(mrc_post_send(qp->qp, &write, &bad_send) == 0 && !bad_send);
 }
 
+static unsigned int duplex_qp_index(const struct connection *connections, uint32_t qpn)
+{
+    unsigned int index = 0;
+    while (index < DUPLEX_QPS && connections[index].qpn != qpn)
+        index++;
+    assert(index < DUPLEX_QPS);
+    return index;
+}
+
 static unsigned int duplex_completions(struct mrc_cq *cq, const struct connection *connections,
                                        unsigned int round, unsigned int active, unsigned int completed,
                                        bool client, bool send)
@@ -545,10 +562,7 @@ static unsigned int duplex_completions(struct mrc_cq *cq, const struct connectio
     assert(count >= 0);
     for (int i = 0; i < count; i++) {
         const struct ibv_wc *wc = &entries[i];
-        unsigned int index = 0;
-        while (index < DUPLEX_QPS && connections[index].qpn != wc->qp_num)
-            index++;
-        assert(index < DUPLEX_QPS);
+        unsigned int index = duplex_qp_index(connections, wc->qp_num);
         unsigned int bit = 1u << index;
         assert((active & bit) && !(completed & bit));
         assert(wc->status == IBV_WC_SUCCESS && wc->wr_id == duplex_wr_id(index, round, send));
@@ -570,20 +584,43 @@ static void marker_name(char out[32], bool client, unsigned int round, const cha
     assert(count > 0 && count < 32);
 }
 
-static const uint8_t *read_tx_udp(struct rte_mbuf *packet, uint8_t *prefix,
-                                  size_t capacity, size_t *udp_bytes)
+static uint16_t wire_be16(const uint8_t *bytes)
+{
+    return ((uint16_t)bytes[0] << 8) | bytes[1];
+}
+
+static uint32_t wire_be24(const uint8_t *bytes)
+{
+    return ((uint32_t)bytes[0] << 16) | wire_be16(bytes + 1);
+}
+
+static uint32_t wire_be32(const uint8_t *bytes)
+{
+    return ((uint32_t)wire_be16(bytes) << 16) | wire_be16(bytes + 2);
+}
+
+struct observed_udp {
+    const uint8_t *header;
+    size_t bytes;
+    uint32_t entropy;
+};
+
+static struct observed_udp read_udp(struct rte_mbuf *packet, uint8_t *prefix, size_t capacity)
 {
     size_t length = rte_pktmbuf_pkt_len(packet);
     if (length > capacity)
         length = capacity;
     const uint8_t *frame = rte_pktmbuf_read(packet, 0, length, prefix);
-    assert(frame && length >= 14 + 20 + 8 + 12);
-    uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
+    assert(frame && length >= 14 + 20 + 8 + WIRE_BTH_LEN);
+    uint16_t ether_type = wire_be16(frame + 12);
     assert(ether_type == RTE_ETHER_TYPE_IPV4 || ether_type == RTE_ETHER_TYPE_IPV6);
-    size_t udp = 14 + (ether_type == RTE_ETHER_TYPE_IPV4 ? (frame[14] & 0x0f) * 4 : 40);
-    assert(udp + 8 + 12 <= length);
-    *udp_bytes = length - udp;
-    return frame + udp;
+    bool ipv6 = ether_type == RTE_ETHER_TYPE_IPV6;
+    size_t udp = 14 + (ipv6 ? 40 : (frame[14] & 0x0f) * 4);
+    assert(udp + 8 + WIRE_BTH_LEN <= length);
+    uint32_t entropy = wire_be16(frame + udp);
+    if (ipv6)
+        entropy |= (uint32_t)wire_be16(frame + 16) << 16;
+    return (struct observed_udp){.header = frame + udp, .bytes = length - udp, .entropy = entropy};
 }
 
 struct cc_window_witness {
@@ -600,17 +637,16 @@ static uint16_t observe_write_frames(uint16_t port, uint16_t queue, struct rte_m
     struct cc_window_witness *observed = argument;
     for (uint16_t i = 0; i < count; i++) {
         /* Ethernet + IPv6 + UDP + BTH, enough for either plain IP family. */
-        uint8_t prefix[14 + 40 + 8 + 12];
-        size_t udp_bytes;
-        const uint8_t *udp = read_tx_udp(packets[i], prefix, sizeof(prefix), &udp_bytes);
-        const uint8_t *bth = udp + 8;
+        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + 8;
         /* Observe each original WRITE and ignore probes, ACKs, and retries. */
         if (bth[0] < 0xc6 || bth[0] > 0xcb || (bth[8] & 0x20))
             continue;
         if (++observed->writes == 1) {
             assert(bth[0] == 0xc6);
             observed->first_flags = bth[8];
-            observed->first_udp_length = ((uint16_t)udp[4] << 8) | udp[5];
+            observed->first_udp_length = wire_be16(udp.header + 4);
         }
     }
     return count;
@@ -710,46 +746,124 @@ static void duplex_round(struct duplex_qp *qps, const struct connection *local,
     } while (!done || access(their_done, F_OK) != 0);
 }
 
-struct rx_flow_witness {
-    const struct connection *peer;
-    uint8_t expected[DUPLEX_QPS];
-    unsigned int data_sacks;
+struct probe_exchange {
+    uint16_t token;
+    uint32_t entropy;
+    bool sent;
+    bool replied;
 };
 
-static uint16_t observe_sack_frames(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
-                                     uint16_t count, void *argument)
+struct rx_flow_witness {
+    const struct connection *local;
+    const struct connection *peer;
+    struct probe_exchange probes[DUPLEX_RAILS][DUPLEX_QPS];
+    uint8_t expected[DUPLEX_QPS];
+    unsigned int data_sacks;
+    unsigned int first_writes;
+    bool check_startup;
+};
+
+static uint16_t observe_flow_tx(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                  uint16_t count, void *argument)
 {
-    (void)port;
     (void)queue;
     struct rx_flow_witness *observed = argument;
     for (uint16_t i = 0; i < count; i++) {
-        /* Ethernet + IPv6 + UDP + BTH + SETH + CC State. */
-        uint8_t prefix[14 + 40 + 8 + 12 + 28 + 8];
-        size_t udp_bytes;
-        const uint8_t *udp = read_tx_udp(packets[i], prefix, sizeof(prefix), &udp_bytes);
-        const uint8_t *bth = udp + 8;
-        if (bth[0] != 0xdc)
+        /* Ethernet, IPv6, UDP, BTH, and the longest relevant extension. */
+        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN + WIRE_SETH_LEN + WIRE_CC_STATE_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + 8;
+        uint8_t opcode = bth[0];
+        if (opcode != WIRE_SACK &&
+            (!observed->check_startup || (opcode != WIRE_PROBE_REQUEST && opcode != WIRE_WRITE_FIRST)))
             continue;
 
-        assert(udp_bytes >= 8 + 12 + 28 + 8);
-        uint32_t qpn = ((uint32_t)bth[5] << 16) | ((uint32_t)bth[6] << 8) | bth[7];
-        unsigned int index = 0;
-        while (index < DUPLEX_QPS && observed->peer[index].qpn != qpn)
-            index++;
-        assert(index < DUPLEX_QPS);
-
-        const uint8_t *seth = bth + 12;
-        const uint8_t *cc_state = seth + 28;
-        bool probe = (seth[1] & 0x02) != 0;
-        if (cc_state[4] != observed->expected[index]) {
-            fprintf(stderr, "QPN %u %sSACK CC State byte was 0x%02x, expected 0x%02x\n",
-                    qpn, probe ? "probe " : "", cc_state[4], observed->expected[index]);
-            abort();
+        uint32_t qpn = wire_be24(bth + 5);
+        unsigned int index = duplex_qp_index(observed->peer, qpn);
+        const uint8_t *extension = bth + WIRE_BTH_LEN;
+        unsigned int bit = 1u << index;
+        if (opcode == WIRE_PROBE_REQUEST) {
+            assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_PETH_LEN);
+            assert(wire_be16(extension + 8) == (uint16_t)observed->local[index].qpn);
+            assert(wire_be16(extension + 10) == (uint16_t)qpn);
+            struct probe_exchange *probe = &observed->probes[port][index];
+            if (!probe->sent)
+                *probe = (struct probe_exchange){
+                    .token = wire_be16(extension + 4), .entropy = udp.entropy, .sent = true,
+                };
+        } else if (opcode == WIRE_WRITE_FIRST) {
+            if (!(bth[8] & 0x20) && !(observed->first_writes & bit)) {
+                assert(wire_be24(bth + 9) == observed->local[index].psn);
+                observed->first_writes |= bit;
+            }
+        } else {
+            assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_SETH_LEN + WIRE_CC_STATE_LEN);
+            const uint8_t *cc_state = extension + WIRE_SETH_LEN;
+            bool probe = (extension[1] & 0x02) != 0;
+            if (cc_state[4] != observed->expected[index]) {
+                fprintf(stderr, "QPN %u %sSACK CC State byte was 0x%02x, expected 0x%02x\n",
+                        qpn, probe ? "probe " : "", cc_state[4], observed->expected[index]);
+                abort();
+            }
+            if (!probe)
+                observed->data_sacks |= bit;
         }
-        if (!probe)
-            observed->data_sacks |= 1u << index;
     }
     return count;
+}
+
+static uint16_t observe_probe_replies(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                      uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)queue;
+    (void)capacity;
+    struct rx_flow_witness *observed = argument;
+    if (!observed->check_startup)
+        return count;
+
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN + WIRE_SETH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + 8;
+        if (bth[0] != WIRE_SACK)
+            continue;
+
+        assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_SETH_LEN);
+        const uint8_t *seth = bth + WIRE_BTH_LEN;
+        if (!(seth[1] & 0x02))
+            continue;
+
+        uint32_t qpn = wire_be24(bth + 5);
+        unsigned int index = duplex_qp_index(observed->local, qpn);
+        struct probe_exchange *probe = &observed->probes[port][index];
+        assert(probe->sent);
+        assert(wire_be16(seth + 8) == (uint16_t)qpn);
+        assert(wire_be16(seth + 10) == (uint16_t)observed->peer[index].qpn);
+        if (wire_be16(seth + 2) == probe->token) {
+            assert(wire_be32(seth + 4) == probe->entropy);
+            probe->replied = true;
+        }
+    }
+    return count;
+}
+
+static void prepare_memif_links(void)
+{
+    uint64_t deadline = rte_get_timer_cycles() + 4 * rte_get_timer_hz();
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        struct rte_eth_link link;
+        do {
+            assert(rte_get_timer_cycles() < deadline);
+            assert(rte_eth_link_get_nowait(port, &link) == 0);
+            if (!link.link_status)
+                rte_delay_us_sleep(1000);
+        } while (!link.link_status);
+
+        /* Memif publishes server-to-client ring credits on the client's first
+         * receive poll. Neither process can send before the round barrier. */
+        struct rte_mbuf *packet;
+        assert(rte_eth_rx_burst(port, 0, &packet, 1) == 0);
+    }
 }
 
 static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
@@ -763,13 +877,16 @@ static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
         {0, 0},
     };
     const unsigned int both_qps = (1u << DUPLEX_QPS) - 1;
-    struct rx_flow_witness observed = {.peer = peer};
-    const struct rte_eth_rxtx_callback *callbacks[2];
-    for (uint16_t port = 0; port < 2; port++) {
-        callbacks[port] = rte_eth_add_tx_callback(port, 0, observe_sack_frames, &observed);
-        assert(callbacks[port]);
+    struct rx_flow_witness observed = {.local = local, .peer = peer, .check_startup = true};
+    const struct rte_eth_rxtx_callback *tx_callbacks[DUPLEX_RAILS];
+    const struct rte_eth_rxtx_callback *rx_callbacks[DUPLEX_RAILS];
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        tx_callbacks[port] = rte_eth_add_tx_callback(port, 0, observe_flow_tx, &observed);
+        rx_callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_probe_replies, &observed);
+        assert(tx_callbacks[port] && rx_callbacks[port]);
     }
 
+    prepare_memif_links();
     assert(mrc_dpdk_set_rx_flow_control(NULL, 0, false) == EINVAL);
     for (unsigned int round = 0; round < RX_FLOW_ROUNDS; round++) {
         observed.data_sacks = 0;
@@ -785,12 +902,23 @@ static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
             assert(mrc_dpdk_set_rx_flow_control(qps[0].qp, 128, false) == EINVAL);
         duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, round, 0, false);
         assert(observed.data_sacks == both_qps);
+        observed.check_startup = false;
     }
 
-    for (uint16_t port = 0; port < 2; port++) {
-        assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
-        /* This thread is the only TX poller, so no callback can still be running. */
-        rte_free((void *)callbacks[port]);
+    assert(observed.first_writes == both_qps);
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
+            if (!observed.probes[port][index].replied) {
+                fprintf(stderr, "QPN %u saw no matching initial probe SACK on port %u\n",
+                        local[index].qpn, port);
+                abort();
+            }
+        }
+        assert(rte_eth_remove_tx_callback(port, 0, tx_callbacks[port]) == 0);
+        assert(rte_eth_remove_rx_callback(port, 0, rx_callbacks[port]) == 0);
+        /* The only poller removed its callbacks after the last burst. */
+        rte_free((void *)tx_callbacks[port]);
+        rte_free((void *)rx_callbacks[port]);
     }
 }
 

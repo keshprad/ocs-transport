@@ -75,6 +75,7 @@ class ReferenceResponder:
         self.received = set()
         self.cumulative = -1
         self.received_bytes = 0
+        self.sacks_sent = 0
         self.rejected_rail = None
         self.retry_rail = None
         self.first_write_acked = False
@@ -97,7 +98,8 @@ class ReferenceResponder:
                                 original_udp_size=original_udp_size)
         self.wire.send(bytes([rail]) + frame)
 
-    def sack(self, rail, packet, index=None, probe_id=None, timestamp=0, *, penalty=0, restore=False):
+    def sack(self, rail, packet, index=None, probe_id=None, timestamp=0, *,
+             penalty=0, restore=False, entropy=None, probe_psn=0):
         # The first bitmap bit represents CACK + 1.
         bitmap = 0
         for received in self.received:
@@ -107,14 +109,16 @@ class ReferenceResponder:
         cack = psn(self.cumulative)
         trigger = probe_id if probe_id is not None else (index - self.cumulative) & 0xFFFF
         ooo_count = bitmap.bit_count()
+        reflected = packet.entropy if entropy is None else entropy
         body = struct.pack("!BBHIHH", 0, 2 if probe_id is not None else 0, trigger,
-                           packet.entropy, *PDC_IDS)
+                           reflected, *PDC_IDS)
         body += struct.pack("!IBBhQ", cack, 0, 0, 1, bitmap)
         wire_bytes = ((self.received_bytes + 255) // 256) & PSN_MASK
         flow_control = (0x80 if restore else 0) | penalty
         body += struct.pack("!HHI", timestamp, ooo_count, flow_control << 24 | wire_bytes)
-        number = 0 if probe_id is not None else cack
+        number = probe_psn if probe_id is not None else cack
         self.reply(rail, 0xDC, number, body, packet.bth.flags & RTX)
+        self.sacks_sent += 1
 
     def transport_ack(self, rail, msn):
         body = struct.pack("!I", (0x1F << 24) | msn)
@@ -178,8 +182,11 @@ class ReferenceResponder:
     def acknowledge_write(self, rail, packet, index):
         self.sack(rail, packet, index=index)
         if self.cumulative == len(self.opcodes) - 1:
-            self.transport_ack(rail, 2)
-            self.finished = True
+            self.finish_write(rail)
+
+    def finish_write(self, rail):
+        self.transport_ack(rail, 2)
+        self.finished = True
 
     def acknowledge_probe(self, rail, packet, token, timestamp):
         self.sack(rail, packet, probe_id=token, timestamp=timestamp)
@@ -371,7 +378,61 @@ class FlowControlResponder(ReferenceResponder):
                     "Zero penalty with restore did not reopen room for multiple outstanding WRITE packets")
 
 
-def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=None, flow_control=False):
+class ProbeCorrelationResponder(FlowControlResponder):
+    RESERVED_PSN = 0x5A5A5A
+
+    def __init__(self, wire, mode):
+        super().__init__(wire, mode)
+        self.initial_tokens = {}
+        self.target_probe = None
+        self.lost_reply_retried = False
+        self.data_complete = False
+        self.uncorrelated_replies_sent = 0
+
+    def acknowledge_probe(self, rail, packet, token, timestamp):
+        if rail not in self.initial_tokens:
+            self.initial_tokens[rail] = token
+            if self.target_probe is None:
+                self.target_probe = (rail, packet, token, timestamp)
+            return
+
+        target_rail = self.target_probe[0]
+        if rail != target_rail and not self.lost_reply_retried:
+            require(token != self.initial_tokens[rail], "Retry reused the lost probe identifier")
+            self.lost_reply_retried = True
+            self.sack(rail, packet, probe_id=token, timestamp=timestamp, probe_psn=self.RESERVED_PSN)
+            if self.data_complete:
+                self.finish_write(rail)
+
+    def idle(self):
+        if self.held_packet is None or self.target_probe is None:
+            return
+        rail, packet, token, timestamp = self.target_probe
+        if self.uncorrelated_replies_sent == 0:
+            self.sack(rail, packet, probe_id=token ^ 0x8000, timestamp=timestamp, restore=True,
+                      probe_psn=self.RESERVED_PSN)
+        elif self.uncorrelated_replies_sent == 1:
+            self.sack(rail, packet, probe_id=token, timestamp=timestamp, restore=True,
+                      entropy=packet.entropy ^ 0x80, probe_psn=self.RESERVED_PSN)
+        else:
+            self.held_packet = None
+            self.restore_at = time.monotonic()
+            self.sack(rail, packet, probe_id=token, timestamp=timestamp, restore=True,
+                      probe_psn=self.RESERVED_PSN)
+            # An already consumed identifier cannot apply a new receiver penalty.
+            self.sack(rail, packet, probe_id=token, timestamp=timestamp, penalty=self.PENALTY,
+                      probe_psn=self.RESERVED_PSN)
+        self.uncorrelated_replies_sent += 1
+
+    def finish_write(self, rail):
+        self.data_complete = True
+        # Keep the requester active until the other rail reissues its probe.
+        if self.lost_reply_retried:
+            super().finish_write(rail)
+
+
+def run_requester(binary, relay_binary, mode, nack_reason=None, *,
+                  port_status=None, flow_control=False, probe_correlation=False):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -394,7 +455,9 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=N
                 time.sleep(0.01)
             wire.connect(str(relay_socket))
             command = eal_args(binary, "tx", cpus[1], directory)
-            if flow_control:
+            if probe_correlation:
+                responder = ProbeCorrelationResponder(wire, mode)
+            elif flow_control:
                 responder = FlowControlResponder(wire, mode)
             elif port_status is not None:
                 responder = PortStatusResponder(wire, mode, expire=port_status == "expire")
@@ -449,12 +512,18 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=N
                         f"Unexpected Port Status counters: {counters}")
                 counters["status_report_interval_ms"] = round(1000 * responder.report_interval)
                 counters["status_resume_delay_ms"] = round(1000 * responder.resume_delay)
-            else:
+            elif flow_control:
                 require(responder.restricted_stages == 2 and responder.restored_full_packets == 2
                         and not any(counters["retries"]) and counters["nack_received_mask"] == 0,
                         f"Unexpected receiver flow-control observations: {counters}")
                 counters["single_packet_stages"] = responder.restricted_stages
                 counters["restored_full_packets_before_feedback"] = responder.restored_full_packets
+            else:
+                require(responder.uncorrelated_replies_sent == 3 and responder.lost_reply_retried
+                        and counters["probe_replies"] == 2
+                        and counters["sacks"] == responder.sacks_sent - responder.uncorrelated_replies_sent,
+                        f"Unexpected probe correlation observations: {counters}")
+                counters["uncorrelated_probe_sacks_ignored"] = responder.uncorrelated_replies_sent
             wire.send(b"")
             _, error = relay.communicate(timeout=3)
             require(relay.returncode == 0, f"memif relay failed\n{error}")
@@ -476,22 +545,27 @@ def main():
     focused = parser.add_mutually_exclusive_group()
     focused.add_argument("--port-status-only", action="store_true", help="Run only the Port Status cases")
     focused.add_argument("--flow-control-only", action="store_true", help="Run only the responder flow-control case")
+    focused.add_argument("--probe-correlation-only", action="store_true", help="Run only the probe correlation case")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
     binary, relay = args.binary.resolve(), args.relay.resolve()
-    if not args.port_status_only and not args.flow_control_only:
+    normal_suite = not (args.port_status_only or args.flow_control_only or args.probe_correlation_only)
+    if normal_suite:
         for mode in args.mode or MODES:
             for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim")):
                 counters = run_requester(binary, relay, mode, reason)
                 print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
     mode = (args.mode or ("ipv6",))[0]
-    if not args.flow_control_only:
+    if normal_suite or args.port_status_only:
         for case in ("replace", "expire"):
             counters = run_requester(binary, relay, mode, port_status=case)
             print(json.dumps({"mode": mode, "port_status": case, **counters}))
-    if not args.port_status_only:
+    if normal_suite or args.flow_control_only:
         counters = run_requester(binary, relay, mode, flow_control=True)
         print(json.dumps({"mode": mode, "flow_control": "penalty_and_restore", **counters}))
+    if normal_suite or args.probe_correlation_only:
+        counters = run_requester(binary, relay, mode, probe_correlation=True)
+        print(json.dumps({"mode": mode, "probe_correlation": True, **counters}))
 
 
 if __name__ == "__main__":

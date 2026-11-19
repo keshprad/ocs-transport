@@ -49,6 +49,7 @@ struct send_record {
 
 struct outstanding_probe {
     uint64_t sent_at;
+    uint32_t entropy;
     uint16_t id;
     bool pending;
 };
@@ -69,7 +70,7 @@ struct mrc_requester {
     uint64_t next_probe;
     uint32_t denied;
     int result;
-    bool initial_probe;
+    uint32_t initial_probe_paths;
     struct mrc_cc cc;
     struct mrc_endpoint_node local_node;
     struct mrc_endpoint_node *node;
@@ -619,6 +620,17 @@ static enum mrc_provider_wc_status aeth_error_status(uint8_t syndrome)
     }
 }
 
+static int match_probe(const struct mrc_requester *sender, const struct mrc_wire_sack *sack)
+{
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        const struct outstanding_probe *probe = &sender->probes[path];
+        if (probe->pending && probe->id == (uint16_t)sack->ack_psn_offset &&
+            probe->entropy == sack->entropy)
+            return (int)path;
+    }
+    return -1;
+}
+
 static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                          struct mrc_endpoint_counters *counts, const struct mrc_wire_packet *packet)
 {
@@ -661,6 +673,12 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         if (wire->spdcid != (uint16_t)transfer->requestor_qpn || wire->dpdcid != (uint16_t)transfer->responder_qpn ||
             (!wire->probe_response && packet->bth.psn != wire->cack_psn))
             return 0;
+        int probe_path = -1;
+        if (wire->probe_response) {
+            probe_path = match_probe(sender, wire);
+            if (probe_path < 0)
+                return 0;
+        }
         struct mrc_sack sack = {
             .cack_psn = wire->cack_psn, .ack_psn_offset = wire->ack_psn_offset,
             .sack_offset = wire->sack_offset, .bitmap = wire->bitmap, .ooo_count = wire->ooo_count,
@@ -676,26 +694,21 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
             fprintf(stderr, "Ignoring invalid dynamic MPR %u at cumulative PSN %u\n",
                     wire->mpr, sack.cack_psn);
         counts->sacks++;
-        int ev = reflected_path(transfer, wire->entropy);
         struct mrc_cc_tx_sample sample;
         struct mrc_cc_tx_sample *rtt_sample = NULL;
-        if (wire->probe_response) {
-            for (unsigned int path = 0; path < PATH_COUNT; path++) {
-                struct outstanding_probe *probe = &sender->probes[path];
-                if (probe->pending && probe->id == (uint16_t)wire->ack_psn_offset &&
-                    wire->entropy == path_entropy(transfer, path, true)) {
-                    sample = (struct mrc_cc_tx_sample){
-                        .sent_at_ns = cycles_to_ns(transfer, probe->sent_at),
-                    };
-                    rtt_sample = &sample;
-                    mrc_ev_feedback(&sender->ev, path, ev_mark(wire->mark), true,
-                                    probe->sent_at, now_cycles);
-                    probe->pending = false;
-                    counts->probe_replies++;
-                    break;
-                }
-            }
+        if (probe_path >= 0) {
+            struct outstanding_probe *probe = &sender->probes[probe_path];
+            sample = (struct mrc_cc_tx_sample){
+                .sent_at_ns = cycles_to_ns(transfer, probe->sent_at),
+            };
+            rtt_sample = &sample;
+            mrc_ev_feedback(&sender->ev, (unsigned int)probe_path, ev_mark(wire->mark),
+                            true, probe->sent_at, now_cycles);
+            probe->pending = false;
+            sender->initial_probe_paths &= ~(UINT32_C(1) << probe_path);
+            counts->probe_replies++;
         } else {
+            int ev = reflected_path(transfer, wire->entropy);
             if (ev >= 0)
                 mrc_ev_feedback(&sender->ev, (unsigned int)ev, ev_mark(wire->mark),
                                 false, 0, now_cycles);
@@ -900,7 +913,14 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
 static bool request_probe(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                            struct mrc_endpoint_counters *counts, unsigned int path, uint64_t now)
 {
-    uint16_t probe_id = (uint16_t)(sender->probe_id + 1);
+    uint16_t probe_id = sender->probe_id;
+    bool outstanding;
+    do {
+        outstanding = false;
+        probe_id++;
+        for (unsigned int i = 0; i < PATH_COUNT; i++)
+            outstanding |= sender->probes[i].pending && sender->probes[i].id == probe_id;
+    } while (outstanding);
     struct mrc_wire_packet packet = packet_for(transfer, path, MRC_RELIABILITY_PROBE, 0);
     packet.body.probe = (struct mrc_wire_probe){
         .probe_id = probe_id, .spdcid = (uint16_t)transfer->requestor_qpn,
@@ -910,7 +930,7 @@ static bool request_probe(const struct mrc_endpoint_config *transfer, struct mrc
         return false;
     sender->probe_id = probe_id;
     sender->probes[path] = (struct outstanding_probe){
-        .sent_at = now, .id = probe_id, .pending = true,
+        .sent_at = now, .entropy = reflect_entropy(&packet), .id = probe_id, .pending = true,
     };
     counts->probe_requests++;
     counts->probe_sent[path]++;
@@ -1306,7 +1326,7 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
         return -ENOMEM;
     sender->counts = counts;
     sender->provider_qp = qp;
-    sender->initial_probe = true;
+    sender->initial_probe_paths = ALL_PATHS;
     sender->transfer = *configuration;
     sender->node = configuration->node ? configuration->node : &sender->local_node;
     struct mrc_endpoint_config *transfer = &sender->transfer;
@@ -1423,24 +1443,26 @@ static int requester_step(struct mrc_requester *sender)
             return result;
         sender->next_retry_scan = now + transfer->initial_rto / 32 + 1;
     }
-    bool general_probe = now >= sender->next_probe && (sender->initial_probe ||
-        (sender->next < transfer->packets &&
-         !mrc_cc_can_send(&sender->cc, nominal_at(transfer, sender->next))));
+    bool probe_timer_due = now >= sender->next_probe;
+    bool window_blocked = probe_timer_due && sender->next < transfer->packets &&
+        !mrc_cc_can_send(&sender->cc, nominal_at(transfer, sender->next));
+    bool general_probe = probe_timer_due && (sender->initial_probe_paths || window_blocked);
     bool sent_probe = false;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        if (sender->node->local_down & (1u << path))
+        uint32_t bit = UINT32_C(1) << path;
+        if (sender->node->local_down & bit)
             continue;
         bool due = mrc_ev_probe_due(&sender->ev, path, now);
-        if (due || (general_probe && mrc_ev_probe_allowed(&sender->ev, path) &&
+        bool initial = (sender->initial_probe_paths & bit) != 0;
+        if (due || (general_probe && (initial || window_blocked) &&
+                    mrc_ev_probe_allowed(&sender->ev, path) &&
                     sender->ev.paths[path].state != MRC_EV_ASSUMED_BAD)) {
             sent_probe |= request_probe(transfer, sender, counts, path, now);
             mrc_ev_probe_attempt(&sender->ev, path, now);
         }
     }
-    if (general_probe) {
-        sender->initial_probe &= !sent_probe;
+    if (general_probe)
         sender->next_probe = now + (sent_probe ? transfer->initial_rto : transfer->initial_rto / 32 + 1);
-    }
     for (unsigned int i = 0; i < BURST && sender->next < transfer->packets &&
          sender->next - first < transfer->window; i++) {
         uint32_t index = sender->next;
