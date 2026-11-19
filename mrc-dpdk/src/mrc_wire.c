@@ -6,11 +6,13 @@
 enum {
     ETHERNET_LEN = 14,
     IPV4_LEN = 20,
+    IPV6_LEN = 40,
     UDP_LEN = 8,
     ETHERTYPE_IPV4 = 0x0800,
+    ETHERTYPE_IPV6 = 0x86dd,
     IPPROTO_UDP = 17,
     IPV4_DONT_FRAGMENT = 0x4000,
-    IPV4_DEFAULT_TTL = 64,
+    IP_DEFAULT_HOP_LIMIT = 64,
     BTH_ACK_REQUEST = 0x80,
     BTH_RETRANSMIT = 0x20,
     BTH_TIMESTAMP = 0x10,
@@ -111,20 +113,27 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *bytes, size_t len)
     return crc;
 }
 
-static uint32_t ipv4_icrc(const uint8_t *ip, size_t len)
+static uint32_t roce_icrc(const uint8_t *ip, size_t ip_header_len, size_t protected_len)
 {
-    uint8_t masked[IPV4_LEN + UDP_LEN + MRC_BTH_LEN];
-    memcpy(masked, ip, sizeof(masked));
-    masked[1] = 0xff;  /* IPv4 DSCP and ECN */
-    masked[8] = 0xff;  /* IPv4 TTL */
-    masked[10] = 0xff; /* IPv4 header checksum */
-    masked[11] = 0xff;
-    masked[IPV4_LEN + 6] = 0xff; /* UDP checksum */
-    masked[IPV4_LEN + 7] = 0xff;
-    masked[IPV4_LEN + UDP_LEN + 4] = 0xff; /* BTH variant reserved field */
+    uint8_t masked[IPV6_LEN + UDP_LEN + MRC_BTH_LEN];
+    size_t prefix_len = ip_header_len + UDP_LEN + MRC_BTH_LEN;
+    memcpy(masked, ip, prefix_len);
+    if (ip_header_len == IPV4_LEN) {
+        masked[1] = 0xff;  /* IPv4 DSCP and ECN */
+        masked[8] = 0xff;  /* IPv4 TTL */
+        masked[10] = 0xff; /* IPv4 header checksum */
+        masked[11] = 0xff;
+    } else {
+        masked[0] |= 0x0f; /* IPv6 traffic class and flow label */
+        memset(masked + 1, 0xff, 3);
+        masked[7] = 0xff;  /* IPv6 hop limit */
+    }
+    masked[ip_header_len + 6] = 0xff; /* UDP checksum */
+    masked[ip_header_len + 7] = 0xff;
+    masked[ip_header_len + UDP_LEN + 4] = 0xff; /* BTH variant reserved field */
     /* This seed includes the eight all-ones bytes of the masked IB LRH. */
-    uint32_t crc = crc32_update(UINT32_C(0xdebb20e3), masked, sizeof(masked));
-    return ~crc32_update(crc, ip + sizeof(masked), len - sizeof(masked));
+    uint32_t crc = crc32_update(UINT32_C(0xdebb20e3), masked, prefix_len);
+    return ~crc32_update(crc, ip + prefix_len, protected_len - prefix_len);
 }
 
 bool mrc_wire_is_write(uint8_t opcode)
@@ -502,15 +511,74 @@ static int decode_control(const uint8_t *bytes, size_t len, struct mrc_wire_pack
     }
 }
 
+static void encode_ethernet(uint8_t *frame, uint16_t ethertype,
+                             const uint8_t *dst, const uint8_t *src)
+{
+    memcpy(frame, dst, MRC_MAC_LEN);
+    memcpy(frame + MRC_MAC_LEN, src, MRC_MAC_LEN);
+    write_be16(frame + 2 * MRC_MAC_LEN, ethertype);
+}
+
+static void encode_ipv4(uint8_t *frame, const struct mrc_wire_ipv4 *ipv4, uint16_t udp_len)
+{
+    encode_ethernet(frame, ETHERTYPE_IPV4, ipv4->dst_mac, ipv4->src_mac);
+    uint8_t *ip = frame + ETHERNET_LEN;
+    ip[0] = 0x45;
+    ip[1] = (uint8_t)((ipv4->dscp << 2) | ipv4->ecn);
+    write_be16(ip + 2, (uint16_t)(IPV4_LEN + udp_len));
+    write_be16(ip + 6, IPV4_DONT_FRAGMENT);
+    ip[8] = ipv4->ttl ? ipv4->ttl : IP_DEFAULT_HOP_LIMIT;
+    ip[9] = IPPROTO_UDP;
+    write_be32(ip + 12, ipv4->src_ip);
+    write_be32(ip + 16, ipv4->dst_ip);
+    write_be16(ip + 10, ipv4_checksum(ip));
+}
+
+static void encode_ipv6(uint8_t *frame, const struct mrc_wire_ipv6 *ipv6, uint16_t udp_len)
+{
+    encode_ethernet(frame, ETHERTYPE_IPV6, ipv6->dst_mac, ipv6->src_mac);
+    uint8_t *ip = frame + ETHERNET_LEN;
+    uint32_t version_traffic_flow = UINT32_C(0x60000000) | ((uint32_t)ipv6->dscp << 22) |
+                                    ((uint32_t)ipv6->ecn << 20) | ipv6->flow_label;
+    write_be32(ip, version_traffic_flow);
+    write_be16(ip + 4, udp_len);
+    ip[6] = IPPROTO_UDP;
+    ip[7] = ipv6->hop_limit ? ipv6->hop_limit : IP_DEFAULT_HOP_LIMIT;
+    memcpy(ip + 8, ipv6->src_ip, MRC_IPV6_ADDR_LEN);
+    memcpy(ip + 24, ipv6->dst_ip, MRC_IPV6_ADDR_LEN);
+}
+
 int mrc_wire_encode(uint8_t *frame, size_t capacity, const struct mrc_wire_packet *packet,
                     size_t *length)
 {
     if (!frame || !packet || !length || packet->bth.psn > MRC_WIRE_PSN_MASK ||
-        packet->bth.dqp > MRC_WIRE_PSN_MASK || packet->ipv4.dscp > 63 || packet->ipv4.ecn > 3)
+        packet->bth.dqp > MRC_WIRE_PSN_MASK)
         return -EINVAL;
 
+    size_t ip_header_len;
+    uint16_t src_port, dst_port;
+    switch (packet->ip_version) {
+    case MRC_WIRE_IP_UNSPECIFIED:
+    case MRC_WIRE_IP4:
+        if (packet->ipv4.dscp > 63 || packet->ipv4.ecn > 3)
+            return -EINVAL;
+        ip_header_len = IPV4_LEN;
+        src_port = packet->ipv4.src_port;
+        dst_port = packet->ipv4.dst_port;
+        break;
+    case MRC_WIRE_IP6:
+        if (packet->ipv6.dscp > 63 || packet->ipv6.ecn > 3 ||
+            packet->ipv6.flow_label > MRC_IPV6_FLOW_LABEL_MASK)
+            return -EINVAL;
+        ip_header_len = IPV6_LEN;
+        src_port = packet->ipv6.src_port;
+        dst_port = packet->ipv6.dst_port;
+        break;
+    default:
+        return -EINVAL;
+    }
+
     const struct mrc_wire_bth *bth = &packet->bth;
-    const struct mrc_wire_ipv4 *ipv4 = &packet->ipv4;
     size_t body_len;
     uint8_t pad = 0;
     bool is_write = mrc_wire_is_write(bth->opcode);
@@ -527,36 +595,29 @@ int mrc_wire_encode(uint8_t *frame, size_t capacity, const struct mrc_wire_packe
         body_len = control_body_len(bth->opcode);
     }
 
-    size_t ip_len = IPV4_LEN + UDP_LEN + MRC_BTH_LEN + body_len + MRC_ICRC_LEN;
+    size_t udp_len = UDP_LEN + MRC_BTH_LEN + body_len + MRC_ICRC_LEN;
+    size_t ip_len = ip_header_len + udp_len;
     size_t frame_len = ETHERNET_LEN + ip_len;
-    if (ip_len > UINT16_MAX)
+    if (udp_len > UINT16_MAX || (ip_header_len == IPV4_LEN && ip_len > UINT16_MAX))
         return -EINVAL;
     if (frame_len > capacity)
         return -EMSGSIZE;
 
-    memcpy(frame, ipv4->dst_mac, MRC_MAC_LEN);
-    memcpy(frame + MRC_MAC_LEN, ipv4->src_mac, MRC_MAC_LEN);
-    write_be16(frame + 2 * MRC_MAC_LEN, ETHERTYPE_IPV4);
     uint8_t *ip = frame + ETHERNET_LEN;
-    memset(ip, 0, IPV4_LEN + UDP_LEN + MRC_BTH_LEN +
+    memset(ip, 0, ip_header_len + UDP_LEN + MRC_BTH_LEN +
                   (is_write ? write_header_len(bth) : body_len));
-    ip[0] = 0x45;
-    ip[1] = (uint8_t)((ipv4->dscp << 2) | ipv4->ecn);
-    write_be16(ip + 2, (uint16_t)ip_len);
-    write_be16(ip + 6, IPV4_DONT_FRAGMENT);
-    ip[8] = ipv4->ttl ? ipv4->ttl : IPV4_DEFAULT_TTL;
-    ip[9] = IPPROTO_UDP;
-    write_be32(ip + 12, ipv4->src_ip);
-    write_be32(ip + 16, ipv4->dst_ip);
-    write_be16(ip + 10, ipv4_checksum(ip));
+    if (ip_header_len == IPV4_LEN)
+        encode_ipv4(frame, &packet->ipv4, (uint16_t)udp_len);
+    else
+        encode_ipv6(frame, &packet->ipv6, (uint16_t)udp_len);
 
-    uint8_t *udp = ip + IPV4_LEN;
-    uint16_t udp_len = (uint16_t)(ip_len - IPV4_LEN);
+    uint8_t *udp = ip + ip_header_len;
+    uint16_t nominal_udp_len = (uint16_t)udp_len;
     if (bth->opcode == MRC_RELIABILITY_NACK && is_trim_reason(packet->body.nack.reason))
-        udp_len = packet->body.nack.original_udp_len;
-    write_be16(udp, ipv4->src_port);
-    write_be16(udp + 2, ipv4->dst_port ? ipv4->dst_port : MRC_UDP_DEFAULT_PORT);
-    write_be16(udp + 4, udp_len);
+        nominal_udp_len = packet->body.nack.original_udp_len;
+    write_be16(udp, src_port);
+    write_be16(udp + 2, dst_port ? dst_port : MRC_UDP_DEFAULT_PORT);
+    write_be16(udp + 4, nominal_udp_len);
     encode_bth(udp + UDP_LEN, bth, pad);
     uint8_t *body = udp + UDP_LEN + MRC_BTH_LEN;
     if (is_write)
@@ -565,65 +626,137 @@ int mrc_wire_encode(uint8_t *frame, size_t capacity, const struct mrc_wire_packe
         encode_control(body, packet);
     memset(body + body_len - pad, 0, pad);
 
-    write_le32(frame + frame_len - MRC_ICRC_LEN, ipv4_icrc(ip, ip_len - MRC_ICRC_LEN));
+    write_le32(frame + frame_len - MRC_ICRC_LEN, roce_icrc(ip, ip_header_len, ip_len - MRC_ICRC_LEN));
     *length = frame_len;
     return 0;
 }
 
-/* Parse only the physically present prefix. The caller verifies lengths and iCRC
- * for normal traffic, or explicitly authorizes trimmed input by DSCP.
+struct wire_prefix {
+    const uint8_t *ip;
+    const uint8_t *udp;
+    enum mrc_wire_ip_version ip_version;
+    uint16_t physical_udp_len;
+};
+
+static enum mrc_wire_ip_version frame_ip_version(const uint8_t *frame)
+{
+    uint16_t ethertype = read_be16(frame + 2 * MRC_MAC_LEN);
+    if (ethertype == ETHERTYPE_IPV4)
+        return MRC_WIRE_IP4;
+    if (ethertype == ETHERTYPE_IPV6)
+        return MRC_WIRE_IP6;
+    return MRC_WIRE_IP_UNSPECIFIED;
+}
+
+static bool family_matches(enum mrc_wire_ip_version actual,
+                           enum mrc_wire_ip_version expected)
+{
+    return actual != MRC_WIRE_IP_UNSPECIFIED &&
+           (expected == MRC_WIRE_IP_UNSPECIFIED || actual == expected);
+}
+
+static uint8_t ip_traffic_class(const uint8_t *ip, enum mrc_wire_ip_version version)
+{
+    return version == MRC_WIRE_IP4 ? ip[1] : (uint8_t)(read_be16(ip) >> 4);
+}
+
+/* Parse the physically present prefix. Ordinary traffic also needs validated
+ * lengths and iCRC. For trim handling the caller checks the configured DSCP.
  */
-static int decode_prefix(const uint8_t *frame, size_t length, struct mrc_wire_ipv4 *ipv4,
-                         struct mrc_wire_bth *decoded_bth)
+static int decode_prefix(const uint8_t *frame, size_t length, enum mrc_wire_ip_version expected,
+                         struct wire_prefix *prefix)
 {
     if (length < MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN)
         return -EBADMSG;
-    if (read_be16(frame + 2 * MRC_MAC_LEN) != ETHERTYPE_IPV4)
-        return -EPROTONOSUPPORT;
 
-    const uint8_t *ip = frame + ETHERNET_LEN;
-    if (ip[0] != 0x45 || ip[9] != IPPROTO_UDP ||
-        (read_be16(ip + 6) & (uint16_t)~IPV4_DONT_FRAGMENT))
+    enum mrc_wire_ip_version version = frame_ip_version(frame);
+    if (!family_matches(version, expected))
         return -EPROTONOSUPPORT;
-
-    const uint8_t *udp = ip + IPV4_LEN;
-    const uint8_t *bth = udp + UDP_LEN;
-    if (ipv4_checksum(ip) || read_be16(udp + 6) || !read_be16(udp + 2) ||
-        (bth[1] & 0xf))
+    size_t ip_header_len = version == MRC_WIRE_IP4 ? IPV4_LEN : IPV6_LEN;
+    if (length < ETHERNET_LEN + ip_header_len + UDP_LEN + MRC_BTH_LEN)
         return -EBADMSG;
 
-    memcpy(ipv4->dst_mac, frame, MRC_MAC_LEN);
-    memcpy(ipv4->src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN);
-    ipv4->src_ip = read_be32(ip + 12);
-    ipv4->dst_ip = read_be32(ip + 16);
-    ipv4->src_port = read_be16(udp);
-    ipv4->dst_port = read_be16(udp + 2);
-    ipv4->dscp = ip[1] >> 2;
-    ipv4->ecn = ip[1] & 3;
-    ipv4->ttl = ip[8];
-    decode_bth(bth, decoded_bth);
+    const uint8_t *ip = frame + ETHERNET_LEN;
+    if (version == MRC_WIRE_IP4) {
+        if (ip[0] != 0x45 || ip[9] != IPPROTO_UDP ||
+            (read_be16(ip + 6) & (uint16_t)~IPV4_DONT_FRAGMENT))
+            return -EPROTONOSUPPORT;
+        if (ipv4_checksum(ip))
+            return -EBADMSG;
+    } else if ((ip[0] >> 4) != 6 || ip[6] != IPPROTO_UDP) {
+        return -EPROTONOSUPPORT;
+    }
+
+    const uint8_t *udp = ip + ip_header_len;
+    const uint8_t *bth = udp + UDP_LEN;
+    if (read_be16(udp + 6) || !read_be16(udp + 2) || (bth[1] & 0xf))
+        return -EBADMSG;
+    *prefix = (struct wire_prefix){ .ip = ip, .udp = udp, .ip_version = version };
     return 0;
 }
 
-static int decode_envelope(const uint8_t *frame, size_t length, struct mrc_wire_ipv4 *ipv4,
-                           struct mrc_wire_bth *bth, uint16_t *physical_udp_len)
+static int decode_envelope(const uint8_t *frame, size_t length, enum mrc_wire_ip_version expected,
+                           struct wire_prefix *prefix)
 {
-    int error = decode_prefix(frame, length, ipv4, bth);
+    int error = decode_prefix(frame, length, expected, prefix);
     if (error)
         return error;
 
-    const uint8_t *ip = frame + ETHERNET_LEN;
-    uint16_t ip_len = read_be16(ip + 2);
-    if (ip_len < IPV4_LEN + UDP_LEN + MRC_BTH_LEN + MRC_ICRC_LEN ||
+    const uint8_t *ip = prefix->ip;
+    size_t ip_header_len = (size_t)(prefix->udp - ip);
+    size_t ip_len = prefix->ip_version == MRC_WIRE_IP4 ? read_be16(ip + 2) :
+                    IPV6_LEN + read_be16(ip + 4);
+    if (ip_len < ip_header_len + UDP_LEN + MRC_BTH_LEN + MRC_ICRC_LEN ||
         ip_len > length - ETHERNET_LEN)
         return -EBADMSG;
 
     size_t crc_offset = ip_len - MRC_ICRC_LEN;
-    if (read_le32(ip + crc_offset) != ipv4_icrc(ip, crc_offset))
+    if (read_le32(ip + crc_offset) != roce_icrc(ip, ip_header_len, crc_offset))
         return -EBADMSG;
 
-    *physical_udp_len = (uint16_t)(ip_len - IPV4_LEN);
+    prefix->physical_udp_len = (uint16_t)(ip_len - ip_header_len);
     return 0;
+}
+
+static void decode_ipv4(const uint8_t *frame, const struct wire_prefix *prefix,
+                         struct mrc_wire_ipv4 *ipv4)
+{
+    const uint8_t *ip = prefix->ip;
+    memcpy(ipv4->dst_mac, frame, MRC_MAC_LEN);
+    memcpy(ipv4->src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN);
+    ipv4->src_ip = read_be32(ip + 12);
+    ipv4->dst_ip = read_be32(ip + 16);
+    ipv4->src_port = read_be16(prefix->udp);
+    ipv4->dst_port = read_be16(prefix->udp + 2);
+    ipv4->dscp = ip[1] >> 2;
+    ipv4->ecn = ip[1] & 3;
+    ipv4->ttl = ip[8];
+}
+
+static void decode_ipv6(const uint8_t *frame, const struct wire_prefix *prefix,
+                         struct mrc_wire_ipv6 *ipv6)
+{
+    const uint8_t *ip = prefix->ip;
+    memcpy(ipv6->dst_mac, frame, MRC_MAC_LEN);
+    memcpy(ipv6->src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN);
+    memcpy(ipv6->src_ip, ip + 8, MRC_IPV6_ADDR_LEN);
+    memcpy(ipv6->dst_ip, ip + 24, MRC_IPV6_ADDR_LEN);
+    ipv6->flow_label = read_be32(ip) & MRC_IPV6_FLOW_LABEL_MASK;
+    ipv6->src_port = read_be16(prefix->udp);
+    ipv6->dst_port = read_be16(prefix->udp + 2);
+    uint8_t traffic_class = ip_traffic_class(ip, MRC_WIRE_IP6);
+    ipv6->dscp = traffic_class >> 2;
+    ipv6->ecn = traffic_class & 3;
+    ipv6->hop_limit = ip[7];
+}
+
+static int decode_header(const uint8_t *frame, size_t length, enum mrc_wire_ip_version version,
+                         struct wire_prefix *prefix)
+{
+    int error = decode_envelope(frame, length, version, prefix);
+    if (error)
+        return error;
+    return read_be16(prefix->udp + 4) == prefix->physical_udp_len ? 0 : -EBADMSG;
 }
 
 int mrc_wire_decode_header(const uint8_t *frame, size_t length, struct mrc_wire_ipv4 *ipv4,
@@ -631,36 +764,51 @@ int mrc_wire_decode_header(const uint8_t *frame, size_t length, struct mrc_wire_
 {
     if (!frame || !ipv4 || !bth)
         return -EINVAL;
-
-    struct mrc_wire_ipv4 decoded_ipv4;
-    struct mrc_wire_bth decoded_bth;
-    uint16_t physical_udp_len;
-    int error = decode_envelope(frame, length, &decoded_ipv4, &decoded_bth, &physical_udp_len);
+    struct wire_prefix prefix;
+    int error = decode_header(frame, length, MRC_WIRE_IP4, &prefix);
     if (error)
         return error;
-    if (read_be16(frame + ETHERNET_LEN + IPV4_LEN + 4) != physical_udp_len)
-        return -EBADMSG;
-
-    *ipv4 = decoded_ipv4;
-    *bth = decoded_bth;
+    decode_ipv4(frame, &prefix, ipv4);
+    decode_bth(prefix.udp + UDP_LEN, bth);
     return 0;
 }
 
-int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet)
+int mrc_wire_decode_ipv6_header(const uint8_t *frame, size_t length, struct mrc_wire_ipv6 *ipv6,
+                                struct mrc_wire_bth *bth)
+{
+    if (!frame || !ipv6 || !bth)
+        return -EINVAL;
+    struct wire_prefix prefix;
+    int error = decode_header(frame, length, MRC_WIRE_IP6, &prefix);
+    if (error)
+        return error;
+    decode_ipv6(frame, &prefix, ipv6);
+    decode_bth(prefix.udp + UDP_LEN, bth);
+    return 0;
+}
+
+static int decode_packet(const uint8_t *frame, size_t length, enum mrc_wire_ip_version expected,
+                         struct mrc_wire_packet *packet)
 {
     if (!frame || !packet)
         return -EINVAL;
 
-    struct mrc_wire_packet decoded = {0};
-    uint16_t physical_udp_len;
-    int error = decode_envelope(frame, length, &decoded.ipv4, &decoded.bth, &physical_udp_len);
+    struct wire_prefix prefix;
+    int error = decode_envelope(frame, length, expected, &prefix);
     if (error)
         return error;
 
-    const uint8_t *udp = frame + ETHERNET_LEN + IPV4_LEN;
-    const uint8_t *bth = udp + UDP_LEN;
+    struct mrc_wire_packet decoded = { .ip_version = prefix.ip_version };
+    if (prefix.ip_version == MRC_WIRE_IP4)
+        decode_ipv4(frame, &prefix, &decoded.ipv4);
+    else
+        decode_ipv6(frame, &prefix, &decoded.ipv6);
+    const uint8_t *bth = prefix.udp + UDP_LEN;
+    decode_bth(bth, &decoded.bth);
+
     const uint8_t *body = bth + MRC_BTH_LEN;
-    uint16_t nominal_udp_len = read_be16(udp + 4);
+    uint16_t nominal_udp_len = read_be16(prefix.udp + 4);
+    uint16_t physical_udp_len = prefix.physical_udp_len;
     size_t body_len = physical_udp_len - UDP_LEN - MRC_BTH_LEN - MRC_ICRC_LEN;
     if (mrc_wire_is_write(decoded.bth.opcode)) {
         if (physical_udp_len != nominal_udp_len)
@@ -676,29 +824,49 @@ int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet 
     return 0;
 }
 
-int mrc_wire_decode_trimmed(const uint8_t *frame, size_t length, uint8_t trim_dscp,
-                            struct mrc_wire_trimmed *packet)
+int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet)
+{
+    return decode_packet(frame, length, MRC_WIRE_IP4, packet);
+}
+
+int mrc_wire_decode_ip(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet)
+{
+    return decode_packet(frame, length, MRC_WIRE_IP_UNSPECIFIED, packet);
+}
+
+static int decode_trimmed(const uint8_t *frame, size_t length, uint8_t trim_dscp,
+                          enum mrc_wire_ip_version expected, struct mrc_wire_trimmed *packet)
 {
     if (!frame || !packet || trim_dscp > 63)
         return -EINVAL;
     if (length < ETHERNET_LEN + 2)
         return -EBADMSG;
-    if (read_be16(frame + 2 * MRC_MAC_LEN) != ETHERTYPE_IPV4 ||
-        frame[ETHERNET_LEN + 1] >> 2 != trim_dscp)
+
+    enum mrc_wire_ip_version version = frame_ip_version(frame);
+    if (!family_matches(version, expected) ||
+        ip_traffic_class(frame + ETHERNET_LEN, version) >> 2 != trim_dscp)
         return -EPROTONOSUPPORT;
 
-    struct mrc_wire_trimmed decoded = {0};
-    int error = decode_prefix(frame, length, &decoded.ipv4, &decoded.bth);
+    struct wire_prefix prefix;
+    int error = decode_prefix(frame, length, version, &prefix);
     if (error)
         return error;
+
+    struct mrc_wire_trimmed decoded = { .ip_version = version };
+    const uint8_t *bth = prefix.udp + UDP_LEN;
+    decode_bth(bth, &decoded.bth);
     if (!mrc_wire_is_write(decoded.bth.opcode))
         return -EBADMSG;
+    if (version == MRC_WIRE_IP4)
+        decode_ipv4(frame, &prefix, &decoded.ipv4);
+    else
+        decode_ipv6(frame, &prefix, &decoded.ipv6);
 
     /* UET 1.0.1 sections 3.5.15.1 and 4.1. A switch may shorten the packet
      * without changing the original UDP length, and the iCRC may be absent.
      */
-    decoded.original_udp_len = read_be16(frame + ETHERNET_LEN + IPV4_LEN + 4);
-    size_t timestamp_offset = MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN;
+    decoded.original_udp_len = read_be16(prefix.udp + 4);
+    size_t timestamp_offset = (size_t)(bth - frame) + MRC_BTH_LEN + MRC_METH_LEN;
     if (decoded.bth.timestamp && length >= timestamp_offset + MRC_TSETH_LEN) {
         const uint8_t *timestamp = frame + timestamp_offset;
         if ((timestamp[3] & 0xf) != TIMESTAMP_TYPE)
@@ -709,4 +877,16 @@ int mrc_wire_decode_trimmed(const uint8_t *frame, size_t length, uint8_t trim_ds
     }
     *packet = decoded;
     return 0;
+}
+
+int mrc_wire_decode_trimmed(const uint8_t *frame, size_t length, uint8_t trim_dscp,
+                            struct mrc_wire_trimmed *packet)
+{
+    return decode_trimmed(frame, length, trim_dscp, MRC_WIRE_IP4, packet);
+}
+
+int mrc_wire_decode_trimmed_ip(const uint8_t *frame, size_t length, uint8_t trim_dscp,
+                               struct mrc_wire_trimmed *packet)
+{
+    return decode_trimmed(frame, length, trim_dscp, MRC_WIRE_IP_UNSPECIFIED, packet);
 }

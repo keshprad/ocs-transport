@@ -8,11 +8,13 @@ from pathlib import Path
 from memif_pair import MACS, eal_args, require, run_pair
 
 
-def transfer(binary, size, *options, drop_after=None, drop_final_acks=None, trim_after=None):
+def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
+             trim_after=None, ipv6=False):
     def command(role, cpu, directory):
         tx = role == "tx"
         peer = "rx" if tx else "tx"
-        addresses = {"tx": "192.0.2.1", "rx": "192.0.2.2"}
+        addresses = ({"tx": "2001:db8::1", "rx": "2001:db8::2"} if ipv6 else
+                     {"tx": "192.0.2.1", "rx": "192.0.2.2"})
         local_ip, peer_ip = addresses[role], addresses[peer]
         args = eal_args(binary, role, cpu, directory)
         args += ["--", role, str(size), local_ip, peer_ip, "0", MACS[peer][0],
@@ -43,7 +45,10 @@ def main():
     require(tx["packets"] == 1 and not rx["immediate_completed"], "WRITE ONLY failed")
     print(json.dumps({"case": "write_only", "tx": tx, "rx": rx}))
 
-    tx, rx = transfer(binary, 0)
+    tx, rx = transfer(binary, 0, "--requestor-qpn", "0x120101",
+                      "--responder-qpn", "0x240102", "--mpr", "1",
+                      "--remote-key", "0x2468", "--p-key", "0xd111",
+                      "--remote-address", "0x123456789000", "--udp-port", "4971")
     require(tx["packets"] == 1 and sum(rx["received"]) == 1, "Zero-length WRITE ONLY failed")
     print(json.dumps({"case": "zero_length_write", "tx": tx, "rx": rx}))
 
@@ -73,6 +78,11 @@ def main():
     require(tx["retries"][0] >= rx["trimmed"] and rx["duplicates"] == 0,
             "Trimmed packets were placed or did not recover over the surviving link")
     print(json.dumps({"case": "write_trim_nack", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 1048576, "--immediate", "23", trim_after=64, ipv6=True)
+    require(rx["trimmed"] > 0 and tx["trim_nacks"] > 0 and rx["immediate_completed"],
+            f"IPv6 WRITEIMM did not recover from trimmed data: {tx}, {rx}")
+    print(json.dumps({"case": "ipv6_write_imm_trim_nack", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":

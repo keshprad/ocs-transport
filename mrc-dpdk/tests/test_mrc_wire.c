@@ -100,6 +100,65 @@ static const uint8_t unknown_frame[] = {
     0xff, 0xee, 0x80, 0x01, 0x23, 0x45, 0x7f, 0x0c, 0x95, 0xde,
 };
 
+/*
+ * IPv6 fixtures use a separate Python struct/ipaddress/zlib construction.
+ * The iCRC masks the traffic class, 20-bit flow label, and hop limit.
+ */
+static const uint8_t ipv6_write_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x3c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x3c,
+    0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0, 0xff, 0xee, 0xb0, 0x00,
+    0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67, 0x80, 0x01, 0x11, 0x11,
+    0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x78, 0x9a, 0xbc, 0xde, 0x00, 0x00,
+    0x00, 0x05, 0xf0, 0x0d, 0xca, 0xfe, 0x4d, 0x52, 0x43, 0x21, 0x01, 0x00,
+    0x00, 0x00, 0x81, 0x74, 0x87, 0x5a,
+};
+
+static const uint8_t ipv6_ack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x1c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x13, 0x6b, 0x00, 0x1c,
+    0x00, 0x00, 0xd1, 0x00, 0xab, 0xcd, 0x00, 0xc0, 0xff, 0xee, 0x00, 0x00,
+    0xff, 0x01, 0x1f, 0x01, 0xa2, 0xb3, 0x6d, 0x4c, 0xe3, 0x64,
+};
+
+static const uint8_t ipv6_nack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x2c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x04, 0x2c,
+    0x00, 0x00, 0xdd, 0x00, 0xab, 0xcd, 0x00, 0xc0, 0xff, 0xee, 0x20, 0x00,
+    0x12, 0x34, 0x00, 0x00, 0x02, 0xe3, 0x00, 0x00, 0xc1, 0x23, 0x1a, 0x1b,
+    0x2a, 0x2b, 0x00, 0x00, 0x12, 0x34, 0x20, 0x00, 0x31, 0xa2, 0xe4, 0x58,
+    0x80, 0x2d,
+};
+
+static const uint8_t ipv6_unknown_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x18, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x18,
+    0x00, 0x00, 0xc5, 0x00, 0xab, 0xcd, 0x00, 0xc0, 0xff, 0xee, 0x80, 0x01,
+    0x23, 0x45, 0xec, 0x0b, 0xa4, 0x80,
+};
+
+static const uint8_t ipv6_trim_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xfa, 0xbc, 0xde, 0x00, 0x1c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x3c,
+    0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0, 0xff, 0xee, 0xb0, 0x00,
+    0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67, 0x80, 0x01,
+};
+
 static struct mrc_wire_packet check_fixture(const uint8_t *frame, size_t len,
                                             const struct mrc_wire_packet *expected)
 {
@@ -109,7 +168,9 @@ static struct mrc_wire_packet check_fixture(const uint8_t *frame, size_t len,
     assert(mrc_wire_encode(encoded, sizeof(encoded), expected, &encoded_len) == 0);
     assert(encoded_len == len);
     assert(memcmp(encoded, frame, len) == 0);
-    assert(mrc_wire_decode(frame, len, &decoded) == 0);
+    assert(mrc_wire_decode_ip(frame, len, &decoded) == 0);
+    assert(decoded.ip_version == (expected->ip_version == MRC_WIRE_IP6 ?
+                                  MRC_WIRE_IP6 : MRC_WIRE_IP4));
     assert(mrc_wire_encode(encoded, sizeof(encoded), &decoded, &encoded_len) == 0);
     assert(encoded_len == len);
     assert(memcmp(encoded, frame, len) == 0);
@@ -323,6 +384,136 @@ static void test_bad_frames(void)
     assert(mrc_wire_encode(frame, sizeof(frame), &packet, &len) == -EPROTONOSUPPORT);
 }
 
+static struct mrc_wire_packet ipv6_packet_for(uint8_t opcode)
+{
+    struct mrc_wire_packet packet = packet_for(opcode);
+    packet.ip_version = MRC_WIRE_IP6;
+    packet.ipv6 = (struct mrc_wire_ipv6) {
+        .src_mac = {2, 0, 0, 0, 0, 1}, .dst_mac = {2, 0, 0, 0, 0, 2},
+        .src_ip = {0x20, 1, 0x0d, 0xb8, 0x11, 0, 0xde, 0xad,
+                   0xbe, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc},
+        .dst_ip = {0x20, 1, 0x0d, 0xb8, 0x22, 0, 0xca, 0xfe,
+                   0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11},
+        .flow_label = 0xabcde, .src_port = 0xe741, .dscp = 46, .ecn = 3,
+        .hop_limit = 52,
+    };
+    return packet;
+}
+
+static void test_ipv6_write(void)
+{
+    const uint8_t data[] = {'M', 'R', 'C', '!', 1};
+    struct mrc_wire_packet packet = ipv6_packet_for(MRC_WRITE_ONLY_IMM);
+    packet.bth.p_key = 0xffff;
+    packet.bth.psn = 0x00ff01;
+    packet.bth.ack_request = true;
+    packet.bth.retransmit = true;
+    packet.bth.timestamp = true;
+    packet.body.write = (struct mrc_wire_write) {
+        .rqmsn = 0x2468, .msn = 0xace0, .tx_timestamp = 0x4567, .tsr = true,
+        .va = UINT64_C(0x1111222233334444), .r_key = 0x789abcde, .dma_len = sizeof(data),
+        .imm_data = 0xf00dcafe, .data = data, .data_len = sizeof(data),
+    };
+    struct mrc_wire_packet decoded =
+        check_fixture(ipv6_write_frame, sizeof(ipv6_write_frame), &packet);
+    assert(decoded.ipv6.src_port == 0xe741 && decoded.ipv6.dst_port == MRC_UDP_DEFAULT_PORT);
+    assert(decoded.ipv6.flow_label == 0xabcde);
+    assert(decoded.ipv6.dscp == 46 && decoded.ipv6.ecn == 3 && decoded.ipv6.hop_limit == 52);
+    assert(decoded.body.write.data == ipv6_write_frame + 102);
+    assert(decoded.body.write.data_len == sizeof(data));
+    assert(memcmp(decoded.body.write.data, data, sizeof(data)) == 0);
+    assert(mrc_wire_decode(ipv6_write_frame, sizeof(ipv6_write_frame), &decoded) ==
+           -EPROTONOSUPPORT);
+
+    uint8_t encoded[128];
+    size_t len;
+    packet.ipv6.flow_label = MRC_IPV6_FLOW_LABEL_MASK + 1;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == -EINVAL);
+    packet.ipv6.flow_label = MRC_IPV6_FLOW_LABEL_MASK;
+    packet.ipv6.hop_limit = 0;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == 0);
+    assert(mrc_wire_decode_ip(encoded, len, &decoded) == 0);
+    assert(decoded.ipv6.flow_label == MRC_IPV6_FLOW_LABEL_MASK && decoded.ipv6.hop_limit == 64);
+}
+
+static void test_ipv6_control(void)
+{
+    struct mrc_wire_packet packet = ipv6_packet_for(MRC_TRANSPORT_ACK);
+    packet.bth.psn = 0x00ff01;
+    packet.ipv6.dst_port = 4971;
+    packet.body.aeth = (struct mrc_wire_aeth){.syndrome = 0x1f, .msn = 0x01a2b3};
+    check_fixture(ipv6_ack_frame, sizeof(ipv6_ack_frame), &packet);
+
+    packet = ipv6_packet_for(MRC_RELIABILITY_NACK);
+    packet.bth.psn = 0x001234;
+    packet.bth.retransmit = true;
+    packet.body.nack = (struct mrc_wire_nack) {
+        .reason = MRC_NACK_TRIMMED_LASTHOP, .vendor_info = 0xe3, .entropy = 0xc123,
+        .spdcid = 0x1a1b, .dpdcid = 0x2a2b, .nack_psn = 0x001234, .tx_timestamp = 0x31a2,
+        .original_udp_len = 1068,
+    };
+    check_fixture(ipv6_nack_frame, sizeof(ipv6_nack_frame), &packet);
+
+    struct mrc_wire_ipv6 ipv6;
+    struct mrc_wire_bth bth;
+    assert(mrc_wire_decode_ipv6_header(ipv6_nack_frame, sizeof(ipv6_nack_frame), &ipv6, &bth) ==
+           -EBADMSG);
+    assert(mrc_wire_decode_ipv6_header(ack_frame, sizeof(ack_frame), &ipv6, &bth) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_ipv6_header(ipv6_unknown_frame, sizeof(ipv6_unknown_frame), &ipv6,
+                                      &bth) == 0);
+    assert(bth.opcode == 0xc5 && bth.dqp == 0xc0ffee && bth.psn == 0x012345);
+    assert(ipv6.flow_label == 0xabcde);
+}
+
+static void test_ipv6_trimmed_request(void)
+{
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), &decoded) == -EBADMSG);
+    struct mrc_wire_trimmed trim;
+    assert(mrc_wire_decode_trimmed(ipv6_trim_frame, sizeof(ipv6_trim_frame), 47, &trim) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_trimmed_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), 46, &trim) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_trimmed_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), 47, &trim) == 0);
+    assert(trim.ip_version == MRC_WIRE_IP6 && trim.ipv6.flow_label == 0xabcde);
+    assert(trim.bth.dqp == 0xc0ffee && trim.bth.psn == 0x00ff01 && trim.bth.retransmit);
+    assert(trim.timestamp && trim.tsr && trim.tx_timestamp == 0x4567);
+    assert(trim.original_udp_len == 60);
+}
+
+static void test_ipv6_integrity(void)
+{
+    struct mrc_wire_packet decoded;
+    uint8_t encoded[sizeof(ipv6_write_frame)];
+    memcpy(encoded, ipv6_write_frame, sizeof(encoded));
+
+    struct mrc_wire_ipv4 ipv4;
+    struct mrc_wire_bth bth;
+    assert(mrc_wire_decode_header(encoded, sizeof(encoded), &ipv4, &bth) == -EPROTONOSUPPORT);
+    for (size_t len = 0; len < sizeof(encoded); ++len)
+        assert(mrc_wire_decode_ip(encoded, len, &decoded) == -EBADMSG);
+
+    /* The version stays 6 while all mutable IPv6 iCRC fields change. */
+    memcpy(encoded + 14, (uint8_t[]){0x6f, 0xdf, 0xff, 0xff}, 4);
+    encoded[21]--;
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == 0);
+    assert(decoded.ipv6.dscp == 63 && decoded.ipv6.ecn == 1 && decoded.ipv6.hop_limit == 51);
+    assert(decoded.ipv6.flow_label == MRC_IPV6_FLOW_LABEL_MASK);
+
+    encoded[22] ^= 1; /* Source IPv6 address is invariant. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EBADMSG);
+    encoded[22] ^= 1;
+    encoded[54] ^= 1; /* UDP source port is invariant. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EBADMSG);
+    encoded[54] ^= 1;
+    encoded[60] = 1; /* OCP specifically requires zero UDP checksum. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EBADMSG);
+    encoded[60] = 0;
+    encoded[20] = 43; /* Base IPv6 codec expects UDP without extension headers. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EPROTONOSUPPORT);
+}
+
 int main(void)
 {
     test_write();
@@ -334,6 +525,10 @@ int main(void)
     test_trimmed_request();
     test_unknown_opcode();
     test_bad_frames();
+    test_ipv6_write();
+    test_ipv6_control();
+    test_ipv6_trimmed_request();
+    test_ipv6_integrity();
     puts("MRC wire codec tests passed");
     return 0;
 }

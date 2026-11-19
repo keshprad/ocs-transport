@@ -26,15 +26,18 @@ enum {
     FRAME_CAPACITY = 1514,
     SACK_THRESHOLD = 4096,
     UDP_HEADER_LEN = 8,
+    REQUESTOR_EV_PORT = 0xc000,
+    RESPONDER_EV_PORT = 0xd000,
+    EV_FLOW_LABEL = 0xa0100,
     NOMINAL_MTU = PMTU + UDP_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN +
                   MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
     INITIAL_CWND = 128 * NOMINAL_MTU,
     TARGET_QUEUE_NS = 20000,
     FAST_LOSS_GAP = 16,
-    REQUESTOR_QPN = 0x101,
-    RESPONDER_QPN = 0x102,
-    PARTITION_KEY = 0xffff,
-    REMOTE_KEY = 0x6d726301,
+    DEFAULT_REQUESTOR_QPN = 0x101,
+    DEFAULT_RESPONDER_QPN = 0x102,
+    DEFAULT_PARTITION_KEY = 0xffff,
+    DEFAULT_REMOTE_KEY = 0x6d726301,
     DATA_DSCP = 0,
     CONTROL_DSCP = 48,
     TRIM_DSCP = 49,
@@ -43,7 +46,7 @@ enum {
     REMOTE_ACCESS_NAK = 0x62,
 };
 
-static const uint64_t remote_address = UINT64_C(0x100000000);
+static const uint64_t default_remote_address = UINT64_C(0x100000000);
 
 struct path {
     uint16_t port;
@@ -58,8 +61,17 @@ struct transfer {
     uint32_t bytes;
     uint32_t packets;
     uint32_t initial_psn;
+    uint32_t requestor_qpn;
+    uint32_t responder_qpn;
+    uint32_t remote_key;
+    uint32_t window;
+    uint64_t remote_address;
+    uint16_t partition_key;
     uint32_t local_ip;
     uint32_t peer_ip;
+    uint8_t local_ip6[MRC_IPV6_ADDR_LEN];
+    uint8_t peer_ip6[MRC_IPV6_ADDR_LEN];
+    enum mrc_wire_ip_version ip_version;
     uint32_t drop_after;
     uint32_t trim_after;
     uint32_t final_ack_drops;
@@ -164,26 +176,88 @@ static uint64_t cycles_to_ns(const struct transfer *transfer, uint64_t cycles)
            (cycles % transfer->hz) * 1000000000 / transfer->hz;
 }
 
+static uint32_t path_entropy(const struct transfer *transfer, unsigned int index,
+                             bool requestor)
+{
+    uint32_t port = (requestor ? REQUESTOR_EV_PORT : RESPONDER_EV_PORT) + index;
+    if (transfer->ip_version == MRC_WIRE_IP6)
+        port |= ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16;
+    return port;
+}
+
+static uint32_t reflect_entropy(const struct mrc_wire_packet *packet)
+{
+    if (packet->ip_version == MRC_WIRE_IP6)
+        return ((packet->ipv6.flow_label & UINT16_MAX) << 16) | packet->ipv6.src_port;
+    return packet->ipv4.src_port;
+}
+
+static uint8_t packet_ecn(const struct mrc_wire_packet *packet)
+{
+    return packet->ip_version == MRC_WIRE_IP6 ? packet->ipv6.ecn : packet->ipv4.ecn;
+}
+
 static struct mrc_wire_packet packet_for(const struct transfer *transfer, unsigned int index,
                                           uint8_t opcode, uint32_t psn)
 {
     const struct path *path = &transfer->paths[index];
     struct mrc_wire_packet packet = {
-        .ipv4 = {
-            .src_ip = transfer->local_ip, .dst_ip = transfer->peer_ip,
-            .src_port = (uint16_t)((transfer->sender ? 0xc000 : 0xd000) + index),
-            .dst_port = transfer->udp_port,
-            .dscp = mrc_wire_is_write(opcode) ? DATA_DSCP : CONTROL_DSCP,
-            .ecn = mrc_wire_is_write(opcode) ? 2 : 0,
-        },
+        .ip_version = transfer->ip_version,
         .bth = {
-            .opcode = opcode, .psn = psn, .p_key = PARTITION_KEY,
-            .dqp = transfer->sender ? RESPONDER_QPN : REQUESTOR_QPN,
+            .opcode = opcode, .psn = psn, .p_key = transfer->partition_key,
+            .dqp = transfer->sender ? transfer->responder_qpn : transfer->requestor_qpn,
         },
     };
-    memcpy(packet.ipv4.src_mac, path->local.addr_bytes, MRC_MAC_LEN);
-    memcpy(packet.ipv4.dst_mac, path->peer.addr_bytes, MRC_MAC_LEN);
+
+    bool data = mrc_wire_is_write(opcode);
+    uint16_t port = (uint16_t)path_entropy(transfer, index, transfer->sender);
+    uint8_t dscp = data ? DATA_DSCP : CONTROL_DSCP;
+    uint8_t ecn = data ? 2 : 0;
+    if (transfer->ip_version == MRC_WIRE_IP6) {
+        packet.ipv6 = (struct mrc_wire_ipv6){
+            .src_port = port, .dst_port = transfer->udp_port,
+            .dscp = dscp, .ecn = ecn, .flow_label = EV_FLOW_LABEL + index,
+        };
+        memcpy(packet.ipv6.src_mac, path->local.addr_bytes, MRC_MAC_LEN);
+        memcpy(packet.ipv6.dst_mac, path->peer.addr_bytes, MRC_MAC_LEN);
+        memcpy(packet.ipv6.src_ip, transfer->local_ip6, MRC_IPV6_ADDR_LEN);
+        memcpy(packet.ipv6.dst_ip, transfer->peer_ip6, MRC_IPV6_ADDR_LEN);
+    } else {
+        packet.ipv4 = (struct mrc_wire_ipv4){
+            .src_port = port, .dst_port = transfer->udp_port, .dscp = dscp, .ecn = ecn,
+            .src_ip = transfer->local_ip, .dst_ip = transfer->peer_ip,
+        };
+        memcpy(packet.ipv4.src_mac, path->local.addr_bytes, MRC_MAC_LEN);
+        memcpy(packet.ipv4.dst_mac, path->peer.addr_bytes, MRC_MAC_LEN);
+    }
     return packet;
+}
+
+static size_t simulate_trim(const struct transfer *transfer, uint8_t *frame)
+{
+    /* Preserve the nominal UDP length but truncate the body before the RETH. */
+    uint8_t *ip = frame + RTE_ETHER_HDR_LEN;
+    size_t trim_headers = MRC_BTH_LEN + MRC_METH_LEN;
+    if (transfer->ip_version == MRC_WIRE_IP6) {
+        struct rte_ipv6_hdr header;
+        memcpy(&header, ip, sizeof(header));
+        uint32_t vtc_flow = rte_be_to_cpu_32(header.vtc_flow);
+        vtc_flow = (vtc_flow & ~(UINT32_C(63) << 22)) | (uint32_t)transfer->trim_dscp << 22;
+        header.vtc_flow = rte_cpu_to_be_32(vtc_flow);
+        header.payload_len = rte_cpu_to_be_16((uint16_t)(UDP_HEADER_LEN + trim_headers));
+        memcpy(ip, &header, sizeof(header));
+        return MRC_WIRE_IPV6_HEADER_LEN + trim_headers;
+    }
+
+    struct rte_ipv4_hdr header;
+    memcpy(&header, ip, sizeof(header));
+    size_t length = MRC_WIRE_IPV4_HEADER_LEN + trim_headers;
+    header.type_of_service = (uint8_t)((transfer->trim_dscp << 2) | (header.type_of_service & 3));
+    header.total_length = rte_cpu_to_be_16((uint16_t)(length - RTE_ETHER_HDR_LEN));
+    header.hdr_checksum = 0;
+    header.hdr_checksum = rte_ipv4_cksum(&header);
+    memcpy(ip, &header, sizeof(header));
+    return length;
 }
 
 static bool transmit_frame(const struct transfer *transfer, unsigned int path,
@@ -199,17 +273,8 @@ static bool transmit_frame(const struct transfer *transfer, unsigned int path,
         rte_pktmbuf_free(mbuf);
         return false;
     }
-    if (inject_trim) {
-        /* Recreate switch trimming, preserving original UDP Length and omitting iCRC. */
-        struct rte_ipv4_hdr ip;
-        memcpy(&ip, frame + RTE_ETHER_HDR_LEN, sizeof(ip));
-        length = MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN;
-        ip.type_of_service = (uint8_t)((transfer->trim_dscp << 2) | (ip.type_of_service & 3));
-        ip.total_length = rte_cpu_to_be_16((uint16_t)(length - RTE_ETHER_HDR_LEN));
-        ip.hdr_checksum = 0;
-        ip.hdr_checksum = rte_ipv4_cksum(&ip);
-        memcpy(frame + RTE_ETHER_HDR_LEN, &ip, sizeof(ip));
-    }
+    if (inject_trim)
+        length = simulate_trim(transfer, frame);
     if (!rte_pktmbuf_append(mbuf, (uint16_t)length)) {
         rte_pktmbuf_free(mbuf);
         return false;
@@ -233,14 +298,28 @@ static const uint8_t *read_frame(const struct rte_mbuf *mbuf,
 }
 
 static bool peer_matches(const struct transfer *transfer, unsigned int index,
-                         const struct mrc_wire_ipv4 *ipv4, const struct mrc_wire_bth *bth)
+                         const struct mrc_wire_packet *packet)
 {
+    uint32_t expected_qpn = transfer->sender ? transfer->requestor_qpn : transfer->responder_qpn;
+    if (packet->bth.p_key != transfer->partition_key || packet->bth.dqp != expected_qpn ||
+        packet->ip_version != transfer->ip_version)
+        return false;
+
     const struct path *path = &transfer->paths[index];
-    return ipv4->dst_ip == transfer->local_ip && ipv4->src_ip == transfer->peer_ip &&
-           ipv4->dst_port == transfer->udp_port && bth->p_key == PARTITION_KEY &&
-           bth->dqp == (transfer->sender ? REQUESTOR_QPN : RESPONDER_QPN) &&
-           memcmp(ipv4->src_mac, path->peer.addr_bytes, MRC_MAC_LEN) == 0 &&
-           memcmp(ipv4->dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
+    if (packet->ip_version == MRC_WIRE_IP6) {
+        const struct mrc_wire_ipv6 *ip = &packet->ipv6;
+        return ip->dst_port == transfer->udp_port &&
+               memcmp(ip->src_ip, transfer->peer_ip6, MRC_IPV6_ADDR_LEN) == 0 &&
+               memcmp(ip->dst_ip, transfer->local_ip6, MRC_IPV6_ADDR_LEN) == 0 &&
+               memcmp(ip->src_mac, path->peer.addr_bytes, MRC_MAC_LEN) == 0 &&
+               memcmp(ip->dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
+    }
+
+    const struct mrc_wire_ipv4 *ip = &packet->ipv4;
+    return ip->dst_port == transfer->udp_port &&
+           ip->src_ip == transfer->peer_ip && ip->dst_ip == transfer->local_ip &&
+           memcmp(ip->src_mac, path->peer.addr_bytes, MRC_MAC_LEN) == 0 &&
+           memcmp(ip->dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
 }
 
 static bool decode(const struct transfer *transfer, unsigned int index,
@@ -249,8 +328,8 @@ static bool decode(const struct transfer *transfer, unsigned int index,
 {
     size_t length;
     const uint8_t *frame = read_frame(mbuf, scratch, &length);
-    return frame && !mrc_wire_decode(frame, length, packet) &&
-           peer_matches(transfer, index, &packet->ipv4, &packet->bth);
+    return frame && !mrc_wire_decode_ip(frame, length, packet) &&
+           peer_matches(transfer, index, packet);
 }
 
 static bool send_write(const struct transfer *transfer, struct sender *sender,
@@ -269,8 +348,8 @@ static bool send_write(const struct transfer *transfer, struct sender *sender,
     packet.body.write = (struct mrc_wire_write){
         .rqmsn = transfer->with_immediate ? 1 : 0,
         .msn = 1,
-        .va = remote_address + index * PMTU,
-        .r_key = REMOTE_KEY,
+        .va = transfer->remote_address + index * PMTU,
+        .r_key = transfer->remote_key,
         .dma_len = transfer->bytes,
         .imm_data = transfer->immediate,
         .data = transfer->data + index * PMTU,
@@ -337,7 +416,7 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
     }
     case MRC_RELIABILITY_SACK: {
         const struct mrc_wire_sack *wire = &packet->body.sack;
-        if (wire->spdcid != REQUESTOR_QPN || wire->dpdcid != RESPONDER_QPN ||
+        if (wire->spdcid != (uint16_t)transfer->requestor_qpn || wire->dpdcid != (uint16_t)transfer->responder_qpn ||
             (!wire->probe_response && packet->bth.psn != wire->cack_psn))
             return 0;
         struct mrc_sack sack = {
@@ -347,10 +426,12 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         if (!mrc_tx_apply_sack(&sender->qp, &sack, wire->probe_response))
             return 0;
         counts->sacks++;
-        if (wire->mark != MRC_SACK_NONE && wire->entropy >= 0xc000 &&
-            wire->entropy < 0xc000 + PATH_COUNT)
-            sender->path_retry_at[wire->entropy - 0xc000] =
-                now_cycles + 10 * transfer->initial_rto;
+        if (wire->mark != MRC_SACK_NONE) {
+            for (unsigned int path = 0; path < PATH_COUNT; path++) {
+                if (wire->entropy == path_entropy(transfer, path, true))
+                    sender->path_retry_at[path] = now_cycles + 10 * transfer->initial_rto;
+            }
+        }
         struct mrc_cc_tx_sample sample;
         struct mrc_cc_tx_sample *rtt_sample = NULL;
         if (!wire->probe_response) {
@@ -390,7 +471,7 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
     case MRC_RELIABILITY_NACK: {
         const struct mrc_wire_nack *nack = &packet->body.nack;
         struct mrc_tx_packet *state = mrc_tx_packet(&sender->qp, nack->nack_psn);
-        if (nack->spdcid != REQUESTOR_QPN || nack->dpdcid != RESPONDER_QPN ||
+        if (nack->spdcid != (uint16_t)transfer->requestor_qpn || nack->dpdcid != (uint16_t)transfer->responder_qpn ||
             packet->bth.psn != nack->nack_psn || !state)
             return 0;
         if (nack->reason == MRC_NACK_UNEXP_EVENT)
@@ -520,7 +601,8 @@ static void request_probe(const struct transfer *transfer, struct sender *sender
     uint16_t probe_id = (uint16_t)(sender->probe_id + 1);
     struct mrc_wire_packet packet = packet_for(transfer, path, MRC_RELIABILITY_PROBE, 0);
     packet.body.probe = (struct mrc_wire_probe){
-        .probe_id = probe_id, .spdcid = REQUESTOR_QPN, .dpdcid = RESPONDER_QPN,
+        .probe_id = probe_id, .spdcid = (uint16_t)transfer->requestor_qpn,
+        .dpdcid = (uint16_t)transfer->responder_qpn,
     };
     if (transmit(transfer, path, &packet))
         sender->probe_id = probe_id;
@@ -529,7 +611,7 @@ static void request_probe(const struct transfer *transfer, struct sender *sender
 static int run_sender(const struct transfer *transfer, struct counters *counts)
 {
     struct sender sender = { .highest_sacked = -1 };
-    if (!mrc_tx_init(&sender.qp, transfer->initial_psn, WINDOW, sender.slots) ||
+    if (!mrc_tx_init(&sender.qp, transfer->initial_psn, transfer->window, sender.slots) ||
         !mrc_cc_init(&sender.cc, NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS))
         return -EINVAL;
 
@@ -568,7 +650,7 @@ static int run_sender(const struct transfer *transfer, struct counters *counts)
             next_probe = now + transfer->initial_rto;
         }
         for (unsigned int i = 0; i < BURST && sender.next < transfer->packets &&
-             sender.next - first < WINDOW; i++) {
+             sender.next - first < transfer->window; i++) {
             uint32_t index = sender.next;
             if (!mrc_cc_can_send(&sender.cc, nominal_at(transfer, index)))
                 break;
@@ -623,11 +705,12 @@ static void send_sack(const struct transfer *transfer, struct responder *receive
                                                  probe ? 0 : state.cack_psn);
     packet.bth.retransmit = !probe && request->bth.retransmit;
     packet.body.sack = (struct mrc_wire_sack){
-        .mark = request->ipv4.ecn == 3 ? MRC_SACK_SKIP : MRC_SACK_NONE,
+        .mark = packet_ecn(request) == 3 ? MRC_SACK_SKIP : MRC_SACK_NONE,
         .probe_response = probe,
         .ack_psn_offset = state.ack_psn_offset,
-        .entropy = request->ipv4.src_port,
-        .spdcid = REQUESTOR_QPN, .dpdcid = RESPONDER_QPN,
+        .entropy = reflect_entropy(request),
+        .spdcid = (uint16_t)transfer->requestor_qpn,
+        .dpdcid = (uint16_t)transfer->responder_qpn,
         .cack_psn = state.cack_psn, .sack_offset = state.sack_offset,
         .bitmap = state.bitmap, .ooo_count = state.ooo_count,
         .rcvd_bytes = mrc_cc_rx_wire_count(&receiver->cc),
@@ -647,8 +730,8 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
                          const struct mrc_wire_packet *packet)
 {
     if (packet->bth.opcode == MRC_RELIABILITY_PROBE) {
-        if (packet->body.probe.spdcid == REQUESTOR_QPN &&
-            packet->body.probe.dpdcid == RESPONDER_QPN)
+        if (packet->body.probe.spdcid == (uint16_t)transfer->requestor_qpn &&
+            packet->body.probe.dpdcid == (uint16_t)transfer->responder_qpn)
             send_sack(transfer, receiver, counts, path, packet, true);
         return 0;
     }
@@ -674,7 +757,7 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
         write->dma_len != transfer->bytes || write->data_len != length_at(transfer, index) ||
         write->msn != 1 || (transfer->with_immediate && write->rqmsn != 1)) {
         syndrome = INVALID_REQUEST_NAK;
-    } else if (write->r_key != REMOTE_KEY || write->va != remote_address + index * PMTU) {
+    } else if (write->r_key != transfer->remote_key || write->va != transfer->remote_address + index * PMTU) {
         syndrome = REMOTE_ACCESS_NAK;
     }
     if (syndrome != ACK_SYNDROME) {
@@ -687,7 +770,7 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
     if (distance > 0 && (uint32_t)distance > counts->reorder_max)
         counts->reorder_max = (uint32_t)distance;
 
-    size_t region_offset = (size_t)(write->va - remote_address);
+    size_t region_offset = (size_t)(write->va - transfer->remote_address);
     if (write->data_len)
         memcpy(transfer->data + region_offset, write->data, write->data_len);
     if (transfer->with_immediate && index + 1 == transfer->packets)
@@ -695,7 +778,7 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
 
     unsigned int flags = (packet->bth.ack_request ? MRC_RX_AR : 0) |
                          (packet->bth.retransmit ? MRC_RX_RTX : 0) |
-                         (packet->ipv4.ecn == 3 ? MRC_RX_ECN : 0);
+                         (packet_ecn(packet) == 3 ? MRC_RX_ECN : 0);
     bool sack_due;
     mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags, SACK_THRESHOLD, &sack_due);
     uint32_t nominal = nominal_size(packet->bth.opcode, write->data_len, packet->bth.timestamp);
@@ -714,7 +797,7 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
 
 static void receive_trimmed(const struct transfer *transfer, const struct responder *receiver,
                             struct counters *counts, unsigned int path,
-                            const struct mrc_wire_trimmed *trimmed)
+                            const struct mrc_wire_trimmed *trimmed, uint32_t entropy)
 {
     if (mrc_rx_classify(&receiver->qp, trimmed->bth.psn) != MRC_RX_NEW ||
         !mrc_cc_nominal_size(trimmed->original_udp_len))
@@ -726,8 +809,9 @@ static void receive_trimmed(const struct transfer *transfer, const struct respon
     nack.bth.retransmit = trimmed->bth.retransmit;
     nack.body.nack = (struct mrc_wire_nack){
         .reason = MRC_NACK_TRIMMED,
-        .entropy = trimmed->ipv4.src_port,
-        .spdcid = REQUESTOR_QPN, .dpdcid = RESPONDER_QPN,
+        .entropy = entropy,
+        .spdcid = (uint16_t)transfer->requestor_qpn,
+        .dpdcid = (uint16_t)transfer->responder_qpn,
         .nack_psn = trimmed->bth.psn,
         .tx_timestamp = trimmed->tx_timestamp,
         .original_udp_len = trimmed->original_udp_len,
@@ -747,29 +831,41 @@ static int receive_frame(const struct transfer *transfer, struct responder *rece
         return 0;
 
     struct mrc_wire_trimmed trimmed;
-    int result = mrc_wire_decode_trimmed(frame, length, transfer->trim_dscp, &trimmed);
+    int result = mrc_wire_decode_trimmed_ip(frame, length, transfer->trim_dscp, &trimmed);
+    struct mrc_wire_packet packet;
     if (result != -EPROTONOSUPPORT) {
-        if (!result && peer_matches(transfer, path, &trimmed.ipv4, &trimmed.bth)) {
-            *last_frame = rte_get_timer_cycles();
-            receive_trimmed(transfer, receiver, counts, path, &trimmed);
+        if (!result) {
+            packet.bth = trimmed.bth;
+            packet.ip_version = trimmed.ip_version;
+            if (trimmed.ip_version == MRC_WIRE_IP6)
+                packet.ipv6 = trimmed.ipv6;
+            else
+                packet.ipv4 = trimmed.ipv4;
+            if (peer_matches(transfer, path, &packet)) {
+                *last_frame = rte_get_timer_cycles();
+                receive_trimmed(transfer, receiver, counts, path, &trimmed, reflect_entropy(&packet));
+            }
         }
         return 0;
     }
 
-    struct mrc_wire_packet packet;
-    result = mrc_wire_decode(frame, length, &packet);
-    if (!result && peer_matches(transfer, path, &packet.ipv4, &packet.bth)) {
+    result = mrc_wire_decode_ip(frame, length, &packet);
+    if (!result && peer_matches(transfer, path, &packet)) {
         *last_frame = rte_get_timer_cycles();
         return receive_write(transfer, receiver, counts, path, &packet);
     }
 
-    struct mrc_wire_ipv4 ipv4;
-    struct mrc_wire_bth bth;
-    if (result == -EPROTONOSUPPORT && !mrc_wire_decode_header(frame, length, &ipv4, &bth) &&
-        peer_matches(transfer, path, &ipv4, &bth) && !mrc_wire_is_write(bth.opcode) &&
-        bth.opcode < MRC_TRANSPORT_ACK) {
-        send_ack(transfer, counts, path, bth.psn, INVALID_REQUEST_NAK, 0);
-        return -EPROTO;
+    if (result == -EPROTONOSUPPORT) {
+        packet.ip_version = transfer->ip_version;
+        if (packet.ip_version == MRC_WIRE_IP6)
+            result = mrc_wire_decode_ipv6_header(frame, length, &packet.ipv6, &packet.bth);
+        else
+            result = mrc_wire_decode_header(frame, length, &packet.ipv4, &packet.bth);
+        if (!result && peer_matches(transfer, path, &packet) &&
+            !mrc_wire_is_write(packet.bth.opcode) && packet.bth.opcode < MRC_TRANSPORT_ACK) {
+            send_ack(transfer, counts, path, packet.bth.psn, INVALID_REQUEST_NAK, 0);
+            return -EPROTO;
+        }
     }
     return 0;
 }
@@ -777,7 +873,7 @@ static int receive_frame(const struct transfer *transfer, struct responder *rece
 static int run_receiver(const struct transfer *transfer, struct counters *counts)
 {
     struct responder receiver = {0};
-    if (!mrc_rx_init(&receiver.qp, transfer->initial_psn, WINDOW, receiver.slots))
+    if (!mrc_rx_init(&receiver.qp, transfer->initial_psn, transfer->window, receiver.slots))
         return -EINVAL;
     uint64_t last_progress = rte_get_timer_cycles(), last_frame = last_progress;
     for (;;) {
@@ -816,17 +912,36 @@ static int run_receiver(const struct transfer *transfer, struct counters *counts
     return 0;
 }
 
-static bool number(const char *value, uint32_t min, uint32_t max, uint32_t *out)
+static bool number64(const char *value, uint64_t min, uint64_t max, uint64_t *out)
 {
     if (*value < '0' || *value > '9')
         return false;
     char *end;
     errno = 0;
-    unsigned long parsed = strtoul(value, &end, 10);
+    int base = value[0] == '0' && (value[1] == 'x' || value[1] == 'X') ? 16 : 10;
+    unsigned long long parsed = strtoull(value, &end, base);
     if (errno || *end || parsed < min || parsed > max)
+        return false;
+    *out = (uint64_t)parsed;
+    return true;
+}
+
+static bool number(const char *value, uint32_t min, uint32_t max, uint32_t *out)
+{
+    uint64_t parsed;
+    if (!number64(value, min, max, &parsed))
         return false;
     *out = (uint32_t)parsed;
     return true;
+}
+
+static bool parse_port(const char *device, uint16_t *port)
+{
+    uint32_t id;
+    if (!number(device, 0, UINT16_MAX, &id))
+        return rte_eth_dev_get_port_by_name(device, port) == 0;
+    *port = (uint16_t)id;
+    return rte_eth_dev_is_valid_port(*port);
 }
 
 static bool parse_args(int argc, char **argv, struct transfer *transfer)
@@ -839,25 +954,33 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     transfer->drop_after = UINT32_MAX;
     transfer->trim_after = UINT32_MAX;
 
-    struct in_addr ip;
-    if (inet_pton(AF_INET, argv[3], &ip) != 1)
+    struct in_addr local, peer;
+    if (inet_pton(AF_INET, argv[3], &local) == 1 && inet_pton(AF_INET, argv[4], &peer) == 1) {
+        transfer->ip_version = MRC_WIRE_IP4;
+        transfer->local_ip = ntohl(local.s_addr);
+        transfer->peer_ip = ntohl(peer.s_addr);
+    } else if (inet_pton(AF_INET6, argv[3], transfer->local_ip6) == 1 &&
+               inet_pton(AF_INET6, argv[4], transfer->peer_ip6) == 1) {
+        transfer->ip_version = MRC_WIRE_IP6;
+    } else {
         return false;
-    transfer->local_ip = ntohl(ip.s_addr);
-    if (inet_pton(AF_INET, argv[4], &ip) != 1)
-        return false;
-    transfer->peer_ip = ntohl(ip.s_addr);
+    }
     for (unsigned int i = 0; i < PATH_COUNT; i++) {
-        uint32_t port;
-        if (!number(argv[5 + 2 * i], 0, UINT16_MAX, &port) ||
-            rte_ether_unformat_addr(argv[6 + 2 * i], &transfer->paths[i].peer))
+        struct path *path = &transfer->paths[i];
+        if (!parse_port(argv[5 + 2 * i], &path->port) ||
+            rte_ether_unformat_addr(argv[6 + 2 * i], &path->peer))
             return false;
-        transfer->paths[i].port = (uint16_t)port;
     }
     if (transfer->paths[0].port == transfer->paths[1].port)
         return false;
 
+    transfer->requestor_qpn = DEFAULT_REQUESTOR_QPN;
+    transfer->responder_qpn = DEFAULT_RESPONDER_QPN;
+    transfer->remote_address = default_remote_address;
+    transfer->remote_key = DEFAULT_REMOTE_KEY;
     uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
+    uint32_t mpr = WINDOW / MRC_MPR_UNIT, p_key = DEFAULT_PARTITION_KEY;
     for (int i = 9; i < argc; i += 2) {
         const char *key = argv[i], *value = argv[i + 1];
         if (!strcmp(key, "--udp-port") && number(value, 1, UINT16_MAX, &udp_port))
@@ -866,6 +989,19 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
             continue;
         if (!strcmp(key, "--trim-dscp") && number(value, 1, 63, &trim_dscp) &&
             trim_dscp != CONTROL_DSCP)
+            continue;
+        if (!strcmp(key, "--requestor-qpn") && number(value, 3, MRC_PSN_MASK, &transfer->requestor_qpn))
+            continue;
+        if (!strcmp(key, "--responder-qpn") && number(value, 3, MRC_PSN_MASK, &transfer->responder_qpn))
+            continue;
+        if (!strcmp(key, "--p-key") && number(value, 1, UINT16_MAX, &p_key))
+            continue;
+        if (!strcmp(key, "--mpr") && number(value, 1, WINDOW / MRC_MPR_UNIT, &mpr))
+            continue;
+        if (!strcmp(key, "--remote-key") && number(value, 0, UINT32_MAX, &transfer->remote_key))
+            continue;
+        if (!strcmp(key, "--remote-address") &&
+            number64(value, 0, UINT64_MAX - transfer->bytes, &transfer->remote_address))
             continue;
         if (!strcmp(key, "--ack-timeout") && number(value, 0, 24, &exponent))
             continue;
@@ -894,6 +1030,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     if (transfer->drop_after != UINT32_MAX && transfer->trim_after != UINT32_MAX)
         return false;
     transfer->udp_port = (uint16_t)udp_port;
+    transfer->window = mpr * MRC_MPR_UNIT;
+    transfer->partition_key = (uint16_t)p_key;
     transfer->trim_dscp = (uint8_t)trim_dscp;
     transfer->timeout_exponent = exponent;
     transfer->linear_retries = linear_retries;
@@ -918,9 +1056,11 @@ int main(int argc, char **argv)
     int result = -EINVAL;
     unsigned int opened = 0;
     if (!parse_args(argc - consumed, argv + consumed, &transfer)) {
-        fprintf(stderr, "Usage: %s [EAL options] -- tx|rx BYTES LOCAL_IPV4 PEER_IPV4\n"
+        fprintf(stderr, "Usage: %s [EAL options] -- tx|rx BYTES LOCAL_IP PEER_IP\n"
                         "       PORT0 PEER_MAC0 PORT1 PEER_MAC1 [--initial-psn N] [--udp-port N]\n"
-                        "       [--immediate N] [--ack-timeout N] [--linear-retries N]\n"
+                        "       [--requestor-qpn N] [--responder-qpn N] [--p-key N] [--mpr N]\n"
+                        "       [--remote-key N] [--remote-address N] [--immediate N]\n"
+                        "       [--ack-timeout N] [--linear-retries N]\n"
                         "       [--exp-retries N] [--timeout-ms N] [--drop-path-after N (tx)]\n"
                         "       [--trim-dscp N] [--trim-path-after N (tx)] [--drop-final-acks N (rx)]\n",
                 argv[0]);

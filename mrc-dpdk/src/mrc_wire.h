@@ -23,6 +23,9 @@
 #define MRC_EETH_LEN 36
 #define MRC_ENDPOINT_QPN UINT32_C(2)
 #define MRC_WIRE_IPV4_HEADER_LEN 42
+#define MRC_WIRE_IPV6_HEADER_LEN 62
+#define MRC_IPV6_ADDR_LEN 16
+#define MRC_IPV6_FLOW_LABEL_MASK UINT32_C(0x000fffff)
 #define MRC_ICRC_LEN 4
 
 enum mrc_opcode {
@@ -61,6 +64,12 @@ enum mrc_sack_mark {
     MRC_SACK_ALWAYS_SKIP = 2,
 };
 
+enum mrc_wire_ip_version {
+    MRC_WIRE_IP_UNSPECIFIED = 0,
+    MRC_WIRE_IP4 = 4,
+    MRC_WIRE_IP6 = 6,
+};
+
 /* Scalars are in host byte order, including IPv4 addresses and immediate data. */
 struct mrc_wire_ipv4 {
     uint8_t src_mac[MRC_MAC_LEN];
@@ -72,6 +81,19 @@ struct mrc_wire_ipv4 {
     uint8_t dscp;
     uint8_t ecn;
     uint8_t ttl; /* 0 requests 64 when encoding. */
+};
+
+struct mrc_wire_ipv6 {
+    uint8_t src_mac[MRC_MAC_LEN];
+    uint8_t dst_mac[MRC_MAC_LEN];
+    uint8_t src_ip[MRC_IPV6_ADDR_LEN]; /* Wire-order octets. */
+    uint8_t dst_ip[MRC_IPV6_ADDR_LEN]; /* Wire-order octets. */
+    uint32_t flow_label;
+    uint16_t src_port;
+    uint16_t dst_port; /* 0 requests the default when encoding. */
+    uint8_t dscp;
+    uint8_t ecn;
+    uint8_t hop_limit; /* 0 requests 64 when encoding. */
 };
 
 struct mrc_wire_bth {
@@ -159,7 +181,11 @@ struct mrc_wire_endpoint_response {
 
 /* Reliability metadata from an explicitly classified, possibly truncated WRITE. */
 struct mrc_wire_trimmed {
-    struct mrc_wire_ipv4 ipv4;
+    enum mrc_wire_ip_version ip_version;
+    union {
+        struct mrc_wire_ipv4 ipv4;
+        struct mrc_wire_ipv6 ipv6;
+    };
     struct mrc_wire_bth bth;
     uint16_t original_udp_len;
     uint16_t tx_timestamp;
@@ -168,7 +194,11 @@ struct mrc_wire_trimmed {
 };
 
 struct mrc_wire_packet {
-    struct mrc_wire_ipv4 ipv4;
+    enum mrc_wire_ip_version ip_version;
+    union {
+        struct mrc_wire_ipv4 ipv4;
+        struct mrc_wire_ipv6 ipv6;
+    };
     struct mrc_wire_bth bth;
     union {
         struct mrc_wire_write write;
@@ -184,8 +214,11 @@ struct mrc_wire_packet {
 bool mrc_wire_is_write(uint8_t opcode);
 
 /*
- * Encode/decode an untagged Ethernet/IPv4/UDP frame, excluding the Ethernet FCS.
- * The decoder verifies IPv4 checksum and RoCE iCRC, and returns a zero-copy
+ * Encode an untagged Ethernet frame carrying IPv4/UDP or IPv6/UDP. A zero
+ * ip_version encodes IPv4 for compatibility. Decode accepts IPv4 only.
+ * Decode_ip accepts either IP version and sets ip_version on success. Frames
+ * exclude the Ethernet FCS. IPv6 frames carry UDP directly after the base IP
+ * header. The decoder verifies the IPv4 checksum and RoCE iCRC and returns a zero-copy
  * payload view valid for as long as the input buffer. Callers own QP state,
  * connection identity checks, data placement bounds, and PMTU validation.
  *
@@ -197,6 +230,7 @@ bool mrc_wire_is_write(uint8_t opcode);
 int mrc_wire_encode(uint8_t *frame, size_t capacity, const struct mrc_wire_packet *packet,
                     size_t *length);
 int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet);
+int mrc_wire_decode_ip(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet);
 
 /*
  * Validate the envelope and iCRC of a complete datagram without interpreting
@@ -205,14 +239,19 @@ int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet 
  */
 int mrc_wire_decode_header(const uint8_t *frame, size_t length, struct mrc_wire_ipv4 *ipv4,
                            struct mrc_wire_bth *bth);
+int mrc_wire_decode_ipv6_header(const uint8_t *frame, size_t length, struct mrc_wire_ipv6 *ipv6,
+                                struct mrc_wire_bth *bth);
 
 /*
  * Call for configured trim DSCPs before attempting ordinary receive processing.
  * A nonmatching DSCP or unsupported IP envelope returns EPROTONOSUPPORT. A
  * matching WRITE may lack an iCRC, so returned metadata is for reliability
  * responses only. It cannot be used for placement or semantic completion.
+ * Decode_trimmed accepts IPv4. Decode_trimmed_ip accepts IPv4 or IPv6.
  */
 int mrc_wire_decode_trimmed(const uint8_t *frame, size_t length, uint8_t trim_dscp,
                             struct mrc_wire_trimmed *packet);
+int mrc_wire_decode_trimmed_ip(const uint8_t *frame, size_t length, uint8_t trim_dscp,
+                               struct mrc_wire_trimmed *packet);
 
 #endif
