@@ -30,13 +30,14 @@ struct mrc_ev_profile {
     uint64_t skip_interval;
     uint64_t probe_interval;
     unsigned int count;
+    unsigned int min_active;
     unsigned int cursor;
     uint32_t skipped;
     uint32_t failed;
     uint32_t recovered;
 };
 
-bool mrc_ev_init(struct mrc_ev_profile *profile, unsigned int count,
+bool mrc_ev_init(struct mrc_ev_profile *profile, unsigned int count, unsigned int min_active,
                  uint64_t skip_interval, uint64_t probe_interval);
 
 void mrc_ev_deny(struct mrc_ev_profile *profile, unsigned int path, bool denied,

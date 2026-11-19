@@ -1,5 +1,6 @@
 #include "dpdk_io.h"
 #include "mrc_cc.h"
+#include "mrc_ctl_store.h"
 #include "mrc_ev.h"
 #include "mrc_mpr.h"
 #include "mrc_provider.h"
@@ -100,6 +101,11 @@ struct transfer {
     bool srv6_srh;
     uint32_t drop_after;
     uint32_t ev_deny_mask;
+    const char *profile_directory;
+    uint64_t profile_id;
+    struct mrc_ctl_store profile_store;
+    struct mrc_ctl_store_ref profile_lease;
+    struct mrc_ctl_store_profile profile;
     uint32_t restore_after;
     uint32_t mpr_change_at;
     uint8_t mpr_change_to;
@@ -143,7 +149,7 @@ struct counters {
     uint32_t probe_requests;
     uint32_t probe_replies;
     uint32_t probe_sent[PATH_COUNT];
-    uint32_t ev_skipped, ev_failed, ev_recovered;
+    uint32_t ev_skipped, ev_failed, ev_recovered, ev_admin_updates;
     uint32_t mpr_updates;
     uint32_t fast_retries;
     uint32_t sacks;
@@ -270,6 +276,8 @@ static uint64_t cycles_to_ns(const struct transfer *transfer, uint64_t cycles)
 static uint32_t path_entropy(const struct transfer *transfer, unsigned int index,
                              bool requestor)
 {
+    if (requestor && transfer->profile_id && transfer->profile.config.mode != MRC_CTL_STORE_AUTO)
+        return transfer->profile.config.entropy[index];
     uint32_t port = (requestor ? REQUESTOR_EV_PORT : RESPONDER_EV_PORT) + index;
     if (transfer->ip_version == MRC_WIRE_IP6)
         port |= ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16;
@@ -301,13 +309,14 @@ static struct mrc_wire_packet packet_for(const struct transfer *transfer, unsign
     };
 
     bool data = mrc_wire_is_write(opcode);
-    uint16_t port = (uint16_t)path_entropy(transfer, index, transfer->sender);
+    uint32_t entropy = path_entropy(transfer, index, transfer->sender);
     uint8_t dscp = data || opcode == MRC_RELIABILITY_PROBE ? DATA_DSCP : CONTROL_DSCP;
     uint8_t ecn = data ? 2 : 0;
     if (transfer->ip_version == MRC_WIRE_IP6) {
         packet.ipv6 = (struct mrc_wire_ipv6){
-            .src_port = port, .dst_port = transfer->udp_port,
-            .dscp = dscp, .ecn = ecn, .flow_label = EV_FLOW_LABEL + index,
+            .src_port = (uint16_t)entropy, .dst_port = transfer->udp_port,
+            .dscp = dscp, .ecn = ecn,
+            .flow_label = (EV_FLOW_LABEL & ~UINT32_C(0xffff)) | (entropy >> 16),
         };
         memcpy(packet.ipv6.src_mac, path->local.addr_bytes, MRC_MAC_LEN);
         memcpy(packet.ipv6.dst_mac, path->peer.addr_bytes, MRC_MAC_LEN);
@@ -315,7 +324,7 @@ static struct mrc_wire_packet packet_for(const struct transfer *transfer, unsign
         memcpy(packet.ipv6.dst_ip, transfer->peer_ip6, MRC_IPV6_ADDR_LEN);
     } else {
         packet.ipv4 = (struct mrc_wire_ipv4){
-            .src_port = port, .dst_port = transfer->udp_port, .dscp = dscp, .ecn = ecn,
+            .src_port = (uint16_t)entropy, .dst_port = transfer->udp_port, .dscp = dscp, .ecn = ecn,
             .src_ip = transfer->local_ip, .dst_ip = transfer->peer_ip,
         };
         memcpy(packet.ipv4.src_mac, path->local.addr_bytes, MRC_MAC_LEN);
@@ -958,22 +967,38 @@ static bool request_probe(const struct transfer *transfer, struct sender *sender
     return true;
 }
 
+static void update_ev_denials(struct sender *sender, uint32_t current, uint32_t updated,
+                              uint64_t now)
+{
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        uint32_t bit = UINT32_C(1) << path;
+        if ((current ^ updated) & bit) {
+            mrc_ev_deny(&sender->ev, path, (updated & bit) != 0, now);
+            sender->probes[path].pending = false;
+        }
+    }
+}
+
 static int poll_sender(const struct transfer *transfer, struct counters *counts,
                        struct mrc_provider_cq *cq)
 {
     struct sender sender = { .highest_sacked = -1, .cq = cq };
     if (!mrc_tx_init(&sender.qp, transfer->initial_psn, transfer->window, sender.slots) ||
         !mrc_cc_init(&sender.cc, NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS) ||
-        !mrc_ev_init(&sender.ev, PATH_COUNT, transfer->initial_rto / 8 + 1,
+        !mrc_ev_init(&sender.ev, PATH_COUNT, transfer->profile.config.min_active,
+                      transfer->initial_rto / 8 + 1,
                       transfer->initial_rto / 2 + 1) ||
         !mrc_mpr_init(&sender.mpr, transfer->dynamic_mpr, transfer->mpr_max))
         return -EINVAL;
 
     uint64_t last_progress = rte_get_timer_cycles();
-    for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        if (transfer->ev_deny_mask & (UINT32_C(1) << path))
-            mrc_ev_deny(&sender.ev, path, true, last_progress);
-    }
+    uint32_t denied = transfer->ev_deny_mask | transfer->profile.config.denied;
+    update_ev_denials(&sender, 0, denied, last_progress);
+    uint64_t profile_period = ns_to_cycles(transfer, UINT64_C(10000000));
+    uint64_t next_profile_check = last_progress + profile_period;
+    if (transfer->profile_id)
+        fprintf(stderr, "MRC EV profile %" PRIu64 " active, deny mask 0x%" PRIx32 "\n",
+                transfer->profile_id, denied);
     uint64_t next_retry_scan = last_progress;
     uint64_t next_probe = last_progress;
     bool initial_probe = true;
@@ -984,6 +1009,24 @@ static int poll_sender(const struct transfer *transfer, struct counters *counts,
         if (result || completion_result)
             return result ? result : completion_result;
         uint64_t now = rte_get_timer_cycles();
+        if (transfer->profile_id && now >= next_profile_check) {
+            struct mrc_ctl_store_profile profile;
+            result = mrc_ctl_store_get(&transfer->profile_store, transfer->profile_id, &profile);
+            if (result || profile.state != MRC_CTL_STORE_ONLINE) {
+                if (!result)
+                    result = -EPROTO;
+                fprintf(stderr, "MRC EV profile refresh failed: %s\n", strerror(-result));
+                return result;
+            }
+            now = rte_get_timer_cycles();
+            uint32_t updated = transfer->ev_deny_mask | profile.config.denied;
+            if (updated != denied) {
+                update_ev_denials(&sender, denied, updated, now);
+                denied = updated;
+                counts->ev_admin_updates++;
+            }
+            next_profile_check = now + profile_period;
+        }
         poll_port_status(transfer, &sender.node, now);
         if (sender.qp.first_psn != previous_psn)
             last_progress = now;
@@ -1581,6 +1624,13 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
             transfer->with_immediate = true;
             continue;
         }
+        if (transfer->sender && !strcmp(key, "--profile-dir") && value[0]) {
+            transfer->profile_directory = value;
+            continue;
+        }
+        if (transfer->sender && !strcmp(key, "--profile-id") &&
+            number64(value, 1, UINT64_MAX, &transfer->profile_id))
+            continue;
         if (transfer->sender && !strcmp(key, "--deny-path-mask") &&
             number(value, 0, ALL_PATHS, &transfer->ev_deny_mask))
             continue;
@@ -1609,6 +1659,7 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
                            transfer->mpr_change_at >= total_packets)) ||
         (transfer->trim_after != UINT32_MAX && transfer->trim_after >= total_packets) ||
         (transfer->drop_after != UINT32_MAX && transfer->trim_after != UINT32_MAX) ||
+        (!!transfer->profile_directory != !!transfer->profile_id) ||
         (!!transfer->oob_address != !!oob_port) || (oob_port && transfer->remote_key_configured) ||
         local_sid != peer_sid ||
         (local_sid && transfer->ip_version != MRC_WIRE_IP6) || (srv6_srh && !local_sid))
@@ -1643,6 +1694,31 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     transfer->initial_rto = ns_to_cycles(transfer, first_timeout);
     transfer->idle_timeout = ns_to_cycles(transfer, (uint64_t)timeout_ms * 1000000);
     return transfer->idle_timeout > transfer->initial_rto;
+}
+
+static int open_ev_profile(struct transfer *transfer)
+{
+    if (!transfer->profile_id)
+        return 0;
+    int result = mrc_ctl_store_open(&transfer->profile_store, transfer->profile_directory);
+    if (result)
+        return result;
+    result = mrc_ctl_store_acquire(&transfer->profile_store, transfer->profile_id,
+                                   &transfer->profile_lease, &transfer->profile);
+    if (result)
+        return result;
+
+    const struct mrc_ctl_store_config *config = &transfer->profile.config;
+    if (config->count != PATH_COUNT)
+        return -EINVAL;
+    if (config->mode == MRC_CTL_STORE_AUTO)
+        return 0;
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        uint32_t entropy = config->entropy[path];
+        if (!(uint16_t)entropy || (transfer->ip_version != MRC_WIRE_IP6 && entropy > UINT16_MAX))
+            return -EINVAL;
+    }
+    return config->entropy[0] != config->entropy[1] ? 0 : -EINVAL;
 }
 
 static int register_buffer(struct transfer *transfer)
@@ -1786,7 +1862,10 @@ int main(int argc, char **argv)
     if (consumed < 0)
         return EXIT_FAILURE;
 
-    struct transfer transfer = {0};
+    struct transfer transfer = {
+        .profile_store = MRC_CTL_STORE_INITIALIZER,
+        .profile_lease = MRC_CTL_STORE_REF_INITIALIZER,
+    };
     struct counters counts = {0};
     int result = -EINVAL;
     unsigned int opened = 0;
@@ -1801,10 +1880,18 @@ int main(int argc, char **argv)
                         "       [--exp-retries N] [--timeout-ms N] [--drop-path-after N (tx)] [--deny-path-mask N (tx)]\n"
                         "       [--trim-dscp N] [--trim-nack 0|1] [--trim-path-after N (tx)]\n"
                         "       [--drop-final-acks N (rx)] [--oob-host IP --oob-port N]\n"
-                        "       [--restore-path-after N (tx)] [--dynamic-mpr 0|1]\n"
+                        "       [--restore-path-after N (tx)] [--profile-dir DIR --profile-id ID (tx)]\n"
+                        "       [--dynamic-mpr 0|1]\n"
                         "       [--mpr-change-at N --mpr-change-to N (rx)]\n"
                         "       [--srv6-local SID --srv6-peer SID] [--srv6-srh 0|1] [--port-stats 0|1]\n",
                 argv[0]);
+        goto done;
+    }
+
+    result = open_ev_profile(&transfer);
+    if (result) {
+        fprintf(stderr, "MRC EV profile %" PRIu64 " setup failed: %s\n",
+                transfer.profile_id, strerror(-result));
         goto done;
     }
 
@@ -1840,7 +1927,8 @@ int main(int argc, char **argv)
                "\"trimmed\":%u,\"trim_nacks\":%u,\"transport_acks\":%u,"
                "\"port_status_updates\":%u,\"port_status_replies\":%u,"
                "\"probe_requests\":%u,\"probe_replies\":%u,\"probe_sent\":[%u,%u],"
-               "\"ev_skipped\":%u,\"ev_failed\":%u,\"ev_recovered\":%u,\"mpr_updates\":%u,"
+               "\"ev_skipped\":%u,\"ev_failed\":%u,\"ev_recovered\":%u,\"ev_admin_updates\":%u,"
+               "\"mpr_updates\":%u,"
                "\"dropped_transport_acks\":%u,"
                "\"duplicates\":%u,\"fast_retries\":%u,"
                "\"reorder_max\":%u,\"write_completions\":%u,\"immediate_completions\":%u,"
@@ -1851,7 +1939,7 @@ int main(int argc, char **argv)
                counts.trimmed, counts.trim_nacks, counts.transport_acks,
                counts.port_status_updates, counts.port_status_replies, counts.probe_requests,
                counts.probe_replies, counts.probe_sent[0], counts.probe_sent[1],
-               counts.ev_skipped, counts.ev_failed, counts.ev_recovered,
+               counts.ev_skipped, counts.ev_failed, counts.ev_recovered, counts.ev_admin_updates,
                counts.mpr_updates, counts.dropped_transport_acks,
                counts.duplicates, counts.fast_retries,
                counts.reorder_max, counts.write_completions, counts.immediate_completions,
@@ -1874,6 +1962,8 @@ done:
     } else {
         free(transfer.data);
     }
+    mrc_ctl_store_release(&transfer.profile_lease);
+    mrc_ctl_store_close(&transfer.profile_store);
     rte_eal_cleanup();
     return result ? EXIT_FAILURE : EXIT_SUCCESS;
 }

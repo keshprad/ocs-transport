@@ -5,7 +5,7 @@
 
 ## OCP WRITE benchmark
 
-From this directory, `make` builds `mrc_write` and the original prototype.
+From this directory, `make` builds `mrc_write`, `mrc_ctl_profile`, and the original prototype.
 `make check` runs the portable format and state tests. With the memif PMD
 available, `python3 tests/check_mrc_write.py` exercises the OCP endpoint
 without using the physical NICs.
@@ -36,6 +36,35 @@ EV profile. Bit 0 selects path 0 and bit 1 selects path 1. For a transient
 in-process path-1 blackhole, pair `--drop-path-after N` with
 `--restore-path-after M`. Recovery is driven by a correlated reliability
 probe reply.
+
+### Persistent EV profiles
+
+Create a private directory on the sender and bring a profile online.
+
+```sh
+mkdir -m 700 ./ev-profiles
+./mrc_ctl_profile ./ev-profiles create 42
+./mrc_ctl_profile ./ev-profiles configure 42 explicit 1 0xe499 0xe49a
+./mrc_ctl_profile ./ev-profiles online 42
+./mrc_ctl_profile ./ev-profiles show 42
+```
+
+Pass `--profile-dir ./ev-profiles --profile-id 42` to `mrc_write tx`.
+The benchmark uses two distinct EVs, in path order. For IPv4, an EV is a
+nonzero UDP source port. For IPv6, its upper 16 bits give the lower 16 bits
+of the flow label and its lower 16 bits give the UDP source port.
+`configure ID auto 2 MIN_ACTIVE` uses the benchmark's default EVs.
+`generated` accepts values already expanded by the caller, in the same
+form as `explicit`. The minimum active setting limits automatic failure
+demotion. Administrative denials still apply.
+
+Use `deny 42 2` and `allow 42 2` with the same directory to change path 1
+while the endpoint runs. The sender refreshes administrative state every
+10 ms and reports applied changes as `ev_admin_updates`. A profile in use
+stays online until the QP releases it. Use `offline 42` and `remove 42` to
+delete it after the run. The directory stores this benchmark's Linux
+controller state. The OCP controller ABI is tracked separately in
+[conformance](CONFORMANCE.md).
 
 ### Spark double ring
 

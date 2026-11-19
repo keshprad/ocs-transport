@@ -6,9 +6,9 @@
 int main(void)
 {
     struct mrc_ev_profile profile;
-    assert(!mrc_ev_init(&profile, 0, 5, 10));
-    assert(!mrc_ev_init(&profile, 33, 5, 10));
-    assert(mrc_ev_init(&profile, 2, 5, 10));
+    assert(!mrc_ev_init(&profile, 0, 0, 5, 10));
+    assert(!mrc_ev_init(&profile, 33, 0, 5, 10));
+    assert(mrc_ev_init(&profile, 2, 0, 5, 10));
 
     assert(mrc_ev_pick(&profile, 3, 0, 0) == 0);
     mrc_ev_sent(&profile, 0);
@@ -48,6 +48,14 @@ int main(void)
     assert(mrc_ev_pick(&profile, 3, 0, 100) == -1);
     mrc_ev_deny(&profile, 1, false, 100);
     assert(mrc_ev_pick(&profile, 3, 0, 101) == 1);
+
+    assert(!mrc_ev_init(&profile, 2, 3, 5, 10));
+    assert(mrc_ev_init(&profile, 2, 1, 5, 10));
+    mrc_ev_timeout(&profile, 0, 110);
+    mrc_ev_timeout(&profile, 1, 111);
+    assert(profile.failed == 1 && mrc_ev_active(&profile, 3, 111) == 2);
+    mrc_ev_deny(&profile, 1, true, 112);
+    assert(mrc_ev_active(&profile, 3, 112) == 0);
 
     puts("MRC EV state tests passed");
     return 0;

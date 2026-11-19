@@ -8,3 +8,5 @@
 /tests/test_mrc_ev
 /tests/test_mrc_mpr
 /tests/test_mrc_provider
+/mrc_ctl_profile
+/tests/test_mrc_ctl_store

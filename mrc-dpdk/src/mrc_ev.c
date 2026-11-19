@@ -2,13 +2,14 @@
 
 #include <string.h>
 
-bool mrc_ev_init(struct mrc_ev_profile *profile, unsigned int count,
+bool mrc_ev_init(struct mrc_ev_profile *profile, unsigned int count, unsigned int min_active,
                  uint64_t skip_interval, uint64_t probe_interval)
 {
-    if (!count || count > MRC_EV_MAX_PATHS || !skip_interval || !probe_interval)
+    if (!count || count > MRC_EV_MAX_PATHS || min_active > count || !skip_interval || !probe_interval)
         return false;
     memset(profile, 0, sizeof(*profile));
     profile->count = count;
+    profile->min_active = min_active;
     profile->skip_interval = skip_interval;
     profile->probe_interval = probe_interval;
     return true;
@@ -33,10 +34,18 @@ void mrc_ev_deny(struct mrc_ev_profile *profile, unsigned int path, bool denied,
 void mrc_ev_timeout(struct mrc_ev_profile *profile, unsigned int path, uint64_t now)
 {
     struct mrc_ev_path *ev = &profile->paths[path];
-    if (ev->state != MRC_EV_DENIED && ev->state != MRC_EV_ASSUMED_BAD) {
-        transition(ev, MRC_EV_ASSUMED_BAD, now, now);
-        profile->failed++;
+    if (ev->state == MRC_EV_DENIED || ev->state == MRC_EV_ASSUMED_BAD)
+        return;
+    if (profile->min_active) {
+        uint32_t others = mrc_ev_active(profile, ~(UINT32_C(1) << path), now);
+        unsigned int active = 0;
+        for (; others; others &= others - 1)
+            active++;
+        if (active < profile->min_active)
+            return;
     }
+    transition(ev, MRC_EV_ASSUMED_BAD, now, now);
+    profile->failed++;
 }
 
 void mrc_ev_feedback(struct mrc_ev_profile *profile, unsigned int path,

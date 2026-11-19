@@ -46,7 +46,7 @@ def collect(process, expected_error=None):
     return json.loads(stdout.strip().splitlines()[-1])
 
 
-def run_pair(build_command, read_artifacts=None, expected_errors=None):
+def run_pair(build_command, read_artifacts=None, expected_errors=None, sender_started=None):
     expected_errors = expected_errors or {}
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The two polling endpoints need at least two usable CPUs")
@@ -65,6 +65,8 @@ def run_pair(build_command, read_artifacts=None, expected_errors=None):
                 time.sleep(0.01)
             sender = start(build_command("tx", cpus[1], directory), directory)
             processes.append(sender)
+            if sender_started:
+                sender_started(sender)
             tx = collect(sender, expected_errors.get("tx"))
             rx = collect(receiver, expected_errors.get("rx"))
             return tx, rx, read_artifacts(directory) if read_artifacts else None

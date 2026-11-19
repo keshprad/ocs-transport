@@ -3,7 +3,12 @@
 
 import argparse
 import json
+import os
+import select
 import socket
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from memif_pair import MACS, eal_args, require, run_pair
@@ -11,7 +16,8 @@ from memif_pair import MACS, eal_args, require, run_pair
 
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
              trim_after=None, ipv6=False, work_requests=1, posted_receives=None,
-             expected_errors=None, negotiate=False, srv6=False, tx_options=(), rx_options=()):
+             expected_errors=None, negotiate=False, srv6=False, tx_options=(), rx_options=(),
+             sender_started=None):
     oob_port = None
     if negotiate:
         with socket.socket() as reserve:
@@ -49,7 +55,7 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
             args += ["--posted-receives", str(posted_receives)]
         return args + list(tx_options if tx else rx_options)
 
-    tx, rx, _ = run_pair(command, expected_errors=expected_errors)
+    tx, rx, _ = run_pair(command, expected_errors=expected_errors, sender_started=sender_started)
     if expected_errors:
         return tx, rx
     require(tx["bytes"] == rx["bytes"] == size * work_requests, "Incorrect completed byte count")
@@ -59,12 +65,59 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
     return tx, rx
 
 
+def controlled_ev_profile(binary, controller):
+    with tempfile.TemporaryDirectory(prefix="mrc-ev-") as directory:
+        def control(*args, check=True):
+            return subprocess.run([controller, directory, *args], text=True, capture_output=True,
+                                  check=check, timeout=3, env={**os.environ, "LC_ALL": "C"})
+
+        control("create", "42")
+        control("configure", "42", "explicit", "1", "0x7233e499", "0x8433e49a")
+        control("online", "42")
+        control("deny", "42", "2")
+        require("42 online explicit count=2 min_active=1 denied=0x00000002" in
+                control("show", "42").stdout, "Profile configuration did not persist")
+
+        def enable_path(sender):
+            ready = b"MRC EV profile 42 active, deny mask 0x3\n"
+            output = bytearray()
+            deadline = time.monotonic() + 3
+            while ready not in output:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0 and select.select([sender.stderr], [], [], remaining)[0],
+                        f"Sender did not acquire the EV profile: {output.decode(errors='replace')}")
+                chunk = os.read(sender.stderr.fileno(), 4096)
+                require(chunk, f"Sender exited before acquiring the profile: {output.decode(errors='replace')}")
+                output.extend(chunk)
+            offline = control("offline", "42", check=False)
+            require(offline.returncode != 0 and "Device or resource busy" in offline.stderr,
+                    "The active QP did not hold the online profile")
+            control("allow", "42", "2")
+
+        tx, rx = transfer(binary, 1048576, ipv6=True,
+                          tx_options=("--profile-dir", directory, "--profile-id", "42",
+                                      "--deny-path-mask", "1"),
+                          sender_started=enable_path)
+        require(tx["ev_admin_updates"] == 1 and tx["sent"] == rx["received"] == [0, 1024],
+                f"Live EV update did not unblock only path 1: {tx}, {rx}")
+        require(tx["probe_sent"][0] == 0 and tx["probe_sent"][1] > 0 and tx["probe_replies"] > 0,
+                f"Probes did not correlate the configured IPv6 entropy: {tx}")
+        control("offline", "42")
+        control("remove", "42")
+        require(not control("list").stdout, "Profile remained after removal")
+        return tx, rx
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
                         default=Path(__file__).resolve().parents[1] / "mrc_write")
-    binary = parser.parse_args().binary.resolve()
+    parser.add_argument("--controller", type=Path, help="Path to mrc_ctl_profile")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    controller = (args.controller or binary.with_name("mrc_ctl_profile")).resolve()
     require(binary.is_file(), f"Build mrc_write first: {binary}")
+    require(controller.is_file(), f"Build mrc_ctl_profile first: {controller}")
 
     tx, rx = transfer(binary, 13)
     require(tx["packets"] == 1 and not rx["immediate_completed"], "WRITE ONLY failed")
@@ -143,6 +196,9 @@ def main():
     require(tx["probe_sent"][0] > 0 and tx["probe_sent"][1] == 0,
             "The denied entropy value was probed or no active path was probed")
     print(json.dumps({"case": "denied_ev", "tx": tx, "rx": rx}))
+
+    tx, rx = controlled_ev_profile(binary, controller)
+    print(json.dumps({"case": "controlled_ev_profile", "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 16777216, "--ack-timeout", "13", drop_after=512,
                       tx_options=("--restore-path-after", "2048"))
