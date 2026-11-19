@@ -5,8 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* OCP MRC 1.0 Tables 6-2 and 7-9. Section 7.5.5.2 says 4971 in prose. */
-#define MRC_UDP_DEFAULT_PORT 4791
+/* Default specified by OCP MRC 1.0 section 7.5.5.2. */
+#define MRC_UDP_DEFAULT_PORT 4971
 #define MRC_WIRE_PSN_MASK UINT32_C(0x00ffffff)
 #define MRC_MAC_LEN 6
 #define MRC_BTH_LEN 12

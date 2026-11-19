@@ -42,6 +42,15 @@ in-process path-1 blackhole, pair `--drop-path-after N` with
 `--restore-path-after M`. Recovery is driven by a correlated reliability
 probe reply.
 
+### Independent wire replay
+
+With DPDK's `net_pcap` PMD available, run `python3 tests/check_mrc_pcap.py`.
+The test generates IPv4 WRITE, WRITEIMM, and probe packets in Python and
+feeds them to the DPDK receiver. It checks the receiver's packet placement
+and reads the captured replies with its own decoder. It covers selective
+and transport ACKs, the out-of-window NACK, reflected entropy and probe
+timestamps, and iCRC without using the endpoint's codec in the test peer.
+
 ### OCP application completion APIs
 
 The optional `libmrc-dpdk.so` target builds the context, CQ, and completion
@@ -126,9 +135,9 @@ On the direct Spark-04 to Spark-02 pair, use the following route mapping:
 Use EAL `-a` for each selected PCI address and `--iova-mode=va --no-huge`
 for the private mlx5 runtime. Start Spark-02 as `rx` and Spark-04 as `tx`.
 The configured IP pair identifies the QP across both circuits, while each
-circuit uses its corresponding peer MAC. Use `--udp-port 4971` on both peers
-for this lab. Port 4791 timed out with RoCE enabled on these ConnectX-7
-ports. Port 4971 completed the same transfer on both rails.
+circuit uses its corresponding peer MAC. UDP 4971 is the default and has
+been verified on both rails with RoCE enabled on the ConnectX-7 ports.
+Use `--udp-port N` on both peers to select another destination port.
 
 For the healthy baseline, run a 4 MiB WRITE (4194304 bytes) with both paths
 active. For a controlled recovery run, use 16777216 bytes and

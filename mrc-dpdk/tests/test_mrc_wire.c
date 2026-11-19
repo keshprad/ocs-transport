@@ -280,7 +280,7 @@ static struct mrc_wire_packet packet_for(uint8_t opcode)
     return (struct mrc_wire_packet) {
         .ipv4 = {
             .src_mac = {2, 0, 0, 0, 0, 1}, .dst_mac = {2, 0, 0, 0, 0, 2},
-            .src_ip = 0xc0000201, .dst_ip = 0xc6336402, .src_port = 0xc123,
+            .src_ip = 0xc0000201, .dst_ip = 0xc6336402, .src_port = 0xc123, .dst_port = 4791,
             .dscp = 17, .ecn = 2, .ttl = 31,
         },
         .bth = {.opcode = opcode, .p_key = 0xabcd, .dqp = 0xc0ffee},
@@ -302,7 +302,7 @@ static void test_write(void)
         .imm_data = 0xf00dcafe, .data = data, .data_len = sizeof(data),
     };
     struct mrc_wire_packet decoded = check_fixture(write_frame, sizeof(write_frame), &packet);
-    assert(decoded.ipv4.dst_port == MRC_UDP_DEFAULT_PORT);
+    assert(decoded.ipv4.dst_port == 4791);
     assert(decoded.bth.ack_request && decoded.bth.retransmit && decoded.bth.timestamp);
     assert(decoded.body.write.data == write_frame + 82);
     assert(decoded.body.write.data_len == sizeof(data));
@@ -366,7 +366,7 @@ static void test_nack(void)
 static void test_probe(void)
 {
     struct mrc_wire_packet packet = packet_for(MRC_RELIABILITY_PROBE);
-    packet.ipv4.dst_port = 4971;
+    packet.ipv4.dst_port = 0;
     packet.body.probe = (struct mrc_wire_probe) {
         .vendor_info = 0x26, .probe_id = 0x1119, .spdcid = 0x1a1b, .dpdcid = 0x2a2b,
         .timestamp = true, .tx_timestamp = 0x1234,
@@ -441,7 +441,7 @@ static void test_unknown_opcode(void)
     struct mrc_wire_bth bth;
     assert(mrc_wire_decode(unknown_frame, sizeof(unknown_frame), &decoded) == -EPROTONOSUPPORT);
     assert(mrc_wire_decode_header(unknown_frame, sizeof(unknown_frame), &ipv4, &bth) == 0);
-    assert(ipv4.src_ip == 0xc0000201 && ipv4.dst_port == MRC_UDP_DEFAULT_PORT);
+    assert(ipv4.src_ip == 0xc0000201 && ipv4.dst_port == 4791);
     assert(bth.opcode == 0xc5 && bth.psn == 0x012345 && bth.dqp == 0xc0ffee);
     uint8_t corrupted[sizeof(unknown_frame)];
     memcpy(corrupted, unknown_frame, sizeof(corrupted));
@@ -492,7 +492,7 @@ static struct mrc_wire_packet ipv6_packet_for(uint8_t opcode)
                    0xbe, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc},
         .dst_ip = {0x20, 1, 0x0d, 0xb8, 0x22, 0, 0xca, 0xfe,
                    0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11},
-        .flow_label = 0xabcde, .src_port = 0xe741, .dscp = 46, .ecn = 3,
+        .flow_label = 0xabcde, .src_port = 0xe741, .dst_port = 4791, .dscp = 46, .ecn = 3,
         .hop_limit = 52,
     };
     return packet;
@@ -514,7 +514,7 @@ static void test_ipv6_write(void)
     };
     struct mrc_wire_packet decoded =
         check_fixture(ipv6_write_frame, sizeof(ipv6_write_frame), &packet);
-    assert(decoded.ipv6.src_port == 0xe741 && decoded.ipv6.dst_port == MRC_UDP_DEFAULT_PORT);
+    assert(decoded.ipv6.src_port == 0xe741 && decoded.ipv6.dst_port == 4791);
     assert(decoded.ipv6.flow_label == 0xabcde);
     assert(decoded.ipv6.dscp == 46 && decoded.ipv6.ecn == 3 && decoded.ipv6.hop_limit == 52);
     assert(decoded.body.write.data == ipv6_write_frame + 102);
@@ -538,7 +538,7 @@ static void test_ipv6_control(void)
 {
     struct mrc_wire_packet packet = ipv6_packet_for(MRC_TRANSPORT_ACK);
     packet.bth.psn = 0x00ff01;
-    packet.ipv6.dst_port = 4971;
+    packet.ipv6.dst_port = 0;
     packet.body.aeth = (struct mrc_wire_aeth){.syndrome = 0x1f, .msn = 0x01a2b3};
     check_fixture(ipv6_ack_frame, sizeof(ipv6_ack_frame), &packet);
 
