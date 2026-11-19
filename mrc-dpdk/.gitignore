@@ -10,3 +10,5 @@
 /tests/test_mrc_provider
 /mrc_ctl_profile
 /tests/test_mrc_ctl_store
+/libmrc-dpdk.so
+/tests/test_mrc_abi

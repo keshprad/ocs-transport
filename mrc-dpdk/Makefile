@@ -4,8 +4,14 @@ CFLAGS ?= -O3 -g
 DPDK_CFLAGS = $(shell $(PKG_CONFIG) --cflags libdpdk)
 DPDK_LIBS = $(shell $(PKG_CONFIG) --libs libdpdk)
 WARNINGS = -Wall -Wextra -Werror
+MRC_INCLUDE_DIR ?=
+MRC_HEADERS = $(if $(MRC_INCLUDE_DIR),$(addprefix $(MRC_INCLUDE_DIR)/,mrc.h mrc_api_ver.h))
+MRC_ABI_CFLAGS = -isystem "$(MRC_INCLUDE_DIR)" $(shell $(PKG_CONFIG) --cflags libibverbs)
+MRC_ABI_LIBS = $(shell $(PKG_CONFIG) --libs libibverbs)
+MRC_ABI_SRC = src/mrc_abi.c src/mrc_provider.c
+MRC_ABI_DEPS = src/mrc_abi.h src/mrc_provider.h src/mrc_qp.h $(MRC_HEADERS)
 
-.PHONY: all check clean
+.PHONY: all check check-mrc-abi clean
 all: mrc_bench mrc_write mrc_ctl_profile
 
 mrc_bench: src/mrc_bench.c src/dpdk_io.c src/dpdk_io.h
@@ -35,6 +41,19 @@ mrc_write tests/test_mrc_wr tests/test_mrc_provider: CFLAGS += -pthread
 tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider mrc_ctl_profile tests/test_mrc_ctl_store:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -std=c11 $(WARNINGS) -pedantic $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
+libmrc-dpdk.so: $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
+	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
+	$(PKG_CONFIG) --exists libibverbs
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) -pthread -fPIC -fvisibility=hidden $(LDFLAGS) -Wl,-z,defs -shared -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(LDLIBS)
+
+tests/test_mrc_abi: tests/test_mrc_abi.c $(MRC_ABI_SRC) src/mrc_provider_qp.c $(MRC_ABI_DEPS)
+	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
+	$(PKG_CONFIG) --exists libibverbs
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(LDLIBS)
+
+check-mrc-abi: libmrc-dpdk.so tests/test_mrc_abi
+	./tests/test_mrc_abi
+
 check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
 	./tests/test_mrc_qp
 	./tests/test_mrc_wire
@@ -47,4 +66,4 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_ctl_store
 
 clean:
-	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
+	$(RM) mrc_bench mrc_write mrc_ctl_profile libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
