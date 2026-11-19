@@ -93,6 +93,14 @@ up to 16 SGEs, and payload-free WRITEIMM receive posts. Use
 receive CQ notification. The remaining APIs are tracked in
 [conformance](CONFORMANCE.md).
 
+Provider-triggered QP failures and CQ overruns generate
+`IBV_EVENT_QP_FATAL` and `IBV_EVENT_CQ_ERR` on the MRC context. Use
+`mrc_get_async_event()` to retrieve events and `mrc_ack_async_event()` to
+release them. Destruction waits for returned events to be acknowledged.
+Use `mrc_dpdk_get_async_fd()` to poll the queue or set nonblocking retrieval
+with `O_NONBLOCK`. An active QP that shares a failed CQ enters ERROR when
+its next query, post, or progress call observes the overrun.
+
 ### Driving the DPDK endpoint from a provider QP
 
 The internal interface in `src/mrc_endpoint.h` lets the application own the

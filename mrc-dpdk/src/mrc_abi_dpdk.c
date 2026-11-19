@@ -401,10 +401,14 @@ MRC_PUBLIC int mrc_dpdk_progress_qp(struct mrc_qp *qp)
     if (route) {
         pthread_mutex_lock(&dispatch_mutex);
         if (!route->error) {
-            receive_ports(route);
-            int result = route->response ? mrc_responder_progress(route->response) : 0;
-            if (result >= 0 && route->request)
-                result = mrc_requester_progress(route->request);
+            int result = mrc_provider_qp_check_cqs(qp->provider);
+            if (!result) {
+                receive_ports(route);
+                if (route->response)
+                    result = mrc_responder_progress(route->response);
+                if (result >= 0 && route->request)
+                    result = mrc_requester_progress(route->request);
+            }
             if (result < 0) {
                 route->error = -result;
                 discard_packets(&route->rx);

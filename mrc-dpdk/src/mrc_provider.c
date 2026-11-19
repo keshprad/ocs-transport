@@ -39,12 +39,20 @@ struct mrc_provider_comp_channel {
     struct completion_notification *tail;
 };
 
+enum cq_health {
+    CQ_READY,
+    CQ_PUBLISHING_ERROR,
+    CQ_OVERRUN,
+};
+
 struct mrc_provider_cq {
     pthread_mutex_t mutex;
     pthread_cond_t events_acked;
     struct mrc_provider_comp_channel *channel;
     struct completion_notification *notification;
     void *context;
+    void (*on_overrun)(void *context);
+    void *overrun_context;
     size_t capacity;
     size_t references;
     size_t head;
@@ -53,7 +61,7 @@ struct mrc_provider_cq {
     size_t unacked;
     bool armed;
     bool solicited_only;
-    bool overrun;
+    atomic_int health;
     bool overflow_event;
     bool closing;
     struct mrc_provider_wc entries[];
@@ -415,6 +423,7 @@ int mrc_provider_cq_create_on_channel(size_t capacity, struct mrc_provider_comp_
         goto destroy_condition;
 
     object->capacity = capacity;
+    atomic_init(&object->health, CQ_READY);
     object->channel = channel;
     object->context = context;
     *cq = object;
@@ -434,6 +443,32 @@ int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq)
     return mrc_provider_cq_create_on_channel(capacity, NULL, NULL, cq);
 }
 
+void mrc_provider_cq_on_overrun(struct mrc_provider_cq *cq, void (*notify)(void *), void *context)
+{
+    pthread_mutex_lock(&cq->mutex);
+    cq->on_overrun = notify;
+    cq->overrun_context = context;
+    pthread_mutex_unlock(&cq->mutex);
+}
+
+bool mrc_provider_cq_failed(struct mrc_provider_cq *cq)
+{
+    if (!cq)
+        return false;
+    int health = atomic_load_explicit(&cq->health, memory_order_acquire);
+    if (health == CQ_PUBLISHING_ERROR) {
+        /* Queue the CQ error before a dependent QP reports its failure. */
+        pthread_mutex_lock(&cq->mutex);
+        pthread_mutex_unlock(&cq->mutex);
+    }
+    return health != CQ_READY;
+}
+
+static bool cq_failed_locked(const struct mrc_provider_cq *cq)
+{
+    return atomic_load_explicit(&cq->health, memory_order_relaxed) != CQ_READY;
+}
+
 int mrc_provider_cq_retain(struct mrc_provider_cq *cq)
 {
     if (!cq)
@@ -442,6 +477,8 @@ int mrc_provider_cq_retain(struct mrc_provider_cq *cq)
     int result = 0;
     if (cq->closing)
         result = -EBUSY;
+    else if (cq_failed_locked(cq))
+        result = -EOVERFLOW;
     else if (cq->references == SIZE_MAX)
         result = -EOVERFLOW;
     else
@@ -555,12 +592,16 @@ static int signal_notification(struct mrc_provider_cq *cq)
 
 static int cq_overrun(struct mrc_provider_cq *cq)
 {
-    cq->overrun = true;
     cq->overflow_event = true;
     cq->count = 0;
     cq->armed = false;
     free(cq->notification);
     cq->notification = NULL;
+    if (cq->on_overrun) {
+        atomic_store_explicit(&cq->health, CQ_PUBLISHING_ERROR, memory_order_release);
+        cq->on_overrun(cq->overrun_context);
+    }
+    atomic_store_explicit(&cq->health, CQ_OVERRUN, memory_order_release);
     return -EOVERFLOW;
 }
 
@@ -575,7 +616,7 @@ int mrc_provider_cq_push(struct mrc_provider_cq *cq, const struct mrc_provider_w
     bool notify = cq->armed && (!cq->solicited_only || solicited || wc->status != MRC_PROVIDER_WC_SUCCESS);
     if (cq->closing) {
         result = -EBUSY;
-    } else if (cq->overrun) {
+    } else if (cq_failed_locked(cq)) {
         result = -EOVERFLOW;
     } else if (cq->count == cq->capacity ||
                (notify && (cq->ready == SIZE_MAX - cq->unacked || signal_notification(cq)))) {
@@ -599,7 +640,7 @@ int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *ent
     if (!cq || (count && !entries) || count > INT_MAX)
         return -EINVAL;
     pthread_mutex_lock(&cq->mutex);
-    if (cq->closing || cq->overrun) {
+    if (cq->closing || cq_failed_locked(cq)) {
         int result = cq->closing ? -EBUSY : -EOVERFLOW;
         pthread_mutex_unlock(&cq->mutex);
         return result;
@@ -622,7 +663,7 @@ int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only)
     int result = 0;
     if (cq->closing) {
         result = -EBUSY;
-    } else if (cq->overrun) {
+    } else if (cq_failed_locked(cq)) {
         result = -EOVERFLOW;
     } else {
         if (cq->channel && !cq->armed) {

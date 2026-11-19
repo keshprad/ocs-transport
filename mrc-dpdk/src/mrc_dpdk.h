@@ -12,6 +12,11 @@ int mrc_dpdk_bind_mr(struct mrc_context *context, const struct ibv_mr *mr,
                      uint64_t iova, unsigned int access);
 int mrc_dpdk_unbind_mr(struct mrc_context *context, const struct ibv_mr *mr);
 
+/* Borrow the context's asynchronous event FD for poll/select.
+ * Read and acknowledge events with the OCP functions. With O_NONBLOCK,
+ * mrc_get_async_event fails with errno EAGAIN when the queue is empty. */
+int mrc_dpdk_get_async_fd(struct mrc_context *context, int *fd);
+
 struct rte_mempool;
 
 /* Application-owned, started DPDK ports with queue zero for RX and TX.

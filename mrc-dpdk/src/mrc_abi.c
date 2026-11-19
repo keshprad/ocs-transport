@@ -63,7 +63,7 @@ MRC_PUBLIC int mrc_query_device_ex(struct ibv_context *verbs, struct mrc_context
     return mrc_query_device(verbs ? verbs : (context ? context->verbs : NULL), attr, supported);
 }
 
-static int retain_context(struct mrc_context *context)
+int mrc_abi_retain_context(struct mrc_context *context)
 {
     pthread_mutex_lock(&context->mutex);
     int error = 0;
@@ -75,7 +75,7 @@ static int retain_context(struct mrc_context *context)
     return error;
 }
 
-static void release_context(struct mrc_context *context)
+void mrc_abi_release_context(struct mrc_context *context)
 {
     pthread_mutex_lock(&context->mutex);
     context->children--;
@@ -115,6 +115,13 @@ MRC_PUBLIC struct mrc_context *mrc_create_context(struct ibv_context *vcontext,
         errno = error;
         return NULL;
     }
+    error = mrc_abi_async_open(&context->async);
+    if (error) {
+        pthread_mutex_destroy(&context->mutex);
+        free(context);
+        errno = error;
+        return NULL;
+    }
     context->verbs = vcontext;
     return context;
 }
@@ -128,6 +135,7 @@ MRC_PUBLIC int mrc_destroy_context(struct mrc_context *context)
     pthread_mutex_unlock(&context->mutex);
     if (busy)
         return set_errno(EBUSY);
+    mrc_abi_async_close(&context->async);
     pthread_mutex_destroy(&context->mutex);
     free(context);
     return 0;
@@ -159,7 +167,7 @@ MRC_PUBLIC int mrc_create_comp_channel(struct mrc_context *context,
     struct mrc_comp_channel *object = calloc(1, sizeof(*object));
     if (!object)
         return -1;
-    int error = retain_context(context);
+    int error = mrc_abi_retain_context(context);
     if (error)
         goto free_object;
     error = -mrc_provider_comp_channel_create(&object->provider);
@@ -177,7 +185,7 @@ MRC_PUBLIC int mrc_create_comp_channel(struct mrc_context *context,
     return 0;
 
 release_parent:
-    release_context(context);
+    mrc_abi_release_context(context);
 free_object:
     free(object);
     return set_errno(error);
@@ -198,9 +206,16 @@ MRC_PUBLIC int mrc_destroy_comp_channel(struct mrc_comp_channel *channel)
     int error = -mrc_provider_comp_channel_destroy(channel->provider);
     if (error)
         return error;
-    release_context(channel->context);
+    mrc_abi_release_context(channel->context);
     free(channel);
     return 0;
+}
+
+static void cq_overrun_event(void *argument)
+{
+    struct mrc_cq *cq = argument;
+    const struct mrc_async_event event = { .event_type = IBV_EVENT_CQ_ERR, .element.cq = cq };
+    mrc_abi_async_publish(&cq->async, &event);
 }
 
 MRC_PUBLIC struct mrc_cq *mrc_create_cq(struct mrc_context *context, int cqe,
@@ -215,13 +230,18 @@ MRC_PUBLIC struct mrc_cq *mrc_create_cq(struct mrc_context *context, int cqe,
     struct mrc_cq *cq = calloc(1, sizeof(*cq));
     if (!cq)
         return NULL;
-    int error = retain_context(context);
+    cq->async.context = context;
+    int error = mrc_abi_retain_context(context);
     if (!error) {
-        error = -mrc_provider_cq_create_on_channel((size_t)cqe,
-                                                   channel ? channel->provider : NULL,
-                                                   cq, &cq->provider);
-        if (error)
-            release_context(context);
+        error = mrc_abi_async_prepare(&cq->async);
+        if (!error)
+            error = -mrc_provider_cq_create_on_channel((size_t)cqe,
+                                                       channel ? channel->provider : NULL,
+                                                       cq, &cq->provider);
+        if (error) {
+            mrc_abi_async_finish(&cq->async);
+            mrc_abi_release_context(context);
+        }
     }
     if (error) {
         free(cq);
@@ -231,6 +251,7 @@ MRC_PUBLIC struct mrc_cq *mrc_create_cq(struct mrc_context *context, int cqe,
     cq->context = context;
     cq->application_context = cq_context;
     cq->capacity = cqe;
+    mrc_provider_cq_on_overrun(cq->provider, cq_overrun_event, cq);
     return cq;
 }
 
@@ -292,7 +313,8 @@ MRC_PUBLIC int mrc_destroy_cq(struct mrc_cq *cq)
     int error = -mrc_provider_cq_destroy_wait(cq->provider);
     if (error)
         return error;
-    release_context(cq->context);
+    mrc_abi_async_finish(&cq->async);
+    mrc_abi_release_context(cq->context);
     free(cq);
     return 0;
 }

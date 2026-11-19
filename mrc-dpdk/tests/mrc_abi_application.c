@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
 #include <stdio.h>
@@ -308,13 +309,63 @@ static void skip_local_qp_numbers(struct mrc_context *context, struct mrc_qp_ini
     }
 }
 
+static void complete_async_error(struct mrc_context *context, struct mrc_qp *qp,
+                                 struct mrc_cq *cq, bool requester, uint32_t qpn)
+{
+    int fd;
+    assert(mrc_dpdk_get_async_fd(context, &fd) == 0);
+    int flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    uint64_t deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
+
+    /* Leave completions in the responder's single-slot CQ. The second
+     * WRITEIMM overflows it and sends UNEXP_EVENT to the requester. */
+    int result;
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        result = mrc_dpdk_progress_qp(qp);
+        rte_pause();
+    } while (result == 0);
+    assert(result == (requester ? EREMOTEIO : EPROTO));
+
+    struct pollfd ready = { .fd = fd, .events = POLLIN };
+    assert(poll(&ready, 1, 0) == 1 && (ready.revents & POLLIN));
+    struct mrc_async_event event;
+    if (!requester) {
+        assert(mrc_get_async_event(context, &event) == 0);
+        assert(event.event_type == IBV_EVENT_CQ_ERR && event.element.cq == cq);
+        mrc_ack_async_event(&event);
+    }
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_QP_FATAL && event.element.qp == qp);
+    mrc_ack_async_event(&event);
+    assert(poll(&ready, 1, 0) == 0);
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+
+    struct ibv_qp_attr observed;
+    assert(mrc_query_qp(qp, &observed, IBV_QP_STATE, NULL, 0, NULL) == 0);
+    assert(observed.qp_state == IBV_QPS_ERR);
+    struct ibv_wc entries[2];
+    if (requester) {
+        assert(mrc_poll_cq(cq, 2, entries) == 2);
+        assert(entries[0].status == IBV_WC_SUCCESS && entries[0].wr_id == 71 &&
+               entries[0].qp_num == qpn);
+        assert(entries[1].status == IBV_WC_REM_OP_ERR && entries[1].wr_id == 72 &&
+               entries[1].qp_num == qpn);
+    } else {
+        assert(mrc_poll_cq(cq, 2, entries) == -1 && errno == EOVERFLOW);
+    }
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+}
+
 static void run_simplex(bool requester, const char *directory, const struct address *address,
-                       struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool)
+                       struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                       bool wire_error)
 {
     struct mrc_comp_channel *channel = NULL;
-    if (!requester)
+    if (!requester && !wire_error)
         assert(mrc_create_comp_channel(context, &channel) == 0);
-    struct mrc_cq *cq = mrc_create_cq(context, 4, NULL, channel, 0);
+    struct mrc_cq *cq = mrc_create_cq(context, !requester && wire_error ? 1 : 4, NULL, channel, 0);
     assert(cq);
 
     uint8_t first_data[TOTAL_BYTES], last_data[TOTAL_BYTES];
@@ -366,17 +417,27 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         post_writes(qp, &peer, first, last);
     } else {
         post_receives(qp);
-        assert(mrc_req_notify_cq(cq, 1) == 0);
+        if (!wire_error)
+            assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
     }
-    complete(qp, cq, channel, directory, requester, local.qpn);
+    if (wire_error)
+        complete_async_error(context, qp, cq, requester, local.qpn);
+    else
+        complete(qp, cq, channel, directory, requester, local.qpn);
     if (requester) {
         publish(directory, "tx.done", NULL, 0);
     } else {
         for (size_t i = 0; i < TOTAL_BYTES; i++)
             assert(first_data[i] == pattern(i));
-        struct pollfd wait = { .fd = completion_fd(channel), .events = POLLIN };
-        assert(poll(&wait, 1, 0) == 0);
+        if (wire_error) {
+            char done[PATH_MAX];
+            path_for(done, directory, "tx.done");
+            wait_for(done);
+        } else {
+            struct pollfd wait = { .fd = completion_fd(channel), .events = POLLIN };
+            assert(poll(&wait, 1, 0) == 0);
+        }
     }
 
     assert(mrc_destroy_qp(qp) == 0);
@@ -386,8 +447,13 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     if (last)
         deregister_memory(context, last);
     deregister_memory(context, first);
-    printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u}\n",
-           requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
+    if (wire_error) {
+        printf("{\"role\":\"%s\",\"qp_fatal\":true,\"cq_error\":%s,\"qpn\":%u}\n",
+               requester ? "tx" : "rx", requester ? "false" : "true", local.qpn);
+    } else {
+        printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u}\n",
+               requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
+    }
 }
 
 struct duplex_qp {
@@ -590,7 +656,8 @@ int main(int argc, char **argv)
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
     bool bidirectional = strcmp(argv[3], "duplex") == 0;
-    assert(bidirectional || strcmp(argv[3], "simplex") == 0);
+    bool wire_error = strcmp(argv[3], "wire_error") == 0;
+    assert(bidirectional || wire_error || strcmp(argv[3], "simplex") == 0);
 
     struct address address = {0};
     struct ibv_context *verbs = open_verbs(&address);
@@ -612,7 +679,7 @@ int main(int argc, char **argv)
     if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool);
     else
-        run_simplex(client, directory, &address, context, pd, pool);
+        run_simplex(client, directory, &address, context, pd, pool, wire_error);
 
     assert(mrc_destroy_context(context) == 0);
     assert(ibv_dealloc_pd(pd) == 0);

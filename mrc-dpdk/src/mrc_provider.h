@@ -125,6 +125,10 @@ int mrc_provider_comp_channel_destroy(struct mrc_provider_comp_channel *channel)
 int mrc_provider_cq_create_on_channel(size_t capacity, struct mrc_provider_comp_channel *channel,
                                       void *context, struct mrc_provider_cq **cq);
 int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq);
+/* Install before sharing the CQ. The callback runs with the CQ locked and
+ * must not call back into provider queues. */
+void mrc_provider_cq_on_overrun(struct mrc_provider_cq *cq, void (*notify)(void *), void *context);
+bool mrc_provider_cq_failed(struct mrc_provider_cq *cq);
 int mrc_provider_cq_retain(struct mrc_provider_cq *cq);
 int mrc_provider_cq_release(struct mrc_provider_cq *cq);
 int mrc_provider_cq_destroy(struct mrc_provider_cq *cq);
@@ -170,6 +174,10 @@ struct mrc_provider_qp_config {
     size_t recv_capacity;
     uint32_t qpn;
     bool sq_sig_all;
+    /* Called with the QP locked on provider-initiated ERROR.
+     * The callback must not call provider queue functions. */
+    void (*on_error)(void *context);
+    void *error_context;
 };
 
 struct mrc_provider_qp_attr {
@@ -185,6 +193,7 @@ struct mrc_provider_qp_attr {
 int mrc_provider_qp_create(const struct mrc_provider_qp_config *config,
                            struct mrc_provider_qp **qp);
 int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_attr *attr);
+int mrc_provider_qp_check_cqs(struct mrc_provider_qp *qp);
 int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_state expected,
                                enum mrc_provider_qp_state next);
 int mrc_provider_qp_destroy(struct mrc_provider_qp *qp);

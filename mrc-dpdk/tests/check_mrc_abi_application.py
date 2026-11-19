@@ -42,6 +42,12 @@ def main():
                 f"Unexpected public bidirectional QP results: {result}")
     print(json.dumps({"case": "public_bidirectional_qps_over_shared_dpdk_ports", "tx": tx, "rx": rx}))
 
+    tx, rx = run_case("wire_error")
+    require(tx["qpn"] != rx["qpn"] and tx["qp_fatal"] and rx["qp_fatal"]
+            and not tx["cq_error"] and rx["cq_error"],
+            f"Unexpected public async events after receiver CQ overflow: {tx}, {rx}")
+    print(json.dumps({"case": "public_async_events_on_unexpected_wire_error", "tx": tx, "rx": rx}))
+
 
 if __name__ == "__main__":
     main()

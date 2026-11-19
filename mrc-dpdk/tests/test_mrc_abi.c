@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "mrc_abi.h"
 
 #include <arpa/inet.h>
@@ -7,6 +11,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 static void transition_to_rts(struct mrc_provider_qp *qp)
 {
@@ -322,6 +327,228 @@ static void test_public_qp(struct ibv_context *verbs)
     assert(ibv_dereg_mr(last_mr) == 0 && ibv_dereg_mr(first_mr) == 0 && ibv_dealloc_pd(pd) == 0);
 }
 
+struct async_call {
+    struct mrc_context *context;
+    struct mrc_async_event event;
+    struct mrc_cq *destroy_cq;
+    struct mrc_qp *destroy_qp;
+    int result;
+};
+
+static void *run_async_call(void *argument)
+{
+    struct async_call *call = argument;
+    if (call->destroy_cq)
+        call->result = mrc_destroy_cq(call->destroy_cq);
+    else if (call->destroy_qp)
+        call->result = mrc_destroy_qp(call->destroy_qp);
+    else
+        call->result = mrc_get_async_event(call->context, &call->event);
+    return NULL;
+}
+
+static int join_with_timeout(pthread_t thread, long milliseconds)
+{
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += milliseconds / 1000;
+    deadline.tv_nsec += (milliseconds % 1000) * 1000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+    return pthread_timedjoin_np(thread, NULL, &deadline);
+}
+
+static void expect_async_readiness(int fd, bool ready)
+{
+    struct pollfd poll_fd = { .fd = fd, .events = POLLIN };
+    assert(poll(&poll_fd, 1, 0) == (ready ? 1 : 0));
+    if (ready)
+        assert(poll_fd.revents & POLLIN);
+}
+
+static void overflow_cq(struct mrc_cq *cq)
+{
+    const struct mrc_provider_wc completion = {
+        .wr_id = 500, .status = MRC_PROVIDER_WC_SUCCESS, .opcode = MRC_PROVIDER_WC_WRITE,
+    };
+    assert(mrc_provider_cq_push(cq->provider, &completion, false) == 0);
+    assert(mrc_provider_cq_push(cq->provider, &completion, false) == -EOVERFLOW);
+    assert(mrc_provider_cq_push(cq->provider, &completion, false) == -EOVERFLOW);
+}
+
+static struct mrc_qp *create_async_qp(struct mrc_context *context, struct ibv_pd *pd,
+                                      struct mrc_cq *send_cq)
+{
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .send_cq = send_cq, .cap = { .max_send_wr = 1 },
+    };
+    struct mrc_qp *qp = mrc_create_qp(context, &init);
+    assert(qp);
+    struct ibv_qp_attr verbs = { .qp_state = IBV_QPS_INIT };
+    assert(mrc_modify_qp(qp, &verbs, IBV_QP_STATE, NULL, 0) == 0);
+    return qp;
+}
+
+static void test_async_events(struct ibv_context *verbs)
+{
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    assert(context && pd);
+
+    int fd;
+    struct mrc_async_event event;
+    assert(mrc_dpdk_get_async_fd(NULL, &fd) == EINVAL);
+    assert(mrc_dpdk_get_async_fd(context, NULL) == EINVAL);
+    assert(mrc_dpdk_get_async_fd(context, &fd) == 0 && fd >= 0);
+    assert(mrc_get_async_event(NULL, &event) == -1 && errno == EINVAL);
+    assert(mrc_get_async_event(context, NULL) == -1 && errno == EINVAL);
+    int flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && !(flags & O_NONBLOCK));
+    expect_async_readiness(fd, false);
+
+    struct mrc_cq *send_cq = mrc_create_cq(context, 4, NULL, NULL, 0);
+    struct mrc_cq *overflow = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(send_cq && overflow);
+    struct mrc_qp *fatal = create_async_qp(context, pd, send_cq);
+    struct mrc_qp *manual = create_async_qp(context, pd, send_cq);
+
+    struct ibv_qp_attr set_error = { .qp_state = IBV_QPS_ERR };
+    assert(mrc_modify_qp(manual, &set_error, IBV_QP_STATE, NULL, 0) == 0);
+    expect_async_readiness(fd, false);
+
+    pthread_t getter;
+    struct async_call waiting = { .context = context, .result = -2 };
+    assert(pthread_create(&getter, NULL, run_async_call, &waiting) == 0);
+    assert(join_with_timeout(getter, 50) == ETIMEDOUT);
+    overflow_cq(overflow);
+    assert(mrc_provider_qp_fail(fatal->provider, 0, MRC_PROVIDER_WC_FLUSHED) == 0);
+    assert(join_with_timeout(getter, 2000) == 0 && waiting.result == 0);
+    assert(waiting.event.event_type == IBV_EVENT_CQ_ERR && waiting.event.element.cq == overflow);
+
+    assert(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    expect_async_readiness(fd, true);
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_QP_FATAL && event.element.qp == fatal);
+    expect_async_readiness(fd, false);
+    struct mrc_async_event none;
+    assert(mrc_get_async_event(context, &none) == -1 && errno == EAGAIN);
+
+    /* Dequeuing clears readiness. The fetched events still hold their objects
+     * alive until their acknowledgements, even when destruction is in progress. */
+    pthread_t cq_destroyer, qp_destroyer;
+    struct async_call cq_destroy = { .destroy_cq = overflow, .result = -2 };
+    struct async_call qp_destroy = { .destroy_qp = fatal, .result = -2 };
+    assert(pthread_create(&cq_destroyer, NULL, run_async_call, &cq_destroy) == 0);
+    assert(pthread_create(&qp_destroyer, NULL, run_async_call, &qp_destroy) == 0);
+    assert(join_with_timeout(cq_destroyer, 50) == ETIMEDOUT);
+    assert(join_with_timeout(qp_destroyer, 50) == ETIMEDOUT);
+    mrc_ack_async_event(&waiting.event);
+    assert(join_with_timeout(cq_destroyer, 2000) == 0 && cq_destroy.result == 0);
+    assert(join_with_timeout(qp_destroyer, 50) == ETIMEDOUT);
+    mrc_ack_async_event(&event);
+    assert(join_with_timeout(qp_destroyer, 2000) == 0 && qp_destroy.result == 0);
+    assert(mrc_destroy_qp(manual) == 0);
+
+    /* Destruction can drop unread events from the head and middle of the
+     * FIFO without consuming a notification belonging to another CQ. */
+    struct mrc_cq *drop_cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    struct mrc_cq *keep_cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(drop_cq && keep_cq);
+    struct mrc_qp *drop_qp = create_async_qp(context, pd, send_cq);
+    overflow_cq(drop_cq);
+    assert(mrc_provider_qp_fail(drop_qp->provider, 0, MRC_PROVIDER_WC_FLUSHED) == 0);
+    overflow_cq(keep_cq);
+
+    cq_destroy = (struct async_call){ .destroy_cq = drop_cq, .result = -2 };
+    qp_destroy = (struct async_call){ .destroy_qp = drop_qp, .result = -2 };
+    assert(pthread_create(&cq_destroyer, NULL, run_async_call, &cq_destroy) == 0);
+    assert(join_with_timeout(cq_destroyer, 2000) == 0 && cq_destroy.result == 0);
+    assert(pthread_create(&qp_destroyer, NULL, run_async_call, &qp_destroy) == 0);
+    assert(join_with_timeout(qp_destroyer, 2000) == 0 && qp_destroy.result == 0);
+    expect_async_readiness(fd, true);
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_CQ_ERR && event.element.cq == keep_cq);
+    mrc_ack_async_event(&event);
+    expect_async_readiness(fd, false);
+    assert(mrc_get_async_event(context, &none) == -1 && errno == EAGAIN);
+
+    assert(mrc_destroy_cq(keep_cq) == 0);
+    assert(mrc_destroy_cq(send_cq) == 0);
+
+    assert(fcntl(fd, F_SETFL, flags) == 0);
+    waiting = (struct async_call){ .context = context, .result = -2 };
+    assert(pthread_create(&getter, NULL, run_async_call, &waiting) == 0);
+    assert(join_with_timeout(getter, 50) == ETIMEDOUT);
+    assert(mrc_destroy_context(context) == -1 && errno == EBUSY);
+    assert(pthread_cancel(getter) == 0);
+    void *cancelled;
+    assert(pthread_join(getter, &cancelled) == 0 && cancelled == PTHREAD_CANCELED);
+    assert(mrc_destroy_context(context) == 0);
+    assert(ibv_dealloc_pd(pd) == 0);
+}
+
+static void test_shared_cq_error(struct ibv_context *verbs)
+{
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    assert(context && pd);
+    struct mrc_cq *send_cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    struct mrc_cq *recv_cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(send_cq && recv_cq);
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .send_cq = send_cq, .recv_cq = recv_cq, .sq_sig_all = 1,
+        .cap = { .max_send_wr = 2, .max_recv_wr = 1 },
+    };
+    struct mrc_qp *trigger = mrc_create_qp(context, &init);
+    struct mrc_qp *sibling = mrc_create_qp(context, &init);
+    assert(trigger && sibling);
+    transition_to_rts(trigger->provider);
+    transition_to_rts(sibling->provider);
+    struct ibv_recv_wr receive = { .wr_id = 601 };
+    struct ibv_recv_wr *bad_receive = NULL;
+    assert(mrc_post_recv(sibling, &receive, &bad_receive) == 0 && !bad_receive);
+
+    int fd;
+    assert(mrc_dpdk_get_async_fd(context, &fd) == 0);
+    int flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    uint64_t sequence;
+    assert(mrc_provider_qp_post_send(trigger->provider, 501, 0, false, &sequence) == 0);
+    assert(mrc_provider_qp_post_send(trigger->provider, 502, 0, false, &sequence) == 0);
+    assert(mrc_provider_qp_complete_send(trigger->provider, sequence) == -EOVERFLOW);
+
+    struct mrc_async_event event;
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_CQ_ERR && event.element.cq == send_cq);
+    mrc_ack_async_event(&event);
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_QP_FATAL && event.element.qp == trigger);
+    mrc_ack_async_event(&event);
+
+    struct ibv_qp_attr observed;
+    assert(mrc_query_qp(sibling, &observed, IBV_QP_STATE, NULL, 0, NULL) == 0);
+    assert(observed.qp_state == IBV_QPS_ERR);
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_QP_FATAL && event.element.qp == sibling);
+    mrc_ack_async_event(&event);
+    struct ibv_wc completion;
+    uint32_t sibling_qpn;
+    assert(mrc_get_qpn(sibling, &sibling_qpn) == 0);
+    assert(mrc_poll_cq(recv_cq, 1, &completion) == 1);
+    assert(completion.wr_id == 601 && completion.qp_num == sibling_qpn &&
+           completion.status == IBV_WC_WR_FLUSH_ERR);
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+
+    assert(mrc_destroy_qp(trigger) == 0);
+    assert(mrc_destroy_qp(sibling) == 0);
+    assert(mrc_destroy_cq(recv_cq) == 0);
+    assert(mrc_destroy_cq(send_cq) == 0);
+    assert(mrc_destroy_context(context) == 0);
+    assert(ibv_dealloc_pd(pd) == 0);
+}
+
 int main(void)
 {
     struct ibv_device **devices = ibv_get_device_list(NULL);
@@ -340,7 +567,9 @@ int main(void)
     test_resources_and_completions(verbs);
     test_verbs_memory_binding(verbs);
     test_public_qp(verbs);
+    test_async_events(verbs);
+    test_shared_cq_error(verbs);
     assert(ibv_close_device(verbs) == 0);
-    puts("OCP MRC context, QP, and completion ABI tests passed");
+    puts("OCP MRC context, QP, completion, and async ABI tests passed");
     return EXIT_SUCCESS;
 }

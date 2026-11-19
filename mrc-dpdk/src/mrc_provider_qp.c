@@ -38,6 +38,8 @@ struct mrc_provider_qp {
     uint64_t next_sequence;
     uint32_t qpn;
     bool sq_sig_all;
+    void (*on_error)(void *context);
+    void *error_context;
     struct work_entry entries[];
 };
 
@@ -70,6 +72,8 @@ int mrc_provider_qp_create(const struct mrc_provider_qp_config *config,
     object->pd = config->pd;
     object->qpn = config->qpn;
     object->sq_sig_all = config->sq_sig_all;
+    object->on_error = config->on_error;
+    object->error_context = config->error_context;
     object->first_sequence = 1;
     object->next_sequence = 1;
     object->send = (struct work_queue){
@@ -95,11 +99,14 @@ free_object:
     return result;
 }
 
+static int check_cqs_locked(struct mrc_provider_qp *qp);
+
 int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_attr *attr)
 {
     if (!qp || !attr)
         return -EINVAL;
     pthread_mutex_lock(&qp->mutex);
+    check_cqs_locked(qp);
     *attr = (struct mrc_provider_qp_attr){
         .state = qp->state, .qpn = qp->qpn, .send_pending = qp->send.count,
         .recv_pending = qp->recv.count, .send_first_sequence = qp->first_sequence,
@@ -208,6 +215,35 @@ static int flush_qp(struct mrc_provider_qp *qp, uint64_t sequence,
     return result;
 }
 
+static int fail_qp(struct mrc_provider_qp *qp, uint64_t sequence,
+                    enum mrc_provider_wc_status status)
+{
+    bool notify = qp->state != MRC_PROVIDER_QP_ERROR;
+    int result = flush_qp(qp, sequence, status);
+    if (notify && qp->on_error)
+        qp->on_error(qp->error_context);
+    return result;
+}
+
+static int check_cqs_locked(struct mrc_provider_qp *qp)
+{
+    if (!mrc_provider_cq_failed(qp->send.cq) && !mrc_provider_cq_failed(qp->recv.cq))
+        return 0;
+    if (qp->state >= MRC_PROVIDER_QP_INIT && qp->state <= MRC_PROVIDER_QP_RTS)
+        fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+    return -EOVERFLOW;
+}
+
+int mrc_provider_qp_check_cqs(struct mrc_provider_qp *qp)
+{
+    if (!qp)
+        return -EINVAL;
+    pthread_mutex_lock(&qp->mutex);
+    int result = check_cqs_locked(qp);
+    pthread_mutex_unlock(&qp->mutex);
+    return result;
+}
+
 int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_state expected,
                                enum mrc_provider_qp_state next)
 {
@@ -217,7 +253,14 @@ int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_
     int result = 0;
     if (qp->state != expected) {
         result = -EAGAIN;
-    } else if (next == MRC_PROVIDER_QP_RESET && (qp->send.count || qp->recv.count)) {
+        goto unlock;
+    }
+    if (next >= MRC_PROVIDER_QP_INIT && next <= MRC_PROVIDER_QP_RTS) {
+        result = check_cqs_locked(qp);
+        if (result)
+            goto unlock;
+    }
+    if (next == MRC_PROVIDER_QP_RESET && (qp->send.count || qp->recv.count)) {
         result = -EBUSY;
     } else if (next == expected || next == MRC_PROVIDER_QP_RESET ||
                (expected < MRC_PROVIDER_QP_RTS && next == expected + 1)) {
@@ -227,12 +270,16 @@ int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_
     } else {
         result = -EINVAL;
     }
+unlock:
     pthread_mutex_unlock(&qp->mutex);
     return result;
 }
 
 static int reserve_send(struct mrc_provider_qp *qp, struct work_entry **work)
 {
+    int result = check_cqs_locked(qp);
+    if (result)
+        return result;
     if (qp->state != MRC_PROVIDER_QP_RTS)
         return -EINVAL;
     if (qp->next_sequence == UINT64_MAX)
@@ -422,7 +469,12 @@ int mrc_provider_qp_post_recv(struct mrc_provider_qp *qp, uint64_t wr_id)
     if (!qp)
         return -EINVAL;
     pthread_mutex_lock(&qp->mutex);
-    int result = -EINVAL;
+    int result = check_cqs_locked(qp);
+    if (result) {
+        pthread_mutex_unlock(&qp->mutex);
+        return result;
+    }
+    result = -EINVAL;
     if (qp->state >= MRC_PROVIDER_QP_INIT && qp->state <= MRC_PROVIDER_QP_RTS) {
         struct work_entry *work = next_entry(&qp->recv);
         if (work) {
@@ -460,7 +512,7 @@ int mrc_provider_qp_complete_send(struct mrc_provider_qp *qp, uint64_t sequence)
             }
         }
         if (result)
-            flush_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+            fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
     }
     pthread_mutex_unlock(&qp->mutex);
     return result;
@@ -486,7 +538,7 @@ int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
         };
         result = mrc_provider_cq_push(qp->recv.cq, &wc, solicited);
         if (result)
-            flush_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+            fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
         else
             *wr_id = work->id;
     }
@@ -507,7 +559,7 @@ int mrc_provider_qp_fail(struct mrc_provider_qp *qp, uint64_t sequence,
     } else if (sequence && (sequence < qp->first_sequence || sequence >= qp->next_sequence)) {
         result = -ENOENT;
     } else {
-        result = flush_qp(qp, sequence, status);
+        result = fail_qp(qp, sequence, status);
     }
     pthread_mutex_unlock(&qp->mutex);
     return result;

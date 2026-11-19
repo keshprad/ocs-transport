@@ -15,6 +15,21 @@ enum {
 };
 
 struct mrc_abi_route;
+struct mrc_abi_async_notice;
+
+struct mrc_abi_async_source {
+    struct mrc_context *context;
+    struct mrc_abi_async_notice *reserved;
+    size_t unacked;
+};
+
+struct mrc_abi_async_channel {
+    pthread_mutex_t mutex;
+    pthread_cond_t acked;
+    struct mrc_abi_async_notice *head;
+    struct mrc_abi_async_notice *tail;
+    int fd;
+};
 
 struct mrc_abi_pd {
     struct mrc_abi_pd *next;
@@ -28,6 +43,7 @@ struct mrc_context {
     pthread_mutex_t mutex;
     size_t children;
     struct mrc_abi_pd *pds;
+    struct mrc_abi_async_channel async;
 };
 
 struct mrc_comp_channel {
@@ -40,6 +56,7 @@ struct mrc_cq {
     struct mrc_provider_cq *provider;
     void *application_context;
     int capacity;
+    struct mrc_abi_async_source async;
 };
 
 struct mrc_qp {
@@ -55,7 +72,16 @@ struct mrc_qp {
     bool requester;
     bool responder;
     uint32_t qpn;
+    struct mrc_abi_async_source async;
 };
+
+int mrc_abi_retain_context(struct mrc_context *context);
+void mrc_abi_release_context(struct mrc_context *context);
+int mrc_abi_async_open(struct mrc_abi_async_channel *channel);
+void mrc_abi_async_close(struct mrc_abi_async_channel *channel);
+int mrc_abi_async_prepare(struct mrc_abi_async_source *source);
+void mrc_abi_async_publish(struct mrc_abi_async_source *source, const struct mrc_async_event *event);
+void mrc_abi_async_finish(struct mrc_abi_async_source *source);
 
 /* Caller holds the QP mutex. */
 void mrc_abi_release_route(struct mrc_qp *qp);

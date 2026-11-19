@@ -128,6 +128,13 @@ static struct mrc_qp_attr default_qp_attrs(void)
     };
 }
 
+static void qp_error_event(void *argument)
+{
+    struct mrc_qp *qp = argument;
+    const struct mrc_async_event event = { .event_type = IBV_EVENT_QP_FATAL, .element.qp = qp };
+    mrc_abi_async_publish(&qp->async, &event);
+}
+
 MRC_PUBLIC struct mrc_qp *mrc_create_qp(struct mrc_context *context, struct mrc_qp_init_attr *init)
 {
     int error = validate_init(context, init);
@@ -141,7 +148,10 @@ MRC_PUBLIC struct mrc_qp *mrc_create_qp(struct mrc_context *context, struct mrc_
     error = pthread_mutex_init(&qp->mutex, NULL);
     if (error)
         goto free_qp;
-    error = allocate_qpn(&qp->qpn);
+    qp->async.context = context;
+    error = mrc_abi_async_prepare(&qp->async);
+    if (!error)
+        error = allocate_qpn(&qp->qpn);
     if (error)
         goto destroy_mutex;
 
@@ -161,6 +171,7 @@ MRC_PUBLIC struct mrc_qp *mrc_create_qp(struct mrc_context *context, struct mrc_
             .send_cq = init->send_cq ? init->send_cq->provider : NULL,
             .recv_cq = init->recv_cq ? init->recv_cq->provider : NULL,
             .sq_sig_all = init->sq_sig_all != 0,
+            .on_error = qp_error_event, .error_context = qp,
         };
         error = -mrc_provider_qp_create(&config, &qp->provider);
         if (!error) {
@@ -182,6 +193,7 @@ MRC_PUBLIC struct mrc_qp *mrc_create_qp(struct mrc_context *context, struct mrc_
     return qp;
 
 destroy_mutex:
+    mrc_abi_async_finish(&qp->async);
     pthread_mutex_destroy(&qp->mutex);
 free_qp:
     free(qp);
@@ -202,6 +214,7 @@ MRC_PUBLIC int mrc_destroy_qp(struct mrc_qp *qp)
     pthread_mutex_unlock(&qp->mutex);
     if (error)
         return error;
+    mrc_abi_async_finish(&qp->async);
     pthread_mutex_lock(&context->mutex);
     struct mrc_abi_pd **slot = find_pd(context, qp->pd->verbs);
     (*slot)->users--;
@@ -398,6 +411,11 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
         }
     }
 
+    if (provider.state == MRC_PROVIDER_QP_RESET && state == MRC_PROVIDER_QP_INIT) {
+        error = mrc_abi_async_prepare(&qp->async);
+        if (error)
+            goto unlock;
+    }
     if (state == MRC_PROVIDER_QP_RESET || state == MRC_PROVIDER_QP_ERROR)
         mrc_abi_release_route(qp);
     error = state == MRC_PROVIDER_QP_RESET ? -mrc_provider_qp_reset(qp->provider)
