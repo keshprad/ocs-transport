@@ -83,6 +83,24 @@ MRC_PUBLIC int mrc_destroy_context(struct mrc_context *context)
     return 0;
 }
 
+int mrc_abi_bind_mr(const struct mrc_context *context, struct mrc_provider_pd *provider,
+                     const struct ibv_pd *verbs_pd, const struct ibv_mr *mr,
+                     uint64_t iova, unsigned int access)
+{
+    const unsigned int supported = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    if (!context || !provider || !verbs_pd || !mr || (access & ~supported) ||
+        verbs_pd->context != context->verbs || mr->context != context->verbs || mr->pd != verbs_pd)
+        return -EINVAL;
+    bool remote_write = (access & IBV_ACCESS_REMOTE_WRITE) != 0;
+    unsigned int flags = (access & IBV_ACCESS_LOCAL_WRITE) ? MRC_PROVIDER_MR_LOCAL_WRITE : 0;
+    if (remote_write)
+        flags |= MRC_PROVIDER_MR_REMOTE_WRITE;
+    const struct mrc_provider_mr_keys keys = {
+        .lkey = mr->lkey, .rkey = remote_write ? mr->rkey : 0,
+    };
+    return mrc_provider_mr_bind(provider, mr->addr, mr->length, iova, flags, &keys);
+}
+
 MRC_PUBLIC int mrc_create_comp_channel(struct mrc_context *context,
                                        struct mrc_comp_channel **channel)
 {

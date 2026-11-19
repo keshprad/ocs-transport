@@ -117,6 +117,65 @@ static void test_resources_and_completions(struct ibv_context *verbs)
     assert(mrc_destroy_context(context) == 0);
 }
 
+static void test_verbs_memory_binding(struct ibv_context *verbs)
+{
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    struct ibv_pd *verbs_pd = ibv_alloc_pd(verbs);
+    struct ibv_pd *other_pd = ibv_alloc_pd(verbs);
+    assert(context && verbs_pd && other_pd);
+    unsigned char memory[64] = "external verbs registration";
+    struct ibv_mr *mr = ibv_reg_mr(verbs_pd, memory, sizeof(memory),
+                                  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    assert(mr);
+    const uint64_t iova = (uintptr_t)memory;
+    struct mrc_provider_pd *provider;
+    assert(mrc_provider_pd_create(2, &provider) == 0);
+    assert(mrc_abi_bind_mr(context, provider, other_pd, mr, iova, 0) == -EINVAL);
+    assert(mrc_abi_bind_mr(context, provider, verbs_pd, mr, iova, IBV_ACCESS_REMOTE_WRITE) == -EINVAL);
+    assert(mrc_abi_bind_mr(context, provider, verbs_pd, mr, iova,
+                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE) == 0);
+
+    struct mrc_cq *send = mrc_create_cq(context, 2, NULL, NULL, 0);
+    assert(send);
+    const struct mrc_provider_qp_config config = {
+        .pd = provider, .send_cq = send->provider, .qpn = 0x202, .send_capacity = 2,
+    };
+    struct mrc_provider_qp *qp;
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    transition_to_rts(qp);
+    const struct mrc_provider_write write = {
+        .wr_id = 831, .local_iova = iova + 4, .lkey = mr->lkey, .length = 8,
+        .remote_address = 0x1000, .rkey = 0x24601, .signaled = true,
+    };
+    uint64_t sequence;
+    assert(mrc_provider_qp_post_write(qp, &write, &sequence) == 0);
+    struct mrc_provider_write_view view;
+    assert(mrc_provider_qp_get_write(qp, sequence, &view) == 0);
+    assert(view.data == memory + 4 && view.length == 8 && view.rkey == 0x24601);
+
+    const struct mrc_provider_mr_access access = {
+        .iova = iova + 32, .key = mr->rkey, .length = 4, .operation = MRC_PROVIDER_MR_WRITE_REMOTE,
+    };
+    struct mrc_provider_mr_lease destination = {0};
+    assert(mrc_provider_mr_acquire(provider, &access, &destination) == 0);
+    assert(destination.address == memory + 32);
+    assert(mrc_provider_mr_deregister(provider, mr->lkey) == -EBUSY);
+    assert(mrc_provider_qp_complete_send(qp, sequence) == 0);
+    struct ibv_wc wc;
+    assert(mrc_poll_cq(send, 1, &wc) == 1);
+    assert(wc.status == IBV_WC_SUCCESS && wc.wr_id == 831 && wc.byte_len == 8);
+    assert(mrc_provider_mr_deregister(provider, mr->lkey) == -EBUSY);
+    assert(mrc_provider_mr_release(&destination) == 0);
+    assert(mrc_provider_mr_deregister(provider, mr->lkey) == 0);
+    assert(ibv_dereg_mr(mr) == 0);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_pd_destroy(provider) == 0);
+    assert(mrc_destroy_cq(send) == 0);
+    assert(ibv_dealloc_pd(other_pd) == 0);
+    assert(ibv_dealloc_pd(verbs_pd) == 0);
+    assert(mrc_destroy_context(context) == 0);
+}
+
 int main(void)
 {
     struct ibv_device **devices = ibv_get_device_list(NULL);
@@ -133,6 +192,7 @@ int main(void)
         return EXIT_FAILURE;
     }
     test_resources_and_completions(verbs);
+    test_verbs_memory_binding(verbs);
     assert(ibv_close_device(verbs) == 0);
     puts("OCP MRC context and completion ABI tests passed");
     return EXIT_SUCCESS;

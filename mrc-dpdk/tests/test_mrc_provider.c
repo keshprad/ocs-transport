@@ -145,6 +145,42 @@ static void test_bounds_and_permissions(void)
     assert(mrc_provider_pd_destroy(pd) == 0);
 }
 
+static void test_external_keys(void)
+{
+    unsigned char buffer[32];
+    struct mrc_provider_pd *pd;
+    assert(mrc_provider_pd_create(4, &pd) == 0);
+
+    struct mrc_provider_mr_keys generated;
+    assert(mrc_provider_mr_register(pd, buffer, 8, 0xab000, 0, &generated) == 0);
+    struct mrc_provider_mr_keys bound = { .lkey = generated.lkey + 1, .rkey = 0xa0123 };
+    assert(mrc_provider_mr_bind(pd, buffer + 8, 8, 0xac000, 0, &bound) == -EINVAL);
+    assert(mrc_provider_mr_bind(pd, buffer + 8, 8, 0xac000, READ_WRITE, &bound) == 0);
+    struct mrc_provider_mr_keys duplicate = bound;
+    duplicate.rkey++;
+    assert(mrc_provider_mr_bind(pd, buffer + 16, 8, 0xad000, READ_WRITE, &duplicate) == -EEXIST);
+    duplicate = bound;
+    duplicate.lkey++;
+    assert(mrc_provider_mr_bind(pd, buffer + 16, 8, 0xad000, READ_WRITE, &duplicate) == -EEXIST);
+
+    struct mrc_provider_mr_keys next;
+    assert(mrc_provider_mr_register(pd, buffer + 16, 8, 0xad000, 0, &next) == 0);
+    assert(next.lkey != bound.lkey);
+    struct mrc_provider_mr_access access = {
+        .iova = 0xac004, .length = 4, .key = bound.rkey, .operation = MRC_PROVIDER_MR_WRITE_REMOTE,
+    };
+    struct mrc_provider_mr_lease lease = {0};
+    assert(mrc_provider_mr_acquire(pd, &access, &lease) == 0);
+    assert(lease.address == buffer + 12 && lease.lkey == bound.lkey);
+    assert(mrc_provider_mr_deregister(pd, bound.lkey) == -EBUSY);
+    assert(mrc_provider_mr_release(&lease) == 0);
+    assert(mrc_provider_mr_deregister(pd, bound.lkey) == 0);
+    assert(mrc_provider_mr_acquire(pd, &access, &lease) == -EACCES);
+    assert(mrc_provider_mr_deregister(pd, generated.lkey) == 0);
+    assert(mrc_provider_mr_deregister(pd, next.lkey) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
 static struct mrc_provider_wc completion(uint64_t id)
 {
     return (struct mrc_provider_wc){
@@ -512,6 +548,7 @@ int main(void)
 {
     test_pds_and_keys();
     test_bounds_and_permissions();
+    test_external_keys();
     test_cq_fifo_and_notifications();
     test_cq_overflow();
     test_qp_lifecycle_and_ordered_flush();

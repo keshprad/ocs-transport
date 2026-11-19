@@ -25,4 +25,10 @@ struct mrc_cq {
     int capacity;
 };
 
+/* Import a caller-owned verbs registration with the permissions enabled for
+ * MRC. Keep the verbs MR live until the provider lkey is deregistered. */
+int mrc_abi_bind_mr(const struct mrc_context *context, struct mrc_provider_pd *provider,
+                     const struct ibv_pd *verbs_pd, const struct ibv_mr *mr,
+                     uint64_t iova, unsigned int access);
+
 #endif

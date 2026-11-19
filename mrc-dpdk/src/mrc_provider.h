@@ -41,6 +41,12 @@ struct mrc_provider_mr_keys {
 int mrc_provider_mr_register(struct mrc_provider_pd *pd, void *base, size_t length,
                              uint64_t iova, unsigned int flags,
                              struct mrc_provider_mr_keys *keys);
+/* Bind externally registered memory and preserve its keys. The owner keeps
+ * that registration live until deregister succeeds here. A nonzero rkey
+ * requires remote-write permission and must be unique in the software PD. */
+int mrc_provider_mr_bind(struct mrc_provider_pd *pd, void *base, size_t length,
+                         uint64_t iova, unsigned int flags,
+                         const struct mrc_provider_mr_keys *keys);
 int mrc_provider_mr_deregister(struct mrc_provider_pd *pd, uint32_t lkey);
 
 enum mrc_provider_mr_operation {

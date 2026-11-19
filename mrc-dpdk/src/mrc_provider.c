@@ -141,38 +141,6 @@ int mrc_provider_pd_destroy(struct mrc_provider_pd *pd)
     return 0;
 }
 
-int mrc_provider_mr_register(struct mrc_provider_pd *pd, void *base, size_t length,
-                             uint64_t iova, unsigned int flags,
-                             struct mrc_provider_mr_keys *keys)
-{
-    unsigned int supported = MRC_PROVIDER_MR_LOCAL_WRITE | MRC_PROVIDER_MR_REMOTE_WRITE;
-    bool remote_write = (flags & MRC_PROVIDER_MR_REMOTE_WRITE) != 0;
-    if (!pd || !base || !length || !keys || (flags & ~supported) ||
-        (remote_write && !(flags & MRC_PROVIDER_MR_LOCAL_WRITE)))
-        return -EINVAL;
-    if (length > UINTPTR_MAX - (uintptr_t)base || length > UINT64_MAX - iova)
-        return -EOVERFLOW;
-
-    pthread_mutex_lock(&pd->mutex);
-    int result = -ENOSPC;
-    for (size_t i = 0; i < pd->capacity; i++) {
-        struct region *slot = &pd->regions[i];
-        if (slot->keys.lkey)
-            continue;
-        struct mrc_provider_mr_keys generated;
-        result = reserve_keys(&generated, remote_write);
-        if (!result) {
-            *slot = (struct region){
-                .base = base, .length = length, .iova = iova, .flags = flags, .keys = generated,
-            };
-            *keys = generated;
-        }
-        break;
-    }
-    pthread_mutex_unlock(&pd->mutex);
-    return result;
-}
-
 static struct region *find_region(struct mrc_provider_pd *pd, uint32_t key, bool remote)
 {
     for (size_t i = 0; i < pd->capacity; i++) {
@@ -181,6 +149,79 @@ static struct region *find_region(struct mrc_provider_pd *pd, uint32_t key, bool
             return slot;
     }
     return NULL;
+}
+
+static int validate_registration(struct mrc_provider_pd *pd, void *base, size_t length,
+                                 uint64_t iova, unsigned int flags)
+{
+    unsigned int supported = MRC_PROVIDER_MR_LOCAL_WRITE | MRC_PROVIDER_MR_REMOTE_WRITE;
+    if (!pd || !base || !length || (flags & ~supported) ||
+        ((flags & MRC_PROVIDER_MR_REMOTE_WRITE) && !(flags & MRC_PROVIDER_MR_LOCAL_WRITE)))
+        return -EINVAL;
+    return length > UINTPTR_MAX - (uintptr_t)base || length > UINT64_MAX - iova
+           ? -EOVERFLOW : 0;
+}
+
+static bool keys_in_use(struct mrc_provider_pd *pd, const struct mrc_provider_mr_keys *keys)
+{
+    return find_region(pd, keys->lkey, false) ||
+           (keys->rkey && find_region(pd, keys->rkey, true));
+}
+
+static int insert_registration(struct mrc_provider_pd *pd, struct region *region,
+                               const struct mrc_provider_mr_keys *external)
+{
+    pthread_mutex_lock(&pd->mutex);
+    int result = -ENOSPC;
+    if (external && keys_in_use(pd, external)) {
+        result = -EEXIST;
+    } else {
+        struct region *slot = find_region(pd, 0, false);
+        if (slot) {
+            if (external) {
+                region->keys = *external;
+                result = 0;
+            } else {
+                bool remote_write = (region->flags & MRC_PROVIDER_MR_REMOTE_WRITE) != 0;
+                do {
+                    result = reserve_keys(&region->keys, remote_write);
+                } while (!result && keys_in_use(pd, &region->keys));
+            }
+            if (!result)
+                *slot = *region;
+        }
+    }
+    pthread_mutex_unlock(&pd->mutex);
+    return result;
+}
+
+int mrc_provider_mr_register(struct mrc_provider_pd *pd, void *base, size_t length,
+                             uint64_t iova, unsigned int flags,
+                             struct mrc_provider_mr_keys *keys)
+{
+    if (!keys)
+        return -EINVAL;
+    int result = validate_registration(pd, base, length, iova, flags);
+    if (result)
+        return result;
+    struct region region = { .base = base, .length = length, .iova = iova, .flags = flags };
+    result = insert_registration(pd, &region, NULL);
+    if (!result)
+        *keys = region.keys;
+    return result;
+}
+
+int mrc_provider_mr_bind(struct mrc_provider_pd *pd, void *base, size_t length,
+                         uint64_t iova, unsigned int flags,
+                         const struct mrc_provider_mr_keys *keys)
+{
+    if (!keys || !keys->lkey || (!!keys->rkey != !!(flags & MRC_PROVIDER_MR_REMOTE_WRITE)))
+        return -EINVAL;
+    int result = validate_registration(pd, base, length, iova, flags);
+    if (result)
+        return result;
+    struct region region = { .base = base, .length = length, .iova = iova, .flags = flags };
+    return insert_registration(pd, &region, keys);
 }
 
 int mrc_provider_mr_deregister(struct mrc_provider_pd *pd, uint32_t lkey)
