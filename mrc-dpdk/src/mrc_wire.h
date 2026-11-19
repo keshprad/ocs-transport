@@ -287,6 +287,11 @@ int mrc_wire_wrap_srv6(uint8_t *frame, size_t capacity, size_t inner_frame_len,
 int mrc_wire_decode_srv6(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet,
                          struct mrc_wire_srv6 *routing);
 
+/* A complete, checksum-verified frame with an unsupported BTH opcode.
+ * Only the IP and BTH fields of header are populated. */
+int mrc_wire_decode_unsupported_opcode(const uint8_t *frame, size_t length,
+                                        struct mrc_wire_packet *header, struct mrc_wire_srv6 *routing);
+
 /*
  * Validate the envelope and iCRC of a complete datagram without interpreting
  * the opcode. Accepts matching IP/UDP lengths only. A responder can use this

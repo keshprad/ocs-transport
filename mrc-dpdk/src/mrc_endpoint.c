@@ -1188,18 +1188,11 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
         return receive_write(transfer, receiver, counts, path, &packet);
     }
 
-    if (result == -EPROTONOSUPPORT) {
-        packet.ip_version = transfer->ip_version;
-        if (packet.ip_version == MRC_WIRE_IP6)
-            result = mrc_wire_decode_ipv6_header(frame, length, &packet.ipv6, &packet.bth);
-        else
-            result = mrc_wire_decode_header(frame, length, &packet.ipv4, &packet.bth);
-        if (!result && mrc_endpoint_peer_matches(transfer, path, &packet) &&
-            !mrc_wire_is_write(packet.bth.opcode) && packet.bth.opcode < MRC_TRANSPORT_ACK) {
-            rx->matched++;
-            return reject_write(transfer, receiver, counts, path, &packet,
-                                 MRC_WR_INVALID, packet.bth.psn);
-        }
+    if (result == -EPROTONOSUPPORT &&
+        !mrc_wire_decode_unsupported_opcode(frame, length, &packet, &route) &&
+        route_matches(transfer, &route) && mrc_endpoint_peer_matches(transfer, path, &packet)) {
+        rx->matched++;
+        return reject_write(transfer, receiver, counts, path, &packet, MRC_WR_INVALID, packet.bth.psn);
     }
     rx->rejected++;
     return 0;

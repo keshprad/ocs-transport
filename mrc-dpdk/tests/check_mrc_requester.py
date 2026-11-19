@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the DPDK requester against independently encoded IPv4 feedback."""
+"""Validate the DPDK requester against independent IPv4, IPv6, and SRv6 feedback."""
 
 import argparse
 import ipaddress
@@ -12,7 +12,9 @@ import time
 from pathlib import Path
 
 from memif_pair import MACS, collect, eal_args, require, start
-from mrc_wire_reference import Bth, IPv4Peer, decode_ipv4, encode_ipv4
+from mrc_wire_reference import (
+    Bth, IPPeer, decode_ipv4, decode_ipv6, encode_ipv4, encode_ipv6, unwrap_srv6, wrap_srv6,
+)
 
 
 REQUESTOR = 0x120345
@@ -24,17 +26,18 @@ ADDRESS = 0x123400000
 RKEY = 0xDECAFE
 UDP_PORT = 4971
 PDC_IDS = (REQUESTOR & 0xFFFF, RESPONDER & 0xFFFF)
-IPV4 = {
-    "tx": ipaddress.IPv4Address("192.0.2.1"),
-    "rx": ipaddress.IPv4Address("192.0.2.2"),
+ADDRESSES = {
+    "ipv4": {"tx": ipaddress.ip_address("192.0.2.1"), "rx": ipaddress.ip_address("192.0.2.2")},
+    "ipv6": {"tx": ipaddress.ip_address("2001:db8::1"), "rx": ipaddress.ip_address("2001:db8::2")},
 }
-PEERS = {role: [IPv4Peer(bytes.fromhex(mac.replace(":", "")), IPV4[role].packed)
-                for mac in macs] for role, macs in MACS.items()}
+SIDS = {"tx": ipaddress.ip_address("2001:db8:aaaa::1"), "rx": ipaddress.ip_address("2001:db8:bbbb::2")}
+MODES = ("ipv4", "ipv6", "srv6", "srv6-srh")
 WRITE_IMMEDIATES = (0xFFFFFFFF, 0x6B)
 WRITE_LENGTHS = (4111, 7)
 OPCODES = (0xC6, 0xC7, 0xC7, 0xC7, 0xC9, 0xCB)
 FIRST_WRITE_END = 4
 REJECTED_PACKET = 1
+TRIM = 0x01
 NO_PKT_BUFFER = 0x07
 RTX = 0x20
 
@@ -49,8 +52,18 @@ def payload(offset, length):
 
 
 class ReferenceResponder:
-    def __init__(self, wire):
+    def __init__(self, wire, mode, nack_reason):
         self.wire = wire
+        self.nack_reason = nack_reason
+        self.ipv6 = mode != "ipv4"
+        self.srv6 = mode in ("srv6", "srv6-srh")
+        self.srh = mode == "srv6-srh"
+        self.addresses = ADDRESSES["ipv6" if self.ipv6 else "ipv4"]
+        self.peers = {
+            role: [IPPeer(bytes.fromhex(mac.replace(":", "")), self.addresses[role].packed)
+                   for mac in macs]
+            for role, macs in MACS.items()
+        }
         self.memory = bytearray(sum(WRITE_LENGTHS))
         self.received = set()
         self.cumulative = -1
@@ -60,10 +73,21 @@ class ReferenceResponder:
         self.first_write_acked = False
         self.finished = False
 
-    def reply(self, rail, opcode, number, body, flags=0):
+    def reply(self, rail, opcode, number, body, flags=0, *, original_udp_size=None):
         qp = 2 if opcode == 0xD9 else REQUESTOR
-        frame = encode_ipv4(PEERS["rx"][rail], PEERS["tx"][rail], 0xD000 + rail,
-                            UDP_PORT, Bth(opcode, PKEY, qp, number, flags), body)
+        source, destination = self.peers["rx"][rail], self.peers["tx"][rail]
+        header = Bth(opcode, PKEY, qp, number, flags)
+        if self.ipv6:
+            frame = encode_ipv6(source, destination, 0xD000 + rail, UDP_PORT,
+                                header, body, flow_label=0x98140 + rail, traffic_class=0xC0,
+                                original_udp_size=original_udp_size)
+            if self.srv6:
+                # Routable outer fields need not carry the inner packet's EV.
+                frame = wrap_srv6(frame, SIDS["rx"].packed, SIDS["tx"].packed, srh=self.srh,
+                                  flow_label=0x2468 + rail, traffic_class=0xC0)
+        else:
+            frame = encode_ipv4(source, destination, 0xD000 + rail, UDP_PORT, header, body,
+                                original_udp_size=original_udp_size)
         self.wire.send(bytes([rail]) + frame)
 
     def sack(self, rail, packet, index=None, probe_id=None, timestamp=0):
@@ -77,7 +101,7 @@ class ReferenceResponder:
         trigger = probe_id if probe_id is not None else (index - self.cumulative) & 0xFFFF
         ooo_count = bitmap.bit_count()
         body = struct.pack("!BBHIHH", 0, 2 if probe_id is not None else 0, trigger,
-                           packet.source_port, *PDC_IDS)
+                           packet.entropy, *PDC_IDS)
         body += struct.pack("!IBBhQ", cack, 0, 0, 1, bitmap)
         wire_bytes = ((self.received_bytes + 255) // 256) & PSN_MASK
         body += struct.pack("!HHI", timestamp, ooo_count, wire_bytes)
@@ -115,10 +139,11 @@ class ReferenceResponder:
         if index == REJECTED_PACKET and not is_retry:
             require(self.rejected_rail is None, "Repeated first transmission without the RTX bit")
             self.rejected_rail = rail
-            body = struct.pack("!HBBIHHI", 0, NO_PKT_BUFFER, 0, packet.source_port,
+            body = struct.pack("!HBBIHHI", 0, self.nack_reason, 0, packet.entropy,
                                *PDC_IDS, packet.bth.psn)
             body += struct.pack("!I", 0x20000000)
-            self.reply(rail, 0xDD, packet.bth.psn, body)
+            original = packet.udp_size if self.nack_reason == TRIM else None
+            self.reply(rail, 0xDD, packet.bth.psn, body, original_udp_size=original)
             return
         if index == REJECTED_PACKET and index not in self.received:
             require(is_retry and self.rejected_rail is not None and rail != self.rejected_rail,
@@ -147,9 +172,20 @@ class ReferenceResponder:
     def receive(self, message):
         require(len(message) > 1 and message[0] < 2, "Invalid relay datagram")
         rail = message[0]
-        packet = decode_ipv4(message[1:], PEERS["tx"][rail], PEERS["rx"][rail], UDP_PORT)
+        frame = message[1:]
+        outer = None
+        if self.srv6:
+            outer = unwrap_srv6(frame, SIDS["tx"].packed, SIDS["rx"].packed, srh=self.srh)
+            frame = outer.frame
+        decode = decode_ipv6 if self.ipv6 else decode_ipv4
+        packet = decode(frame, self.peers["tx"][rail], self.peers["rx"][rail], UDP_PORT)
+        if outer:
+            require((outer.flow_label, outer.traffic_class) == (packet.flow_label, packet.traffic_class),
+                    "SRv6 envelope lost the configured flow label or traffic class")
         bth = packet.bth
-        require(bth.pkey == PKEY and packet.source_port == 0xC000 + rail,
+        expected_flow = 0xA0100 + rail if self.ipv6 else 0
+        expected_entropy = ((expected_flow & 0xFFFF) << 16) | (0xC000 + rail)
+        require(bth.pkey == PKEY and packet.entropy == expected_entropy and packet.flow_label == expected_flow,
                 "Incorrect requester partition or path entropy")
         require(bth.qp == (2 if bth.opcode == 0xD8 else RESPONDER), "Incorrect destination QP")
         if bth.opcode == 0xD8 and len(packet.body) == 16 and packet.body[1] == 0:
@@ -164,7 +200,7 @@ class ReferenceResponder:
             self.write(rail, packet)
 
 
-def run_requester(binary, relay_binary):
+def run_requester(binary, relay_binary, mode, nack_reason):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -187,13 +223,18 @@ def run_requester(binary, relay_binary):
                 time.sleep(0.01)
             wire.connect(str(relay_socket))
             command = eal_args(binary, "tx", cpus[1], directory)
-            command += ["--", "tx", "4111@0xffffffff,7@0x6b", str(IPV4["tx"]), str(IPV4["rx"]),
+            responder = ReferenceResponder(wire, mode, nack_reason)
+            command += ["--", "tx", "4111@0xffffffff,7@0x6b",
+                        str(responder.addresses["tx"]), str(responder.addresses["rx"]),
                         "0", MACS["rx"][0], "1", MACS["rx"][1], "--initial-psn", str(INITIAL_PSN),
                         "--requestor-qpn", hex(REQUESTOR), "--responder-qpn", hex(RESPONDER),
                         "--p-key", hex(PKEY), "--remote-address", hex(ADDRESS), "--remote-key", hex(RKEY),
                         "--ack-timeout", "16", "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
+            if responder.srv6:
+                command += ["--srv6-local", str(SIDS["tx"]), "--srv6-peer", str(SIDS["rx"])]
+                if responder.srh:
+                    command += ["--srv6-srh", "1"]
             requester = start(command, directory)
-            responder = ReferenceResponder(wire)
             deadline = time.monotonic() + 4
             while not responder.finished:
                 require(time.monotonic() < deadline, "Independent peer did not complete the exchange")
@@ -213,7 +254,8 @@ def run_requester(binary, relay_binary):
             require(responder.retry_rail is not None and responder.first_write_acked,
                     "Fixture did not exercise both retransmission and delayed semantic completion")
             require(counters["bytes"] == sum(WRITE_LENGTHS) and counters["packets"] == len(OPCODES) and
-                    counters["nack_received_mask"] == 1 << NO_PKT_BUFFER and
+                    counters["nack_received_mask"] == 1 << nack_reason and
+                    counters["trim_nacks"] == (nack_reason == TRIM) and
                     counters["probe_replies"] > 0 and counters["transport_acks"] == 2 and
                     counters["write_completions"] == 2,
                     f"Unexpected requester counters: {counters}")
@@ -234,9 +276,13 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser.add_argument("--binary", type=Path, default=root / "mrc_write")
     parser.add_argument("--relay", type=Path, default=root / "tests" / "mrc_memif_relay")
+    parser.add_argument("--mode", choices=MODES, action="append", help="Run only this mode")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
-    print(json.dumps(run_requester(args.binary.resolve(), args.relay.resolve())))
+    for mode in args.mode or MODES:
+        for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim")):
+            counters = run_requester(args.binary.resolve(), args.relay.resolve(), mode, reason)
+            print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
 
 
 if __name__ == "__main__":

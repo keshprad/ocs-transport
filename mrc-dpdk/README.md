@@ -45,18 +45,18 @@ probe reply.
 ### Independent wire tests
 
 With DPDK's `net_pcap` PMD available, run `python3 tests/check_mrc_pcap.py`.
-The test generates IPv4 WRITE, WRITEIMM, and probe packets in Python and
-feeds them to the DPDK receiver. It checks the receiver's packet placement
-and reads the captured replies with its own decoder. It covers selective
-and transport ACKs, the out-of-window NACK, reflected entropy and probe
-timestamps, and iCRC without using the endpoint's codec in the test peer.
+A Python codec generates IPv4, IPv6, and preserved SRv6 requests with and
+without a final SRH. The replay validates data placement, SACKs and transport
+ACKs across PSN wrap, iCRC and routing rejection, and the invalid-request
+error for an unsupported opcode. The IPv6 cases also check structured
+entropy and CE feedback. The final SRH case checks the original UDP length
+and timestamp in a TRIM NACK.
 
-With the `net_memif` PMD available, run `make tests/mrc_memif_relay` and
-run `python3 tests/check_mrc_requester.py`. The independent peer checks
-payload and WRITEIMM fields across PSN wrap. It sends a packet-buffer
-NACK and checks that the requester retries on the other rail. The peer
-withholds a transport ACK after confirming delivery by SACK and verifies
-that the next WRITEIMM waits for the receive credit to be released.
+With the `net_memif` PMD available, build `tests/mrc_memif_relay` and run
+`python3 tests/check_mrc_requester.py`. The Python responder verifies the same
+four wire modes. It injects packet-buffer and TRIM NACKs in separate runs
+and checks alternate-rail retries, payload across PSN wrap, and that a
+WRITEIMM credit stays occupied until its transport ACK.
 
 ### OCP application API
 
