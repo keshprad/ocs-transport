@@ -7,9 +7,13 @@
 #define MRC_CC_NOMINAL_HDRSIZE 40u
 #define MRC_CC_RECVD_UNIT 256u
 #define MRC_CC_RECVD_MASK UINT32_C(0x00ffffff)
+#define MRC_CC_TIMESTAMP_UNIT_NS UINT64_C(128)
 
 /* OCP MRC 1.0 §8.3.1 and §8.6. Pass the untrimmed UDP Length field. */
 uint32_t mrc_cc_nominal_size(uint16_t udp_length);
+/* OCP MRC 1.0 §7.5.5.8. Encode a service duration or adjust a wire timestamp. */
+uint16_t mrc_cc_service_timestamp(uint64_t elapsed_ns, bool report, bool timestamp_present,
+                                  bool tsr, uint16_t timestamp);
 
 struct mrc_cc_rx {
     uint32_t received_bytes;
@@ -108,6 +112,8 @@ enum mrc_cc_adjustment {
 
 struct mrc_cc_tx_sample {
     uint64_t sent_at_ns;
+    uint64_t arrived_at_ns; /* Local RX poll time. Zero uses the processing time. */
+    uint64_t service_time_ns; /* Decoded responder duration, or zero without negotiation. */
     uint32_t retransmissions;
 };
 

@@ -166,6 +166,28 @@ static uint64_t cycles_to_ns(const struct mrc_endpoint_config *transfer, uint64_
            (cycles % transfer->hz) * 1000000000 / transfer->hz;
 }
 
+static uint16_t feedback_timestamp(const struct mrc_endpoint_config *transfer, uint64_t arrival_cycles,
+                                    bool timestamp_present, bool tsr, uint16_t timestamp)
+{
+    uint64_t elapsed = transfer->report_service_time ?
+        cycles_to_ns(transfer, rte_get_timer_cycles() - arrival_cycles) : 0;
+    return mrc_cc_service_timestamp(elapsed, transfer->report_service_time, timestamp_present, tsr, timestamp);
+}
+
+static uint16_t write_feedback_timestamp(const struct mrc_endpoint_config *transfer,
+                                          const struct mrc_wire_packet *request, uint64_t arrival_cycles)
+{
+    const struct mrc_wire_write *write = &request->body.write;
+    return feedback_timestamp(transfer, arrival_cycles, request->bth.timestamp, write->tsr, write->tx_timestamp);
+}
+
+/* The requester keeps a local send time and sends neither TSETH nor a
+ * timestamp in PETH. A negotiated report is a standalone duration. */
+static uint64_t peer_service_ns(const struct mrc_endpoint_config *transfer, uint16_t timestamp)
+{
+    return transfer->peer_service_time ? (uint64_t)timestamp * MRC_CC_TIMESTAMP_UNIT_NS : 0;
+}
+
 uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path)
 {
     uint32_t port = REQUESTOR_EV_PORT + path;
@@ -451,7 +473,7 @@ static void poll_port_status(const struct mrc_endpoint_config *transfer, struct 
 
 static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                                 struct mrc_endpoint_counters *counts, unsigned int path,
-                                const struct mrc_wire_packet *packet)
+                                const struct mrc_wire_packet *packet, uint64_t arrival_cycles)
 {
     if (packet->bth.opcode == MRC_ENDPOINT_RESPONSE) {
         if (packet->body.endpoint_response.op == MRC_ENDPOINT_PORT_STATUS) {
@@ -480,7 +502,9 @@ static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, stru
                                                   (uint16_t)packet->bth.psn);
     response.bth.dqp = MRC_ENDPOINT_QPN;
     response.body.endpoint_response = (struct mrc_wire_endpoint_response){
-        .op = request->op, .tx_timestamp = request->timestamp ? request->tx_timestamp : 0,
+        .op = request->op,
+        .tx_timestamp = feedback_timestamp(transfer, arrival_cycles, request->timestamp,
+                                           request->tsr, request->tx_timestamp),
     };
     transmit(transfer, path, &response);
     return true;
@@ -634,7 +658,8 @@ static int match_probe(const struct mrc_requester *sender, const struct mrc_wire
 }
 
 static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
-                         struct mrc_endpoint_counters *counts, const struct mrc_wire_packet *packet)
+                         struct mrc_endpoint_counters *counts, const struct mrc_wire_packet *packet,
+                         uint64_t arrival_cycles)
 {
     uint64_t now_cycles = rte_get_timer_cycles();
     uint64_t now = cycles_to_ns(transfer, now_cycles);
@@ -702,6 +727,8 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
             struct outstanding_probe *probe = &sender->probes[probe_path];
             sample = (struct mrc_cc_tx_sample){
                 .sent_at_ns = cycles_to_ns(transfer, probe->sent_at),
+                .arrived_at_ns = cycles_to_ns(transfer, arrival_cycles),
+                .service_time_ns = peer_service_ns(transfer, wire->tx_timestamp),
             };
             rtt_sample = &sample;
             mrc_ev_feedback(&sender->ev, (unsigned int)probe_path, ev_mark(wire->mark),
@@ -723,6 +750,8 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
                     return -EPROTO;
                 sample = (struct mrc_cc_tx_sample){
                     .sent_at_ns = cycles_to_ns(transfer, sent->sent_at),
+                    .arrived_at_ns = cycles_to_ns(transfer, arrival_cycles),
+                    .service_time_ns = peer_service_ns(transfer, wire->tx_timestamp),
                     .retransmissions = sent->retransmissions,
                 };
                 rtt_sample = &sample;
@@ -777,6 +806,8 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
                 packet->bth.retransmit == (state->retransmissions != 0)) {
                 struct mrc_cc_tx_sample sample = {
                     .sent_at_ns = cycles_to_ns(transfer, state->sent_at),
+                    .arrived_at_ns = cycles_to_ns(transfer, arrival_cycles),
+                    .service_time_ns = peer_service_ns(transfer, nack->tx_timestamp),
                     .retransmissions = state->retransmissions,
                 };
                 bool trimmed = nack->reason == MRC_NACK_TRIMMED ||
@@ -805,11 +836,16 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
 }
 
 static uint16_t receive_burst(const struct mrc_endpoint_config *config, unsigned int path,
-                               struct rte_mbuf **packets)
+                               struct mrc_endpoint_rx_packet *packets)
 {
     if (config->receive)
         return config->receive(config->receive_context, path, packets, BURST);
-    return rte_eth_rx_burst(config->paths[path].port, 0, packets, BURST);
+    struct rte_mbuf *mbufs[BURST];
+    uint16_t count = rte_eth_rx_burst(config->paths[path].port, 0, mbufs, BURST);
+    uint64_t arrival_cycles = count ? rte_get_timer_cycles() : 0;
+    for (uint16_t i = 0; i < count; i++)
+        packets[i] = (struct mrc_endpoint_rx_packet){ .mbuf = mbufs[i], .arrival_cycles = arrival_cycles };
+    return count;
 }
 
 static int receive_control(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
@@ -817,15 +853,16 @@ static int receive_control(const struct mrc_endpoint_config *transfer, struct mr
 {
     int result = 0;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        struct rte_mbuf *packets[BURST];
+        struct mrc_endpoint_rx_packet packets[BURST];
         uint16_t n = receive_burst(transfer, path, packets);
         for (uint16_t i = 0; i < n; i++) {
+            const struct mrc_endpoint_rx_packet *received = &packets[i];
             uint8_t scratch[FRAME_CAPACITY];
             struct mrc_wire_packet packet;
-            if (!result && decode(transfer, path, packets[i], scratch, &packet, &counts->rx[path]) &&
-                !receive_endpoint_op(transfer, sender->node, counts, path, &packet))
-                result = apply_control(transfer, sender, counts, &packet);
-            rte_pktmbuf_free(packets[i]);
+            if (!result && decode(transfer, path, received->mbuf, scratch, &packet, &counts->rx[path]) &&
+                !receive_endpoint_op(transfer, sender->node, counts, path, &packet, received->arrival_cycles))
+                result = apply_control(transfer, sender, counts, &packet, received->arrival_cycles);
+            rte_pktmbuf_free(received->mbuf);
         }
     }
     return result;
@@ -967,7 +1004,7 @@ static void send_ack(const struct mrc_endpoint_config *transfer, struct mrc_endp
 
 static void send_sack(const struct mrc_endpoint_config *transfer, struct mrc_responder *receiver,
                       struct mrc_endpoint_counters *counts, unsigned int path,
-                      const struct mrc_wire_packet *request, bool probe)
+                      const struct mrc_wire_packet *request, bool probe, uint64_t arrival_cycles)
 {
     struct mrc_sack state;
     if (probe)
@@ -991,10 +1028,11 @@ static void send_sack(const struct mrc_endpoint_config *transfer, struct mrc_res
         .rcvd_bytes = mrc_cc_rx_wire_count(&receiver->cc),
         .rcv_cwnd_pen = receiver->flow.penalty, .restore_cwnd = receiver->flow.restore,
     };
-    if (probe && request->body.probe.timestamp)
-        packet.body.sack.tx_timestamp = request->body.probe.tx_timestamp;
-    else if (!probe && request->bth.timestamp)
-        packet.body.sack.tx_timestamp = request->body.write.tx_timestamp;
+    const struct mrc_wire_probe *probe_request = &request->body.probe;
+    packet.body.sack.tx_timestamp = probe ?
+        feedback_timestamp(transfer, arrival_cycles, probe_request->timestamp,
+                           probe_request->tsr, probe_request->tx_timestamp) :
+        write_feedback_timestamp(transfer, request, arrival_cycles);
     if (transmit(transfer, path, &packet)) {
         counts->sacks++;
         mrc_rx_sack_sent(&receiver->qp, &state);
@@ -1045,7 +1083,7 @@ static enum mrc_wr_result advance_writes(struct mrc_responder *receiver)
 static int reject_write(const struct mrc_endpoint_config *transfer, const struct mrc_responder *receiver,
                          struct mrc_endpoint_counters *counts, unsigned int path,
                          const struct mrc_wire_packet *packet, enum mrc_wr_result result,
-                         uint32_t ack_psn)
+                         uint32_t ack_psn, uint64_t arrival_cycles)
 {
     uint8_t reason;
     switch (result) {
@@ -1066,19 +1104,19 @@ static int reject_write(const struct mrc_endpoint_config *transfer, const struct
         return -EPROTO;
     }
     send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet), reason,
-              0, packet->body.write.tx_timestamp);
+              0, write_feedback_timestamp(transfer, packet, arrival_cycles));
     return result == MRC_WR_QP_ERROR ? -EPROTO : 0;
 }
 
 static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_responder *receiver,
                          struct mrc_endpoint_counters *counts, unsigned int path,
-                         const struct mrc_wire_packet *packet)
+                         const struct mrc_wire_packet *packet, uint64_t arrival_cycles)
 {
     if (packet->bth.opcode == MRC_RELIABILITY_PROBE) {
         if (packet->body.probe.spdcid == (uint16_t)transfer->requestor_qpn &&
             packet->body.probe.dpdcid == (uint16_t)transfer->responder_qpn) {
             counts->probe_requests++;
-            send_sack(transfer, receiver, counts, path, packet, true);
+            send_sack(transfer, receiver, counts, path, packet, true, arrival_cycles);
         }
         return 0;
     }
@@ -1090,12 +1128,12 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, psn);
     if (disposition == MRC_RX_OUTSIDE_WINDOW) {
         send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
-                  MRC_NACK_PSN_OOR_WINDOW, 0, write->tx_timestamp);
+                  MRC_NACK_PSN_OOR_WINDOW, 0, write_feedback_timestamp(transfer, packet, arrival_cycles));
         return 0;
     }
     if (disposition == MRC_RX_DUPLICATE) {
         counts->duplicates++;
-        send_sack(transfer, receiver, counts, path, packet, false);
+        send_sack(transfer, receiver, counts, path, packet, false, arrival_cycles);
         send_ack(transfer, counts, path, receiver->qp.cack_psn, ACK_SYNDROME,
                  mrc_wr_ack_msn(&receiver->wr));
         return 0;
@@ -1104,19 +1142,19 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     if (receiver->qp.ooo_count >= transfer->rx_ooo_capacity &&
         psn != mrc_psn_add(receiver->qp.cack_psn, 1)) {
         send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
-                  MRC_NACK_NO_BITMAP, 0, write->tx_timestamp);
+                  MRC_NACK_NO_BITMAP, 0, write_feedback_timestamp(transfer, packet, arrival_cycles));
         return 0;
     }
 
     uint32_t index = (uint32_t)mrc_psn_delta(psn, transfer->initial_psn);
     if (transfer->work && (index >= transfer->packets ||
         write->dma_len != transfer->work[request_index(transfer, index)].length))
-        return reject_write(transfer, receiver, counts, path, packet, MRC_WR_INVALID, psn);
+        return reject_write(transfer, receiver, counts, path, packet, MRC_WR_INVALID, psn, arrival_cycles);
 
     enum mrc_wr_result result = mrc_wr_receive(&receiver->wr, psn, packet->bth.opcode, write,
                                                packet->bth.solicited);
     if (result != MRC_WR_OK)
-        return reject_write(transfer, receiver, counts, path, packet, result, psn);
+        return reject_write(transfer, receiver, counts, path, packet, result, psn, arrival_cycles);
 
     uint32_t previous_cack = receiver->qp.cack_psn;
     int32_t distance = mrc_psn_delta(receiver->qp.max_rcv_psn, psn);
@@ -1129,7 +1167,7 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     bool sack_due;
     if (mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags,
                       SACK_THRESHOLD, &sack_due) != MRC_RX_NEW)
-        return reject_write(transfer, receiver, counts, path, packet, MRC_WR_QP_ERROR, psn);
+        return reject_write(transfer, receiver, counts, path, packet, MRC_WR_QP_ERROR, psn, arrival_cycles);
     uint32_t nominal = nominal_size(packet->bth.opcode, write->data_len, packet->bth.timestamp);
     mrc_cc_rx_record(&receiver->cc, nominal, true, false);
     receiver->unique_packets++;
@@ -1142,11 +1180,11 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     bool complete = transfer->packets && receiver->unique_packets == transfer->packets;
     result = advance_writes(receiver);
     if (result != MRC_WR_OK)
-        return reject_write(transfer, receiver, counts, path, packet, result, receiver->qp.cack_psn);
+        return reject_write(transfer, receiver, counts, path, packet, result, receiver->qp.cack_psn, arrival_cycles);
 
     uint32_t msn = mrc_wr_ack_msn(&receiver->wr);
     if (sack_due || complete)
-        send_sack(transfer, receiver, counts, path, packet, false);
+        send_sack(transfer, receiver, counts, path, packet, false, arrival_cycles);
     if (previous_cack != receiver->qp.cack_psn && (sack_due || complete))
         send_ack(transfer, counts, path, receiver->qp.cack_psn, ACK_SYNDROME, msn);
     return 0;
@@ -1154,12 +1192,13 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
 
 static void receive_trimmed(const struct mrc_endpoint_config *transfer, const struct mrc_responder *receiver,
                             struct mrc_endpoint_counters *counts, unsigned int path,
-                            const struct mrc_wire_trimmed *trimmed, uint32_t entropy)
+                            const struct mrc_wire_trimmed *trimmed, uint32_t entropy, uint64_t arrival_cycles)
 {
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, trimmed->bth.psn);
     if (disposition == MRC_RX_OUTSIDE_WINDOW) {
         send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_PSN_OOR_WINDOW,
-                  0, trimmed->tx_timestamp);
+                  0, feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
+                                        trimmed->tsr, trimmed->tx_timestamp));
         return;
     }
     if (disposition == MRC_RX_DUPLICATE || !mrc_cc_nominal_size(trimmed->original_udp_len))
@@ -1168,19 +1207,21 @@ static void receive_trimmed(const struct mrc_endpoint_config *transfer, const st
     counts->trimmed++;
     if (transfer->trim_nack_enabled && send_nack(transfer, counts, path, &trimmed->bth, entropy,
                                                MRC_NACK_TRIMMED, trimmed->original_udp_len,
-                                               trimmed->tx_timestamp))
+                                               feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
+                                                                  trimmed->tsr, trimmed->tx_timestamp)))
         counts->trim_nacks++;
 }
 
 static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_responder *receiver,
                          struct mrc_endpoint_counters *counts, unsigned int path,
-                         const struct rte_mbuf *mbuf, uint64_t *last_frame)
+                         const struct mrc_endpoint_rx_packet *received)
 {
+    uint64_t arrival_cycles = received->arrival_cycles;
     struct mrc_endpoint_rx_counters *rx = &counts->rx[path];
     rx->frames++;
     uint8_t scratch[FRAME_CAPACITY];
     size_t length;
-    const uint8_t *frame = read_frame(mbuf, scratch, &length);
+    const uint8_t *frame = read_frame(received->mbuf, scratch, &length);
     if (!frame) {
         rx->rejected++;
         return 0;
@@ -1202,8 +1243,9 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
                 packet.ipv4 = trimmed.ipv4;
             if (mrc_endpoint_peer_matches(transfer, path, &packet)) {
                 rx->matched++;
-                *last_frame = rte_get_timer_cycles();
-                receive_trimmed(transfer, receiver, counts, path, &trimmed, reflect_entropy(&packet));
+                receiver->last_frame = rte_get_timer_cycles();
+                receive_trimmed(transfer, receiver, counts, path, &trimmed, reflect_entropy(&packet),
+                                arrival_cycles);
             } else {
                 rx->other_peer++;
             }
@@ -1218,17 +1260,18 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
             return 0;
         }
         rx->matched++;
-        if (receive_endpoint_op(transfer, receiver->node, counts, path, &packet))
+        if (receive_endpoint_op(transfer, receiver->node, counts, path, &packet, arrival_cycles))
             return 0;
-        *last_frame = rte_get_timer_cycles();
-        return receive_write(transfer, receiver, counts, path, &packet);
+        receiver->last_frame = rte_get_timer_cycles();
+        return receive_write(transfer, receiver, counts, path, &packet, arrival_cycles);
     }
 
     if (result == -EPROTONOSUPPORT &&
         !mrc_wire_decode_unsupported_opcode(frame, length, &packet, &route) &&
         route_matches(transfer, &route) && mrc_endpoint_peer_matches(transfer, path, &packet)) {
         rx->matched++;
-        return reject_write(transfer, receiver, counts, path, &packet, MRC_WR_INVALID, packet.bth.psn);
+        return reject_write(transfer, receiver, counts, path, &packet, MRC_WR_INVALID,
+                            packet.bth.psn, arrival_cycles);
     }
     rx->rejected++;
     return 0;
@@ -1585,13 +1628,12 @@ static int responder_step(struct mrc_responder *receiver)
     uint32_t before = receiver->unique_packets;
     int result = 0;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        struct rte_mbuf *packets[BURST];
+        struct mrc_endpoint_rx_packet packets[BURST];
         uint16_t n = receive_burst(transfer, path, packets);
         for (uint16_t i = 0; i < n; i++) {
             if (!result)
-                result = receive_frame(transfer, receiver, counts, path, packets[i],
-                                       &receiver->last_frame);
-            rte_pktmbuf_free(packets[i]);
+                result = receive_frame(transfer, receiver, counts, path, &packets[i]);
+            rte_pktmbuf_free(packets[i].mbuf);
         }
     }
     if (result)

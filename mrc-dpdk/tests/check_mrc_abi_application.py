@@ -92,6 +92,10 @@ def main():
 
     tx, rx = run_case("rx_flow_control")
     check_duplex(tx, rx, completions=8)
+    for result, unsupported_index in ((tx, 0), (rx, 1)):
+        require(result["service_time_dest_unsupported_qpn"] == result["qpns"][unsupported_index]
+                and result["service_time_data_qps"] == result["service_time_probe_qps"] == 2,
+                f"Missing directional service-time reports: {result}")
     print(json.dumps({"case": "public_qp_receiver_flow_control", "tx": tx, "rx": rx}))
 
     tx, rx = run_case("wire_error")

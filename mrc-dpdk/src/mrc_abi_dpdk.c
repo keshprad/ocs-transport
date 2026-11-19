@@ -18,7 +18,7 @@ enum {
 };
 
 struct rx_queue {
-    struct rte_mbuf *packets[RX_PENDING];
+    struct mrc_endpoint_rx_packet packets[RX_PENDING];
     uint16_t head;
     uint16_t count;
 };
@@ -54,7 +54,7 @@ static struct mrc_abi_route *routes;
 static struct mrc_abi_route *routes_by_qpn[ROUTE_BUCKETS];
 
 static uint16_t take_packets(void *context, unsigned int path,
-                              struct rte_mbuf **packets, uint16_t limit)
+                              struct mrc_endpoint_rx_packet *packets, uint16_t limit)
 {
     struct qp_direction *direction = context;
     struct rx_queue *queue = &direction->ingress[path];
@@ -69,14 +69,15 @@ static uint16_t take_packets(void *context, unsigned int path,
 static void discard_packets(struct qp_direction *direction)
 {
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        struct rte_mbuf *packets[RX_PENDING];
+        struct mrc_endpoint_rx_packet packets[RX_PENDING];
         uint16_t count = take_packets(direction, path, packets, RX_PENDING);
-        rte_pktmbuf_free_bulk(packets, count);
+        for (uint16_t i = 0; i < count; i++)
+            rte_pktmbuf_free(packets[i].mbuf);
     }
 }
 
 static bool queue_packet(struct qp_direction *direction, uint16_t port,
-                          const struct mrc_wire_packet *header, struct rte_mbuf *packet)
+                          const struct mrc_wire_packet *header, struct mrc_endpoint_rx_packet packet)
 {
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
         if (direction->config.paths[path].port != port)
@@ -98,7 +99,7 @@ static struct qp_direction *node_direction(struct mrc_abi_route *route)
 }
 
 static bool node_packet(struct mrc_abi_route *current, uint16_t port,
-                         const struct mrc_wire_packet *header, struct rte_mbuf *packet)
+                         const struct mrc_wire_packet *header, struct mrc_endpoint_rx_packet packet)
 {
     /* Prefer the QP already progressing. QPs on the same path to this peer
      * share node state, so one copy suffices and requests get one reply. */
@@ -120,13 +121,14 @@ static struct mrc_abi_route *find_route(uint32_t qpn)
     return route;
 }
 
-static bool dispatch_packet(struct mrc_abi_route *current, uint16_t port, struct rte_mbuf *packet)
+static bool dispatch_packet(struct mrc_abi_route *current, uint16_t port,
+                             struct mrc_endpoint_rx_packet packet)
 {
     uint8_t scratch[MRC_WIRE_IPV6_HEADER_LEN + MRC_BTH_LEN];
-    uint32_t length = rte_pktmbuf_pkt_len(packet);
+    uint32_t length = rte_pktmbuf_pkt_len(packet.mbuf);
     if (length > sizeof(scratch))
         length = sizeof(scratch);
-    const uint8_t *prefix = rte_pktmbuf_read(packet, 0, length, scratch);
+    const uint8_t *prefix = rte_pktmbuf_read(packet.mbuf, 0, length, scratch);
     struct mrc_wire_packet header;
     if (!prefix || mrc_wire_dispatch_header(prefix, length, &header))
         return false;
@@ -154,8 +156,10 @@ static void receive_ports(struct mrc_abi_route *route)
         uint16_t port = config->paths[path].port;
         struct rte_mbuf *packets[RX_BURST];
         uint16_t count = rte_eth_rx_burst(port, 0, packets, RX_BURST);
+        uint64_t arrival_cycles = count ? rte_get_timer_cycles() : 0;
         for (uint16_t i = 0; i < count; i++) {
-            if (!dispatch_packet(route, port, packets[i]))
+            struct mrc_endpoint_rx_packet packet = { .mbuf = packets[i], .arrival_cycles = arrival_cycles };
+            if (!dispatch_packet(route, port, packet))
                 rte_pktmbuf_free(packets[i]);
         }
     }
@@ -277,6 +281,8 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         .rx_ooo_capacity = window, .rx_staging_capacity = window, .rx_work_capacity = window,
         .dynamic_mpr = (attrs->cap & MRC_QP_CAP_DYNAMIC_MPR) != 0,
         .trim_nack_enabled = !(attrs->cap & MRC_QP_CAP_TRIM_NACK_DEST_UNSUPPORTED),
+        .report_service_time = true,
+        .peer_service_time = tx && !(attrs->cap & MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED),
         .timeout_exponent = attrs->timeout, .linear_retries = attrs->retry.linear_cnt,
         .exponential_retries = attrs->retry.exp_cnt,
         .udp_port = route->udp_port ? route->udp_port : MRC_UDP_DEFAULT_PORT,

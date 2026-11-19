@@ -49,7 +49,7 @@ MRC_PUBLIC int mrc_query_device(struct ibv_context *verbs, struct mrc_device_att
             .mrc_protocol_version = MRC_PROTOCOL_VERSION_1,
             .wimm_attr = { .max_wimm = MRC_ABI_MAX_WIMM, .max_wimm_dest = MRC_ABI_MAX_WIMM },
             .mpr_attr = { .max_mpr = MRC_ABI_MAX_MPR, .mpr_resolution = 1 },
-            .cap = MRC_DEVICE_CAP_TRIM_NACK | MRC_DEVICE_CAP_DYNAMIC_MPR,
+            .cap = MRC_DEVICE_CAP_TRIM_NACK | MRC_DEVICE_CAP_DYNAMIC_MPR | MRC_DEVICE_CAP_SVC_TIME,
         };
     }
     return 0;

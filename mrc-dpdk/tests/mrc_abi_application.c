@@ -140,7 +140,8 @@ static void read_peer_connections(const char *directory, bool client,
 
 static void configure_qp(struct mrc_qp *qp, const struct address *address,
                           const struct connection *peer, uint32_t send_psn,
-                          bool send, bool receive, uint64_t ev_profile_id, uint64_t cc_profile_id)
+                          bool send, bool receive, uint64_t ev_profile_id, uint64_t cc_profile_id,
+                          unsigned int qp_caps)
 {
     struct ibv_qp_attr verbs = {
         .qp_state = IBV_QPS_INIT,
@@ -160,9 +161,12 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
             .grh = { .dgid = peer->gid, .sgid_index = address->gid_index, .hop_limit = 64 },
         },
     };
-    attrs = (struct mrc_qp_attr){ .mpr.mpr_dest = 1, .wimm.max_wimm_dest = receive ? 1 : 0 };
+    attrs = (struct mrc_qp_attr){
+        .mpr.mpr_dest = 1, .wimm.max_wimm_dest = receive ? 1 : 0, .cap = qp_caps,
+    };
     const int rtr_verbs = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
-    assert(mrc_modify_qp(qp, &verbs, rtr_verbs, &attrs, MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST) == 0);
+    const int rtr_attrs = MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST | (qp_caps ? MRC_QP_CAP : 0);
+    assert(mrc_modify_qp(qp, &verbs, rtr_verbs, &attrs, rtr_attrs) == 0);
     if (!send)
         return;
 
@@ -449,7 +453,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     struct connection peer;
     read_peer_connections(directory, requester, &peer, 1);
     assert(local.qpn != peer.qpn);
-    configure_qp(qp, address, &peer, local.psn, requester, !requester, requester ? ev_profile_id : 0, 0);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester,
+                 requester ? ev_profile_id : 0, 0, 0);
 
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
@@ -778,10 +783,16 @@ struct probe_exchange {
     bool replied;
 };
 
+struct service_time_witness {
+    unsigned int data_qps;
+    unsigned int probe_qps;
+};
+
 struct rx_flow_witness {
     const struct connection *local;
     const struct connection *peer;
     struct probe_exchange probes[DUPLEX_RAILS][DUPLEX_QPS];
+    struct service_time_witness service_time;
     uint8_t expected[DUPLEX_QPS];
     unsigned int data_sacks;
     unsigned int first_writes;
@@ -799,6 +810,8 @@ static uint16_t observe_flow_tx(uint16_t port, uint16_t queue, struct rte_mbuf *
         struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
         const uint8_t *bth = udp.header + 8;
         uint8_t opcode = bth[0];
+        if (opcode >= WIRE_WRITE_FIRST && opcode <= 0xcb)
+            assert(!(bth[8] & 0x10));
         if (opcode != WIRE_SACK &&
             (!observed->check_startup || (opcode != WIRE_PROBE_REQUEST && opcode != WIRE_WRITE_FIRST)))
             continue;
@@ -809,6 +822,7 @@ static uint16_t observe_flow_tx(uint16_t port, uint16_t queue, struct rte_mbuf *
         unsigned int bit = 1u << index;
         if (opcode == WIRE_PROBE_REQUEST) {
             assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_PETH_LEN);
+            assert(!(extension[15] & 0x0f));
             assert(wire_be16(extension + 8) == (uint16_t)observed->local[index].qpn);
             assert(wire_be16(extension + 10) == (uint16_t)qpn);
             struct probe_exchange *probe = &observed->probes[port][index];
@@ -830,8 +844,14 @@ static uint16_t observe_flow_tx(uint16_t port, uint16_t queue, struct rte_mbuf *
                         qpn, probe ? "probe " : "", cc_state[4], observed->expected[index]);
                 abort();
             }
-            if (!probe)
+            if (probe) {
+                if (wire_be16(cc_state))
+                    observed->service_time.probe_qps |= bit;
+            } else {
                 observed->data_sacks |= bit;
+                if (wire_be16(cc_state))
+                    observed->service_time.data_qps |= bit;
+            }
         }
     }
     return count;
@@ -891,9 +911,10 @@ static void prepare_memif_links(void)
     }
 }
 
-static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
-                          const struct connection *peer, struct mrc_cq *send_cq,
-                          struct mrc_cq *recv_cq, const char *directory, bool client)
+static struct service_time_witness check_rx_flow(struct duplex_qp *qps,
+                                                  const struct connection *local,
+                                                  const struct connection *peer, struct mrc_cq *send_cq,
+                                                  struct mrc_cq *recv_cq, const char *directory, bool client)
 {
     static const uint8_t settings[RX_FLOW_ROUNDS][DUPLEX_QPS] = {
         {RX_FLOW_RESTORE | RX_FLOW_PENALTY_MASK, 0},
@@ -931,6 +952,7 @@ static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
     }
 
     assert(observed.first_writes == both_qps);
+    assert(observed.service_time.data_qps == both_qps && observed.service_time.probe_qps == both_qps);
     for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
         for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
             if (!observed.probes[port][index].replied) {
@@ -945,6 +967,7 @@ static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
         rte_free((void *)tx_callbacks[port]);
         rte_free((void *)rx_callbacks[port]);
     }
+    return observed.service_time;
 }
 
 enum qa_round {
@@ -1147,6 +1170,13 @@ static void run_duplex(bool client, const char *directory, const struct address 
 {
     const bool rx_flow = mode == DUPLEX_RX_FLOW;
     const bool quick_adapt = mode == DUPLEX_QA;
+    const unsigned int unsupported_index = client ? 0 : 1;
+    if (rx_flow) {
+        struct mrc_device_attr device;
+        int supported;
+        assert(mrc_query_device_ex(NULL, context, &device, &supported) == 0);
+        assert(supported && (device.cap & MRC_DEVICE_CAP_SVC_TIME));
+    }
     if (client && cc_profile_id)
         assert(mrc_dpdk_set_ev_store(context, profile_store) == 0);
     struct mrc_cq *send_cq = mrc_create_cq(context, 8, NULL, NULL, 0);
@@ -1184,18 +1214,25 @@ static void run_duplex(bool client, const char *directory, const struct address 
     struct mrc_dpdk_route route = path_route(pool, client);
     route.bidirectional = true;
     for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
+        const unsigned int caps = rx_flow && index == unsupported_index
+                                  ? MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED : 0;
         configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true, 0,
-                     client ? cc_profile_id : 0);
-        if (rx_flow)
+                     client ? cc_profile_id : 0, caps);
+        if (rx_flow) {
+            struct mrc_qp_attr attr;
+            assert(mrc_query_qp(qps[index].qp, NULL, 0, &attr, MRC_QP_CAP, NULL) == 0);
+            assert(attr.cap == caps);
             assert(mrc_dpdk_set_rx_flow_control(qps[index].qp, 1, false) == ENOTCONN);
+        }
         attach_qp(qps[index].qp, &route);
     }
 
     struct qa_result qa = {0};
+    struct service_time_witness service_time = {0};
     if (quick_adapt)
         qa = check_quick_adapt(&qps[0], local, peer, client ? send_cq : recv_cq, directory, client);
     else if (rx_flow)
-        check_rx_flow(qps, local, peer, send_cq, recv_cq, directory, client);
+        service_time = check_rx_flow(qps, local, peer, send_cq, recv_cq, directory, client);
     else
         duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0, cc_profile_id != 0);
 
@@ -1226,9 +1263,16 @@ static void run_duplex(bool client, const char *directory, const struct address 
     }
     unsigned int completions = rx_flow ? RX_FLOW_ROUNDS * DUPLEX_QPS : 3;
     printf("{\"role\":\"%s\",\"bytes\":%u,\"send_completions\":%u,\"recv_completions\":%u,"
-           "\"qpns\":[%u,%u],\"reset_qpn\":%u}\n",
+           "\"qpns\":[%u,%u],\"reset_qpn\":%u",
            client ? "tx" : "rx", completions * DUPLEX_BYTES, completions, completions,
            local[0].qpn, local[1].qpn, local[0].qpn);
+    if (rx_flow) {
+        printf(",\"service_time_dest_unsupported_qpn\":%u,\"service_time_data_qps\":%u,"
+               "\"service_time_probe_qps\":%u", local[unsupported_index].qpn,
+               (unsigned int)__builtin_popcount(service_time.data_qps),
+               (unsigned int)__builtin_popcount(service_time.probe_qps));
+    }
+    puts("}");
 }
 
 int main(int argc, char **argv)

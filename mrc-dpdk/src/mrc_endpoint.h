@@ -19,6 +19,11 @@ enum {
 
 struct rte_mbuf;
 
+struct mrc_endpoint_rx_packet {
+    struct rte_mbuf *mbuf;
+    uint64_t arrival_cycles;
+};
+
 struct mrc_endpoint_node {
     uint32_t local_ports;
     uint32_t local_down;
@@ -52,6 +57,8 @@ struct mrc_endpoint_config {
     bool sender;
     bool continuous_send;
     bool trim_nack_enabled;
+    bool report_service_time;
+    bool peer_service_time;
     uint32_t bytes;
     uint32_t packets;
     uint32_t uniform_wr_packets;
@@ -104,9 +111,10 @@ struct mrc_endpoint_config {
     struct rte_mempool *pool;
     uint8_t *data;
     struct mrc_provider_pd *pd;
-    /* Optional shared ingress. Receive transfers ownership of each returned
-     * mbuf to the endpoint, which performs full validation and frees it. */
-    uint16_t (*receive)(void *context, unsigned int path, struct rte_mbuf **packets, uint16_t max_packets);
+    /* Optional shared ingress. Receive transfers each mbuf and its original
+     * port polling timestamp to the endpoint. The endpoint frees the mbuf. */
+    uint16_t (*receive)(void *context, unsigned int path,
+                        struct mrc_endpoint_rx_packet *packets, uint16_t max_packets);
     void *receive_context;
     struct mrc_endpoint_node *node;
 };

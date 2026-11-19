@@ -244,7 +244,8 @@ def main():
 
     check_reliability_nacks(binary)
 
-    tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8)
+    tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8,
+                      rx_options=("--service-time", "1"))
     require(rx["immediate_completions"] == 8, "Negotiated WRITEIMM sequence was incomplete")
     require(tx["registered_memory"] and rx["registered_memory"],
             "Negotiated transfer did not use provider-registered memory")

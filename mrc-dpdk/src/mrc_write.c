@@ -353,7 +353,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     transfer->remote_address = default_remote_address;
     transfer->remote_key = DEFAULT_REMOTE_KEY;
     uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
-    uint32_t oob_port = 0, trim_nack = 1, srv6_srh = 0, port_stats = 0;
+    uint32_t oob_port = 0, trim_nack = 1, service_time = 0, srv6_srh = 0, port_stats = 0;
     bool local_sid = false, peer_sid = false, with_immediate = false;
     uint32_t repeat = 0, immediate = 0;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
@@ -374,6 +374,8 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
         if (!strcmp(key, "--oob-port") && number(value, 1, UINT16_MAX, &oob_port))
             continue;
         if (!strcmp(key, "--trim-nack") && number(value, 0, 1, &trim_nack))
+            continue;
+        if (!strcmp(key, "--service-time") && number(value, 0, 1, &service_time))
             continue;
         if (!strcmp(key, "--srv6-local") && inet_pton(AF_INET6, value, transfer->local_sid) == 1) {
             local_sid = true;
@@ -512,6 +514,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     benchmark->timeout_ms = timeout_ms;
     benchmark->oob_port = (uint16_t)oob_port;
     transfer->trim_nack_enabled = trim_nack != 0;
+    transfer->report_service_time = transfer->peer_service_time = service_time != 0;
     benchmark->port_stats = port_stats != 0;
     transfer->srv6 = local_sid;
     transfer->srv6_srh = srv6_srh != 0;
@@ -593,9 +596,10 @@ static int setup_qp(struct benchmark *benchmark)
             .max_wimm = (uint16_t)transfer->max_wimm_inflight,
         },
         .pmtu = PMTU, .p_key = transfer->partition_key,
-        .supported = MRC_CONNECT_TRIM_NACK | MRC_CONNECT_DYNAMIC_MPR,
+        .supported = MRC_CONNECT_TRIM_NACK | MRC_CONNECT_DYNAMIC_MPR | MRC_CONNECT_SERVICE_TIME,
         .offered = (transfer->trim_nack_enabled ? MRC_CONNECT_TRIM_NACK : 0) |
-                   (transfer->dynamic_mpr ? MRC_CONNECT_DYNAMIC_MPR : 0),
+                   (transfer->dynamic_mpr ? MRC_CONNECT_DYNAMIC_MPR : 0) |
+                   (transfer->report_service_time ? MRC_CONNECT_SERVICE_TIME : 0),
     };
     if (!transfer->sender) {
         local.receive.memory = (struct mrc_connect_memory){
@@ -615,6 +619,9 @@ static int setup_qp(struct benchmark *benchmark)
     transfer->peer_partition_key = qp.peer_p_key;
     transfer->dynamic_mpr = qp.dynamic_mpr;
     transfer->trim_nack_enabled = (qp.local_responder_features & MRC_CONNECT_TRIM_NACK) != 0;
+    transfer->report_service_time =
+        (qp.local_responder_features & qp.peer_supported & MRC_CONNECT_SERVICE_TIME) != 0;
+    transfer->peer_service_time = (qp.peer_responder_features & MRC_CONNECT_SERVICE_TIME) != 0;
     if (transfer->sender) {
         transfer->responder_qpn = qp.send.qpn;
         transfer->initial_psn = qp.send.initial_psn;
@@ -713,7 +720,7 @@ int main(int argc, char **argv)
                         "       [--trim-dscp N] [--trim-nack 0|1] [--trim-path-after N (tx)]\n"
                         "       [--drop-final-acks N (rx)] [--oob-host IP --oob-port N]\n"
                         "       [--restore-path-after N (tx)] [--profile-dir DIR --profile-id ID (tx)]\n"
-                        "       [--dynamic-mpr 0|1]\n"
+                        "       [--dynamic-mpr 0|1] [--service-time 0|1]\n"
                         "       [--mpr-change-at N --mpr-change-to N (rx)]\n"
                         "       [--rx-ooo-capacity N] [--rx-staging-capacity N] (rx)\n"
                         "       [--rx-work-capacity N] [--rx-cq-capacity N] (rx)\n"

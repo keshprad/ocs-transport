@@ -73,8 +73,15 @@ python3 tests/check_mrc_abi_application.py
 
 An application opens a verbs context and PD, creates the MRC QP and CQs,
 and configures the QP through `mrc_modify_qp()`. It exchanges connection
-parameters and remote memory keys with the peer. With the DPDK extensions
-in `src/mrc_dpdk.h`, it binds the verbs MR registrations, attaches two
+parameters and remote memory keys with the peer. Exchange
+`MRC_DEVICE_CAP_SVC_TIME` in each direction and set
+`MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED` when the remote responder cannot
+report Service Time. The requester subtracts a negotiated peer duration
+from its stored-timestamp RTT sample. The responder estimates its service
+duration from the DPDK RX poll to feedback preparation. This estimate
+includes shared ingress queue time and uses 128 ns wire units.
+With the DPDK extensions in `src/mrc_dpdk.h`, the application binds the
+verbs MR registrations, attaches two
 started DPDK ports to the QP, and drives progress from its polling worker.
 The application posts standard WRITE and WRITEIMM work requests and polls
 the public CQs. Keep the verbs context, PD, MRs, and DPDK resources live
@@ -215,6 +222,10 @@ The configured IP pair identifies the QP across both circuits, while each
 circuit uses its corresponding peer MAC. UDP 4971 is the default and has
 been verified on both rails with RoCE enabled on the ConnectX-7 ports.
 Use `--udp-port N` on both peers to select another destination port.
+With out-of-band negotiation, `--service-time 1` offers local Service
+Time reporting and the requester follows the peer's offer. With manual
+peer configuration, enable the option on both benchmark endpoints to
+report and consume Service Time.
 
 For the healthy baseline, run a 4 MiB WRITE (4194304 bytes) with both paths
 active. For a controlled recovery run, use 16777216 bytes and

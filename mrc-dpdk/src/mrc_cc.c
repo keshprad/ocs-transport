@@ -19,6 +19,18 @@ uint32_t mrc_cc_nominal_size(uint16_t udp_length)
     return (uint32_t)udp_length + MRC_CC_NOMINAL_HDRSIZE;
 }
 
+uint16_t mrc_cc_service_timestamp(uint64_t elapsed_ns, bool report, bool timestamp_present,
+                                  bool tsr, uint16_t timestamp)
+{
+    if (!report || (timestamp_present && tsr))
+        return timestamp_present ? timestamp : 0;
+
+    uint64_t units = elapsed_ns / MRC_CC_TIMESTAMP_UNIT_NS;
+    if (timestamp_present)
+        return (uint16_t)(timestamp + units);
+    return units > UINT16_MAX ? UINT16_MAX : (uint16_t)units;
+}
+
 void mrc_cc_rx_record(struct mrc_cc_rx *rx, uint32_t nominal_bytes,
                       bool new_data, bool trimmed)
 {
@@ -171,13 +183,18 @@ static bool retire_bytes(struct mrc_cc *cc, uint32_t nominal_bytes)
     return true;
 }
 
-static uint64_t measure_rtt(struct mrc_cc *cc, uint64_t arrive_ns,
+static uint64_t measure_rtt(struct mrc_cc *cc, uint64_t now_ns,
                             const struct mrc_cc_tx_sample *sample, bool rtx)
 {
-    if (!sample || sample->retransmissions != (rtx ? 1u : 0u) ||
-        arrive_ns <= sample->sent_at_ns)
+    if (!sample || sample->retransmissions != (rtx ? 1u : 0u))
         return 0;
-    const uint64_t rtt = arrive_ns - sample->sent_at_ns;
+    const uint64_t arrival = sample->arrived_at_ns ? sample->arrived_at_ns : now_ns;
+    if (arrival <= sample->sent_at_ns || arrival > now_ns)
+        return 0;
+    const uint64_t elapsed = arrival - sample->sent_at_ns;
+    if (sample->service_time_ns >= elapsed)
+        return 0;
+    const uint64_t rtt = elapsed - sample->service_time_ns;
     if (cc->base_rtt_ns == 0 || rtt < cc->base_rtt_ns) {
         cc->base_rtt_ns = rtt;
         cc->nscc.current_delay = (struct mrc_cc_delay_window){0};

@@ -60,10 +60,10 @@ REPLAYS = (
 
 
 def request(replay, path, opcode, psn, body, flags=0, *, ce=False, source_sid=PEER_SID,
-            outer_traffic_class=None):
+            outer_traffic_class=None, dqp=RESPONDER):
     source = IPPeer(PEER_MACS[path], ipaddress.ip_address(replay.peer_ip).packed)
     destination = IPPeer(PCAP_MACS[path], ipaddress.ip_address(replay.local_ip).packed)
-    bth = Bth(opcode, PKEY, RESPONDER, psn, flags)
+    bth = Bth(opcode, PKEY, dqp, psn, flags)
     if not replay.ipv6:
         return encode_ipv4(source, destination, SOURCE_PORTS[path], UDP_PORT, bth, body)
     frame = encode_ipv6(source, destination, SOURCE_PORTS[path], UDP_PORT, bth, body,
@@ -76,18 +76,27 @@ def request(replay, path, opcode, psn, body, flags=0, *, ce=False, source_sid=PE
                      flow_label=0xD0300 + path, traffic_class=outer_traffic_class)
 
 
+def timestamp_extension(timestamp, opaque):
+    if timestamp is None:
+        return bytes(4)
+    return struct.pack("!HBB", timestamp, 0x80 if opaque else 0, 1)
+
+
 def write_request(replay, path, opcode, psn, msn, rqmsn, offset, length, payload,
-                  immediate=None, flags=0x80, **envelope):
-    headers = struct.pack("!HHQII", rqmsn, msn, ADDRESS + offset, RKEY, length)
+                  immediate=None, flags=0x80, *, timestamp=None, opaque=False, **envelope):
+    headers = struct.pack("!HH", rqmsn, msn)
+    if timestamp is not None:
+        headers += timestamp_extension(timestamp, opaque)
+        flags |= 0x10
+    headers += struct.pack("!QII", ADDRESS + offset, RKEY, length)
     if immediate is not None:
         headers += struct.pack("!I", immediate)
     return request(replay, path, opcode, psn, headers + payload, flags, **envelope)
 
 
-def trimmed_request(replay, data):
-    headers = struct.pack("!HHHBBQII", 0, 1, TRIM_TIMESTAMP, 0x80, 1, ADDRESS, RKEY, len(data))
-    full = request(replay, 0, 0xCA, INITIAL_PSN, headers + data, flags=0x90,
-                   outer_traffic_class=TRIM_DSCP << 2)
+def trimmed_request(replay, data, *, timestamp=TRIM_TIMESTAMP, opaque=True):
+    full = write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, len(data), data,
+                         timestamp=timestamp, opaque=opaque, outer_traffic_class=TRIM_DSCP << 2)
     # The switch preserves the original declared lengths and removes data and iCRC.
     udp_offset = 14 + 40 + 24 + 40  # Ethernet, outer IPv6, single-segment SRH, inner IPv6
     original_udp_size = struct.unpack_from("!H", full, udp_offset + 4)[0]
@@ -129,6 +138,51 @@ def captured_requests(replay):
         rail.append(trim)
     rail.extend((first, tail, duplicate))
     return (rail, [head]), outside, len(rejected), trim_size
+
+
+def service_time_requests(replay):
+    data = bytes((i ^ (i >> 8)) & 0xFF for i in range(13 + 1025))
+    standalone = (None, False)
+    compensated = (0xFFFF, False)
+    opaque = (0x923B, True)
+    rail, expected = [], {}
+
+    # Start with opaque timestamps so the positive samples follow earlier feedback
+    # preparation in the same receive burst, even on a fast idle core.
+    for index, timing in enumerate((opaque, standalone, compensated)):
+        timestamp, is_opaque = timing
+        extension = timestamp_extension(timestamp, is_opaque)
+        endpoint_id = 0x7710 + index
+        erth = struct.pack("!III", 0, 3, 0) + extension
+        rail.append(request(replay, 0, 0xD8, 0x900000 | endpoint_id, erth, dqp=2))
+        expected["EETH", endpoint_id] = timing
+
+        probe_id = 0x7620 + index
+        peth = struct.pack("!6H", 0, 0, probe_id, 0, *PDC_IDS) + extension
+        rail.append(request(replay, 0, 0xDE, 0x7FED03, peth))
+        expected["probe SACK", probe_id] = timing
+
+        outside = (INITIAL_PSN + 1024 + index) & 0xFFFFFF
+        rail.append(write_request(replay, 0, 0xCA, outside, 1, 0, 0, 13, data[:13],
+                                  timestamp=timestamp, opaque=is_opaque))
+        expected["NETH", 0x0B, outside] = timing
+
+    trim_size = None
+    if replay.srh:
+        trim, trim_size = trimmed_request(replay, data[:13], timestamp=compensated[0], opaque=False)
+        rail.append(trim)
+        expected["NETH", 0x01, INITIAL_PSN] = compensated
+
+    rail.append(write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, 13, data[:13]))
+    expected["WRITE SACK", INITIAL_PSN, False] = standalone
+    rail.append(write_request(replay, 0, 0xC9, 1, 2, 1, 1037, 1025, data[1037:],
+                              0xFEC01234, timestamp=compensated[0]))
+    expected["WRITE SACK", 1, False] = compensated
+    rail.append(write_request(replay, 0, 0xC9, 1, 2, 1, 1037, 1025, data[1037:],
+                              0xFEC01234, flags=0xA0, timestamp=opaque[0], opaque=True))
+    expected["WRITE SACK", 1, True] = opaque
+    head = write_request(replay, 1, 0xC6, 0, 2, 1, 13, 1025, data[13:1037])
+    return (rail, [head]), expected, trim_size
 
 
 def write_capture(path, frames):
@@ -229,7 +283,7 @@ def check_responses(replay, output_paths, outside, trim_size):
 
 
 @contextmanager
-def run_capture(binary, replay, requests, *, trim=False):
+def run_capture(binary, replay, requests, *, trim=False, service_time=False):
     with tempfile.TemporaryDirectory(prefix="mrc-pcap-") as temp:
         directory = Path(temp)
         incoming = [directory / f"rx{path}.pcap" for path in range(2)]
@@ -249,6 +303,8 @@ def run_capture(binary, replay, requests, *, trim=False):
                     "--port-stats", "1", "--timeout-ms", "2000"]
         if trim:
             command += ["--trim-dscp", str(TRIM_DSCP), "--trim-nack", "1"]
+        if service_time:
+            command += ["--service-time", "1"]
         if replay.srh is not None:
             command += ["--srv6-local", str(ipaddress.IPv6Address(LOCAL_SID)),
                         "--srv6-peer", str(ipaddress.IPv6Address(PEER_SID))]
@@ -274,6 +330,67 @@ def run_replay(binary, replay):
                 f"Unexpected {replay.name} placement or error counters: {counters}\n{result.stderr}")
         check_responses(replay, outgoing, outside, trim_size)
         print(f"Independent {replay.name} packet replay passed WRITE, WRITEIMM, SACK, AETH, PETH, and NETH checks")
+
+
+def check_service_time(binary, replay):
+    requests, expected, trim_size = service_time_requests(replay)
+    with run_capture(binary, replay, requests, trim=trim_size is not None,
+                     service_time=True) as (result, outgoing):
+        require(result.returncode == 0, f"pcap service-time endpoint failed\n{result.stdout}\n{result.stderr}")
+        counters = json.loads(result.stdout.strip().splitlines()[-1])
+        require(counters["bytes"] == 1038 and counters["received"] == [2, 1]
+                and counters["duplicates"] == 1 and counters["immediate_completions"] == 1
+                and counters["probe_requests"] == 3 and counters["port_status_updates"] == 3,
+                f"Unexpected {replay.name} service-time placement or controls: {counters}")
+
+        actual = {}
+        for frame in read_capture(outgoing[0]):
+            packet = decode_response(replay, 0, frame)
+            body = packet.body
+            if packet.bth.opcode == 0xDC:
+                require(len(body) == 36, "Wrong service-time SACK length")
+                if body[1] & 2:
+                    key = ("probe SACK", struct.unpack_from("!H", body, 2)[0])
+                else:
+                    offset, = struct.unpack_from("!h", body, 2)
+                    trigger_psn = (packet.bth.psn + offset) & 0xFFFFFF
+                    key = ("WRITE SACK", trigger_psn, bool(packet.bth.flags & 0x20))
+                field = 28
+            elif packet.bth.opcode == 0xDD:
+                require(len(body) == 20 and int.from_bytes(body[13:16], "big") == packet.bth.psn,
+                        "Service-time NETH did not reflect the request PSN")
+                key = ("NETH", body[2], packet.bth.psn)
+                if body[2] == 0x01:
+                    require(packet.udp_size == trim_size, "Service-time trim NACK changed the original UDP length")
+                field = 18
+            elif packet.bth.opcode == 0xD9:
+                require(len(body) == 36 and (body[1] >> 2) & 3 == 0,
+                        "Unexpected service-time EETH format")
+                key = ("EETH", packet.bth.psn)
+                field = 28
+            else:
+                continue
+            require(key not in actual, f"Duplicate service-time feedback {key}")
+            actual[key], = struct.unpack_from("!H", body, field)
+
+        require(actual.keys() == expected.keys(),
+                f"Unexpected {replay.name} service-time feedback: {actual}, expected {expected.keys()}")
+        measured = []
+        for key, (timestamp, opaque) in expected.items():
+            observed = actual[key]
+            if opaque:
+                require(observed == timestamp,
+                        f"{replay.name} {key} changed opaque timestamp {timestamp:#x} to {observed:#x}")
+                continue
+            ticks = (observed - (timestamp or 0)) & 0xFFFF
+            # Half the 16-bit range is 4.194 ms at the specification's 128 ns resolution.
+            require(0 < ticks < 0x8000,
+                    f"{replay.name} {key} did not report a positive local service interval: {ticks * 128} ns")
+            if timestamp is not None:
+                require(observed < timestamp, f"{replay.name} {key} did not wrap the adjusted timestamp")
+            measured.append(ticks)
+        print(f"Independent {replay.name} service time passed standalone, wrapped, and opaque checks "
+              f"({min(measured) * 128}–{max(measured) * 128} ns)")
 
 
 def check_reserved_opcode(binary, replay):
@@ -314,6 +431,7 @@ def main():
     for replay in REPLAYS:
         run_replay(binary, replay)
         check_reserved_opcode(binary, replay)
+        check_service_time(binary, replay)
 
 
 if __name__ == "__main__":

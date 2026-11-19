@@ -434,6 +434,53 @@ static void test_receiver_flow_control(void)
     assert(cc.cwnd == 3580); /* Half of (7168 inflight - 8 bytes penalty). */
 }
 
+static void test_service_time(void)
+{
+    assert(mrc_cc_service_timestamp(512, false, false, false, 123) == 0);
+    assert(mrc_cc_service_timestamp(512, false, true, false, 123) == 123);
+    assert(mrc_cc_service_timestamp(127, true, false, false, 0) == 0);
+    assert(mrc_cc_service_timestamp(511, true, false, false, 0) == 3);
+    assert(mrc_cc_service_timestamp(UINT64_MAX, true, false, false, 0) == UINT16_MAX);
+    assert(mrc_cc_service_timestamp(512, true, true, false, UINT16_C(0xfffe)) == 2);
+    assert(mrc_cc_service_timestamp(512, true, true, true, UINT16_C(0xfffe)) == UINT16_C(0xfffe));
+
+    struct mrc_cc cc;
+    assert(mrc_cc_init(&cc, 1024, 8192, 0, 1000));
+    struct mrc_cc_tx_sample sample = { .sent_at_ns = 1000, .service_time_ns = 384 };
+    struct mrc_cc_feedback feedback;
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 2600, &sample, NULL, &feedback));
+    assert(feedback.rtt_valid && feedback.rtt_ns == 1216 && cc.base_rtt_ns == 1216);
+
+    sample.service_time_ns = 256;
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 3000, &sample, NULL, &feedback));
+    assert(feedback.rtt_valid && feedback.rtt_ns == 1744 && feedback.queue_delay_ns == 528);
+
+    /* Implausible service durations cannot produce a zero or wrapped RTT.
+     * The ACK can still advance the delivery counter. */
+    sample.service_time_ns = 2000;
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 3000, &sample, NULL, &feedback));
+    assert(!feedback.rtt_valid && feedback.newly_received_bytes == 256 && cc.base_rtt_ns == 1216);
+    sample.service_time_ns = 2048;
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 3000, &sample, NULL, &feedback));
+    assert(!feedback.rtt_valid && cc.base_rtt_ns == 1216);
+
+    sample.service_time_ns = 2816;
+    assert(mrc_cc_on_nack(&cc, 0, false, false, 4000, &sample));
+    assert(cc.base_rtt_ns == 184);
+    sample.service_time_ns = 0;
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 4000, &sample, NULL, &feedback));
+    assert(feedback.rtt_valid && feedback.rtt_ns == 3000);
+
+    /* Shared ingress may deliver packets in a different order across rails.
+     * RTT uses the original poll time while the controller advances its clock. */
+    sample.arrived_at_ns = 2000;
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 4100, &sample, NULL, &feedback));
+    assert(feedback.rtt_valid && feedback.rtt_ns == 1000 && cc.nscc.last_ack_ns == 4100);
+    sample.arrived_at_ns = 4200;
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 4100, &sample, NULL, &feedback));
+    assert(!feedback.rtt_valid && cc.nscc.last_ack_ns == 4100);
+}
+
 static const struct mrc_cc_config qa_config = {
     .adjust_bytes_threshold = 8192, .adjust_period_threshold = 1000,
     .base_rtt = 1000, .target_delay = 1000, .max_cwnd = 16384,
@@ -563,6 +610,7 @@ int main(void)
     test_nscc_link_derived_bounds();
     test_controller_config();
     test_receiver_flow_control();
+    test_service_time();
     test_quick_adapt_delay();
     test_quick_adapt_averages_delay();
     test_quick_adapt_gate_and_flow();
