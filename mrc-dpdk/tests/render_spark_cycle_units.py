@@ -89,6 +89,8 @@ DynamicUser=yes
 WorkingDirectory={snapshot}
 Environment=LD_LIBRARY_PATH={library_dir}
 Environment=XDG_RUNTIME_DIR=/run/{runtime_dir}
+# systemd joins RuntimeDirectory paths with a colon. DPDK treats it as one path.
+UnsetEnvironment=RUNTIME_DIRECTORY
 RuntimeDirectory=ocs-mrc {runtime_dir}
 RuntimeDirectoryPreserve=yes
 NoNewPrivileges=yes

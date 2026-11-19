@@ -180,7 +180,13 @@ def preflight_host(commands, host, profile, revision):
             commands.run(host, "sudo", "-n", "-l", "/usr/bin/systemctl", action, endpoint.unit)
         commands.check_journal(endpoint)
 
-        props = commands.properties(endpoint, "WorkingDirectory", "ExecStart")
+        props = commands.properties(
+            endpoint, "WorkingDirectory", "ExecStart", "UnsetEnvironment",
+        )
+        require(
+            "RUNTIME_DIRECTORY" in shlex.split(props.get("UnsetEnvironment", "")),
+            f"{endpoint.label}: add UnsetEnvironment=RUNTIME_DIRECTORY to the unit",
+        )
         directory = Path(props.get("WorkingDirectory", ""))
         require(
             directory.parent == Path("/opt/ocs-mrc") and directory.name.startswith(f"{revision[:7]}."),
