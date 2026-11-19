@@ -4,8 +4,10 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define READ_WRITE (MRC_PROVIDER_MR_LOCAL_WRITE | MRC_PROVIDER_MR_REMOTE_WRITE)
 
@@ -342,6 +344,94 @@ static void test_qp_cq_overrun_flushes_other_queue(void)
     assert(mrc_provider_cq_destroy(recv) == 0);
 }
 
+struct cq_destroy_request {
+    struct mrc_provider_cq *cq;
+    int result;
+};
+
+static void *destroy_cq_wait(void *argument)
+{
+    struct cq_destroy_request *request = argument;
+    request->result = mrc_provider_cq_destroy_wait(request->cq);
+    return NULL;
+}
+
+static void test_completion_channel(void)
+{
+    struct mrc_provider_comp_channel *channel = NULL;
+    struct mrc_provider_cq *send, *recv, *event_cq = NULL;
+    void *event_context = NULL;
+    int send_context, recv_context;
+    assert(mrc_provider_comp_channel_create(&channel) == 0);
+    int fd = mrc_provider_comp_channel_fd(channel);
+    assert(fd >= 0);
+    struct pollfd waiter = { .fd = fd, .events = POLLIN };
+    assert(poll(&waiter, 1, 0) == 0);
+    assert(mrc_provider_comp_channel_next(channel, &event_cq, &event_context) == -EAGAIN);
+    assert(mrc_provider_cq_create_on_channel(2, channel, &send_context, &send) == 0);
+    assert(mrc_provider_cq_create_on_channel(2, channel, &recv_context, &recv) == 0);
+    assert(mrc_provider_comp_channel_destroy(channel) == -EBUSY);
+
+    const struct mrc_provider_qp_config config = {
+        .send_cq = send, .recv_cq = recv, .qpn = 42, .send_capacity = 2, .recv_capacity = 2,
+    };
+    struct mrc_provider_qp *qp;
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    assert(mrc_provider_cq_destroy_wait(send) == -EBUSY);
+    ready_to_send(qp);
+    assert(mrc_provider_cq_arm(send, false) == 0);
+    assert(mrc_provider_cq_arm(recv, true) == 0);
+    uint64_t first, second, id;
+    assert(mrc_provider_qp_post_send(qp, 100, 33, true, &first) == 0);
+    assert(mrc_provider_qp_post_recv(qp, 200) == 0);
+    assert(mrc_provider_qp_complete_recv(qp, 44, 0x01020304, false, &id) == 0 && id == 200);
+    assert(poll(&waiter, 1, 0) == 0);
+    assert(mrc_provider_qp_complete_send(qp, first) == 0);
+    assert(mrc_provider_qp_post_recv(qp, 201) == 0);
+    assert(mrc_provider_qp_complete_recv(qp, 55, 0x04030201, true, &id) == 0 && id == 201);
+
+    assert(poll(&waiter, 1, 0) == 1 && (waiter.revents & POLLIN));
+    enum mrc_provider_cq_event event;
+    assert(mrc_provider_cq_next_event(send, &event) == -EAGAIN);
+    struct mrc_provider_wc wc[2];
+    /* Polling a CQ can consume the WC while its notification still waits. */
+    assert(mrc_provider_cq_poll(send, wc, 2) == 1 && wc[0].wr_id == 100);
+    assert(mrc_provider_comp_channel_next(channel, &event_cq, &event_context) == 0);
+    assert(event_cq == send && event_context == &send_context);
+    assert(mrc_provider_cq_arm(send, false) == 0);
+    assert(mrc_provider_qp_post_send(qp, 101, 66, true, &second) == 0);
+    assert(mrc_provider_qp_complete_send(qp, second) == 0);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(send) == -EBUSY);
+
+    struct cq_destroy_request destroy = { .cq = send, .result = -1 };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, destroy_cq_wait, &destroy) == 0);
+    struct timespec delay = { .tv_nsec = 1000000 };
+    for (unsigned int attempts = 0;; attempts++) {
+        int result = mrc_provider_cq_arm(send, false);
+        if (result == -EBUSY)
+            break;
+        assert(result == 0 && attempts < 2000);
+        nanosleep(&delay, NULL);
+    }
+
+    /* The unread send event is gone, and the read send event pins the CQ. */
+    assert(mrc_provider_comp_channel_next(channel, &event_cq, &event_context) == 0);
+    assert(event_cq == recv && event_context == &recv_context);
+    assert(mrc_provider_comp_channel_next(channel, &event_cq, &event_context) == -EAGAIN);
+    assert(poll(&waiter, 1, 0) == 0);
+    assert(mrc_provider_cq_ack_events(send, 1) == 0);
+    assert(pthread_join(thread, NULL) == 0 && destroy.result == 0);
+
+    assert(mrc_provider_cq_poll(recv, wc, 2) == 2);
+    assert(wc[0].wr_id == 200 && wc[1].wr_id == 201);
+    assert(wc[1].with_immediate && wc[1].immediate == 0x04030201);
+    assert(mrc_provider_cq_ack_events(recv, 1) == 0);
+    assert(mrc_provider_cq_destroy_wait(recv) == 0);
+    assert(mrc_provider_comp_channel_destroy(channel) == 0);
+}
+
 int main(void)
 {
     test_pds_and_keys();
@@ -350,6 +440,7 @@ int main(void)
     test_cq_overflow();
     test_qp_lifecycle_and_ordered_flush();
     test_qp_cq_overrun_flushes_other_queue();
+    test_completion_channel();
     puts("MRC provider resource tests passed");
     return 0;
 }

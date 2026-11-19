@@ -7,6 +7,7 @@
 
 struct mrc_provider_pd;
 struct mrc_provider_cq;
+struct mrc_provider_comp_channel;
 struct mrc_provider_qp;
 
 /*
@@ -107,10 +108,23 @@ enum mrc_provider_cq_event {
     MRC_PROVIDER_CQ_OVERFLOW,
 };
 
+/* The channel FD is borrowed for poll/select. Retrieve notifications with
+ * next rather than reading the FD directly. Next returns -EAGAIN when empty. */
+int mrc_provider_comp_channel_create(struct mrc_provider_comp_channel **channel);
+int mrc_provider_comp_channel_fd(const struct mrc_provider_comp_channel *channel);
+int mrc_provider_comp_channel_next(struct mrc_provider_comp_channel *channel,
+                                   struct mrc_provider_cq **cq, void **context);
+int mrc_provider_comp_channel_destroy(struct mrc_provider_comp_channel *channel);
+
+int mrc_provider_cq_create_on_channel(size_t capacity, struct mrc_provider_comp_channel *channel,
+                                      void *context, struct mrc_provider_cq **cq);
 int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq);
 int mrc_provider_cq_retain(struct mrc_provider_cq *cq);
 int mrc_provider_cq_release(struct mrc_provider_cq *cq);
 int mrc_provider_cq_destroy(struct mrc_provider_cq *cq);
+/* Discard unread completions and notifications, then wait for already read
+ * events to be acknowledged. Both destroy variants reject retained CQs. */
+int mrc_provider_cq_destroy_wait(struct mrc_provider_cq *cq);
 
 /*
  * Push and poll use a bounded FIFO. An overrun invalidates pending entries
@@ -126,7 +140,9 @@ int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *ent
  * Arm one notification for a future completion. In solicited mode, successful
  * completions only qualify when solicited is set. Errors always qualify.
  * An overflow event is available even when notifications were not armed.
- * Each event returned by next_event must be acknowledged exactly once.
+ * Read completion events on the attached channel, or with next_event for
+ * a CQ without a channel. Overflow is available through next_event.
+ * Each event returned by either call must be acknowledged exactly once.
  */
 int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only);
 int mrc_provider_cq_next_event(struct mrc_provider_cq *cq, enum mrc_provider_cq_event *event);

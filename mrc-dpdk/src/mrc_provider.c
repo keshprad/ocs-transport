@@ -5,6 +5,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 _Static_assert(SIZE_MAX <= UINT64_MAX, "MR lengths must fit in a 64-bit IOVA");
 
@@ -24,8 +26,25 @@ struct mrc_provider_pd {
     struct region regions[];
 };
 
+struct completion_notification {
+    struct mrc_provider_cq *cq;
+    struct completion_notification *next;
+};
+
+struct mrc_provider_comp_channel {
+    pthread_mutex_t mutex;
+    size_t references;
+    int fd;
+    struct completion_notification *head;
+    struct completion_notification *tail;
+};
+
 struct mrc_provider_cq {
     pthread_mutex_t mutex;
+    pthread_cond_t events_acked;
+    struct mrc_provider_comp_channel *channel;
+    struct completion_notification *notification;
+    void *context;
     size_t capacity;
     size_t references;
     size_t head;
@@ -36,6 +55,7 @@ struct mrc_provider_cq {
     bool solicited_only;
     bool overrun;
     bool overflow_event;
+    bool closing;
     struct mrc_provider_wc entries[];
 };
 
@@ -251,7 +271,90 @@ int mrc_provider_mr_release(struct mrc_provider_mr_lease *lease)
     return 0;
 }
 
-int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq)
+int mrc_provider_comp_channel_create(struct mrc_provider_comp_channel **channel)
+{
+    if (!channel)
+        return -EINVAL;
+    struct mrc_provider_comp_channel *object = calloc(1, sizeof(*object));
+    if (!object)
+        return -ENOMEM;
+    int error = pthread_mutex_init(&object->mutex, NULL);
+    if (error) {
+        free(object);
+        return -error;
+    }
+    object->fd = eventfd(0, EFD_CLOEXEC | EFD_SEMAPHORE | EFD_NONBLOCK);
+    if (object->fd < 0) {
+        error = errno;
+        pthread_mutex_destroy(&object->mutex);
+        free(object);
+        return -error;
+    }
+    *channel = object;
+    return 0;
+}
+
+int mrc_provider_comp_channel_fd(const struct mrc_provider_comp_channel *channel)
+{
+    return channel ? channel->fd : -EINVAL;
+}
+
+int mrc_provider_comp_channel_destroy(struct mrc_provider_comp_channel *channel)
+{
+    if (!channel)
+        return -EINVAL;
+    pthread_mutex_lock(&channel->mutex);
+    bool busy = channel->references || channel->head;
+    pthread_mutex_unlock(&channel->mutex);
+    if (busy)
+        return -EBUSY;
+    close(channel->fd);
+    pthread_mutex_destroy(&channel->mutex);
+    free(channel);
+    return 0;
+}
+
+static int change_notification_count(int fd, bool add)
+{
+    eventfd_t value;
+    int result;
+    do {
+        result = add ? eventfd_write(fd, 1) : eventfd_read(fd, &value);
+    } while (result < 0 && errno == EINTR);
+    return result < 0 ? -errno : 0;
+}
+
+int mrc_provider_comp_channel_next(struct mrc_provider_comp_channel *channel,
+                                   struct mrc_provider_cq **cq, void **context)
+{
+    if (!channel || !cq || !context)
+        return -EINVAL;
+    pthread_mutex_lock(&channel->mutex);
+    struct completion_notification *notification = channel->head;
+    int result = notification ? change_notification_count(channel->fd, false) : -EAGAIN;
+    if (!result) {
+        channel->head = notification->next;
+        if (!channel->head)
+            channel->tail = NULL;
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    if (result)
+        return result;
+
+    struct mrc_provider_cq *object = notification->cq;
+    free(notification);
+    /* ready pins the CQ until ownership of the event passes to the caller. */
+    pthread_mutex_lock(&object->mutex);
+    object->ready--;
+    object->unacked++;
+    *cq = object;
+    *context = object->context;
+    pthread_mutex_unlock(&object->mutex);
+    return 0;
+}
+
+int mrc_provider_cq_create_on_channel(size_t capacity, struct mrc_provider_comp_channel *channel,
+                                      void *context, struct mrc_provider_cq **cq)
 {
     if (!cq || !capacity)
         return -EINVAL;
@@ -261,19 +364,49 @@ int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq)
         calloc(1, sizeof(*object) + capacity * sizeof(struct mrc_provider_wc));
     if (!object)
         return -ENOMEM;
-    int error = pthread_mutex_init(&object->mutex, NULL);
-    if (error) {
-        free(object);
-        return -error;
-    }
+    int result = -pthread_mutex_init(&object->mutex, NULL);
+    if (result)
+        goto free_object;
+    result = -pthread_cond_init(&object->events_acked, NULL);
+    if (result)
+        goto destroy_mutex;
+    if (channel && (result = change_reference(&channel->mutex, &channel->references, true)))
+        goto destroy_condition;
+
     object->capacity = capacity;
+    object->channel = channel;
+    object->context = context;
     *cq = object;
     return 0;
+
+destroy_condition:
+    pthread_cond_destroy(&object->events_acked);
+destroy_mutex:
+    pthread_mutex_destroy(&object->mutex);
+free_object:
+    free(object);
+    return result;
+}
+
+int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq)
+{
+    return mrc_provider_cq_create_on_channel(capacity, NULL, NULL, cq);
 }
 
 int mrc_provider_cq_retain(struct mrc_provider_cq *cq)
 {
-    return cq ? change_reference(&cq->mutex, &cq->references, true) : -EINVAL;
+    if (!cq)
+        return -EINVAL;
+    pthread_mutex_lock(&cq->mutex);
+    int result = 0;
+    if (cq->closing)
+        result = -EBUSY;
+    else if (cq->references == SIZE_MAX)
+        result = -EOVERFLOW;
+    else
+        cq->references++;
+    pthread_mutex_unlock(&cq->mutex);
+    return result;
 }
 
 int mrc_provider_cq_release(struct mrc_provider_cq *cq)
@@ -281,18 +414,102 @@ int mrc_provider_cq_release(struct mrc_provider_cq *cq)
     return cq ? change_reference(&cq->mutex, &cq->references, false) : -EINVAL;
 }
 
+static void free_cq(struct mrc_provider_cq *cq)
+{
+    if (cq->channel)
+        change_reference(&cq->channel->mutex, &cq->channel->references, false);
+    free(cq->notification);
+    pthread_cond_destroy(&cq->events_acked);
+    pthread_mutex_destroy(&cq->mutex);
+    free(cq);
+}
+
 int mrc_provider_cq_destroy(struct mrc_provider_cq *cq)
 {
     if (!cq)
         return -EINVAL;
     pthread_mutex_lock(&cq->mutex);
-    bool busy = cq->references || cq->count || cq->ready || cq->unacked || cq->overflow_event;
+    bool busy = cq->closing || cq->references || cq->count ||
+                cq->ready || cq->unacked || cq->overflow_event;
     pthread_mutex_unlock(&cq->mutex);
     if (busy)
         return -EBUSY;
-    pthread_mutex_destroy(&cq->mutex);
-    free(cq);
+    free_cq(cq);
     return 0;
+}
+
+static int discard_notifications(struct mrc_provider_cq *cq)
+{
+    struct mrc_provider_comp_channel *channel = cq->channel;
+    if (!channel) {
+        cq->ready = 0;
+        return 0;
+    }
+
+    pthread_mutex_lock(&channel->mutex);
+    struct completion_notification **link = &channel->head;
+    struct completion_notification *previous = NULL;
+    int result = 0;
+    while (*link) {
+        struct completion_notification *notification = *link;
+        if (notification->cq != cq) {
+            previous = notification;
+            link = &notification->next;
+            continue;
+        }
+        result = change_notification_count(channel->fd, false);
+        if (result)
+            break;
+        *link = notification->next;
+        if (channel->tail == notification)
+            channel->tail = previous;
+        cq->ready--;
+        free(notification);
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    return result;
+}
+
+int mrc_provider_cq_destroy_wait(struct mrc_provider_cq *cq)
+{
+    if (!cq)
+        return -EINVAL;
+    pthread_mutex_lock(&cq->mutex);
+    if (cq->closing || cq->references) {
+        pthread_mutex_unlock(&cq->mutex);
+        return -EBUSY;
+    }
+    cq->closing = true;
+    int result = discard_notifications(cq);
+    if (result) {
+        cq->closing = false;
+    } else {
+        while (cq->unacked || cq->ready)
+            pthread_cond_wait(&cq->events_acked, &cq->mutex);
+    }
+    pthread_mutex_unlock(&cq->mutex);
+    if (!result)
+        free_cq(cq);
+    return result;
+}
+
+static int signal_notification(struct mrc_provider_cq *cq)
+{
+    struct mrc_provider_comp_channel *channel = cq->channel;
+    if (!channel)
+        return 0;
+    pthread_mutex_lock(&channel->mutex);
+    int result = change_notification_count(channel->fd, true);
+    if (!result) {
+        if (channel->tail)
+            channel->tail->next = cq->notification;
+        else
+            channel->head = cq->notification;
+        channel->tail = cq->notification;
+        cq->notification = NULL;
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    return result;
 }
 
 static int cq_overrun(struct mrc_provider_cq *cq)
@@ -301,6 +518,8 @@ static int cq_overrun(struct mrc_provider_cq *cq)
     cq->overflow_event = true;
     cq->count = 0;
     cq->armed = false;
+    free(cq->notification);
+    cq->notification = NULL;
     return -EOVERFLOW;
 }
 
@@ -313,9 +532,12 @@ int mrc_provider_cq_push(struct mrc_provider_cq *cq, const struct mrc_provider_w
 
     int result = 0;
     bool notify = cq->armed && (!cq->solicited_only || solicited || wc->status != MRC_PROVIDER_WC_SUCCESS);
-    if (cq->overrun) {
+    if (cq->closing) {
+        result = -EBUSY;
+    } else if (cq->overrun) {
         result = -EOVERFLOW;
-    } else if (cq->count == cq->capacity || (notify && cq->ready == SIZE_MAX)) {
+    } else if (cq->count == cq->capacity ||
+               (notify && (cq->ready == SIZE_MAX - cq->unacked || signal_notification(cq)))) {
         result = cq_overrun(cq);
     } else {
         size_t tail = (cq->head + cq->count) % cq->capacity;
@@ -336,9 +558,10 @@ int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *ent
     if (!cq || (count && !entries) || count > INT_MAX)
         return -EINVAL;
     pthread_mutex_lock(&cq->mutex);
-    if (cq->overrun) {
+    if (cq->closing || cq->overrun) {
+        int result = cq->closing ? -EBUSY : -EOVERFLOW;
         pthread_mutex_unlock(&cq->mutex);
-        return -EOVERFLOW;
+        return result;
     }
 
     size_t copied = count < cq->count ? count : cq->count;
@@ -356,11 +579,22 @@ int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only)
         return -EINVAL;
     pthread_mutex_lock(&cq->mutex);
     int result = 0;
-    if (cq->overrun) {
+    if (cq->closing) {
+        result = -EBUSY;
+    } else if (cq->overrun) {
         result = -EOVERFLOW;
     } else {
-        cq->armed = true;
-        cq->solicited_only = solicited_only;
+        if (cq->channel && !cq->armed) {
+            cq->notification = calloc(1, sizeof(*cq->notification));
+            if (!cq->notification)
+                result = -ENOMEM;
+            else
+                cq->notification->cq = cq;
+        }
+        if (!result) {
+            cq->armed = true;
+            cq->solicited_only = solicited_only;
+        }
     }
     pthread_mutex_unlock(&cq->mutex);
     return result;
@@ -372,12 +606,18 @@ int mrc_provider_cq_next_event(struct mrc_provider_cq *cq, enum mrc_provider_cq_
         return -EINVAL;
     pthread_mutex_lock(&cq->mutex);
     int result = 0;
-    if (cq->unacked == SIZE_MAX) {
+    if (cq->closing) {
+        result = -EBUSY;
+    } else if (cq->unacked == SIZE_MAX) {
         result = -EOVERFLOW;
-    } else if (cq->ready) {
+    } else if (!cq->channel && cq->ready) {
         cq->ready--;
         *event = MRC_PROVIDER_CQ_COMPLETION;
     } else if (cq->overflow_event) {
+        if (cq->ready == SIZE_MAX - cq->unacked) {
+            pthread_mutex_unlock(&cq->mutex);
+            return -EOVERFLOW;
+        }
         cq->overflow_event = false;
         *event = MRC_PROVIDER_CQ_OVERFLOW;
     } else {
@@ -397,8 +637,11 @@ int mrc_provider_cq_ack_events(struct mrc_provider_cq *cq, size_t count)
     int result = 0;
     if (count > cq->unacked)
         result = -EINVAL;
-    else
+    else {
         cq->unacked -= count;
+        if (cq->closing && !cq->unacked && !cq->ready)
+            pthread_cond_signal(&cq->events_acked);
+    }
     pthread_mutex_unlock(&cq->mutex);
     return result;
 }
