@@ -65,21 +65,30 @@ struct path {
     struct rte_ether_addr peer;
 };
 
+struct write_request {
+    uint32_t first_packet;
+    uint32_t packets;
+    uint32_t offset;
+    uint32_t length;
+    uint32_t preceding_immediates;
+    uint32_t immediate;
+    bool with_immediate;
+};
+
 struct transfer {
     bool sender;
-    bool with_immediate;
     bool trim_nack_enabled;
     bool port_stats;
     bool remote_key_configured;
     const char *oob_address;
     uint16_t oob_port;
     uint32_t timeout_ms;
-    uint32_t immediate;
     uint32_t bytes;
     uint32_t packets;
-    uint32_t wr_bytes;
-    uint32_t wr_packets;
+    uint32_t uniform_wr_packets;
+    struct write_request *work;
     uint32_t work_requests;
+    uint32_t immediate_requests;
     uint32_t posted_receives;
     uint32_t max_wimm_inflight;
     uint32_t initial_psn;
@@ -164,6 +173,7 @@ struct counters {
     uint32_t duplicates;
     uint32_t reorder_max;
     uint32_t immediate_completions;
+    uint32_t next_receive_work;
     uint32_t write_completions;
     uint32_t work_errors;
     uint32_t work_flushed;
@@ -232,26 +242,39 @@ static uint8_t pattern(uint32_t offset)
     return (uint8_t)(offset ^ (offset >> 8) ^ (offset >> 16) ^ (offset >> 24));
 }
 
-static uint32_t request_index(const struct transfer *transfer, uint32_t index)
+static uint32_t request_index(const struct transfer *transfer, uint32_t packet)
 {
-    return index / transfer->wr_packets;
+    if (packet >= transfer->packets)
+        return transfer->work_requests;
+    if (transfer->uniform_wr_packets)
+        return packet / transfer->uniform_wr_packets;
+
+    uint32_t first = 0, last = transfer->work_requests;
+    while (last - first > 1) {
+        uint32_t middle = first + (last - first) / 2;
+        if (packet < transfer->work[middle].first_packet)
+            last = middle;
+        else
+            first = middle;
+    }
+    return first;
 }
 
-static uint32_t length_at(const struct transfer *transfer, uint32_t index)
+static uint32_t length_at(const struct write_request *work, uint32_t index)
 {
-    uint32_t remaining = transfer->wr_bytes - (index % transfer->wr_packets) * PMTU;
+    uint32_t remaining = work->length - (index - work->first_packet) * PMTU;
     return remaining < PMTU ? remaining : PMTU;
 }
 
-static uint8_t expected_opcode(const struct transfer *transfer, uint32_t index)
+static uint8_t expected_opcode(const struct write_request *work, uint32_t index)
 {
-    if (transfer->wr_packets == 1)
-        return transfer->with_immediate ? MRC_WRITE_ONLY_IMM : MRC_WRITE_ONLY;
-    uint32_t fragment = index % transfer->wr_packets;
+    if (work->packets == 1)
+        return work->with_immediate ? MRC_WRITE_ONLY_IMM : MRC_WRITE_ONLY;
+    uint32_t fragment = index - work->first_packet;
     if (fragment == 0)
         return MRC_WRITE_FIRST;
-    if (fragment + 1 == transfer->wr_packets)
-        return transfer->with_immediate ? MRC_WRITE_LAST_IMM : MRC_WRITE_LAST;
+    if (fragment + 1 == work->packets)
+        return work->with_immediate ? MRC_WRITE_LAST_IMM : MRC_WRITE_LAST;
     return MRC_WRITE_MIDDLE;
 }
 
@@ -268,7 +291,8 @@ static uint32_t nominal_size(uint8_t opcode, size_t data_length, bool timestamp)
 
 static uint32_t nominal_at(const struct transfer *transfer, uint32_t index)
 {
-    return nominal_size(expected_opcode(transfer, index), length_at(transfer, index), false);
+    const struct write_request *work = &transfer->work[request_index(transfer, index)];
+    return nominal_size(expected_opcode(work, index), length_at(work, index), false);
 }
 
 static uint64_t cycles_to_ns(const struct transfer *transfer, uint64_t cycles)
@@ -601,32 +625,34 @@ static int send_write(const struct transfer *transfer, struct sender *sender,
                        bool retry)
 {
     uint32_t wr = request_index(transfer, index);
+    const struct write_request *work = &transfer->work[wr];
     struct mrc_provider_write_view write;
     int result = mrc_provider_qp_get_write(sender->provider_qp, wr + 1, &write);
     if (result)
         return result;
-    if (write.length != transfer->wr_bytes || write.with_immediate != transfer->with_immediate)
+    if (write.length != work->length || write.with_immediate != work->with_immediate)
         return -EPROTO;
 
-    struct mrc_wire_packet packet = packet_for(transfer, path, expected_opcode(transfer, index),
+    struct mrc_wire_packet packet = packet_for(transfer, path, expected_opcode(work, index),
         mrc_psn_add(transfer->initial_psn, (int32_t)index));
+    uint32_t length = length_at(work, index);
     struct mrc_cc after_send = sender->cc;
-    if (!mrc_cc_on_send(&after_send, nominal_at(transfer, index)))
+    if (!mrc_cc_on_send(&after_send, nominal_size(packet.bth.opcode, length, false)))
         return -EPROTO;
     packet.bth.retransmit = retry;
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
                              index + 1 == transfer->packets ||
                              mrc_cc_ack_request(&after_send, SACK_THRESHOLD);
-    uint32_t offset = (index % transfer->wr_packets) * PMTU;
+    uint32_t offset = (index - work->first_packet) * PMTU;
     packet.body.write = (struct mrc_wire_write){
-        .rqmsn = write.with_immediate ? (uint16_t)(wr + 1) : 0,
+        .rqmsn = write.with_immediate ? (uint16_t)(work->preceding_immediates + 1) : 0,
         .msn = (uint16_t)(wr + 1),
         .va = write.remote_address + offset,
         .r_key = write.rkey,
         .dma_len = write.length,
         .imm_data = write.immediate,
         .data = write.data ? write.data + offset : NULL,
-        .data_len = length_at(transfer, index),
+        .data_len = length,
     };
 
     if (blackholed(transfer, sender, path)) {
@@ -686,8 +712,16 @@ static int drain_completions(const struct transfer *transfer, struct mrc_provide
                     counts->first_work_error = wc->status;
                 counts->work_errors++;
             } else {
-                if (wc->byte_length != transfer->wr_bytes || wc->with_immediate == transfer->sender ||
-                    (wc->with_immediate && wc->immediate != transfer->immediate + *total))
+                uint32_t index = *total;
+                if (!transfer->sender) {
+                    index = counts->next_receive_work;
+                    while (index < transfer->work_requests && !transfer->work[index].with_immediate)
+                        index++;
+                    counts->next_receive_work = index + 1;
+                }
+                if (index >= transfer->work_requests || wc->with_immediate == transfer->sender ||
+                    wc->byte_length != transfer->work[index].length ||
+                    (wc->with_immediate && wc->immediate != transfer->work[index].immediate))
                     return -EPROTO;
                 (*total)++;
             }
@@ -789,7 +823,7 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
             if (ack->syndrome == REMOTE_OPERATION_NAK &&
                 ack->msn >= request_index(transfer, (uint32_t)first) &&
                 ack->msn <= request_index(transfer, (uint32_t)last)) {
-                uint32_t start = ack->msn * transfer->wr_packets;
+                uint32_t start = transfer->work[ack->msn].first_packet;
                 failed = start < (uint32_t)first ? (uint32_t)first : start;
             }
             return fail_send(transfer, sender, failed, aeth_error_status(ack->syndrome), -EPROTO);
@@ -1165,8 +1199,10 @@ static int poll_sender(const struct transfer *transfer, struct counters *counts,
             uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
             if (!mrc_mpr_can_transmit(&sender.mpr, sender.qp.delivery_cack_psn, psn))
                 break;
-            uint32_t wimm_inflight = request_index(transfer, index) - request_index(transfer, first);
-            if ((transfer->with_immediate && wimm_inflight >= transfer->max_wimm_inflight) ||
+            const struct write_request *work = &transfer->work[request_index(transfer, index)];
+            uint32_t wimm_inflight = work->preceding_immediates -
+                transfer->work[request_index(transfer, first)].preceding_immediates;
+            if ((work->with_immediate && wimm_inflight >= transfer->max_wimm_inflight) ||
                 !mrc_cc_can_send(&sender.cc, nominal_at(transfer, index)))
                 break;
             int picked = mrc_ev_pick(&sender.ev, available_paths(&sender, now), 0, now);
@@ -1204,15 +1240,15 @@ static int run_sender(const struct transfer *transfer, struct counters *counts)
     if (!result)
         result = open_provider_qp(transfer, cq, &qp);
     for (uint32_t wr = 0; !result && wr < transfer->work_requests; wr++) {
-        uint32_t offset = wr * transfer->wr_bytes;
+        const struct write_request *work = &transfer->work[wr];
         const struct mrc_provider_write write = {
             .wr_id = wr + 1,
-            .local_buffer = transfer->pd ? NULL : transfer->data + offset,
-            .local_iova = transfer->pd ? (uint64_t)(uintptr_t)(transfer->data + offset) : 0,
-            .remote_address = transfer->remote_address + offset,
-            .length = transfer->wr_bytes, .lkey = transfer->buffer_keys.lkey,
-            .rkey = transfer->remote_key, .with_immediate = transfer->with_immediate,
-            .immediate = transfer->immediate + wr,
+            .local_buffer = transfer->pd ? NULL : transfer->data + work->offset,
+            .local_iova = transfer->pd ? (uint64_t)(uintptr_t)(transfer->data + work->offset) : 0,
+            .remote_address = transfer->remote_address + work->offset,
+            .length = work->length, .lkey = transfer->buffer_keys.lkey,
+            .rkey = transfer->remote_key, .with_immediate = work->with_immediate,
+            .immediate = work->immediate,
         };
         uint64_t sequence;
         result = mrc_provider_qp_post_write(qp, &write, &sequence);
@@ -1383,7 +1419,8 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
     }
 
     uint32_t index = (uint32_t)mrc_psn_delta(psn, transfer->initial_psn);
-    if (index >= transfer->packets || write->dma_len != transfer->wr_bytes)
+    if (index >= transfer->packets ||
+        write->dma_len != transfer->work[request_index(transfer, index)].length)
         return reject_write(transfer, receiver, counts, path, packet, MRC_WR_INVALID, psn);
 
     enum mrc_wr_result result = mrc_wr_receive(&receiver->wr, psn, packet->bth.opcode, write);
@@ -1551,7 +1588,7 @@ static int poll_receiver(const struct transfer *transfer, struct responder *rece
     }
 
     if (mrc_wr_ack_msn(&receiver->wr) != transfer->work_requests ||
-        (transfer->with_immediate && counts->immediate_completions != transfer->work_requests))
+        counts->immediate_completions != transfer->immediate_requests)
         return -EBADMSG;
     for (uint32_t i = 0; i < transfer->bytes; i++) {
         if (transfer->data[i] != pattern(i))
@@ -1646,16 +1683,83 @@ static bool parse_port(const char *device, uint16_t *port)
     return rte_eth_dev_is_valid_port(*port);
 }
 
+static bool append_write(struct transfer *transfer, uint32_t length, bool with_immediate,
+                          uint32_t immediate)
+{
+    uint32_t packets = length ? (length + PMTU - 1) / PMTU : 1;
+    if (length > (1U << 30) - transfer->bytes || packets >= MRC_PSN_HALF - transfer->packets)
+        return false;
+
+    transfer->work[transfer->work_requests++] = (struct write_request){
+        .first_packet = transfer->packets, .packets = packets, .offset = transfer->bytes,
+        .length = length, .preceding_immediates = transfer->immediate_requests,
+        .with_immediate = with_immediate, .immediate = immediate,
+    };
+    transfer->bytes += length;
+    transfer->packets += packets;
+    transfer->immediate_requests += with_immediate;
+    return true;
+}
+
+static bool parse_writes(struct transfer *transfer, const char *input, uint32_t repeat,
+                          bool with_immediate, uint32_t immediate)
+{
+    bool list = strpbrk(input, ",@") != NULL;
+    if (!list) {
+        uint32_t length;
+        if (!number(input, 0, 1U << 30, &length))
+            return false;
+        if (!repeat)
+            repeat = 1;
+        transfer->work = calloc(repeat, sizeof(*transfer->work));
+        if (!transfer->work)
+            return false;
+        for (uint32_t wr = 0; wr < repeat; wr++) {
+            if (!append_write(transfer, length, with_immediate, immediate + wr))
+                return false;
+        }
+        transfer->uniform_wr_packets = transfer->work[0].packets;
+        return true;
+    }
+
+    if (repeat || with_immediate)
+        return false;
+    uint32_t entries = 1;
+    for (const char *cursor = input; *cursor; cursor++) {
+        if (*cursor == ',' && ++entries > MAX_WORK_REQUESTS)
+            return false;
+    }
+    transfer->work = calloc(entries, sizeof(*transfer->work));
+    char *copy = strdup(input);
+    if (!transfer->work || !copy) {
+        free(copy);
+        return false;
+    }
+    bool valid = true;
+    char *cursor = copy;
+    for (char *entry = strsep(&cursor, ","); entry; entry = strsep(&cursor, ",")) {
+        char *imm = strchr(entry, '@');
+        uint32_t length, value = 0;
+        if (imm)
+            *imm++ = '\0';
+        if (!number(entry, 0, 1U << 30, &length) ||
+            (imm && !number(imm, 0, UINT32_MAX, &value)) ||
+            !append_write(transfer, length, imm != NULL, value)) {
+            valid = false;
+            break;
+        }
+    }
+    free(copy);
+    return valid;
+}
+
 static bool parse_args(int argc, char **argv, struct transfer *transfer)
 {
-    if (argc < 9 || (argc - 9) % 2 || (strcmp(argv[1], "tx") && strcmp(argv[1], "rx")) ||
-        !number(argv[2], 0, 1U << 30, &transfer->wr_bytes))
+    if (argc < 9 || (argc - 9) % 2 || (strcmp(argv[1], "tx") && strcmp(argv[1], "rx")))
         return false;
     transfer->sender = strcmp(argv[1], "tx") == 0;
-    transfer->work_requests = 1;
     transfer->max_wimm_inflight = DEFAULT_WIMM_INFLIGHT;
     transfer->posted_receives = UINT32_MAX;
-    transfer->wr_packets = transfer->wr_bytes ? (transfer->wr_bytes + PMTU - 1) / PMTU : 1;
     transfer->drop_after = UINT32_MAX;
     transfer->restore_after = UINT32_MAX;
     transfer->mpr_change_at = UINT32_MAX;
@@ -1687,7 +1791,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     transfer->remote_key = DEFAULT_REMOTE_KEY;
     uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
     uint32_t oob_port = 0, trim_nack = 1, srv6_srh = 0, port_stats = 0;
-    bool local_sid = false, peer_sid = false;
+    bool local_sid = false, peer_sid = false, with_immediate = false;
+    uint32_t repeat = 0, immediate = 0;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
     uint32_t mpr = WINDOW / MRC_MPR_UNIT, p_key = DEFAULT_PARTITION_KEY;
     uint32_t rx_ooo_capacity = UINT32_MAX, rx_staging_capacity = UINT32_MAX;
@@ -1744,7 +1849,7 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
             number64(value, 0, UINT64_MAX, &transfer->remote_address))
             continue;
         if (!strcmp(key, "--work-requests") &&
-            number(value, 1, MAX_WORK_REQUESTS, &transfer->work_requests))
+            number(value, 1, MAX_WORK_REQUESTS, &repeat))
             continue;
         if (!strcmp(key, "--max-wimm-inflight") &&
             number(value, 1, WINDOW, &transfer->max_wimm_inflight))
@@ -1777,8 +1882,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
         if (!transfer->sender && !strcmp(key, "--drop-final-acks") &&
             number(value, 0, 25, &transfer->final_ack_drops))
             continue;
-        if (!strcmp(key, "--immediate") && number(value, 0, UINT32_MAX, &transfer->immediate)) {
-            transfer->with_immediate = true;
+        if (!strcmp(key, "--immediate") && number(value, 0, UINT32_MAX, &immediate)) {
+            with_immediate = true;
             continue;
         }
         if (transfer->sender && !strcmp(key, "--profile-dir") && value[0]) {
@@ -1803,28 +1908,25 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
         return false;
     }
 
-    uint64_t total_bytes = (uint64_t)transfer->wr_bytes * transfer->work_requests;
-    uint64_t total_packets = (uint64_t)transfer->wr_packets * transfer->work_requests;
-    if (total_bytes > (1U << 30) || total_packets >= MRC_PSN_HALF ||
-        transfer->remote_address > UINT64_MAX - total_bytes ||
-        (transfer->drop_after != UINT32_MAX && transfer->drop_after >= total_packets) ||
+    if (!parse_writes(transfer, argv[2], repeat, with_immediate, immediate))
+        return false;
+    if (transfer->remote_address > UINT64_MAX - transfer->bytes ||
+        (transfer->drop_after != UINT32_MAX && transfer->drop_after >= transfer->packets) ||
         (transfer->restore_after != UINT32_MAX &&
-         (transfer->restore_after <= transfer->drop_after || transfer->restore_after >= total_packets)) ||
+         (transfer->restore_after <= transfer->drop_after || transfer->restore_after >= transfer->packets)) ||
         (dynamic_mpr && !oob_port) ||
         ((transfer->mpr_change_at != UINT32_MAX) != (mpr_change_to != 0)) ||
         (mpr_change_to && (!dynamic_mpr || mpr_change_to > mpr ||
-                           transfer->mpr_change_at >= total_packets)) ||
-        (transfer->trim_after != UINT32_MAX && transfer->trim_after >= total_packets) ||
+                           transfer->mpr_change_at >= transfer->packets)) ||
+        (transfer->trim_after != UINT32_MAX && transfer->trim_after >= transfer->packets) ||
         (transfer->drop_after != UINT32_MAX && transfer->trim_after != UINT32_MAX) ||
         (!!transfer->profile_directory != !!transfer->profile_id) ||
         (!!transfer->oob_address != !!oob_port) || (oob_port && transfer->remote_key_configured) ||
         local_sid != peer_sid ||
         (local_sid && transfer->ip_version != MRC_WIRE_IP6) || (srv6_srh && !local_sid))
         return false;
-    transfer->bytes = (uint32_t)total_bytes;
-    transfer->packets = (uint32_t)total_packets;
     if (transfer->posted_receives == UINT32_MAX)
-        transfer->posted_receives = transfer->with_immediate ? transfer->work_requests : 0;
+        transfer->posted_receives = transfer->immediate_requests;
     if (transfer->posted_receives > transfer->work_requests)
         return false;
     transfer->udp_port = (uint16_t)udp_port;
@@ -1963,7 +2065,7 @@ static int setup_qp(struct transfer *transfer)
         uint32_t peer_window = qp.send.max_mpr * MRC_MPR_UNIT;
         if (peer_window < transfer->window)
             transfer->window = peer_window;
-        if (transfer->with_immediate && !qp.send.max_wimm)
+        if (transfer->immediate_requests && !qp.send.max_wimm)
             return -EPROTONOSUPPORT;
         if (qp.send.max_wimm < transfer->max_wimm_inflight)
             transfer->max_wimm_inflight = qp.send.max_wimm;
@@ -2043,7 +2145,7 @@ int main(int argc, char **argv)
     unsigned int opened = 0;
     struct port_snapshot initial_stats[PATH_COUNT] = {0};
     if (!parse_args(argc - consumed, argv + consumed, &transfer)) {
-        fprintf(stderr, "Usage: %s [EAL options] -- tx|rx BYTES LOCAL_IP PEER_IP\n"
+        fprintf(stderr, "Usage: %s [EAL options] -- tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP\n"
                         "       PORT0 PEER_MAC0 PORT1 PEER_MAC1 [--initial-psn N] [--udp-port N]\n"
                         "       [--requestor-qpn N] [--responder-qpn N] [--p-key N] [--mpr N]\n"
                         "       [--remote-key N] [--remote-address N] [--immediate N]\n"
@@ -2140,6 +2242,7 @@ done:
     }
     mrc_ctl_store_release(&transfer.profile_lease);
     mrc_ctl_store_close(&transfer.profile_store);
+    free(transfer.work);
     rte_eal_cleanup();
     return result ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -17,7 +17,16 @@ from memif_pair import MACS, eal_args, require, run_pair
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
              trim_after=None, ipv6=False, work_requests=1, posted_receives=None,
              expected_errors=None, negotiate=False, srv6=False, tx_options=(), rx_options=(),
-             sender_started=None):
+             sender_started=None, writes=None):
+    work = str(size)
+    repeat = ("--work-requests", str(work_requests))
+    total_bytes = size * work_requests
+    if writes is not None:
+        work = ",".join(str(length) if immediate is None else f"{length}@{immediate}"
+                        for length, immediate in writes)
+        repeat = ()
+        work_requests = len(writes)
+        total_bytes = sum(length for length, _ in writes)
     oob_port = None
     if negotiate:
         with socket.socket() as reserve:
@@ -30,9 +39,8 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
                      {"tx": "192.0.2.1", "rx": "192.0.2.2"})
         local_ip, peer_ip = addresses[role], addresses[peer]
         args = eal_args(binary, role, cpu, directory)
-        args += ["--", role, str(size), local_ip, peer_ip, "0", MACS[peer][0],
-                 "1", MACS[peer][1], "--ack-timeout", "16",
-                 "--work-requests", str(work_requests), *options]
+        args += ["--", role, work, local_ip, peer_ip, "0", MACS[peer][0],
+                 "1", MACS[peer][1], "--ack-timeout", "16", *repeat, *options]
         if srv6:
             sids = {"tx": "2001:db8:aaaa::1", "rx": "2001:db8:bbbb::3"}
             args += ["--srv6-local", sids[role], "--srv6-peer", sids[peer], "--srv6-srh", "1"]
@@ -58,7 +66,7 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
     tx, rx, _ = run_pair(command, expected_errors=expected_errors, sender_started=sender_started)
     if expected_errors:
         return tx, rx
-    require(tx["bytes"] == rx["bytes"] == size * work_requests, "Incorrect completed byte count")
+    require(tx["bytes"] == rx["bytes"] == total_bytes, "Incorrect completed byte count")
     require(tx["packets"] == sum(rx["received"]), "Receiver missed or double-counted a segment")
     require(tx["transport_acks"] > 0, "Requester did not receive a semantic transport ACK")
     require(tx["write_completions"] == work_requests, "Requester CQ did not report every WRITE")
@@ -207,6 +215,19 @@ def main():
     require(rx["immediate_completions"] == 32 and tx["dropped"] > 0 and rx["reorder_max"] > 0,
             "WRITEIMM sequence failed under receive-credit limits and out-of-order placement")
     print(json.dumps({"case": "ordered_write_imm_completions", "tx": tx, "rx": rx}))
+
+    writes = [(0, None), (8196, 4294967295), (3075, None), (0, 0),
+              (1025, None), (2055, 77), (13, None)]
+    tx, rx = transfer(binary, 0, "--max-wimm-inflight", "1", "--udp-port", "4971",
+                      writes=writes, negotiate=True, posted_receives=3, drop_after=1,
+                      rx_options=("--max-wimm-inflight", "1"))
+    expected_packets = sum(max(1, (length + 1023) // 1024) for length, _ in writes)
+    require(tx["packets"] == expected_packets and tx["write_completions"] == len(writes) and
+            rx["immediate_completions"] == 3 and tx["registered_memory"] and rx["registered_memory"],
+            f"Mixed WRITE and WRITEIMM sequence failed: {tx}, {rx}")
+    require(tx["dropped"] > 0 and tx["retries"][0] > 0 and rx["reorder_max"] > 0,
+            f"Mixed work did not exercise reordering and retransmission: {tx}, {rx}")
+    print(json.dumps({"case": "mixed_write_sizes_and_receive_sequences", "tx": tx, "rx": rx}))
 
     tx, _ = transfer(binary, 1024, "--immediate", "23", posted_receives=0, work_requests=3,
                      expected_errors={"tx": "syndrome 0x63", "rx": "MRC QP state=ERROR"})

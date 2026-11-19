@@ -11,7 +11,7 @@ available, `python3 tests/check_mrc_write.py` exercises the OCP endpoint
 without using the physical NICs.
 
 The arguments after EAL are
-`tx|rx BYTES_PER_WR LOCAL_IP PEER_IP PORT0 PEER_MAC0 PORT1 PEER_MAC1`.
+`tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP PORT0 PEER_MAC0 PORT1 PEER_MAC1`.
 Ports may be DPDK port IDs or names, including PCI BDFs. Both peers use
 matching QP and memory attributes. Run `mrc_write` with valid EAL parameters
 and no benchmark arguments for the option list. Use `--work-requests N` for
@@ -19,6 +19,11 @@ multiple WRs and `--immediate N` to give the first WR an immediate value.
 Subsequent immediate values increment modulo 32 bits. The default receiver
 posts one receive credit per WRITEIMM. `--max-wimm-inflight N` sets the agreed
 credit limit and `--mpr N` sets the static window in units of 128 packets.
+To mix sizes and operation types, pass the same comma-separated list on
+both peers, such as `4097,0@42,11,2049@7`. An `@VALUE` suffix makes that
+entry a WRITEIMM. Use the list by itself in place of the single size,
+`--work-requests`, and `--immediate`. Each WRITEIMM consumes one receive
+credit and advances the receive queue message sequence.
 
 Add `--oob-host IP --oob-port N` on both endpoints to exchange the QP
 parameters over TCP. On the receiver, the IP is the local management address
