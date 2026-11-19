@@ -9,7 +9,7 @@ from memif_pair import MACS, eal_args, require, run_pair
 
 
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
-             trim_after=None, ipv6=False):
+             trim_after=None, ipv6=False, work_requests=1, posted_receives=None, expected_errors=None):
     def command(role, cpu, directory):
         tx = role == "tx"
         peer = "rx" if tx else "tx"
@@ -18,17 +18,22 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
         local_ip, peer_ip = addresses[role], addresses[peer]
         args = eal_args(binary, role, cpu, directory)
         args += ["--", role, str(size), local_ip, peer_ip, "0", MACS[peer][0],
-                 "1", MACS[peer][1], "--ack-timeout", "16", *options]
+                 "1", MACS[peer][1], "--ack-timeout", "16",
+                 "--work-requests", str(work_requests), *options]
         if tx and drop_after is not None:
             args += ["--drop-path-after", str(drop_after)]
         if tx and trim_after is not None:
             args += ["--trim-path-after", str(trim_after)]
         if not tx and drop_final_acks is not None:
             args += ["--drop-final-acks", str(drop_final_acks)]
+        if not tx and posted_receives is not None:
+            args += ["--posted-receives", str(posted_receives)]
         return args
 
-    tx, rx, _ = run_pair(command)
-    require(tx["bytes"] == rx["bytes"] == size, "Incorrect completed byte count")
+    tx, rx, _ = run_pair(command, expected_errors=expected_errors)
+    if expected_errors:
+        return tx, rx
+    require(tx["bytes"] == rx["bytes"] == size * work_requests, "Incorrect completed byte count")
     require(tx["packets"] == sum(rx["received"]), "Receiver missed or double-counted a segment")
     require(tx["transport_acks"] > 0, "Requester did not receive a semantic transport ACK")
     return tx, rx
@@ -62,6 +67,8 @@ def main():
     tx, rx = transfer(binary, 4194304)
     require(tx["sent"] == [2048, 2048], f"Healthy striping mismatch: {tx}")
     require(tx["sacks"] > 0 and tx["retries"] == [0, 0], "Healthy transfer did not receive SACKs")
+    require(rx["port_status_updates"] > 0 and tx["port_status_replies"] > 0,
+            "Node-scoped port status was not acknowledged")
     print(json.dumps({"case": "write_striped", "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 4194301, "--immediate", "305419896",
@@ -83,6 +90,16 @@ def main():
     require(rx["trimmed"] > 0 and tx["trim_nacks"] > 0 and rx["immediate_completed"],
             f"IPv6 WRITEIMM did not recover from trimmed data: {tx}, {rx}")
     print(json.dumps({"case": "ipv6_write_imm_trim_nack", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 8195, "--immediate", "4294967290", "--max-wimm-inflight", "2",
+                      "--mpr", "1", work_requests=32, drop_after=6)
+    require(rx["immediate_completions"] == 32 and tx["dropped"] > 0 and rx["reorder_max"] > 0,
+            "WRITEIMM sequence failed under receive-credit limits and out-of-order placement")
+    print(json.dumps({"case": "ordered_write_imm_completions", "tx": tx, "rx": rx}))
+
+    transfer(binary, 1024, "--immediate", "23", posted_receives=0,
+             expected_errors={"tx": "syndrome 0x63", "rx": "Protocol error"})
+    print(json.dumps({"case": "write_imm_without_receive_credit"}))
 
 
 if __name__ == "__main__":

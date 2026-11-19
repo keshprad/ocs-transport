@@ -3,3 +3,4 @@
 /tests/test_mrc_qp
 /tests/test_mrc_wire
 /tests/test_mrc_cc
+/tests/test_mrc_wr

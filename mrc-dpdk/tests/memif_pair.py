@@ -35,14 +35,19 @@ def start(args, directory):
                             stderr=subprocess.PIPE)
 
 
-def collect(process):
+def collect(process, expected_error=None):
     stdout, stderr = process.communicate(timeout=12)
+    if expected_error is not None:
+        require(process.returncode != 0 and expected_error in stderr,
+                f"Expected {expected_error!r} with failure, got {process.returncode}\n{stdout}\n{stderr}")
+        return stderr
     require(process.returncode == 0,
             f"Endpoint exited {process.returncode}\n{stdout}\n{stderr}")
     return json.loads(stdout.strip().splitlines()[-1])
 
 
-def run_pair(build_command, read_artifacts=None):
+def run_pair(build_command, read_artifacts=None, expected_errors=None):
+    expected_errors = expected_errors or {}
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The two polling endpoints need at least two usable CPUs")
     with tempfile.TemporaryDirectory(prefix="mrc-") as temporary:
@@ -60,8 +65,8 @@ def run_pair(build_command, read_artifacts=None):
                 time.sleep(0.01)
             sender = start(build_command("tx", cpus[1], directory), directory)
             processes.append(sender)
-            tx = collect(sender)
-            rx = collect(receiver)
+            tx = collect(sender, expected_errors.get("tx"))
+            rx = collect(receiver, expected_errors.get("rx"))
             return tx, rx, read_artifacts(directory) if read_artifacts else None
         finally:
             for process in processes:

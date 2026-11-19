@@ -3,6 +3,43 @@
 `mrc_write` is the in-progress OCP MRC 1.0 endpoint. See the
 [conformance status and verification](CONFORMANCE.md).
 
+## OCP WRITE benchmark
+
+From this directory, `make` builds `mrc_write` and the original prototype.
+`make check` runs the portable format and state tests. With the memif PMD
+available, `python3 tests/check_mrc_write.py` exercises the OCP endpoint
+without using the physical NICs.
+
+The arguments after EAL are
+`tx|rx BYTES_PER_WR LOCAL_IP PEER_IP PORT0 PEER_MAC0 PORT1 PEER_MAC1`.
+Ports may be DPDK port IDs or names, including PCI BDFs. Both peers use
+matching QP and memory attributes. Run `mrc_write` with valid EAL parameters
+and no benchmark arguments for the option list. Use `--work-requests N` for
+multiple WRs and `--immediate N` to give the first WR an immediate value.
+Subsequent immediate values increment modulo 32 bits. The default receiver
+posts one receive credit per WRITEIMM. `--max-wimm-inflight N` sets the agreed
+credit limit and `--mpr N` sets the static window in units of 128 packets.
+
+### Spark double ring
+
+Run the [revision gate](CONFORMANCE.md#verification) immediately before
+starting the test. Build on each selected host from its clean test worktree.
+On the direct Spark-04 to Spark-02 pair, use the following route mapping:
+
+| End | Local IP | Peer IP | Path 0 PCI / peer MAC | Path 1 PCI / peer MAC |
+| --- | --- | --- | --- | --- |
+| Spark-04 | 10.61.0.2 | 10.61.0.1 | `0000:01:00.0` / `4c:bb:47:82:4e:db` | `0002:01:00.0` / `4c:bb:47:82:4e:df` |
+| Spark-02 | 10.61.0.1 | 10.61.0.2 | `0000:01:00.1` / `4c:bb:47:2e:7e:65` | `0002:01:00.1` / `4c:bb:47:2e:7e:69` |
+
+Use EAL `-a` for each selected PCI address and `--iova-mode=va --no-huge`
+for the private mlx5 runtime. Start Spark-02 as `rx` and Spark-04 as `tx`.
+The configured IP pair identifies the QP across both circuits, while each
+circuit uses its corresponding peer MAC. First run with both paths healthy.
+Use `--drop-path-after N` on the sender for an in-process path-1 blackhole
+that leaves the Polatis configuration untouched.
+
+## Original multipath prototype
+
 `mrc_bench` is the original prototype. It sends one host-memory buffer over two DPDK Ethernet ports.
 It stripes 1,400-byte segments across the ports, places segments by sequence
 number, and sends selective ACKs as 64-segment bitmaps. When a segment's ACK

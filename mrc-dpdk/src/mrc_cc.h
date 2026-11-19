@@ -20,6 +20,29 @@ void mrc_cc_rx_record(struct mrc_cc_rx *rx, uint32_t nominal_bytes,
                       bool new_data, bool trimmed);
 uint32_t mrc_cc_rx_wire_count(const struct mrc_cc_rx *rx);
 
+struct mrc_cc_delay_window {
+    double sum_ns;
+    uint64_t samples;
+};
+
+struct mrc_cc_nscc {
+    uint32_t max_wnd;
+    uint64_t config_base_rtt_ns;
+    uint64_t sender_link_bytes_per_second;
+    double scaling_a;
+    double inc_bytes;
+    uint64_t received_bytes;
+    uint64_t fast_bytes;
+    uint64_t last_adjust_ns;
+    uint64_t last_decrease_ns;
+    uint64_t last_ack_ns;
+    uint64_t delay_start_ns;
+    struct mrc_cc_delay_window previous_delay;
+    struct mrc_cc_delay_window current_delay;
+    bool clock_started;
+    bool increase_mode;
+};
+
 /*
  * Per-QP NSCC accounting for one QP/QPCC. The signed 32-bit inflight
  * counter permits small negative values from ACK counter rounding.
@@ -31,6 +54,7 @@ struct mrc_cc {
     uint32_t nominal_mtu;
     uint64_t base_rtt_ns;
     uint64_t target_queue_delay_ns;
+    struct mrc_cc_nscc nscc;
 };
 
 enum mrc_cc_adjustment {
@@ -62,6 +86,14 @@ enum mrc_cc_qp_state {
 
 bool mrc_cc_init(struct mrc_cc *cc, uint32_t nominal_mtu, uint32_t initial_cwnd,
                  uint64_t initial_base_rtt_ns, uint64_t target_queue_delay_ns);
+/*
+ * Set link-derived BDP and MaxWnd before sending. A zero receiver rate uses
+ * the sender rate. With no explicit rate, init uses initial_cwnd as MaxWnd
+ * and derives the tuning BDP from it. The ACK algorithm works in either mode.
+ */
+bool mrc_cc_configure_nscc(struct mrc_cc *cc, uint64_t sender_link_bytes_per_second,
+                            uint64_t receiver_link_bytes_per_second,
+                            uint64_t config_base_rtt_ns, uint64_t now_ns);
 bool mrc_cc_can_send(const struct mrc_cc *cc, uint32_t nominal_bytes);
 bool mrc_cc_on_send(struct mrc_cc *cc, uint32_t nominal_bytes);
 /* Evaluate after mrc_cc_on_send(). ACK threshold is expressed in bytes. */
@@ -71,8 +103,9 @@ bool mrc_cc_ack_request(const struct mrc_cc *cc, uint32_t ack_trigger_bytes);
  * SACKs use local packet timestamps and the echoed RTX flag (OCP §8.4).
  * Use NULL for missing TX state or a probe response without a local timestamp.
  * ECN is the SACK SKIP mark, separate from an ALWAYS_SKIP path decision.
- * The returned adjustment classifies feedback. Applying the NSCC increase,
- * decrease, quick adaptation and receiver penalty requires a window algorithm.
+ * Fresh RTT/ECN feedback drives UE 1.0.1 §3.6.13 window updates. Quick adapt
+ * and receiver window penalties are optional OCP signals outside this API.
+ * The caller handles the recommended probe for obtaining an unloaded RTT.
  */
 bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
                     uint64_t arrive_ns, const struct mrc_cc_tx_sample *sample,

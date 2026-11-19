@@ -9,8 +9,8 @@ WARNINGS = -Wall -Wextra -Werror
 all: mrc_bench mrc_write
 
 mrc_bench: src/mrc_bench.c src/dpdk_io.c src/dpdk_io.h
-mrc_write: src/mrc_write.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.c \
-           src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h
+mrc_write: src/mrc_write.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.c src/mrc_wr.c \
+           src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h
 
 mrc_bench mrc_write:
 	$(PKG_CONFIG) --exists libdpdk
@@ -20,14 +20,16 @@ tests/test_mrc_qp: tests/test_mrc_qp.c src/mrc_qp.c src/mrc_qp.h
 tests/test_mrc_wire: tests/test_mrc_wire.c src/mrc_wire.c src/mrc_wire.h
 
 tests/test_mrc_cc: tests/test_mrc_cc.c src/mrc_cc.c src/mrc_cc.h
+tests/test_mrc_wr: tests/test_mrc_wr.c src/mrc_wr.c src/mrc_wire.c src/mrc_qp.c src/mrc_wr.h src/mrc_wire.h src/mrc_qp.h
 
-tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc:
+tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -std=c11 $(WARNINGS) -pedantic $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc
+check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_qp
 	./tests/test_mrc_wire
 	./tests/test_mrc_cc
+	./tests/test_mrc_wr
 
 clean:
-	$(RM) mrc_bench mrc_write tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc
+	$(RM) mrc_bench mrc_write tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr

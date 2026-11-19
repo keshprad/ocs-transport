@@ -133,24 +133,25 @@ static void test_rtt_and_ecn(void)
     assert(mrc_cc_on_sack(&cc, 0, false, false, 210, &sample, &feedback));
     assert(feedback.adjustment == MRC_CC_FAIR_INCREASE);
 
-    assert(mrc_cc_on_sack(&cc, 0, false, true, 91, &sample, &feedback));
+    sample.sent_at_ns = 200;
+    assert(mrc_cc_on_sack(&cc, 0, false, true, 281, &sample, &feedback));
     assert(!feedback.rtt_valid);
     sample.retransmissions = 1;
-    assert(mrc_cc_on_sack(&cc, 1, false, false, 91, &sample, &feedback));
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 281, &sample, &feedback));
     assert(!feedback.rtt_valid);
     assert(feedback.newly_received_bytes == 256);
     assert(cc.base_rtt_ns == 100);
-    assert(mrc_cc_on_sack(&cc, 1, false, true, 91, &sample, &feedback));
+    assert(mrc_cc_on_sack(&cc, 1, false, true, 281, &sample, &feedback));
     assert(feedback.rtt_valid);
     assert(cc.base_rtt_ns == 81);
     sample.retransmissions = 2;
-    assert(mrc_cc_on_sack(&cc, 1, false, true, 91, &sample, &feedback));
+    assert(mrc_cc_on_sack(&cc, 1, false, true, 281, &sample, &feedback));
     assert(!feedback.rtt_valid);
 
     sample.retransmissions = 0;
     assert(mrc_cc_on_sack(&cc, 1, false, false, sample.sent_at_ns, &sample, &feedback));
     assert(!feedback.rtt_valid);
-    assert(mrc_cc_on_sack(&cc, 1, false, false, 91, NULL, &feedback));
+    assert(mrc_cc_on_sack(&cc, 1, false, false, 281, NULL, &feedback));
     assert(!feedback.rtt_valid);
 }
 
@@ -186,6 +187,130 @@ static void test_loss_and_trim(void)
     assert(cc.cwnd == cc.nominal_mtu);
 }
 
+static void test_nscc_increase_formulas(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = {.sent_at_ns = 1};
+    const uint64_t line_rate = UINT64_C(12500000000);
+
+    assert(mrc_cc_init(&cc, 1000, 100000, 12000, 12000));
+    assert(mrc_cc_configure_nscc(&cc, line_rate, 0, 12000, 0));
+    assert(cc.nscc.max_wnd == 225000);
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 18001, &sample, NULL));
+    /* PI: floor(4 * 1000 / 12000 * 1024 * 6000 / 100000 + 150). */
+    assert(cc.cwnd == 100170);
+
+    assert(mrc_cc_init(&cc, 1000, 100000, 12000, 12000));
+    assert(mrc_cc_configure_nscc(&cc, line_rate, 0, 12000, 0));
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 25001, &sample, NULL));
+    /* Fair: floor(5 * 1000 * 1024 / 100000 + 150). */
+    assert(cc.cwnd == 100201);
+
+    assert(mrc_cc_init(&cc, 1024, 100000, 12000, 12000));
+    assert(mrc_cc_configure_nscc(&cc, line_rate, 0, 12000, 1000));
+    assert(mrc_cc_on_sack(&cc, 32, false, false, 12001, &sample, NULL));
+    assert(cc.cwnd == 100000); /* Exactly eight nominal MTUs. */
+    assert(mrc_cc_on_sack(&cc, 33, false, false, 12002, &sample, NULL));
+    assert(cc.cwnd == 100346); /* Byte threshold, no periodic eta. */
+
+    assert(mrc_cc_init(&cc, 1000, 2000, 12000, 12000));
+    assert(mrc_cc_configure_nscc(&cc, line_rate, 0, 12000, 1000));
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 12001, &sample, NULL));
+    assert(cc.cwnd == 2000);
+    assert(mrc_cc_on_sack(&cc, 8, false, false, 12002, &sample, NULL));
+    assert(cc.cwnd == 2256); /* Fast increase: 1024 * 0.25. */
+}
+
+static void test_nscc_decrease_and_staleness(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = {.sent_at_ns = 1};
+    struct mrc_cc_feedback feedback;
+    const uint64_t line_rate = UINT64_C(12500000000);
+
+    assert(mrc_cc_init(&cc, 1000, 100000, 12000, 12000));
+    assert(mrc_cc_configure_nscc(&cc, line_rate, 0, 12000, 0));
+    assert(mrc_cc_on_sack(&cc, 4, true, false, 36001, &sample, &feedback));
+    assert(feedback.adjustment == MRC_CC_MULTIPLICATIVE_DECREASE);
+    /* 100000 * (1 - 0.8 * (24000 - 12000) / 24000) + 150. */
+    assert(cc.cwnd == 60150);
+    assert(mrc_cc_on_sack(&cc, 5, true, false, 48001, &sample, NULL));
+    assert(cc.cwnd == 60300); /* Exactly one base RTT, periodic eta only. */
+    assert(mrc_cc_on_sack(&cc, 6, true, false, 48002, &sample, NULL));
+    assert(cc.cwnd < 60300);
+    assert(cc.nscc.last_decrease_ns == 48002);
+
+    const uint32_t old_cwnd = cc.cwnd;
+    const int32_t old_inflight = cc.inflight;
+    assert(mrc_cc_on_sack(&cc, 5, true, false, 1000000, &sample, &feedback));
+    assert(!feedback.rtt_valid);
+    assert(feedback.newly_received_bytes == 0);
+    assert(cc.cwnd == old_cwnd);
+    assert(cc.inflight == old_inflight);
+    assert(cc.nscc.last_ack_ns == 48002);
+
+    sample.retransmissions = 1;
+    assert(mrc_cc_on_sack(&cc, 7, true, false, 1000001, &sample, &feedback));
+    assert(!feedback.rtt_valid);
+    assert(cc.cwnd == old_cwnd);
+    assert(cc.inflight == old_inflight - 256); /* ACK-clock still advances. */
+    assert(cc.nscc.last_ack_ns == 48002);
+    assert(mrc_cc_on_sack(&cc, 7, true, true, 1000002, &sample, &feedback));
+    assert(feedback.rtt_valid);
+    assert(cc.cwnd == (old_cwnd / 2) + 150); /* Limit any decrease to 50%. */
+}
+
+static void test_nscc_decrease_uses_recent_delay_average(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = {.sent_at_ns = 24000};
+    struct mrc_cc_feedback feedback;
+    const uint64_t line_rate = UINT64_C(12500000000);
+
+    assert(mrc_cc_init(&cc, 1000, 100000, 12000, 12000));
+    assert(mrc_cc_configure_nscc(&cc, line_rate, 0, 12000, 0));
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 36000, &sample, NULL));
+    sample.sent_at_ns = 24001;
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 36001, &sample, NULL));
+
+    sample.sent_at_ns = 2;
+    assert(mrc_cc_on_sack(&cc, 0, true, false, 36002, &sample, &feedback));
+    assert(feedback.adjustment == MRC_CC_MULTIPLICATIVE_DECREASE);
+    assert(cc.cwnd == 100150); /* Mean queueing delay is 8 us, under the 12 us target. */
+
+    sample.sent_at_ns = 36004;
+    assert(mrc_cc_on_sack(&cc, 0, true, false, 72004, &sample, NULL));
+    assert(cc.cwnd == 60240); /* Older low-delay samples have expired. */
+}
+
+static void test_nscc_link_derived_bounds(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = {.sent_at_ns = 2000};
+    const uint64_t sender_rate = UINT64_C(10000000000);
+    const uint64_t receiver_rate = UINT64_C(5000000000);
+
+    assert(mrc_cc_init(&cc, 1000, 100000, 12000, 12000));
+    assert(!mrc_cc_configure_nscc(&cc, 0, receiver_rate, 12000, 0));
+    assert(!mrc_cc_configure_nscc(&cc, sender_rate, receiver_rate, 0, 0));
+    assert(mrc_cc_configure_nscc(&cc, sender_rate, receiver_rate, 12000, 0));
+    assert(cc.nscc.max_wnd == 90000);
+    assert(cc.cwnd == 90000);
+
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 5000, &sample, NULL));
+    assert(cc.base_rtt_ns == 3000);
+    assert(cc.nscc.max_wnd == 45000);
+    assert(cc.cwnd == 45000);
+
+    assert(mrc_cc_on_sack(&cc, 5, true, false, 80000, &sample, NULL));
+    assert(cc.cwnd < 45000);
+    sample.sent_at_ns = 81000;
+    assert(mrc_cc_on_sack(&cc, 6, false, false, 81001, &sample, NULL));
+    assert(cc.base_rtt_ns == 1);
+    assert(cc.nscc.max_wnd == cc.nominal_mtu);
+    assert(cc.cwnd == cc.nominal_mtu);
+}
+
 int main(void)
 {
     test_nominal_size_and_receive_counter();
@@ -193,6 +318,10 @@ int main(void)
     test_ack_clock_rounding_and_wrap();
     test_rtt_and_ecn();
     test_loss_and_trim();
+    test_nscc_increase_formulas();
+    test_nscc_decrease_and_staleness();
+    test_nscc_decrease_uses_recent_delay_average();
+    test_nscc_link_derived_bounds();
     puts("MRC congestion accounting tests passed");
     return 0;
 }
