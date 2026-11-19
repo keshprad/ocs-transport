@@ -37,6 +37,17 @@ in-process path-1 blackhole, pair `--drop-path-after N` with
 `--restore-path-after M`. Recovery is driven by a correlated reliability
 probe reply.
 
+### Receiver resource limits
+
+The receiver normally reserves tracking slots, staging buffers, and work
+records for the configured window. Use `--rx-ooo-capacity`,
+`--rx-staging-capacity`, and `--rx-work-capacity` to limit these resources
+and exercise their reliability NACKs under reordering. Use
+`--rx-cq-capacity` to bound the number of pending receive completions.
+A completion queue overrun terminates the transfer with `UNEXP_EVENT`.
+The result includes `nack_sent_mask` and `nack_received_mask`. Each bit
+position corresponds to its Table 7-3 reason code.
+
 ### Persistent EV profiles
 
 Create a private directory on the sender and bring a profile online.

@@ -87,6 +87,10 @@ struct transfer {
     uint32_t responder_qpn;
     uint32_t remote_key;
     uint32_t window;
+    uint32_t rx_ooo_capacity;
+    uint32_t rx_staging_capacity;
+    uint32_t rx_work_capacity;
+    uint32_t rx_cq_capacity;
     uint64_t remote_address;
     uint16_t partition_key;
     uint16_t peer_partition_key;
@@ -144,6 +148,8 @@ struct counters {
     uint32_t dropped;
     uint32_t trimmed;
     uint32_t trim_nacks;
+    uint32_t nack_sent_mask;
+    uint32_t nack_received_mask;
     uint32_t port_status_updates;
     uint32_t port_status_replies;
     uint32_t probe_requests;
@@ -811,8 +817,11 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
         if (nack->spdcid != (uint16_t)transfer->requestor_qpn || nack->dpdcid != (uint16_t)transfer->responder_qpn ||
             packet->bth.psn != nack->nack_psn || !state)
             return 0;
-        if (nack->reason == MRC_NACK_UNEXP_EVENT)
+        if (nack->reason == MRC_NACK_UNEXP_EVENT) {
+            counts->nack_received_mask |= UINT32_C(1) << nack->reason;
+            fprintf(stderr, "Unexpected remote event at PSN %" PRIu32 "\n", nack->nack_psn);
             return -EREMOTEIO;
+        }
         if (state->received)
             return 0;
         switch (nack->reason) {
@@ -841,6 +850,7 @@ static int apply_control(const struct transfer *transfer, struct sender *sender,
                     return -EPROTO;
                 record->counted_inflight = false;
                 record->nacked = true;
+                counts->nack_received_mask |= UINT32_C(1) << nack->reason;
                 counts->trim_nacks += trimmed;
             }
             return 0;
@@ -1163,7 +1173,7 @@ static void send_sack(const struct transfer *transfer, struct responder *receive
     }
 }
 
-static bool send_nack(const struct transfer *transfer, unsigned int path,
+static bool send_nack(const struct transfer *transfer, struct counters *counts, unsigned int path,
                       const struct mrc_wire_bth *request, uint32_t entropy, uint8_t reason,
                       uint16_t original_udp_len, uint16_t tx_timestamp)
 {
@@ -1175,7 +1185,10 @@ static bool send_nack(const struct transfer *transfer, unsigned int path,
         .nack_psn = request->psn, .tx_timestamp = tx_timestamp,
         .original_udp_len = original_udp_len,
     };
-    return transmit(transfer, path, &nack);
+    if (!transmit(transfer, path, &nack))
+        return false;
+    counts->nack_sent_mask |= UINT32_C(1) << reason;
+    return true;
 }
 
 static uint8_t write_error_syndrome(enum mrc_wr_result result)
@@ -1184,7 +1197,6 @@ static uint8_t write_error_syndrome(enum mrc_wr_result result)
     case MRC_WR_REMOTE_ACCESS:
         return REMOTE_ACCESS_NAK;
     case MRC_WR_RQ_EMPTY:
-    case MRC_WR_QP_ERROR:
         return REMOTE_OPERATION_NAK;
     default:
         return INVALID_REQUEST_NAK;
@@ -1215,6 +1227,32 @@ static enum mrc_wr_result advance_writes(const struct transfer *transfer,
     return MRC_WR_OK;
 }
 
+static int reject_write(const struct transfer *transfer, const struct responder *receiver,
+                         struct counters *counts, unsigned int path,
+                         const struct mrc_wire_packet *packet, enum mrc_wr_result result,
+                         uint32_t ack_psn)
+{
+    uint8_t reason;
+    switch (result) {
+    case MRC_WR_NO_RESOURCE:
+        reason = MRC_NACK_NO_RESOURCE;
+        break;
+    case MRC_WR_NO_PKT_BUFFER:
+        reason = MRC_NACK_NO_PKT_BUFFER;
+        break;
+    case MRC_WR_QP_ERROR:
+        reason = MRC_NACK_UNEXP_EVENT;
+        break;
+    default:
+        send_ack(transfer, counts, path, ack_psn, write_error_syndrome(result),
+                 mrc_wr_ack_msn(&receiver->wr));
+        return -EPROTO;
+    }
+    send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet), reason,
+              0, packet->body.write.tx_timestamp);
+    return result == MRC_WR_QP_ERROR ? -EPROTO : 0;
+}
+
 static int receive_write(const struct transfer *transfer, struct responder *receiver,
                          struct counters *counts, unsigned int path,
                          const struct mrc_wire_packet *packet)
@@ -1231,9 +1269,13 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
         return 0;
 
     uint32_t psn = packet->bth.psn;
+    const struct mrc_wire_write *write = &packet->body.write;
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, psn);
-    if (disposition == MRC_RX_OUTSIDE_WINDOW)
+    if (disposition == MRC_RX_OUTSIDE_WINDOW) {
+        send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
+                  MRC_NACK_PSN_OOR_WINDOW, 0, write->tx_timestamp);
         return 0;
+    }
     if (disposition == MRC_RX_DUPLICATE) {
         counts->duplicates++;
         send_sack(transfer, receiver, counts, path, packet, false);
@@ -1242,24 +1284,22 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
         return 0;
     }
 
+    if (receiver->qp.ooo_count >= transfer->rx_ooo_capacity &&
+        psn != mrc_psn_add(receiver->qp.cack_psn, 1)) {
+        send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
+                  MRC_NACK_NO_BITMAP, 0, write->tx_timestamp);
+        return 0;
+    }
+
     uint32_t index = (uint32_t)mrc_psn_delta(psn, transfer->initial_psn);
-    const struct mrc_wire_write *write = &packet->body.write;
     if (index >= transfer->packets || write->dma_len != transfer->wr_bytes) {
         send_ack(transfer, counts, path, psn, INVALID_REQUEST_NAK, mrc_wr_ack_msn(&receiver->wr));
         return -EPROTO;
     }
 
     enum mrc_wr_result result = mrc_wr_receive(&receiver->wr, psn, packet->bth.opcode, write);
-    if (result == MRC_WR_NO_RESOURCE) {
-        send_nack(transfer, path, &packet->bth, reflect_entropy(packet), MRC_NACK_NO_RESOURCE,
-                  0, write->tx_timestamp);
-        return 0;
-    }
-    if (result != MRC_WR_OK) {
-        send_ack(transfer, counts, path, psn, write_error_syndrome(result),
-                 mrc_wr_ack_msn(&receiver->wr));
-        return -EPROTO;
-    }
+    if (result != MRC_WR_OK)
+        return reject_write(transfer, receiver, counts, path, packet, result, psn);
 
     uint32_t previous_cack = receiver->qp.cack_psn;
     int32_t distance = mrc_psn_delta(receiver->qp.max_rcv_psn, psn);
@@ -1270,7 +1310,9 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
                          (packet->bth.retransmit ? MRC_RX_RTX : 0) |
                          (packet_ecn(packet) == 3 ? MRC_RX_ECN : 0);
     bool sack_due;
-    mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags, SACK_THRESHOLD, &sack_due);
+    if (mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags,
+                      SACK_THRESHOLD, &sack_due) != MRC_RX_NEW)
+        return reject_write(transfer, receiver, counts, path, packet, MRC_WR_QP_ERROR, psn);
     uint32_t nominal = nominal_size(packet->bth.opcode, write->data_len, packet->bth.timestamp);
     mrc_cc_rx_record(&receiver->cc, nominal, true, false);
     receiver->unique_packets++;
@@ -1282,11 +1324,10 @@ static int receive_write(const struct transfer *transfer, struct responder *rece
     counts->received[path]++;
     bool complete = receiver->unique_packets == transfer->packets;
     result = advance_writes(transfer, receiver);
+    if (result != MRC_WR_OK)
+        return reject_write(transfer, receiver, counts, path, packet, result, receiver->qp.cack_psn);
+
     uint32_t msn = mrc_wr_ack_msn(&receiver->wr);
-    if (result != MRC_WR_OK) {
-        send_ack(transfer, counts, path, receiver->qp.cack_psn, write_error_syndrome(result), msn);
-        return -EPROTO;
-    }
     if (sack_due || complete)
         send_sack(transfer, receiver, counts, path, packet, false);
     if (previous_cack != receiver->qp.cack_psn && (sack_due || complete))
@@ -1298,13 +1339,19 @@ static void receive_trimmed(const struct transfer *transfer, const struct respon
                             struct counters *counts, unsigned int path,
                             const struct mrc_wire_trimmed *trimmed, uint32_t entropy)
 {
-    if (mrc_rx_classify(&receiver->qp, trimmed->bth.psn) != MRC_RX_NEW ||
-        !mrc_cc_nominal_size(trimmed->original_udp_len))
+    enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, trimmed->bth.psn);
+    if (disposition == MRC_RX_OUTSIDE_WINDOW) {
+        send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_PSN_OOR_WINDOW,
+                  0, trimmed->tx_timestamp);
+        return;
+    }
+    if (disposition == MRC_RX_DUPLICATE || !mrc_cc_nominal_size(trimmed->original_udp_len))
         return;
 
     counts->trimmed++;
-    if (transfer->trim_nack_enabled && send_nack(transfer, path, &trimmed->bth, entropy, MRC_NACK_TRIMMED,
-                  trimmed->original_udp_len, trimmed->tx_timestamp))
+    if (transfer->trim_nack_enabled && send_nack(transfer, counts, path, &trimmed->bth, entropy,
+                                               MRC_NACK_TRIMMED, trimmed->original_udp_len,
+                                               trimmed->tx_timestamp))
         counts->trim_nacks++;
 }
 
@@ -1427,11 +1474,13 @@ static int poll_receiver(const struct transfer *transfer, struct responder *rece
 static int run_receiver(const struct transfer *transfer, struct counters *counts)
 {
     struct responder *receiver = calloc(1, sizeof(*receiver));
-    uint8_t *staged_payload = malloc(transfer->window * PMTU);
+    uint8_t *staged_payload = NULL;
+    if (transfer->rx_staging_capacity)
+        staged_payload = malloc(transfer->rx_staging_capacity * PMTU);
     int result = -ENOMEM;
-    if (!receiver || !staged_payload)
+    if (!receiver || (transfer->rx_staging_capacity && !staged_payload))
         goto done;
-    result = mrc_provider_cq_create(transfer->work_requests, &receiver->cq);
+    result = mrc_provider_cq_create(transfer->rx_cq_capacity, &receiver->cq);
     if (result)
         goto done;
 
@@ -1444,9 +1493,9 @@ static int run_receiver(const struct transfer *transfer, struct counters *counts
         .pmtu = PMTU, .initial_psn = transfer->initial_psn,
         .initial_msn = 1, .initial_rqmsn = 1,
         .max_wimm_inflight = transfer->max_wimm_inflight,
-        .work = receiver->work, .work_capacity = transfer->window,
+        .work = receiver->work, .work_capacity = transfer->rx_work_capacity,
         .staged = receiver->staged, .staged_payload = staged_payload,
-        .staged_capacity = transfer->window,
+        .staged_capacity = transfer->rx_staging_capacity,
         .recv_queue = receiver->receive_queue, .recv_capacity = transfer->work_requests,
     };
     result = -EINVAL;
@@ -1550,6 +1599,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     bool local_sid = false, peer_sid = false;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
     uint32_t mpr = WINDOW / MRC_MPR_UNIT, p_key = DEFAULT_PARTITION_KEY;
+    uint32_t rx_ooo_capacity = UINT32_MAX, rx_staging_capacity = UINT32_MAX;
+    uint32_t rx_work_capacity = 0, rx_cq_capacity = 0;
     uint32_t dynamic_mpr = 0, mpr_change_to = 0;
     for (int i = 9; i < argc; i += 2) {
         const char *key = argv[i], *value = argv[i + 1];
@@ -1606,6 +1657,18 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
             continue;
         if (!strcmp(key, "--max-wimm-inflight") &&
             number(value, 1, WINDOW, &transfer->max_wimm_inflight))
+            continue;
+        if (!transfer->sender && !strcmp(key, "--rx-ooo-capacity") &&
+            number(value, 0, WINDOW, &rx_ooo_capacity))
+            continue;
+        if (!transfer->sender && !strcmp(key, "--rx-staging-capacity") &&
+            number(value, 0, WINDOW, &rx_staging_capacity))
+            continue;
+        if (!transfer->sender && !strcmp(key, "--rx-work-capacity") &&
+            number(value, 1, WINDOW, &rx_work_capacity))
+            continue;
+        if (!transfer->sender && !strcmp(key, "--rx-cq-capacity") &&
+            number(value, 1, MAX_WORK_REQUESTS, &rx_cq_capacity))
             continue;
         if (!transfer->sender && !strcmp(key, "--posted-receives") &&
             number(value, 0, MAX_WORK_REQUESTS, &transfer->posted_receives))
@@ -1675,6 +1738,16 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
         return false;
     transfer->udp_port = (uint16_t)udp_port;
     transfer->window = mpr * MRC_MPR_UNIT;
+    if ((rx_ooo_capacity != UINT32_MAX && rx_ooo_capacity > transfer->window) ||
+        (rx_staging_capacity != UINT32_MAX && rx_staging_capacity > transfer->window) ||
+        rx_work_capacity > transfer->window || rx_cq_capacity > transfer->work_requests)
+        return false;
+    transfer->rx_ooo_capacity = rx_ooo_capacity == UINT32_MAX ? transfer->window : rx_ooo_capacity;
+    transfer->rx_staging_capacity = rx_staging_capacity == UINT32_MAX ? transfer->window : rx_staging_capacity;
+    transfer->rx_work_capacity = rx_work_capacity ? rx_work_capacity : transfer->window;
+    transfer->rx_cq_capacity = rx_cq_capacity ? rx_cq_capacity : transfer->work_requests;
+    if (!transfer->sender && transfer->max_wimm_inflight > transfer->rx_work_capacity)
+        transfer->max_wimm_inflight = transfer->rx_work_capacity;
     transfer->mpr_max = (uint8_t)mpr;
     transfer->mpr_change_to = (uint8_t)mpr_change_to;
     transfer->dynamic_mpr = dynamic_mpr != 0;
@@ -1837,10 +1910,11 @@ static void print_diagnostics(const struct transfer *transfer, const struct coun
                               const struct port_snapshot start[PATH_COUNT], unsigned int opened)
 {
     fprintf(stderr, "MRC progress: data TX=%u/%u retry=%u/%u data RX=%u/%u "
-                    "SACK=%u transport-ACK=%u probe-reply=%u\n",
+                    "SACK=%u transport-ACK=%u probe-reply=%u NACK-TX=%#x NACK-RX=%#x\n",
             counts->sent[0], counts->sent[1], counts->retries[0], counts->retries[1],
             counts->received[0], counts->received[1], counts->sacks,
-            counts->transport_acks, counts->probe_replies);
+            counts->transport_acks, counts->probe_replies,
+            counts->nack_sent_mask, counts->nack_received_mask);
     for (unsigned int path = 0; path < opened; path++) {
         const struct rx_counters *rx = &counts->rx[path];
         fprintf(stderr, "MRC path %u: RX frames=%" PRIu64 " matched=%" PRIu64
@@ -1886,6 +1960,8 @@ int main(int argc, char **argv)
                         "       [--restore-path-after N (tx)] [--profile-dir DIR --profile-id ID (tx)]\n"
                         "       [--dynamic-mpr 0|1]\n"
                         "       [--mpr-change-at N --mpr-change-to N (rx)]\n"
+                        "       [--rx-ooo-capacity N] [--rx-staging-capacity N] (rx)\n"
+                        "       [--rx-work-capacity N] [--rx-cq-capacity N] (rx)\n"
                         "       [--srv6-local SID --srv6-peer SID] [--srv6-srh 0|1] [--port-stats 0|1]\n",
                 argv[0]);
         goto done;
@@ -1928,6 +2004,7 @@ int main(int argc, char **argv)
         printf("{\"role\":\"%s\",\"bytes\":%u,\"packets\":%u,\"sent\":[%u,%u],"
                "\"received\":[%u,%u],\"retries\":[%u,%u],\"dropped\":%u,\"sacks\":%u,"
                "\"trimmed\":%u,\"trim_nacks\":%u,\"transport_acks\":%u,"
+               "\"nack_sent_mask\":%u,\"nack_received_mask\":%u,"
                "\"port_status_updates\":%u,\"port_status_replies\":%u,"
                "\"probe_requests\":%u,\"probe_replies\":%u,\"probe_sent\":[%u,%u],"
                "\"ev_skipped\":%u,\"ev_failed\":%u,\"ev_recovered\":%u,\"ev_admin_updates\":%u,"
@@ -1940,7 +2017,7 @@ int main(int argc, char **argv)
                counts.sent[0], counts.sent[1], counts.received[0], counts.received[1],
                counts.retries[0], counts.retries[1], counts.dropped, counts.sacks,
                counts.trimmed, counts.trim_nacks, counts.transport_acks,
-               counts.port_status_updates, counts.port_status_replies, counts.probe_requests,
+               counts.nack_sent_mask, counts.nack_received_mask, counts.port_status_updates, counts.port_status_replies, counts.probe_requests,
                counts.probe_replies, counts.probe_sent[0], counts.probe_sent[1],
                counts.ev_skipped, counts.ev_failed, counts.ev_recovered, counts.ev_admin_updates,
                counts.ev_failed_mask, counts.ev_recovered_mask, counts.mpr_updates,

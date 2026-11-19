@@ -108,6 +108,38 @@ def controlled_ev_profile(binary, controller):
         return tx, rx
 
 
+def check_reliability_nacks(binary):
+    for name, reason, size, count, limit in (
+        ("no_bitmap", 0x06, 8192, 1, ("--rx-ooo-capacity", "0")),
+        ("no_packet_buffer", 0x07, 5120, 2, ("--rx-staging-capacity", "0")),
+        ("no_work_slot", 0x0A, 1024, 4, ("--rx-work-capacity", "1")),
+    ):
+        tx, rx = transfer(binary, size, "--exp-retries", "10", work_requests=count,
+                          drop_after=1, rx_options=limit)
+        expected = 1 << reason
+        require(tx["nack_received_mask"] == rx["nack_sent_mask"] == expected,
+                f"{name} did not generate the required NACK: {tx}, {rx}")
+        require(tx["retries"][0] > 0 and tx["write_completions"] == count,
+                f"{name} did not recover the rejected packet: {tx}, {rx}")
+        print(json.dumps({"case": name, "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 1024, "--timeout-ms", "500", "--mpr", "1",
+                      "--linear-retries", "1", "--exp-retries", "0",
+                      tx_options=("--initial-psn", "128"),
+                      expected_errors={"tx": "NACK-RX=0x800", "rx": "NACK-TX=0x800"})
+    require("Retry limit exhausted for PSN 128" in tx and "RX stalled after 0 of 1" in rx,
+            f"An out-of-window packet was accepted or the retry limit was bypassed: {tx}, {rx}")
+    print(json.dumps({"case": "outside_receive_window"}))
+
+    tx, _ = transfer(binary, 1024, "--immediate", "23", work_requests=4, drop_after=1,
+                     rx_options=("--rx-cq-capacity", "1"),
+                     expected_errors={"tx": "Unexpected remote event at PSN",
+                                      "rx": "NACK-TX=0x2000000"})
+    require("NACK-RX=0x2000000" in tx and "Retry limit exhausted" not in tx,
+            f"UNEXP_EVENT did not terminate the requester: {tx}")
+    print(json.dumps({"case": "unexpected_completion_queue_overrun"}))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
@@ -177,6 +209,8 @@ def main():
     transfer(binary, 1024, "--immediate", "23", posted_receives=0,
              expected_errors={"tx": "syndrome 0x63", "rx": "MRC path 0: RX frames="})
     print(json.dumps({"case": "write_imm_without_receive_credit"}))
+
+    check_reliability_nacks(binary)
 
     tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8)
     require(rx["immediate_completions"] == 8, "Negotiated WRITEIMM sequence was incomplete")

@@ -7,6 +7,7 @@
 enum mrc_wr_result {
     MRC_WR_OK,
     MRC_WR_NO_RESOURCE,
+    MRC_WR_NO_PKT_BUFFER,
     MRC_WR_INVALID,
     MRC_WR_REMOTE_ACCESS,
     MRC_WR_IMM_LIMIT,

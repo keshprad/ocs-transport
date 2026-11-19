@@ -189,7 +189,7 @@ static void test_work_and_staging_bounds(void)
     assert(offer(&f, MRC_WRITE_MIDDLE, 22, 1, 0, VA + 16, 33, 0,
                  "qrstuvwx", 8) == MRC_WR_OK);
     assert(offer(&f, MRC_WRITE_MIDDLE, 23, 1, 0, VA + 24, 33, 0,
-                 "yzABCDEF", 8) == MRC_WR_NO_RESOURCE);
+                 "yzABCDEF", 8) == MRC_WR_NO_PKT_BUFFER);
     assert(offer(&f, MRC_WRITE_FIRST, 20, 1, 0, VA, 33, 0,
                  "abcdefgh", 8) == MRC_WR_OK);
     assert(offer(&f, MRC_WRITE_MIDDLE, 23, 1, 0, VA + 24, 33, 0,

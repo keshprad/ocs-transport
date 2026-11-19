@@ -242,7 +242,7 @@ static enum mrc_wr_result stage_middle(struct mrc_wr_responder *responder,
 {
     size_t index = responder->free_stage;
     if (index == NO_STAGE)
-        return MRC_WR_NO_RESOURCE;
+        return MRC_WR_NO_PKT_BUFFER;
 
     for (size_t i = 0; i < responder->config.work_capacity; i++) {
         const struct mrc_wr_message *other = &responder->config.work[i].message;
