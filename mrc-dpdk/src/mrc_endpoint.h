@@ -32,6 +32,7 @@ struct mrc_endpoint_write {
 
 struct mrc_endpoint_config {
     bool sender;
+    bool continuous_send;
     bool trim_nack_enabled;
     uint32_t bytes;
     uint32_t packets;
@@ -136,9 +137,11 @@ uint64_t mrc_endpoint_cycles(const struct mrc_endpoint_config *transfer, uint64_
 
 /* The caller owns the ports, configuration, QP and counters for the lifetime
  * of each endpoint. It posts work and polls its CQs independently. The
- * requester snapshots the currently posted send batch at creation. Polls
- * on a given endpoint must be serialized with QP teardown and reset.
- * Progress returns 0 while active, 1 on finite completion, or negative errno
+ * requester snapshots the currently posted send batch at creation.
+ * With continuous_send, it can start with an empty SQ and admits later
+ * batches once the preceding batch has retired. Polls on a given endpoint
+ * must be serialized with QP teardown and reset. Progress returns 0 while
+ * active or waiting for new work, 1 on finite completion, or negative errno
  * after transitioning the QP to ERROR and flushing outstanding work. */
 int mrc_requester_create(const struct mrc_endpoint_config *transfer, struct mrc_provider_qp *qp,
                          struct mrc_endpoint_counters *counts, struct mrc_requester **requester);

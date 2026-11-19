@@ -72,6 +72,10 @@ struct mrc_requester {
     struct mrc_endpoint_counters *counts;
     struct mrc_provider_qp *provider_qp;
     uint64_t first_sequence;
+    uint64_t scheduled_packets;
+    uint32_t msn_base;
+    uint16_t rqmsn_base;
+    size_t work_capacity;
     uint64_t last_progress;
     uint64_t profile_period;
     uint64_t next_profile_check;
@@ -466,8 +470,10 @@ static uint32_t available_paths(const struct mrc_requester *sender, uint64_t now
 static bool blackholed(const struct mrc_endpoint_config *transfer, const struct mrc_requester *sender,
                         unsigned int path)
 {
-    return path == 1 && sender->next >= transfer->drop_after &&
-           sender->next < transfer->restore_after;
+    return path == 1 && transfer->drop_after != UINT32_MAX &&
+           sender->scheduled_packets >= transfer->drop_after &&
+           (transfer->restore_after == UINT32_MAX ||
+            sender->scheduled_packets < transfer->restore_after);
 }
 
 static int reflected_path(const struct mrc_endpoint_config *transfer, uint32_t entropy)
@@ -516,8 +522,9 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
                              mrc_cc_ack_request(&after_send, SACK_THRESHOLD);
     uint32_t offset = (index - work->first_packet) * PMTU;
     packet.body.write = (struct mrc_wire_write){
-        .rqmsn = write.with_immediate ? (uint16_t)(work->preceding_immediates + 1) : 0,
-        .msn = (uint16_t)(wr + 1),
+        .rqmsn = write.with_immediate ?
+            (uint16_t)(sender->rqmsn_base + work->preceding_immediates + 1) : 0,
+        .msn = (uint16_t)mrc_psn_add(sender->msn_base, (int32_t)wr + 1),
         .va = write.remote_address + offset,
         .r_key = write.rkey,
         .dma_len = write.length,
@@ -529,7 +536,8 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     if (blackholed(transfer, sender, path)) {
         counts->dropped++;
     } else {
-        bool inject_trim = path == 1 && sender->next >= transfer->trim_after;
+        bool inject_trim = path == 1 && transfer->trim_after != UINT32_MAX &&
+                           sender->scheduled_packets >= transfer->trim_after;
         if (!transmit_frame(transfer, path, &packet, inject_trim))
             return -EAGAIN;
         counts->trimmed += inject_trim;
@@ -591,19 +599,20 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         int32_t first = mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
         if (last < first || last >= (int32_t)sender->next)
             return 0;
+        int32_t msn = mrc_psn_delta(ack->msn, sender->msn_base);
         if (ack->syndrome != ACK_SYNDROME) {
             fprintf(stderr, "Transport rejected WRITE, syndrome %#x\n", ack->syndrome);
             uint32_t failed = (uint32_t)last;
             if (ack->syndrome == REMOTE_OPERATION_NAK &&
-                ack->msn >= request_index(transfer, (uint32_t)first) &&
-                ack->msn <= request_index(transfer, (uint32_t)last)) {
-                uint32_t start = transfer->work[ack->msn].first_packet;
+                msn >= (int32_t)request_index(transfer, (uint32_t)first) &&
+                msn <= (int32_t)request_index(transfer, (uint32_t)last)) {
+                uint32_t start = transfer->work[msn].first_packet;
                 failed = start < (uint32_t)first ? (uint32_t)first : start;
             }
             return fail_send(transfer, sender, failed, aeth_error_status(ack->syndrome), -EPROTO);
         }
         uint32_t completed = request_index(transfer, (uint32_t)last + 1);
-        if (ack->msn != completed)
+        if (msn != (int32_t)completed)
             return fail_send(transfer, sender, (uint32_t)last, MRC_PROVIDER_WC_BAD_RESPONSE, -EPROTO);
         for (int32_t index = first; index <= last; index++) {
             if (!retire_redundant_attempt(transfer, sender, (uint32_t)index))
@@ -1187,6 +1196,57 @@ bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capa
     return true;
 }
 
+static int load_requester_batch(struct mrc_requester *sender,
+                                const struct mrc_provider_qp_attr *attr)
+{
+    struct mrc_endpoint_config *transfer = &sender->transfer;
+    size_t pending = attr->send_pending;
+    if (pending > MAX_WORK_REQUESTS)
+        pending = MAX_WORK_REQUESTS;
+    if (pending > sender->work_capacity) {
+        struct mrc_endpoint_write *work = realloc(transfer->work, pending * sizeof(*work));
+        if (!work)
+            return -ENOMEM;
+        transfer->work = work;
+        sender->work_capacity = pending;
+    }
+
+    sender->first_sequence = attr->send_first_sequence;
+    for (size_t wr = 0; wr < pending; wr++) {
+        struct mrc_provider_write_view write;
+        int result = mrc_provider_qp_get_write(sender->provider_qp, sender->first_sequence + wr, &write);
+        if (result)
+            return result;
+        if (write.with_immediate && !transfer->max_wimm_inflight)
+            return -EINVAL;
+        if (!mrc_endpoint_append_write(transfer, pending, write.length,
+                                       write.with_immediate, write.immediate)) {
+            if (!transfer->continuous_send || !wr)
+                return -EINVAL;
+            break;
+        }
+        uint32_t packets = transfer->work[wr].packets;
+        if (!wr)
+            transfer->uniform_wr_packets = packets;
+        else if (packets != transfer->uniform_wr_packets)
+            transfer->uniform_wr_packets = 0;
+    }
+    return 0;
+}
+
+static void reset_requester_batch(struct mrc_requester *sender)
+{
+    struct mrc_endpoint_config *transfer = &sender->transfer;
+    transfer->initial_psn = sender->qp.first_psn;
+    transfer->packets = 0;
+    transfer->bytes = 0;
+    transfer->work_requests = 0;
+    transfer->immediate_requests = 0;
+    transfer->uniform_wr_packets = 0;
+    sender->next = 0;
+    sender->highest_sacked = -1;
+}
+
 int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct mrc_provider_qp *qp,
                          struct mrc_endpoint_counters *counts, struct mrc_requester **requester)
 {
@@ -1199,7 +1259,8 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     if (result)
         return result;
     if (attr.state != MRC_PROVIDER_QP_RTS || attr.qpn != configuration->requestor_qpn ||
-        !attr.send_pending || attr.send_pending > MAX_WORK_REQUESTS)
+        (!configuration->continuous_send &&
+         (!attr.send_pending || attr.send_pending > MAX_WORK_REQUESTS)))
         return -EINVAL;
 
     struct mrc_requester *sender = calloc(1, sizeof(*sender));
@@ -1207,44 +1268,11 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
         return -ENOMEM;
     sender->counts = counts;
     sender->provider_qp = qp;
-    sender->first_sequence = attr.send_first_sequence;
-    sender->highest_sacked = -1;
     sender->initial_probe = true;
     sender->transfer = *configuration;
     struct mrc_endpoint_config *transfer = &sender->transfer;
     transfer->sender = true;
-    transfer->packets = 0;
-    transfer->bytes = 0;
-    transfer->work_requests = 0;
-    transfer->immediate_requests = 0;
-    transfer->uniform_wr_packets = 0;
-    transfer->work = calloc(attr.send_pending, sizeof(*transfer->work));
-    if (!transfer->work) {
-        result = -ENOMEM;
-        goto failed;
-    }
-    for (size_t wr = 0; wr < attr.send_pending; wr++) {
-        struct mrc_provider_write_view write;
-        result = mrc_provider_qp_get_write(qp, sender->first_sequence + wr, &write);
-        if (result)
-            goto failed;
-        if (!mrc_endpoint_append_write(transfer, attr.send_pending,
-                                       write.length, write.with_immediate, write.immediate)) {
-            result = -EINVAL;
-            goto failed;
-        }
-    }
-    if (transfer->immediate_requests && !transfer->max_wimm_inflight) {
-        result = -EINVAL;
-        goto failed;
-    }
-    transfer->uniform_wr_packets = transfer->work[0].packets;
-    for (uint32_t wr = 1; wr < transfer->work_requests; wr++) {
-        if (transfer->work[wr].packets != transfer->uniform_wr_packets) {
-            transfer->uniform_wr_packets = 0;
-            break;
-        }
-    }
+    transfer->work = NULL;
     if (!mrc_tx_init(&sender->qp, transfer->initial_psn, transfer->window, sender->slots) ||
         !mrc_cc_init(&sender->cc, NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS) ||
         !mrc_ev_init(&sender->ev, PATH_COUNT, transfer->profile.config.min_active,
@@ -1252,6 +1280,13 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
         !mrc_mpr_init(&sender->mpr, transfer->dynamic_mpr, transfer->mpr_max)) {
         result = -EINVAL;
         goto failed;
+    }
+
+    reset_requester_batch(sender);
+    if (!transfer->continuous_send || attr.send_pending) {
+        result = load_requester_batch(sender, &attr);
+        if (result)
+            goto failed;
     }
 
     sender->last_progress = rte_get_timer_cycles();
@@ -1274,8 +1309,22 @@ failed:
 
 static int requester_step(struct mrc_requester *sender)
 {
-    const struct mrc_endpoint_config *transfer = &sender->transfer;
+    struct mrc_endpoint_config *transfer = &sender->transfer;
     struct mrc_endpoint_counters *counts = sender->counts;
+    if (!transfer->packets && transfer->continuous_send) {
+        struct mrc_provider_qp_attr attr;
+        int result = mrc_provider_qp_query(sender->provider_qp, &attr);
+        if (result)
+            return result;
+        if (attr.state != MRC_PROVIDER_QP_RTS)
+            return -EINVAL;
+        if (attr.send_pending) {
+            result = load_requester_batch(sender, &attr);
+            if (result)
+                return result;
+            sender->last_progress = rte_get_timer_cycles();
+        }
+    }
     uint32_t previous_psn = sender->qp.first_psn;
     int result = receive_control(transfer, sender, counts);
     if (result)
@@ -1310,7 +1359,14 @@ static int requester_step(struct mrc_requester *sender)
         counts->ev_recovered = sender->ev.recovered;
         counts->ev_failed_mask = sender->ev.failed_mask;
         counts->ev_recovered_mask = sender->ev.recovered_mask;
-        return 1;
+        if (!transfer->continuous_send)
+            return 1;
+        if (transfer->packets) {
+            sender->msn_base = mrc_psn_add(sender->msn_base, (int32_t)transfer->work_requests);
+            sender->rqmsn_base = (uint16_t)(sender->rqmsn_base + transfer->immediate_requests);
+            reset_requester_batch(sender);
+        }
+        return 0;
     }
     if (now - sender->last_progress >= transfer->idle_timeout) {
         fprintf(stderr, "TX stalled at segment %u, next %u, inflight %d, cwnd %u, "
@@ -1375,6 +1431,7 @@ static int requester_step(struct mrc_requester *sender)
             .path = path, .counted_inflight = true,
         };
         sender->next++;
+        sender->scheduled_packets++;
     }
     return 0;
 }

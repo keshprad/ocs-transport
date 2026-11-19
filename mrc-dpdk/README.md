@@ -79,15 +79,19 @@ integration, and controller APIs are tracked in [conformance](CONFORMANCE.md).
 ### Driving the DPDK endpoint from a provider QP
 
 The internal interface in `src/mrc_endpoint.h` lets the application own the
-provider QP and poll its completion queues. Post a batch of writes before
-creating the requester. The packet engine derives the lengths, segmentation,
-and immediate sequence from the posted work and progresses one round per
-call. A responder configured without a total packet count can keep receiving
-work until the application stops it.
+provider QP and poll its completion queues. The packet engine derives the
+lengths, segmentation, and immediate sequence from the posted work and
+progresses one round per call. The benchmark requester takes a finite batch.
+With `continuous_send`, a requester can start with an empty send queue and
+admit further batches after earlier work retires, keeping the same packet
+and message sequence. A responder configured without a total packet count
+can keep receiving work until the application stops it.
 
 Build `make tests/mrc_endpoint_application` and run
 `python3 tests/check_mrc_application.py` with the memif PMD. The application
-uses its own work IDs and registered source buffer and polls its own send CQ.
+posts a WRITE and two WRITEIMMs to a running QP and polls its own send CQ.
+The test checks registered source data, application work IDs, and ordered
+immediate values across batch boundaries and PSN wrap.
 
 ### Work completions
 
@@ -179,7 +183,7 @@ rings. Each Spark receives one WRITE and sends another using separate PCI
 functions, lcores, and DPDK runtime directories. Both profiles send 256 MiB
 on each edge. In `failover`, Spark-04 injects a path-1 blackhole on its
 outgoing edge from scheduled segments 512 through 2047. The other two
-edges carry traffic throughout the run.
+edges send their own WRITEs during the same run.
 
 The test uses the installed root-owned endpoint snapshots. Render the unit
 files for each Spark, substituting its host number and snapshot directory.

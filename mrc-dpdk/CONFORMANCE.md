@@ -31,10 +31,11 @@ independent live peer. The relay moves Ethernet frames and the Python peer
 owns the wire encoding, memory placement, and feedback.
 
 `make tests/mrc_endpoint_application` and `python3 tests/check_mrc_application.py`
-verify that the DPDK requester can derive its packet plan from a batch posted
-on an application-owned provider QP. The test starts after a QP reset with a
-noninitial work sequence. It verifies mixed WRITE/WRITEIMM placement and
-the application's completion IDs over two memif rails.
+verify that an application can start a DPDK requester on an empty provider
+QP, post new work while it runs, and poll its own CQ. The test starts after
+a QP reset with a noninitial work sequence. It verifies WRITE/WRITEIMM
+placement and completion IDs across separate admissions, PSN wrap, and
+continued immediate receive sequencing over two memif rails.
 
 Use Spark-04 as the implementation source. After pushing the exact clean commit, run `tests/verify_spark_revisions.sh --sync "$(git rev-parse HEAD)"` to advance the detached test worktrees on Spark-02 and Spark-03. Run the same command without `--sync` immediately before each live test. The script checks that all three worktrees are clean and at the requested commit.
 

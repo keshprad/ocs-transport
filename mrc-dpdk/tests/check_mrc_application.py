@@ -21,17 +21,17 @@ def main():
         if role == "tx":
             return eal_args(args.application.resolve(), role, cpu, directory)
         return eal_args(args.receiver.resolve(), role, cpu, directory) + [
-            "--", "rx", "13,1025@84", "192.0.2.2", "192.0.2.1",
+            "--", "rx", "13,1025@84,0@85", "192.0.2.2", "192.0.2.1",
             "0", MACS["tx"][0], "1", MACS["tx"][1],
             "--initial-psn", "16777215", "--mpr", "1", "--max-wimm-inflight", "1",
             "--ack-timeout", "16", "--timeout-ms", "2000",
         ]
 
     tx, rx, _ = run_pair(command)
-    require(tx["bytes"] == rx["bytes"] == 1038 and tx["write_completions"] == 2 and
-            rx["immediate_completions"] == 1 and sum(rx["received"]) == 3,
+    require(tx["bytes"] == rx["bytes"] == 1038 and tx["write_completions"] == 3 and
+            rx["immediate_completions"] == 2 and sum(rx["received"]) == 4,
             f"Unexpected application transfer results: {tx}, {rx}")
-    print(json.dumps({"case": "application_owned_work_and_cq", "tx": tx, "rx": rx}))
+    print(json.dumps({"case": "application_posts_to_running_qp", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":
