@@ -20,6 +20,14 @@ Subsequent immediate values increment modulo 32 bits. The default receiver
 posts one receive credit per WRITEIMM. `--max-wimm-inflight N` sets the agreed
 credit limit and `--mpr N` sets the static window in units of 128 packets.
 
+Add `--oob-host IP --oob-port N` on both endpoints to exchange the QP
+parameters over TCP. On the receiver, the IP is the local management address
+to bind. On the sender, it is the receiver's management address. The peers
+exchange QPN, initial PSN, receive limits, P_Key, trim capability, and
+registered-memory information before the data transfer. The exchange record
+is specific to this benchmark. OCP leaves the out-of-band encoding to the
+application.
+
 ### Spark double ring
 
 Run the [revision gate](CONFORMANCE.md#verification) immediately before

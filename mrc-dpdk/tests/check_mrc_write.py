@@ -3,13 +3,20 @@
 
 import argparse
 import json
+import socket
 from pathlib import Path
 
 from memif_pair import MACS, eal_args, require, run_pair
 
 
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
-             trim_after=None, ipv6=False, work_requests=1, posted_receives=None, expected_errors=None):
+             trim_after=None, ipv6=False, work_requests=1, posted_receives=None,
+             expected_errors=None, negotiate=False):
+    oob_port = None
+    if negotiate:
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            oob_port = str(reserve.getsockname()[1])
     def command(role, cpu, directory):
         tx = role == "tx"
         peer = "rx" if tx else "tx"
@@ -20,6 +27,15 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
         args += ["--", role, str(size), local_ip, peer_ip, "0", MACS[peer][0],
                  "1", MACS[peer][1], "--ack-timeout", "16",
                  "--work-requests", str(work_requests), *options]
+        if negotiate:
+            args += ["--oob-host", "127.0.0.1", "--oob-port", oob_port]
+            if tx:
+                args += ["--requestor-qpn", "0x140101", "--initial-psn", "77",
+                         "--p-key", "0x2345"]
+            else:
+                args += ["--responder-qpn", "0x250102", "--initial-psn", "16777212",
+                         "--remote-key", "0x3458", "--remote-address", "0x123456781000",
+                         "--p-key", "0xa345", "--mpr", "1", "--max-wimm-inflight", "2"]
         if tx and drop_after is not None:
             args += ["--drop-path-after", str(drop_after)]
         if tx and trim_after is not None:
@@ -69,6 +85,8 @@ def main():
     require(tx["sacks"] > 0 and tx["retries"] == [0, 0], "Healthy transfer did not receive SACKs")
     require(rx["port_status_updates"] > 0 and tx["port_status_replies"] > 0,
             "Node-scoped port status was not acknowledged")
+    require(rx["probe_requests"] > 0 and tx["probe_replies"] > 0,
+            "Reliability probe SACK did not echo any in-flight probe ID")
     print(json.dumps({"case": "write_striped", "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 4194301, "--immediate", "305419896",
@@ -100,6 +118,10 @@ def main():
     transfer(binary, 1024, "--immediate", "23", posted_receives=0,
              expected_errors={"tx": "syndrome 0x63", "rx": "Protocol error"})
     print(json.dumps({"case": "write_imm_without_receive_credit"}))
+
+    tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8)
+    require(rx["immediate_completions"] == 8, "Negotiated WRITEIMM sequence was incomplete")
+    print(json.dumps({"case": "negotiated_qp", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":

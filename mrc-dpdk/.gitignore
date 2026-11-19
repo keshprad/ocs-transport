@@ -4,3 +4,4 @@
 /tests/test_mrc_wire
 /tests/test_mrc_cc
 /tests/test_mrc_wr
+/tests/test_mrc_connect
