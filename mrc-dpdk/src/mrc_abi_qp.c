@@ -107,8 +107,8 @@ static int validate_init(struct mrc_context *context, const struct mrc_qp_init_a
     if (!context || !attr || !attr->pd || attr->pd->context != context->verbs ||
         (!attr->send_cq && !attr->recv_cq) ||
         (attr->cap.max_send_wr && !attr->send_cq) || (attr->cap.max_recv_wr && !attr->recv_cq) ||
-        (attr->send_cq && attr->send_cq->context != context) ||
-        (attr->recv_cq && attr->recv_cq->context != context))
+        (attr->send_cq && (attr->send_cq->context != context || attr->send_cq->ev_events)) ||
+        (attr->recv_cq && (attr->recv_cq->context != context || attr->recv_cq->ev_events)))
         return EINVAL;
     if (attr->protocol_version != MRC_PROTOCOL_VERSION_0 &&
         attr->protocol_version != MRC_PROTOCOL_VERSION_1)

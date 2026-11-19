@@ -3,6 +3,7 @@
 #include "dpdk_io.h"
 #include "mrc_cc.h"
 #include "mrc_ev.h"
+#include "mrc_ev_event_io.h"
 #include "mrc_mpr.h"
 #include "mrc_qp.h"
 #include "mrc_wr.h"
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <rte_cycles.h>
 #include <rte_ethdev.h>
@@ -68,6 +70,8 @@ struct mrc_requester {
     uint64_t next_retry_scan;
     uint64_t next_probe;
     uint32_t denied;
+    int event_fd;
+    bool event_dropped;
     int result;
     uint32_t initial_probe_paths;
     struct mrc_cc cc;
@@ -246,6 +250,44 @@ static uint32_t path_entropy(const struct mrc_endpoint_config *transfer, unsigne
     }
     uint32_t port = RESPONDER_EV_PORT + index;
     return structured ? port | ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16 : port;
+}
+
+static void publish_ev_transition(void *context, unsigned int path, enum mrc_ev_state state)
+{
+    struct mrc_requester *sender = context;
+    const struct mrc_endpoint_config *transfer = &sender->transfer;
+    const struct mrc_ctl_store_config *profile = &transfer->profile.config;
+    uint8_t mask;
+    uint8_t event_state;
+    if (state == MRC_EV_GOOD) {
+        mask = MRC_CTL_STORE_EV_EVENT_GOOD;
+        event_state = MRC_EV_EVENT_GOOD;
+    } else if (state == MRC_EV_ASSUMED_BAD) {
+        mask = MRC_CTL_STORE_EV_EVENT_ASSUMED_BAD;
+        event_state = MRC_EV_EVENT_ASSUMED_BAD;
+    } else {
+        return;
+    }
+    if (!(profile->event_mask & mask))
+        return;
+
+    struct mrc_ev_event_record event = {
+        .profile_id = transfer->profile_id, .port = (uint8_t)(path + 1),
+        .state = event_state, .dropped = sender->event_dropped,
+    };
+    if (mrc_ctl_store_format_is_srv6(profile->format)) {
+        memcpy(event.value, profile->srv6[path], sizeof(event.value));
+    } else {
+        uint32_t value = path_entropy(transfer, path, true);
+        for (unsigned int i = 0; i < sizeof(value); i++)
+            event.value[i] = (uint8_t)(value >> (8 * (sizeof(value) - 1 - i)));
+    }
+
+    int result = mrc_ev_event_send(sender->event_fd, transfer->profile_store.fd, &event);
+    if (!result)
+        sender->event_dropped = false;
+    else if (result == -EAGAIN || result == -ENOBUFS)
+        sender->event_dropped = true;
 }
 
 static uint32_t reflect_entropy(const struct mrc_wire_packet *packet)
@@ -1401,6 +1443,7 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     struct mrc_requester *sender = calloc(1, sizeof(*sender));
     if (!sender)
         return -ENOMEM;
+    sender->event_fd = -1;
     sender->counts = counts;
     sender->provider_qp = qp;
     sender->initial_probe_paths = ALL_PATHS;
@@ -1419,6 +1462,14 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
         !mrc_mpr_init(&sender->mpr, transfer->dynamic_mpr, transfer->mpr_max)) {
         result = -EINVAL;
         goto failed;
+    }
+    if (transfer->profile_id && transfer->profile.config.event_mask) {
+        result = mrc_ev_event_open_sender();
+        if (result < 0)
+            goto failed;
+        sender->event_fd = result;
+        sender->ev.notify = publish_ev_transition;
+        sender->ev.notify_context = sender;
     }
 
     reset_requester_batch(sender);
@@ -1594,6 +1645,8 @@ int mrc_requester_progress(struct mrc_requester *requester)
 void mrc_requester_destroy(struct mrc_requester *requester)
 {
     if (requester) {
+        if (requester->event_fd >= 0)
+            close(requester->event_fd);
         free(requester->transfer.work);
         free(requester);
     }

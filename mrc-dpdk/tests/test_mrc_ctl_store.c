@@ -701,6 +701,38 @@ static void test_format_activation_race(const struct mrc_ctl_store *store, uint6
     assert(mrc_ctl_store_set_state(store, ev_id, MRC_CTL_STORE_OFFLINE) == 0);
 }
 
+static void test_ev_event_masks(const struct mrc_ctl_store *store)
+{
+    const uint64_t id = 30;
+    const uint8_t both = MRC_CTL_STORE_EV_EVENT_GOOD | MRC_CTL_STORE_EV_EVENT_ASSUMED_BAD;
+    struct mrc_ctl_store_config config = explicit_config();
+    assert(mrc_ctl_store_create(store, id) == 0);
+    config.event_mask = both | 4;
+    assert(mrc_ctl_store_configure(store, id, &config) == -EINVAL);
+    expect_ev_snapshot_version(store, 5);
+
+    config.event_mask = both;
+    assert(mrc_ctl_store_configure(store, id, &config) == 0);
+    expect_ev_snapshot_version(store, 6);
+    assert(mrc_ctl_store_set_state(store, id, MRC_CTL_STORE_ONLINE) == 0);
+    struct mrc_ctl_store_ref lease = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_profile saved;
+    assert(mrc_ctl_store_acquire(store, id, &lease, &saved) == 0);
+    assert(saved.config.event_mask == both);
+    saved.config.event_mask = MRC_CTL_STORE_EV_EVENT_GOOD;
+    assert(mrc_ctl_store_edit(store, id, replace_profile, &saved) == -EBUSY);
+    assert(mrc_ctl_store_update_denied(store, id, 1, 0) == 0);
+    assert(mrc_ctl_store_get(store, id, &saved) == 0);
+    assert(saved.config.denied == 1 && saved.config.event_mask == both);
+    mrc_ctl_store_release(&lease);
+
+    assert(mrc_ctl_store_set_state(store, id, MRC_CTL_STORE_OFFLINE) == 0);
+    config.event_mask = 0;
+    assert(mrc_ctl_store_configure(store, id, &config) == 0);
+    expect_ev_snapshot_version(store, 5);
+    assert(mrc_ctl_store_remove(store, id) == 0);
+}
+
 static void test_custom_ev_formats(void)
 {
     char directory[] = "/tmp/mrc-ctl-formats.XXXXXX";
@@ -761,6 +793,8 @@ static void test_custom_ev_formats(void)
     assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_ONLINE) == 0);
     assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &offline) == -EBUSY);
     assert(mrc_ctl_store_update_denied(&store, ev_id, 1, 0) == 0);
+
+    test_ev_event_masks(&store);
 
     mrc_ctl_store_close(&store);
     assert(mrc_ctl_store_open(&store, directory) == 0);

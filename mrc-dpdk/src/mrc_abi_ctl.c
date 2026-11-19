@@ -16,6 +16,10 @@ enum {
         MRC_CTL_EV_PROFILE_MIN_ACTIVE | MRC_CTL_EV_PROFILE_EVENT_MASK |
         MRC_CTL_EV_PROFILE_EV_OP | MRC_CTL_EV_PROFILE_EV_FIELDS_OP,
     EV_GEOMETRY = MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_FMT_ID | MRC_CTL_EV_PROFILE_COUNT,
+    EV_EVENT_MASK = MRC_CTL_EV_GOOD | MRC_CTL_EV_ASSUMED_BAD,
+    EVENT_LAYOUT_DEFAULT = 0,
+    EVENT_LAYOUT_LEGACY,
+    EVENT_LAYOUT_WITH_STATE,
 };
 
 _Static_assert((int)MRC_CTL_PROFILE_INIT == (int)MRC_CTL_STORE_INIT &&
@@ -24,6 +28,11 @@ _Static_assert((int)MRC_CTL_PROFILE_INIT == (int)MRC_CTL_STORE_INIT &&
                "Controller and persistent profile states must agree");
 _Static_assert(MRC_CTL_EV_MAX_BYTES == MRC_CTL_STORE_SRV6_EV_BYTES,
                "Controller and persistent SRv6 EV widths must agree");
+_Static_assert((int)MRC_CTL_EV_GOOD == (int)MRC_CTL_STORE_EV_EVENT_GOOD &&
+               (int)MRC_CTL_EV_ASSUMED_BAD == (int)MRC_CTL_STORE_EV_EVENT_ASSUMED_BAD,
+               "Controller and persistent event mask bits must agree");
+
+static atomic_uint fallback_event_layout = EVENT_LAYOUT_LEGACY;
 
 static const char nscc_algorithm[] = "uet-1.0-nscc";
 static const char *cc_algorithms[] = { nscc_algorithm, NULL };
@@ -87,8 +96,16 @@ MRC_PUBLIC void mrc_ctl_query_version(uint32_t *current, uint32_t *minimum,
         *vendor_minimum = MRC_CTL_API_VER(1, 0, 0);
 }
 
-MRC_PUBLIC int mrc_ctl_query_device_ex(struct ibv_context *verbs, struct mrc_context *context,
-                                       struct mrc_ctl_device_attr *out, int *supported)
+bool mrc_abi_ev_event_state_supported(struct mrc_context *context)
+{
+    unsigned int layout = atomic_load(&context->ctl_event_layout);
+    if (layout == EVENT_LAYOUT_DEFAULT)
+        layout = atomic_load(&fallback_event_layout);
+    return layout == EVENT_LAYOUT_WITH_STATE;
+}
+
+static int query_controller_device(struct ibv_context *verbs, struct mrc_context *context,
+                                    struct mrc_ctl_device_attr *out, int *supported)
 {
     if (!out || !supported)
         return set_errno(EINVAL);
@@ -140,15 +157,32 @@ MRC_PUBLIC int mrc_ctl_query_device_ex(struct ibv_context *verbs, struct mrc_con
         },
         .cc = { .cc_max_profiles = MRC_CTL_STORE_MAX_CC_PROFILES, .algorithms = cc_algorithms },
         .phy_port_mask = ports,
+        .opt_attr = MRC_CTL_OPT_CAP_EV_EVENT,
     };
     return 0;
+}
+
+MRC_PUBLIC int mrc_ctl_query_device_ex(struct ibv_context *verbs, struct mrc_context *context,
+                                       struct mrc_ctl_device_attr *out, int *supported)
+{
+    int result = query_controller_device(verbs, context, out, supported);
+    if (!result && *supported) {
+        atomic_uint *layout = context ? &context->ctl_event_layout : &fallback_event_layout;
+        atomic_store(layout, EVENT_LAYOUT_WITH_STATE);
+    }
+    return result;
 }
 
 MRC_PUBLIC int mrc_ctl_query_device(struct ibv_context *verbs, struct mrc_ctl_device_attr *out)
 {
     int supported;
-    int result = mrc_ctl_query_device_ex(verbs, NULL, out, &supported);
-    return result || supported ? result : set_errno(EOPNOTSUPP);
+    int result = query_controller_device(verbs, NULL, out, &supported);
+    if (result)
+        return result;
+    if (!supported)
+        return set_errno(EOPNOTSUPP);
+    atomic_store(&fallback_event_layout, EVENT_LAYOUT_LEGACY);
+    return 0;
 }
 
 enum mrc_ctl_store_format mrc_abi_builtin_ev_format(uint64_t id)
@@ -593,8 +627,11 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
             return -EINVAL;
         config->min_active = (uint8_t)attr->ev_min_active;
     }
-    if ((mask & MRC_CTL_EV_PROFILE_EVENT_MASK) && attr->ev_event_mask)
-        return -EOPNOTSUPP;
+    if (mask & MRC_CTL_EV_PROFILE_EVENT_MASK) {
+        if ((unsigned int)attr->ev_event_mask & ~EV_EVENT_MASK)
+            return -EINVAL;
+        config->event_mask = (uint8_t)attr->ev_event_mask;
+    }
     if (mask & MRC_CTL_EV_PROFILE_EV_FIELDS_OP) {
         int slots = (int)profile_field_count(config);
         int count = attr->ev_fields_op.field_count;
@@ -654,6 +691,7 @@ static int edit_profile(struct mrc_ctl_store_profile *profile, void *argument)
         return -EBUSY;
 
     uint8_t old_min_active = profile->config.min_active;
+    uint8_t old_event_mask = profile->config.event_mask;
     int error = configure_profile(&profile->config, change);
     if (error)
         return error;
@@ -672,6 +710,7 @@ static int edit_profile(struct mrc_ctl_store_profile *profile, void *argument)
                 if (!i)
                     return error;
                 profile->config.min_active = old_min_active;
+                profile->config.event_mask = old_event_mask;
                 change->entry_error = error;
                 return 0;
             }
@@ -800,7 +839,7 @@ MRC_PUBLIC int mrc_ctl_query_ev_profile(struct mrc_context *context, uint64_t id
     if (mask & MRC_CTL_EV_PROFILE_MIN_ACTIVE)
         attr->ev_min_active = config->min_active;
     if (mask & MRC_CTL_EV_PROFILE_EVENT_MASK)
-        attr->ev_event_mask = 0;
+        attr->ev_event_mask = config->event_mask;
     if (mask & MRC_CTL_EV_PROFILE_EV_OP)
         error = query_entries(config, attr);
     else

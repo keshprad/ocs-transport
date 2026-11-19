@@ -245,6 +245,23 @@ format, take its dependent EV profiles OFFLINE. After changing the
 layout, rebind the format ID and configure the EV values again before
 returning those profiles ONLINE.
 
+Select `MRC_CTL_EV_ASSUMED_BAD`, `MRC_CTL_EV_GOOD`, or both in
+`ev_event_mask` while the EV profile is OFFLINE or being moved ONLINE.
+With the same profile store as the application, a controller can create
+an event CQ with `mrc_ctl_create_ev_event_cq()`. Call
+`mrc_ctl_query_device_ex()` with the controller's MRC context before
+creating the CQ to receive the event state with the 1.0.1 ABI. Poll with
+`mrc_ctl_poll_ev_event()`, or arm a completion channel and acknowledge
+its CQ notifications as usual.
+
+Each profile store supports one event CQ. Creating it requires
+`CAP_NET_ADMIN` and write access to the store directory. In a setgid
+shared store, the controller's event socket allows applications in that
+group to publish events. Notifications carry the profile ID, rail port,
+and exact EV. When the CQ fills, it keeps the newest events and marks the
+next result with `drop_count=1`. The publisher also flags socket
+congestion when it can send its next event.
+
 The benchmark CLI uses the same storage. Create a private directory on the
 sender and bring a profile online.
 

@@ -109,6 +109,7 @@ MRC_PUBLIC struct mrc_context *mrc_create_context(struct ibv_context *vcontext,
     struct mrc_context *context = calloc(1, sizeof(*context));
     if (!context)
         return NULL;
+    atomic_init(&context->ctl_event_layout, 0);
     error = pthread_mutex_init(&context->mutex, NULL);
     if (error) {
         free(context);
@@ -288,7 +289,7 @@ static struct ibv_wc verbs_completion(const struct mrc_provider_wc *entry)
 
 MRC_PUBLIC int mrc_poll_cq(struct mrc_cq *cq, int num_entries, struct ibv_wc *wc)
 {
-    if (!cq || num_entries < 0 || (num_entries && !wc))
+    if (!cq || cq->ev_events || num_entries < 0 || (num_entries && !wc))
         return set_errno(EINVAL);
     size_t count = num_entries < cq->capacity ? (size_t)num_entries : (size_t)cq->capacity;
     struct mrc_provider_wc stack[32];
@@ -312,9 +313,13 @@ MRC_PUBLIC int mrc_destroy_cq(struct mrc_cq *cq)
 {
     if (!cq)
         return EINVAL;
+    if (cq->ev_events)
+        mrc_abi_ev_cq_stop(cq->ev_events);
     int error = -mrc_provider_cq_destroy_wait(cq->provider);
     if (error)
         return error;
+    if (cq->ev_events)
+        mrc_abi_ev_cq_free(cq->ev_events);
     mrc_abi_async_finish(&cq->async);
     mrc_abi_release_context(cq->context);
     free(cq);

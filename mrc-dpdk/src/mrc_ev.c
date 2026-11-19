@@ -15,12 +15,16 @@ bool mrc_ev_init(struct mrc_ev_profile *profile, unsigned int count, unsigned in
     return true;
 }
 
-static void transition(struct mrc_ev_path *ev, enum mrc_ev_state state,
+static void transition(struct mrc_ev_profile *profile, unsigned int path, enum mrc_ev_state state,
                        uint64_t now, uint64_t next)
 {
+    struct mrc_ev_path *ev = &profile->paths[path];
+    bool changed = ev->state != state;
     ev->state = state;
     ev->changed_at = now;
     ev->next_action = next;
+    if (changed && profile->notify)
+        profile->notify(profile->notify_context, path, state);
 }
 
 void mrc_ev_deny(struct mrc_ev_profile *profile, unsigned int path, bool denied,
@@ -28,7 +32,7 @@ void mrc_ev_deny(struct mrc_ev_profile *profile, unsigned int path, bool denied,
 {
     struct mrc_ev_path *ev = &profile->paths[path];
     if (denied || ev->state == MRC_EV_DENIED)
-        transition(ev, denied ? MRC_EV_DENIED : MRC_EV_GOOD, now, 0);
+        transition(profile, path, denied ? MRC_EV_DENIED : MRC_EV_GOOD, now, 0);
 }
 
 void mrc_ev_timeout(struct mrc_ev_profile *profile, unsigned int path, uint64_t now)
@@ -44,7 +48,7 @@ void mrc_ev_timeout(struct mrc_ev_profile *profile, unsigned int path, uint64_t 
         if (active < profile->min_active)
             return;
     }
-    transition(ev, MRC_EV_ASSUMED_BAD, now, now);
+    transition(profile, path, MRC_EV_ASSUMED_BAD, now, now);
     profile->failed++;
     profile->failed_mask |= UINT32_C(1) << path;
 }
@@ -64,15 +68,16 @@ void mrc_ev_feedback(struct mrc_ev_profile *profile, unsigned int path,
     if (ev->state == MRC_EV_ASSUMED_BAD) {
         if (!probe || probe_sent_at < ev->changed_at)
             return;
-        transition(ev, MRC_EV_GOOD, now, 0);
         profile->recovered++;
         profile->recovered_mask |= UINT32_C(1) << path;
+        if (feedback != MRC_EV_SKIP_ONCE)
+            transition(profile, path, MRC_EV_GOOD, now, 0);
     }
 
     if (feedback == MRC_EV_SKIP_ONCE) {
         if (ev->state != MRC_EV_SKIP)
             profile->skipped++;
-        transition(ev, MRC_EV_SKIP, now, now + profile->skip_interval);
+        transition(profile, path, MRC_EV_SKIP, now, now + profile->skip_interval);
     }
 }
 
@@ -82,7 +87,7 @@ uint32_t mrc_ev_active(struct mrc_ev_profile *profile, uint32_t available, uint6
     for (unsigned int path = 0; path < profile->count; path++) {
         struct mrc_ev_path *ev = &profile->paths[path];
         if (ev->state == MRC_EV_SKIP && now >= ev->next_action)
-            transition(ev, MRC_EV_GOOD, now, 0);
+            transition(profile, path, MRC_EV_GOOD, now, 0);
         if (ev->state == MRC_EV_GOOD)
             active |= UINT32_C(1) << path;
     }

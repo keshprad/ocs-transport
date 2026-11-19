@@ -6,9 +6,13 @@
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -25,6 +29,7 @@ enum {
     GEN_CUSTOM_STEV_PROFILE_ID = 17,
     GEN_CUSTOM_SRV6_PROFILE_ID = 18,
     EXP_CUSTOM_UDP_PROFILE_ID = 19,
+    EVENT_PROFILE_ID = 20,
     CUSTOM_STEV_FORMAT_ID = 100,
     CUSTOM_SRV6_FORMAT_ID = 101,
     CUSTOM_UDP_FORMAT_ID = 102,
@@ -179,6 +184,9 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
     assert(extended.cc.algorithms && extended.cc.algorithms[0] &&
            strcmp(extended.cc.algorithms[0], nscc_algorithm) == 0 && !extended.cc.algorithms[1]);
     assert(!((legacy.opt_attr | extended.opt_attr) & MRC_CTL_OPT_CAP_CC_PROFILE_MODIFY_ONLINE));
+    assert((legacy.opt_attr & extended.opt_attr) & MRC_CTL_OPT_CAP_EV_EVENT);
+    assert(!((legacy.opt_attr | extended.opt_attr) &
+             (MRC_CTL_OPT_CAP_EV_PROFILE_MODIFY_ONLINE | MRC_CTL_OPT_CAP_EV_EVENT_PRECISE_DROP_CNT)));
 
     static const struct {
         uint64_t id;
@@ -357,6 +365,48 @@ static void test_auto_profile(struct mrc_context *controller)
     }
     assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
     assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_INIT) == 0);
+}
+
+static int query_event_mask(struct mrc_context *context)
+{
+    struct mrc_ctl_ev_profile_attr attr = {0};
+    assert(mrc_ctl_query_ev_profile(context, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EVENT_MASK) == 0);
+    return attr.ev_event_mask;
+}
+
+static void test_event_masks(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *controller = open_store(verbs, directory);
+    struct mrc_ctl_ev_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_OFFLINE, .ev_mode = MRC_CTL_EV_MODE_AUTO, .ev_count = RAILS,
+    };
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_STATE |
+                                     MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_COUNT) == 0);
+    assert(query_event_mask(controller) == 0);
+    attr.ev_event_mask = MRC_CTL_EV_DENIED;
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EVENT_MASK) == -1 &&
+           errno == EINVAL);
+    assert(query_event_mask(controller) == 0);
+    attr.ev_event_mask = MRC_CTL_EV_ASSUMED_BAD;
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EVENT_MASK) == 0);
+    assert(query_event_mask(controller) == MRC_CTL_EV_ASSUMED_BAD);
+
+    attr.profile_state = MRC_CTL_PROFILE_ONLINE;
+    attr.ev_event_mask = MRC_CTL_EV_GOOD | MRC_CTL_EV_ASSUMED_BAD;
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr,
+                                     MRC_CTL_EV_PROFILE_STATE | MRC_CTL_EV_PROFILE_EVENT_MASK) == 0);
+    struct mrc_context *reader = open_store(verbs, directory);
+    assert(query_event_mask(reader) == attr.ev_event_mask);
+    assert(mrc_destroy_context(reader) == 0);
+    attr.ev_event_mask = 0;
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EVENT_MASK) == -1 &&
+           errno == EBUSY);
+    assert(query_event_mask(controller) == (MRC_CTL_EV_GOOD | MRC_CTL_EV_ASSUMED_BAD));
+    assert(set_profile_state(controller, EVENT_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EVENT_MASK) == 0);
+    assert(query_event_mask(controller) == 0);
+    assert(set_profile_state(controller, EVENT_PROFILE_ID, MRC_CTL_PROFILE_INIT) == 0);
+    assert(mrc_destroy_context(controller) == 0);
 }
 
 static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context *controller,
@@ -1116,6 +1166,89 @@ static void seed_denied_profile(struct mrc_context *controller)
     printf("%u\n", (unsigned int)PROFILE_ID);
 }
 
+static uint64_t monotonic_ms(void)
+{
+    struct timespec now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static void watch_ev_events(struct mrc_context *controller, const char *directory, bool bad_only)
+{
+    struct mrc_ctl_device_attr device;
+    int supported;
+    assert(mrc_ctl_query_device_ex(NULL, controller, &device, &supported) == 0 && supported);
+    assert(device.opt_attr & MRC_CTL_OPT_CAP_EV_EVENT);
+    assert(configure_explicit(controller, EVENT_PROFILE_ID, MRC_DPDK_EV_FORMAT_UDP) == 0);
+    struct mrc_ctl_ev_op_entry evs[RAILS] = {
+        { .ev = ev(1, 0), .ev_new = ev(1, 0xc405), .state = MRC_CTL_EV_GOOD },
+        { .ev = ev(2, 0), .ev_new = ev(2, 0xc410), .state = MRC_CTL_EV_GOOD },
+    };
+    assert(replace_evs(controller, EVENT_PROFILE_ID, evs, RAILS) == 0);
+    struct mrc_ctl_ev_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_ONLINE, .ev_min_active = 1,
+        .ev_event_mask = MRC_CTL_EV_ASSUMED_BAD | (bad_only ? 0 : MRC_CTL_EV_GOOD),
+    };
+    assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_STATE |
+                                     MRC_CTL_EV_PROFILE_MIN_ACTIVE | MRC_CTL_EV_PROFILE_EVENT_MASK) == 0);
+
+    enum { EVENT_CAPACITY = 32, DEADLINE_MS = 8000, DRAIN_MS = 200 };
+    struct mrc_comp_channel *channel;
+    assert(mrc_create_comp_channel(controller, &channel) == 0);
+    struct mrc_cq *cq = mrc_ctl_create_ev_event_cq(controller, EVENT_CAPACITY, &device, channel, 0);
+    assert(cq && mrc_req_notify_cq(cq, 0) == 0);
+    struct pollfd wait = { .events = POLLIN };
+    assert(mrc_get_comp_channel_fd(channel, &wait.fd) == 0);
+    char finished[PATH_MAX];
+    int length = snprintf(finished, sizeof(finished), "%s/tx.finished", directory);
+    assert(length > 0 && (size_t)length < sizeof(finished));
+
+    printf("%u\n", (unsigned int)EVENT_PROFILE_ID);
+    assert(fflush(stdout) == 0);
+    uint64_t deadline = monotonic_ms() + DEADLINE_MS;
+    uint64_t drain_until = 0;
+    struct mrc_ctl_ev_event events[EVENT_CAPACITY];
+    int count = 0;
+    for (;;) {
+        uint64_t now = monotonic_ms();
+        if (drain_until && now >= drain_until)
+            break;
+        assert(now < deadline);
+        if (!drain_until && access(finished, F_OK) == 0)
+            drain_until = now + DRAIN_MS;
+        int ready = poll(&wait, 1, 20);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        assert(ready >= 0);
+        if (!ready)
+            continue;
+        assert(wait.revents == POLLIN);
+        struct mrc_cq *source;
+        void *context;
+        assert(mrc_get_cq_event(channel, &source, &context) == 0);
+        assert(source == cq && context == &device);
+        mrc_ack_cq_events(cq, 1);
+        assert(mrc_req_notify_cq(cq, 0) == 0);
+        assert(count < EVENT_CAPACITY);
+        int received = mrc_ctl_poll_ev_event(cq, EVENT_CAPACITY - count, events + count);
+        assert(received >= 0 && received <= EVENT_CAPACITY - count);
+        count += received;
+    }
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(mrc_destroy_comp_channel(channel) == 0);
+
+    fputc('[', stdout);
+    for (int i = 0; i < count; i++) {
+        const struct mrc_ctl_ev_event *event = &events[i];
+        assert(event->profile_id == EVENT_PROFILE_ID);
+        assert(event->state == MRC_CTL_EV_ASSUMED_BAD || event->state == MRC_CTL_EV_GOOD);
+        printf("%s{\"state\":\"%s\",\"port\":%u,\"value\":%" PRIu32 ",\"drop_count\":%" PRIu32 "}",
+               i ? "," : "", event->state == MRC_CTL_EV_ASSUMED_BAD ? "bad" : "good",
+               event->ev.port, ev_value(&event->ev), event->drop_count);
+    }
+    puts("]");
+}
+
 int main(int argc, char **argv)
 {
     bool expect_no_cap = argc == 2 && strcmp(argv[1], "--expect-no-cap") == 0;
@@ -1126,6 +1259,8 @@ int main(int argc, char **argv)
     bool seed_srv6 = argc == 3 && strcmp(argv[1], "--seed-explicit-srv6") == 0;
     bool unblock_srv6 = argc == 3 && strcmp(argv[1], "--unblock-explicit-srv6") == 0;
     bool seed_srv6_srh = argc == 3 && strcmp(argv[1], "--seed-generated-srv6-srh") == 0;
+    bool watch_events = argc == 3 && strcmp(argv[1], "--watch-ev-events") == 0;
+    bool watch_bad = argc == 3 && strcmp(argv[1], "--watch-ev-bad") == 0;
     const struct generated_profile *generated = NULL;
     if (argc == 3 && strcmp(argv[1], "--seed-gen") == 0)
         generated = &generated_udp;
@@ -1133,11 +1268,13 @@ int main(int argc, char **argv)
         generated = &generated_stev;
     else if (argc == 3 && strcmp(argv[1], "--seed-gen-custom-stev") == 0)
         generated = &generated_custom_stev;
-    bool fixture = seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 || seed_srv6_srh;
+    bool fixture = seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 ||
+                   seed_srv6_srh || watch_events || watch_bad;
     if (argc != 1 && !expect_no_cap && !fixture) {
         fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | "
                         "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR | --seed-gen-custom-stev DIR | "
-                        "--seed-explicit-srv6 DIR | --unblock-explicit-srv6 DIR | --seed-generated-srv6-srh DIR]\n",
+                        "--seed-explicit-srv6 DIR | --unblock-explicit-srv6 DIR | --seed-generated-srv6-srh DIR | "
+                        "--watch-ev-events DIR | --watch-ev-bad DIR]\n",
                         argv[0]);
         return EXIT_FAILURE;
     }
@@ -1148,7 +1285,9 @@ int main(int argc, char **argv)
     }
     if (fixture) {
         struct mrc_context *controller = open_store(verbs, argv[2]);
-        if (seed) {
+        if (watch_events || watch_bad) {
+            watch_ev_events(controller, argv[2], watch_bad);
+        } else if (seed) {
             seed_denied_profile(controller);
         } else if (unblock) {
             assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
@@ -1188,6 +1327,9 @@ int main(int argc, char **argv)
         assert(configure_generated(controller, generated_udp) == -1 && errno == EPERM);
         assert(profile_state(controller, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_INIT);
         assert(configure_format(controller, CUSTOM_STEV_FORMAT_ID, MRC_CTL_EV_FMT_MODE_STEV) == -1 && errno == EPERM);
+        struct mrc_ctl_ev_profile_attr events = { .ev_event_mask = MRC_CTL_EV_GOOD };
+        assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &events,
+                                         MRC_CTL_EV_PROFILE_EVENT_MASK) == -1 && errno == EPERM);
         struct mrc_ctl_cc_profile_attr cc = {0};
         assert(mrc_ctl_query_cc_profile(controller, CC_PROFILE_ID, &cc,
                                         MRC_CTL_CC_PROFILE_CUR_STATE) == -1 && errno == EPERM);
@@ -1197,6 +1339,8 @@ int main(int argc, char **argv)
     } else {
         test_profile_lifecycle(verbs, controller, directory);
         puts("OCP controller EV profiles, live EV state, persistence, and QP leases passed");
+        test_event_masks(verbs, directory);
+        puts("OCP controller EV event subscriptions, persistence, and ONLINE immutability passed");
         test_generated_profiles(verbs, directory);
         puts("OCP controller UDP and STEV generation, persistence, and QP leases passed");
         test_srv6_profiles(verbs, directory);

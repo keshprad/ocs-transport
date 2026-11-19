@@ -116,6 +116,41 @@ def controlled_ev_profile(binary, controller):
         return tx, rx
 
 
+def check_controller_ev_events(binary, controller, bad_only):
+    with tempfile.TemporaryDirectory(prefix="mrc-ev-events-") as directory:
+        store = Path(directory)
+        operation = "--watch-ev-bad" if bad_only else "--watch-ev-events"
+        with subprocess.Popen(["unshare", "-Ur", str(controller), operation, str(store)],
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as monitor:
+            try:
+                require(select.select([monitor.stdout], [], [], 4)[0], "EV event CQ did not become ready")
+                profile_id = monitor.stdout.readline().strip()
+                if not profile_id and monitor.poll() is not None:
+                    _, stderr = monitor.communicate(timeout=1)
+                    raise RuntimeError(f"EV event controller exited before setup\n{stderr}")
+                require(profile_id.isdecimal() and int(profile_id) > 0, "Invalid EV event profile ID")
+                tx, rx = transfer(binary, 16777216, "--ack-timeout", "13", drop_after=512,
+                                  tx_options=("--restore-path-after", "2048",
+                                              "--profile-dir", str(store), "--profile-id", profile_id))
+                require(tx["ev_failed_mask"] & 2 and tx["ev_recovered_mask"] & 2 and rx["received"][1] > 256,
+                        f"EV event case did not exercise failure and recovery: {tx}, {rx}")
+                (store / "tx.finished").touch()
+                stdout, stderr = monitor.communicate(timeout=4)
+                require(monitor.returncode == 0, f"EV event controller failed\n{stdout}\n{stderr}")
+            finally:
+                if monitor.poll() is None:
+                    monitor.kill()
+                    monitor.communicate()
+
+    events = json.loads(stdout)
+    expected = [{"state": "bad", "port": 2, "value": 0xC410, "drop_count": 0}]
+    if not bad_only:
+        expected.append({"state": "good", "port": 2, "value": 0xC410, "drop_count": 0})
+    require(events == expected, f"Unexpected EV events for {operation}: {events}")
+    print(json.dumps({"case": "ev_events_bad_only" if bad_only else "ev_events_failover",
+                      "events": events, "tx_bytes": tx["bytes"], "rx_rail_packets": rx["received"]}))
+
+
 def check_reliability_nacks(binary):
     for name, reason, size, count, limit in (
         ("no_bitmap", 0x06, 8192, 1, ("--rx-ooo-capacity", "0")),
@@ -155,6 +190,8 @@ def main():
     parser.add_argument("--binary", type=Path,
                         default=Path(__file__).resolve().parents[1] / "mrc_write")
     parser.add_argument("--controller", type=Path, help="Path to mrc_ctl_profile")
+    parser.add_argument("--event-controller", type=Path,
+                        help="Path to test_mrc_ctl_abi for cross-process EV event verification")
     args = parser.parse_args()
     binary = args.binary.resolve()
     controller = (args.controller or binary.with_name("mrc_ctl_profile")).resolve()
@@ -273,6 +310,10 @@ def main():
     require(tx["ev_failed_mask"] & 2 and tx["ev_recovered_mask"] & 2 and rx["received"][1] > 256,
             f"Path 1 did not rejoin the active set after a correlated probe: {tx}, {rx}")
     print(json.dumps({"case": "recovered_ev", "tx": tx, "rx": rx}))
+
+    if args.event_controller:
+        check_controller_ev_events(binary, args.event_controller.resolve(), bad_only=False)
+        check_controller_ev_events(binary, args.event_controller.resolve(), bad_only=True)
 
     change = ("--dynamic-mpr", "1", "--mpr", "8", "--mpr-change-at", "65",
               "--mpr-change-to", "1")

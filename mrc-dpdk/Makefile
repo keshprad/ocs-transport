@@ -8,7 +8,7 @@ MRC_INCLUDE_DIR ?=
 MRC_HEADERS = $(if $(MRC_INCLUDE_DIR),$(addprefix $(MRC_INCLUDE_DIR)/,mrc.h mrc_api_ver.h mrc_ctl.h mrc_ctl_api_ver.h))
 MRC_ABI_CFLAGS = -isystem "$(MRC_INCLUDE_DIR)" $(shell $(PKG_CONFIG) --cflags libibverbs)
 MRC_ABI_LIBS = $(shell $(PKG_CONFIG) --libs libibverbs)
-MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_async.c src/mrc_abi_ctl.c src/mrc_abi_ev_format.c \
+MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_async.c src/mrc_abi_ctl.c src/mrc_abi_ev_format.c src/mrc_abi_ev_event.c \
               src/mrc_abi_qp.c src/mrc_abi_dpdk.c $(MRC_ENDPOINT_SRC)
 MRC_ABI_DEPS = src/mrc_abi.h src/mrc_dpdk.h $(MRC_ENDPOINT_HEADERS) $(MRC_HEADERS)
 
@@ -17,9 +17,10 @@ all: mrc_bench mrc_write mrc_ctl_profile
 
 mrc_bench: src/mrc_bench.c src/dpdk_io.c src/dpdk_io.h
 MRC_ENDPOINT_SRC = src/mrc_endpoint.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.c src/mrc_wr.c \
-                   src/mrc_ev.c src/mrc_mpr.c src/mrc_provider.c src/mrc_provider_qp.c src/mrc_ctl_store.c
+                   src/mrc_ev.c src/mrc_ev_event_io.c src/mrc_mpr.c src/mrc_provider.c \
+                   src/mrc_provider_qp.c src/mrc_ctl_store.c
 MRC_ENDPOINT_HEADERS = src/mrc_endpoint.h src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h \
-                       src/mrc_ev.h src/mrc_mpr.h src/mrc_provider.h src/mrc_ctl_store.h
+                       src/mrc_ev.h src/mrc_ev_event_io.h src/mrc_mpr.h src/mrc_provider.h src/mrc_ctl_store.h
 
 mrc_write: src/mrc_write.c src/mrc_connect.c src/mrc_oob.c src/mrc_connect.h src/mrc_oob.h \
            $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)

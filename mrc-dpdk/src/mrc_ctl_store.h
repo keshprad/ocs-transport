@@ -31,6 +31,11 @@ enum mrc_ctl_store_mode {
     MRC_CTL_STORE_GENERATED,
 };
 
+enum mrc_ctl_store_ev_event {
+    MRC_CTL_STORE_EV_EVENT_GOOD = 1,
+    MRC_CTL_STORE_EV_EVENT_ASSUMED_BAD = 2,
+};
+
 enum mrc_ctl_store_format {
     MRC_CTL_STORE_FORMAT_LEGACY = 0,
     MRC_CTL_STORE_FORMAT_UDP = 1,
@@ -66,6 +71,7 @@ struct mrc_ctl_store_config {
     uint64_t format_id; /* Zero uses the built-in layout for format. */
     uint8_t count;
     uint8_t min_active;
+    uint8_t event_mask; /* Requested states from mrc_ctl_store_ev_event. */
     uint32_t populated; /* Bit i identifies a configured entropy slot. */
     uint32_t denied; /* Administrative DENY updates are allowed while ONLINE. */
     uint32_t entropy[MRC_EV_MAX_PATHS];

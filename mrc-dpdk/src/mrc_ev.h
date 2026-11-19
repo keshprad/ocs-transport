@@ -37,6 +37,8 @@ struct mrc_ev_profile {
     uint32_t recovered;
     uint32_t failed_mask;
     uint32_t recovered_mask;
+    void (*notify)(void *context, unsigned int path, enum mrc_ev_state state);
+    void *notify_context;
 };
 
 bool mrc_ev_init(struct mrc_ev_profile *profile, unsigned int count, unsigned int min_active,

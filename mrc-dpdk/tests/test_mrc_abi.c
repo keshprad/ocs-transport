@@ -3,15 +3,19 @@
 #endif
 
 #include "mrc_abi.h"
+#include "mrc_ev_event_io.h"
 
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mrc_ctl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static void transition_to_rts(struct mrc_provider_qp *qp)
 {
@@ -549,6 +553,149 @@ static void test_shared_cq_error(struct ibv_context *verbs)
     assert(ibv_dealloc_pd(pd) == 0);
 }
 
+static void send_ev_event(int sender, int directory, struct mrc_comp_channel *channel,
+                           struct mrc_cq *cq, void *context, unsigned int token,
+                           enum mrc_ev_event_state state, bool dropped)
+{
+    struct mrc_ev_event_record record = {
+        .profile_id = 71, .value = {0x20, 0x01, 0x0d, 0xb8}, .port = 2,
+        .state = state, .dropped = dropped,
+    };
+    record.value[31] = (uint8_t)token;
+    int fd;
+    assert(mrc_get_comp_channel_fd(channel, &fd) == 0);
+    struct pollfd readiness = { .fd = fd, .events = POLLIN };
+    assert(poll(&readiness, 1, 0) == 0);
+    assert(mrc_req_notify_cq(cq, 1) == 0);
+    assert(mrc_ev_event_send(sender, directory, &record) == 0);
+    assert(poll(&readiness, 1, 2000) == 1 && (readiness.revents & POLLIN));
+    struct mrc_cq *ready = NULL;
+    void *received_context = NULL;
+    assert(mrc_get_cq_event(channel, &ready, &received_context) == 0);
+    assert(ready == cq && received_context == context);
+    mrc_ack_cq_events(ready, 1);
+}
+
+static void test_ev_event_cq(struct ibv_context *verbs)
+{
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    assert(context);
+    if (!mrc_abi_controller_capable()) {
+        assert(mrc_ctl_create_ev_event_cq(context, 2, NULL, NULL, 0) == NULL && errno == EPERM);
+        assert(mrc_destroy_context(context) == 0);
+        return;
+    }
+
+    char directory[] = "/tmp/ocs-mrc-ev-cq.XXXXXX";
+    assert(mkdtemp(directory));
+    assert(mrc_dpdk_set_profile_store(context, directory) == 0);
+    struct mrc_ctl_device_attr device;
+    int supported;
+    assert(mrc_ctl_query_device_ex(NULL, context, &device, &supported) == 0 && supported);
+    assert(device.opt_attr & MRC_CTL_OPT_CAP_EV_EVENT);
+    assert(!(device.opt_attr & MRC_CTL_OPT_CAP_EV_EVENT_PRECISE_DROP_CNT));
+    struct mrc_comp_channel *channel;
+    assert(mrc_create_comp_channel(context, &channel) == 0);
+    int consumer = 51;
+    struct mrc_cq *cq = mrc_ctl_create_ev_event_cq(context, 2, &consumer, channel, 0);
+    assert(cq);
+    struct mrc_context *other = mrc_create_context(verbs, NULL);
+    assert(other && mrc_dpdk_set_profile_store(other, directory) == 0);
+    assert(mrc_ctl_create_ev_event_cq(other, 2, NULL, NULL, 0) == NULL && errno == EBUSY);
+    assert(mrc_poll_cq(cq, 0, NULL) == -1 && errno == EINVAL);
+    assert(mrc_ctl_poll_ev_event(cq, 1, NULL) == -EINVAL);
+    assert(mrc_ctl_poll_ev_event(cq, 0, NULL) == 0);
+    struct mrc_cq *normal = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(normal && mrc_ctl_poll_ev_event(normal, 0, NULL) == -EINVAL);
+    assert(mrc_destroy_cq(normal) == 0);
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    assert(pd);
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .send_cq = cq, .cap = { .max_send_wr = 1 },
+    };
+    assert(mrc_create_qp(context, &init) == NULL && errno == EINVAL);
+    assert(ibv_dealloc_pd(pd) == 0);
+
+    int sender = mrc_ev_event_open_sender();
+    int store_fd = mrc_abi_profile_store(context).fd;
+    assert(sender >= 0 && store_fd >= 0);
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 1, MRC_EV_EVENT_ASSUMED_BAD, false);
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 2, MRC_EV_EVENT_GOOD, false);
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 3, MRC_EV_EVENT_ASSUMED_BAD, false);
+
+    struct mrc_ctl_ev_event events[2];
+    assert(mrc_ctl_poll_ev_event(cq, 2, events) == 2);
+    assert(events[0].profile_id == 71 && events[0].ev.port == 2 &&
+           events[0].ev.val[31] == 2 && events[0].state == MRC_CTL_EV_GOOD &&
+           events[0].drop_count == 1);
+    assert(events[1].profile_id == 71 && events[1].ev.port == 2 &&
+           events[1].ev.val[31] == 3 && events[1].state == MRC_CTL_EV_ASSUMED_BAD &&
+           events[1].drop_count == 0);
+    assert(mrc_ctl_poll_ev_event(cq, 2, events) == 0);
+    int async_fd;
+    assert(mrc_dpdk_get_async_fd(context, &async_fd) == 0);
+    expect_async_readiness(async_fd, false);
+
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 4, MRC_EV_EVENT_GOOD, true);
+    assert(mrc_ctl_poll_ev_event(cq, 1, events) == 1 && events[0].ev.val[31] == 4 &&
+           events[0].drop_count == 1);
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 5, MRC_EV_EVENT_ASSUMED_BAD, false);
+    assert(mrc_ctl_poll_ev_event(cq, 1, events) == 1 && events[0].ev.val[31] == 5 &&
+           events[0].drop_count == 0);
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(mrc_destroy_comp_channel(channel) == 0);
+
+    /* Legacy callers use a shorter array stride. Ensure a second event data
+     * record is contiguous and neither returned event writes past that array. */
+    assert(mrc_ctl_query_device(verbs, &device) == 0);
+    assert(mrc_create_comp_channel(other, &channel) == 0);
+    cq = mrc_ctl_create_ev_event_cq(other, 2, &consumer, channel, 0);
+    assert(cq);
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 6, MRC_EV_EVENT_GOOD, false);
+    send_ev_event(sender, store_fd, channel, cq, &consumer, 7, MRC_EV_EVENT_ASSUMED_BAD, true);
+    struct legacy_event {
+        uint64_t profile_id;
+        struct mrc_ctl_ev ev;
+        uint32_t drop_count;
+    } legacy[2];
+    _Alignas(struct mrc_ctl_ev_event) uint8_t output[sizeof(events)];
+    memset(output, 0x5a, sizeof(output));
+    assert(mrc_ctl_poll_ev_event(cq, 2, (struct mrc_ctl_ev_event *)output) == 2);
+    memcpy(legacy, output, sizeof(legacy));
+    for (size_t i = 0; i < 2; i++) {
+        assert(legacy[i].profile_id == 71 && legacy[i].ev.port == 2);
+        assert(legacy[i].ev.val[31] == 6 + i && legacy[i].drop_count == i);
+    }
+    for (size_t i = sizeof(legacy); i < sizeof(output); i++)
+        assert(output[i] == 0x5a);
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(mrc_destroy_comp_channel(channel) == 0);
+    assert(mrc_destroy_context(other) == 0);
+
+    /* A context with an extended query keeps its layout after a legacy
+     * query elsewhere in the process. Polling also works without a channel. */
+    cq = mrc_ctl_create_ev_event_cq(context, 1, NULL, NULL, 0);
+    assert(cq);
+    const struct mrc_ev_event_record record = {
+        .profile_id = 72, .port = 1, .state = MRC_EV_EVENT_ASSUMED_BAD,
+    };
+    assert(mrc_ev_event_send(sender, store_fd, &record) == 0);
+    int count = mrc_ctl_poll_ev_event(cq, 2, events);
+    const struct timespec delay = { .tv_nsec = 1000000 };
+    for (unsigned int retry = 0; !count && retry < 2000; retry++) {
+        nanosleep(&delay, NULL);
+        count = mrc_ctl_poll_ev_event(cq, 2, events);
+    }
+    assert(count == 1 && events[0].profile_id == 72 && events[0].ev.port == 1 &&
+           events[0].state == MRC_CTL_EV_ASSUMED_BAD && events[0].drop_count == 0);
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(close(sender) == 0);
+    assert(unlinkat(store_fd, "ev-events.lock", 0) == 0);
+    assert(mrc_destroy_context(context) == 0);
+    assert(rmdir(directory) == 0);
+    puts("OCP MRC controller EV CQ notification, overflow, and legacy polling tests passed");
+}
+
 int main(void)
 {
     struct ibv_device **devices = ibv_get_device_list(NULL);
@@ -569,6 +716,7 @@ int main(void)
     test_public_qp(verbs);
     test_async_events(verbs);
     test_shared_cq_error(verbs);
+    test_ev_event_cq(verbs);
     assert(ibv_close_device(verbs) == 0);
     puts("OCP MRC context, QP, completion, and async ABI tests passed");
     return EXIT_SUCCESS;

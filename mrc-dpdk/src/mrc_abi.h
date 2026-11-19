@@ -7,6 +7,7 @@
 #include "mrc_ctl_store.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define MRC_PUBLIC __attribute__((visibility("default")))
 
@@ -17,6 +18,7 @@ enum {
 
 struct mrc_abi_route;
 struct mrc_abi_async_notice;
+struct mrc_abi_ev_cq;
 
 struct mrc_abi_async_source {
     struct mrc_context *context;
@@ -46,6 +48,7 @@ struct mrc_context {
     struct mrc_abi_pd *pds;
     struct mrc_abi_async_channel async;
     struct mrc_ctl_store profile_store;
+    atomic_uint ctl_event_layout;
 };
 
 struct mrc_comp_channel {
@@ -59,6 +62,7 @@ struct mrc_cq {
     void *application_context;
     int capacity;
     struct mrc_abi_async_source async;
+    struct mrc_abi_ev_cq *ev_events;
 };
 
 struct mrc_qp {
@@ -82,6 +86,9 @@ struct mrc_qp {
 
 struct mrc_ctl_store mrc_abi_profile_store(struct mrc_context *context);
 bool mrc_abi_controller_capable(void);
+bool mrc_abi_ev_event_state_supported(struct mrc_context *context);
+void mrc_abi_ev_cq_stop(struct mrc_abi_ev_cq *events);
+void mrc_abi_ev_cq_free(struct mrc_abi_ev_cq *events);
 enum mrc_ctl_store_format mrc_abi_builtin_ev_format(uint64_t id);
 unsigned int mrc_abi_builtin_ev_fields(enum mrc_ctl_store_format format);
 int mrc_abi_retain_context(struct mrc_context *context);

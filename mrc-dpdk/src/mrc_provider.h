@@ -155,6 +155,8 @@ int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *ent
  * Each event returned by either call must be acknowledged exactly once.
  */
 int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only);
+/* Signal an armed CQ whose entries are managed by its caller. */
+int mrc_provider_cq_signal(struct mrc_provider_cq *cq, bool solicited);
 int mrc_provider_cq_next_event(struct mrc_provider_cq *cq, enum mrc_provider_cq_event *event);
 int mrc_provider_cq_ack_events(struct mrc_provider_cq *cq, size_t count);
 

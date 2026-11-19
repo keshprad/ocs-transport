@@ -17,8 +17,10 @@ enum {
     GENERATED_FIELDS_VERSION = 3,
     SRV6_VERSION = 4,
     CUSTOM_FORMAT_VERSION = 5,
+    EV_EVENT_VERSION = 6,
     LEGACY_ENTRY_HEADER_SIZE = 20,
     ENTRY_HEADER_SIZE = 24,
+    EV_EVENT_MASK_OFFSET = 22,
     ENTROPY_SIZE = 4 * MRC_EV_MAX_PATHS,
     ENTRY_SIZE = ENTRY_HEADER_SIZE + ENTROPY_SIZE,
     EV_FIELD_SIZE = 20,
@@ -192,6 +194,7 @@ static bool config_valid(const struct mrc_ctl_store_config *config)
         (unsigned int)config->format > MRC_CTL_STORE_FORMAT_SRV6_SRH ||
         (srv6 && config->mode == MRC_CTL_STORE_AUTO) ||
         !config->count || config->count > MRC_EV_MAX_PATHS || config->min_active > config->count ||
+        (config->event_mask & ~(MRC_CTL_STORE_EV_EVENT_GOOD | MRC_CTL_STORE_EV_EVENT_ASSUMED_BAD)) ||
         !format_binding_valid(config) || !ev_fields_valid(config, srv6))
         return false;
 
@@ -229,6 +232,7 @@ static bool profile_valid(const struct mrc_ctl_store_profile *profile)
     switch (profile->state) {
     case MRC_CTL_STORE_INIT:
         if (config->mode || config->format || config->format_id || config->count || config->min_active ||
+            config->event_mask ||
             config->populated || config->denied || config->field_count || !format_binding_valid(config))
             return false;
         for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
@@ -272,6 +276,7 @@ static bool same_layout(const struct mrc_ctl_store_config *previous,
 {
     return previous->mode == updated->mode && same_format_binding(previous, updated) &&
            previous->count == updated->count && previous->min_active == updated->min_active &&
+           previous->event_mask == updated->event_mask &&
            previous->populated == updated->populated && same_fields(previous, updated) &&
            memcmp(previous->entropy, updated->entropy, sizeof(previous->entropy)) == 0 &&
            memcmp(previous->srv6, updated->srv6, sizeof(previous->srv6)) == 0;
@@ -322,6 +327,7 @@ static unsigned int ev_entry_size(uint8_t version)
     case SRV6_VERSION:
         return SRV6_ENTRY_SIZE;
     case CUSTOM_FORMAT_VERSION:
+    case EV_EVENT_VERSION:
         return CUSTOM_FORMAT_ENTRY_SIZE;
     default:
         return 0;
@@ -373,12 +379,14 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
     bool srv6 = version >= SRV6_VERSION;
     bool fields = version >= GENERATED_FIELDS_VERSION;
     unsigned int header_size = typed ? ENTRY_HEADER_SIZE : LEGACY_ENTRY_HEADER_SIZE;
-    if (typed && ((!fields && bytes[21]) || bytes[22] || bytes[23]))
+    bool events = version >= EV_EVENT_VERSION;
+    if (typed && ((!fields && bytes[21]) || (!events && bytes[EV_EVENT_MASK_OFFSET]) || bytes[23]))
         return false;
     *profile = (struct mrc_ctl_store_profile){
         .id = id, .state = bytes[8],
         .config = {
             .mode = bytes[9], .count = bytes[10], .min_active = bytes[11],
+            .event_mask = events ? bytes[EV_EVENT_MASK_OFFSET] : 0,
             .format = typed ? bytes[20] : MRC_CTL_STORE_FORMAT_LEGACY,
             .field_count = fields ? bytes[21] : 0,
             .populated = read32(bytes + 12), .denied = read32(bytes + 16),
@@ -390,7 +398,7 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
         memcpy(profile->config.srv6, bytes + SRV6_VALUES_OFFSET, sizeof(profile->config.srv6));
     else if (mrc_ctl_store_format_is_srv6(profile->config.format))
         return false;
-    if (version == CUSTOM_FORMAT_VERSION) {
+    if (version >= CUSTOM_FORMAT_VERSION) {
         const uint8_t *binding = bytes + SRV6_ENTRY_SIZE;
         const size_t widths = sizeof(profile->config.format_widths);
         size_t used = 9 + widths;
@@ -421,9 +429,11 @@ static void encode_profile(uint8_t *bytes, uint8_t version, const struct mrc_ctl
         bytes[21] = config->field_count;
         encode_ev_fields(bytes + ENTRY_SIZE, config);
     }
+    if (version >= EV_EVENT_VERSION)
+        bytes[EV_EVENT_MASK_OFFSET] = config->event_mask;
     if (version >= SRV6_VERSION)
         memcpy(bytes + SRV6_VALUES_OFFSET, config->srv6, sizeof(config->srv6));
-    if (version == CUSTOM_FORMAT_VERSION) {
+    if (version >= CUSTOM_FORMAT_VERSION) {
         uint8_t *binding = bytes + SRV6_ENTRY_SIZE;
         write64(binding, config->format_id);
         binding[8] = config->format_field_count;
@@ -690,11 +700,13 @@ static int save_snapshot(const struct mrc_ctl_store *store, const struct transac
     uint8_t version = TYPED_VERSION;
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
         const struct mrc_ctl_store_config *config = &txn->profiles[i].config;
-        if (config->format_id) {
-            version = CUSTOM_FORMAT_VERSION;
+        if (config->event_mask) {
+            version = EV_EVENT_VERSION;
             break;
         }
-        if (mrc_ctl_store_format_is_srv6(config->format))
+        if (config->format_id)
+            version = CUSTOM_FORMAT_VERSION;
+        else if (mrc_ctl_store_format_is_srv6(config->format) && version < SRV6_VERSION)
             version = SRV6_VERSION;
         else if (config->field_count && version < GENERATED_FIELDS_VERSION)
             version = GENERATED_FIELDS_VERSION;

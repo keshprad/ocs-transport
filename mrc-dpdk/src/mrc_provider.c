@@ -655,6 +655,27 @@ int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *ent
     return (int)copied;
 }
 
+int mrc_provider_cq_signal(struct mrc_provider_cq *cq, bool solicited)
+{
+    if (!cq)
+        return -EINVAL;
+    pthread_mutex_lock(&cq->mutex);
+    int result = 0;
+    if (cq->closing) {
+        result = -EBUSY;
+    } else if (cq_failed_locked(cq)) {
+        result = -EOVERFLOW;
+    } else if (cq->armed && (!cq->solicited_only || solicited)) {
+        result = cq->ready == SIZE_MAX - cq->unacked ? -EOVERFLOW : signal_notification(cq);
+        if (!result) {
+            cq->ready++;
+            cq->armed = false;
+        }
+    }
+    pthread_mutex_unlock(&cq->mutex);
+    return result;
+}
+
 int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only)
 {
     if (!cq)
