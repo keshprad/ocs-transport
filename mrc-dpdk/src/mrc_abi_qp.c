@@ -507,7 +507,7 @@ MRC_PUBLIC int mrc_post_recv(struct mrc_qp *qp, struct ibv_recv_wr *wr, struct i
     }
 
     pthread_mutex_lock(&qp->mutex);
-    int error = wr && qp->route && qp->requester ? EOPNOTSUPP : 0;
+    int error = wr && qp->route && !qp->responder ? EOPNOTSUPP : 0;
     while (wr && !error) {
         error = wr->num_sge ? EINVAL : -mrc_provider_qp_post_recv(qp->provider, wr->wr_id);
         if (!error)

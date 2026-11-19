@@ -9,39 +9,218 @@
 
 #include <rte_cycles.h>
 #include <rte_ethdev.h>
+#include <rte_mbuf.h>
+
+enum {
+    RX_BURST = 32,
+    RX_PENDING = 128,
+    ROUTE_BUCKETS = 256,
+};
+
+struct rx_queue {
+    struct rte_mbuf *packets[RX_PENDING];
+    uint16_t head;
+    uint16_t count;
+};
+
+struct qp_direction {
+    struct mrc_endpoint_config config;
+    struct rx_queue ingress[PATH_COUNT];
+};
+
+struct peer_node {
+    struct mrc_endpoint_node state;
+    size_t users;
+};
 
 struct mrc_abi_route {
-    struct mrc_endpoint_config config;
+    struct mrc_abi_route *next;
+    struct mrc_abi_route *next_qpn;
+    struct qp_direction tx;
+    struct qp_direction rx;
+    struct peer_node *node;
     struct mrc_endpoint_counters counts;
     struct mrc_requester *request;
     struct mrc_responder *response;
+    uint32_t qpn;
+    int error;
 };
 
-/* Until there is shared RX dispatch, no two attached QPs may poll the same
- * ethdev RX queue. An application with separate rails can drive them in parallel. */
-static pthread_mutex_t port_mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool port_attached[RTE_MAX_ETHPORTS];
+/* Shared ethdev RX and TX queue I/O, route lifetime, and node state are
+ * serialized here. Callers already hold their own QP mutex. The dispatcher
+ * never takes another QP's mutex. */
+static pthread_mutex_t dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct mrc_abi_route *routes;
+static struct mrc_abi_route *routes_by_qpn[ROUTE_BUCKETS];
 
-static int claim_ports(const struct mrc_dpdk_route *route)
+static uint16_t take_packets(void *context, unsigned int path,
+                              struct rte_mbuf **packets, uint16_t limit)
 {
-    pthread_mutex_lock(&port_mutex);
-    int error = 0;
-    if (port_attached[route->ports[0]] || port_attached[route->ports[1]]) {
-        error = EBUSY;
-    } else {
-        port_attached[route->ports[0]] = true;
-        port_attached[route->ports[1]] = true;
-    }
-    pthread_mutex_unlock(&port_mutex);
-    return error;
+    struct qp_direction *direction = context;
+    struct rx_queue *queue = &direction->ingress[path];
+    uint16_t count = queue->count < limit ? queue->count : limit;
+    for (uint16_t i = 0; i < count; i++)
+        packets[i] = queue->packets[(queue->head + i) % RX_PENDING];
+    queue->head = (queue->head + count) % RX_PENDING;
+    queue->count -= count;
+    return count;
 }
 
-static void release_ports(const struct mrc_endpoint_config *config)
+static void discard_packets(struct qp_direction *direction)
 {
-    pthread_mutex_lock(&port_mutex);
-    for (unsigned int i = 0; i < PATH_COUNT; i++)
-        port_attached[config->paths[i].port] = false;
-    pthread_mutex_unlock(&port_mutex);
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        struct rte_mbuf *packets[RX_PENDING];
+        uint16_t count = take_packets(direction, path, packets, RX_PENDING);
+        rte_pktmbuf_free_bulk(packets, count);
+    }
+}
+
+static bool queue_packet(struct qp_direction *direction, uint16_t port,
+                          const struct mrc_wire_packet *header, struct rte_mbuf *packet)
+{
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        if (direction->config.paths[path].port != port)
+            continue;
+        struct rx_queue *queue = &direction->ingress[path];
+        if (queue->count == RX_PENDING ||
+            !mrc_endpoint_peer_matches(&direction->config, path, header))
+            return false;
+        queue->packets[(queue->head + queue->count) % RX_PENDING] = packet;
+        queue->count++;
+        return true;
+    }
+    return false;
+}
+
+static struct qp_direction *node_direction(struct mrc_abi_route *route)
+{
+    return route->request ? &route->tx : &route->rx;
+}
+
+static bool node_packet(struct mrc_abi_route *current, uint16_t port,
+                         const struct mrc_wire_packet *header, struct rte_mbuf *packet)
+{
+    /* Prefer the QP already progressing. QPs on the same path to this peer
+     * share node state, so one copy suffices and requests get one reply. */
+    if (queue_packet(node_direction(current), port, header, packet))
+        return true;
+    for (struct mrc_abi_route *route = routes; route; route = route->next) {
+        if (route != current && !route->error &&
+            queue_packet(node_direction(route), port, header, packet))
+            return true;
+    }
+    return false;
+}
+
+static struct mrc_abi_route *find_route(uint32_t qpn)
+{
+    struct mrc_abi_route *route = routes_by_qpn[qpn % ROUTE_BUCKETS];
+    while (route && route->qpn != qpn)
+        route = route->next_qpn;
+    return route;
+}
+
+static bool dispatch_packet(struct mrc_abi_route *current, uint16_t port, struct rte_mbuf *packet)
+{
+    uint8_t scratch[MRC_WIRE_IPV6_HEADER_LEN + MRC_BTH_LEN];
+    uint32_t length = rte_pktmbuf_pkt_len(packet);
+    if (length > sizeof(scratch))
+        length = sizeof(scratch);
+    const uint8_t *prefix = rte_pktmbuf_read(packet, 0, length, scratch);
+    struct mrc_wire_packet header;
+    if (!prefix || mrc_wire_dispatch_header(prefix, length, &header))
+        return false;
+
+    if (header.bth.dqp == MRC_ENDPOINT_QPN)
+        return (header.bth.opcode == MRC_ENDPOINT_REQUEST || header.bth.opcode == MRC_ENDPOINT_RESPONSE)
+               && node_packet(current, port, &header, packet);
+    struct mrc_abi_route *target = find_route(header.bth.dqp);
+    if (!target || target->error)
+        return false;
+    switch (header.bth.opcode) {
+    case MRC_TRANSPORT_ACK:
+    case MRC_RELIABILITY_SACK:
+    case MRC_RELIABILITY_NACK:
+        return target->request && queue_packet(&target->tx, port, &header, packet);
+    default:
+        return target->response && queue_packet(&target->rx, port, &header, packet);
+    }
+}
+
+static void receive_ports(struct mrc_abi_route *route)
+{
+    const struct mrc_endpoint_config *config = &node_direction(route)->config;
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        uint16_t port = config->paths[path].port;
+        struct rte_mbuf *packets[RX_BURST];
+        uint16_t count = rte_eth_rx_burst(port, 0, packets, RX_BURST);
+        for (uint16_t i = 0; i < count; i++) {
+            if (!dispatch_packet(route, port, packets[i]))
+                rte_pktmbuf_free(packets[i]);
+        }
+    }
+}
+
+static bool same_node_peer(const struct mrc_endpoint_config *a, const struct mrc_endpoint_config *b)
+{
+    if (a->udp_port != b->udp_port || a->partition_key != b->partition_key ||
+        a->peer_partition_key != b->peer_partition_key || a->ip_version != b->ip_version)
+        return false;
+    if (a->ip_version == MRC_WIRE_IP4) {
+        if (a->local_ip != b->local_ip || a->peer_ip != b->peer_ip)
+            return false;
+    } else if (memcmp(a->local_ip6, b->local_ip6, MRC_IPV6_ADDR_LEN) ||
+               memcmp(a->peer_ip6, b->peer_ip6, MRC_IPV6_ADDR_LEN)) {
+        return false;
+    }
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        if (a->paths[path].port != b->paths[path].port ||
+            !rte_is_same_ether_addr(&a->paths[path].local, &b->paths[path].local) ||
+            !rte_is_same_ether_addr(&a->paths[path].peer, &b->paths[path].peer))
+            return false;
+    }
+    return true;
+}
+
+static struct peer_node *join_peer_node(const struct mrc_endpoint_config *config)
+{
+    for (struct mrc_abi_route *route = routes; route; route = route->next) {
+        if (same_node_peer(config, &node_direction(route)->config)) {
+            route->node->users++;
+            return route->node;
+        }
+    }
+    struct peer_node *node = calloc(1, sizeof(*node));
+    if (node)
+        node->users = 1;
+    return node;
+}
+
+static void release_peer_node(struct peer_node *node)
+{
+    if (node && --node->users == 0)
+        free(node);
+}
+
+static void register_route(struct mrc_abi_route *route)
+{
+    struct mrc_abi_route **bucket = &routes_by_qpn[route->qpn % ROUTE_BUCKETS];
+    route->next = routes;
+    route->next_qpn = *bucket;
+    routes = *bucket = route;
+}
+
+static void unregister_route(const struct mrc_abi_route *route)
+{
+    struct mrc_abi_route **bucket = &routes_by_qpn[route->qpn % ROUTE_BUCKETS];
+    while (*bucket != route)
+        bucket = &(*bucket)->next_qpn;
+    *bucket = route->next_qpn;
+
+    struct mrc_abi_route **entry = &routes;
+    while (*entry != route)
+        entry = &(*entry)->next;
+    *entry = route->next;
 }
 
 static int configure_addresses(struct mrc_endpoint_config *config, const union ibv_gid *local,
@@ -71,9 +250,9 @@ static int configure_addresses(struct mrc_endpoint_config *config, const union i
 }
 
 static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
-                            struct mrc_endpoint_config *config)
+                            struct qp_direction *direction, bool tx)
 {
-    const bool tx = route->requester;
+    struct mrc_endpoint_config *config = &direction->config;
     const struct ibv_qp_attr *verbs = &qp->verbs;
     const struct mrc_qp_attr *attrs = &qp->attrs;
     const uint8_t mpr = tx ? attrs->mpr.mpr : attrs->mpr.mpr_dest;
@@ -104,6 +283,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         .trim_dscp = route->trim_dscp ? route->trim_dscp : 49,
         .drop_after = UINT32_MAX, .restore_after = UINT32_MAX, .trim_after = UINT32_MAX,
         .mpr_change_at = UINT32_MAX, .hz = rte_get_timer_hz(),
+        .receive = take_packets, .receive_context = direction,
     };
     if (!config->hz)
         return EIO;
@@ -125,7 +305,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     return 0;
 }
 
-static int validate_attachment(struct mrc_qp *qp, const struct mrc_dpdk_route *route)
+static int validate_attachment(struct mrc_qp *qp, bool tx, bool rx)
 {
     if (qp->route)
         return EBUSY;
@@ -133,20 +313,27 @@ static int validate_attachment(struct mrc_qp *qp, const struct mrc_dpdk_route *r
     int error = -mrc_provider_qp_query(qp->provider, &attr);
     if (error)
         return error;
-    if (route->requester) {
-        if (attr.state != MRC_PROVIDER_QP_RTS || !qp->init.cap.max_send_wr)
-            return EINVAL;
-        if (attr.recv_pending)
-            return EBUSY;
-    } else {
+    if (tx && (attr.state != MRC_PROVIDER_QP_RTS || !qp->init.cap.max_send_wr))
+        return EINVAL;
+    if (rx) {
         if (attr.state != MRC_PROVIDER_QP_RTR && attr.state != MRC_PROVIDER_QP_RTS)
             return EINVAL;
         if (!(qp->verbs.qp_access_flags & IBV_ACCESS_REMOTE_WRITE))
             return EACCES;
-        if (attr.send_pending)
-            return EBUSY;
     }
+    if ((!tx && attr.send_pending) || (!rx && attr.recv_pending))
+        return EBUSY;
     return 0;
+}
+
+static void free_route(struct mrc_abi_route *route)
+{
+    discard_packets(&route->tx);
+    discard_packets(&route->rx);
+    mrc_requester_destroy(route->request);
+    mrc_responder_destroy(route->response);
+    release_peer_node(route->node);
+    free(route);
 }
 
 MRC_PUBLIC int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route)
@@ -158,8 +345,10 @@ MRC_PUBLIC int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route
             return ENODEV;
     }
 
+    bool tx = route->requester || route->bidirectional;
+    bool rx = !route->requester || route->bidirectional;
     pthread_mutex_lock(&qp->mutex);
-    int error = validate_attachment(qp, route);
+    int error = validate_attachment(qp, tx, rx);
     if (error)
         goto unlock;
     struct mrc_abi_route *object = calloc(1, sizeof(*object));
@@ -167,25 +356,36 @@ MRC_PUBLIC int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route
         error = ENOMEM;
         goto unlock;
     }
-    error = configure_route(qp, route, &object->config);
-    if (!error)
-        error = claim_ports(route);
-    if (error)
-        goto free_route;
+    object->qpn = qp->qpn;
+    if (tx)
+        error = configure_route(qp, route, &object->tx, true);
+    if (!error && rx)
+        error = configure_route(qp, route, &object->rx, false);
 
-    error = route->requester ?
-        -mrc_requester_create(&object->config, qp->provider, &object->counts, &object->request) :
-        -mrc_responder_create(&object->config, qp->provider, &object->counts, &object->response);
-    if (error) {
-        release_ports(&object->config);
-        goto free_route;
+    pthread_mutex_lock(&dispatch_mutex);
+    if (!error) {
+        object->node = join_peer_node(tx ? &object->tx.config : &object->rx.config);
+        if (!object->node)
+            error = ENOMEM;
     }
-    qp->requester = route->requester;
-    qp->route = object;
-    goto unlock;
+    if (!error && tx) {
+        object->tx.config.node = &object->node->state;
+        error = -mrc_requester_create(&object->tx.config, qp->provider, &object->counts, &object->request);
+    }
+    if (!error && rx) {
+        object->rx.config.node = &object->node->state;
+        error = -mrc_responder_create(&object->rx.config, qp->provider, &object->counts, &object->response);
+    }
+    if (error) {
+        free_route(object);
+    } else {
+        register_route(object);
+        qp->requester = tx;
+        qp->responder = rx;
+        qp->route = object;
+    }
+    pthread_mutex_unlock(&dispatch_mutex);
 
-free_route:
-    free(object);
 unlock:
     pthread_mutex_unlock(&qp->mutex);
     return error;
@@ -197,23 +397,35 @@ MRC_PUBLIC int mrc_dpdk_progress_qp(struct mrc_qp *qp)
         return EINVAL;
     pthread_mutex_lock(&qp->mutex);
     struct mrc_abi_route *route = qp->route;
-    int result = -ENOTCONN;
+    int error = ENOTCONN;
     if (route) {
-        result = route->request ? mrc_requester_progress(route->request)
-                               : mrc_responder_progress(route->response);
+        pthread_mutex_lock(&dispatch_mutex);
+        if (!route->error) {
+            receive_ports(route);
+            int result = route->response ? mrc_responder_progress(route->response) : 0;
+            if (result >= 0 && route->request)
+                result = mrc_requester_progress(route->request);
+            if (result < 0) {
+                route->error = -result;
+                discard_packets(&route->rx);
+                discard_packets(&route->tx);
+            }
+        }
+        error = route->error;
+        pthread_mutex_unlock(&dispatch_mutex);
     }
     pthread_mutex_unlock(&qp->mutex);
-    return result < 0 ? -result : 0;
+    return error;
 }
 
 void mrc_abi_release_route(struct mrc_qp *qp)
 {
     struct mrc_abi_route *route = qp->route;
     if (route) {
-        mrc_requester_destroy(route->request);
-        mrc_responder_destroy(route->response);
-        release_ports(&route->config);
-        free(route);
+        pthread_mutex_lock(&dispatch_mutex);
+        unregister_route(route);
+        free_route(route);
+        pthread_mutex_unlock(&dispatch_mutex);
         qp->route = NULL;
     }
 }

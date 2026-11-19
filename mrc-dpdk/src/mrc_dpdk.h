@@ -15,9 +15,8 @@ int mrc_dpdk_unbind_mr(struct mrc_context *context, const struct ibv_mr *mr);
 struct rte_mempool;
 
 /* Application-owned, started DPDK ports with queue zero for RX and TX.
- * One direction uses these ports until reset, an explicit transition to
- * ERROR, or destruction.
- * Do not poll the same RX queues elsewhere during that time. */
+ * QPs in this process can share these ports. Keep application I/O on the
+ * attached queues inside the MRC progress calls until the QPs detach. */
 struct mrc_dpdk_route {
     uint16_t ports[2];
     uint8_t peer_macs[2][6];
@@ -25,7 +24,8 @@ struct mrc_dpdk_route {
     uint16_t peer_pkey; /* Host order. Zero uses the local P_Key. */
     uint16_t udp_port; /* Zero uses the OCP default. */
     uint8_t trim_dscp; /* Zero selects the default trim DSCP (49). */
-    bool requester;
+    bool requester; /* Selects the direction when bidirectional is false. */
+    bool bidirectional; /* Attach requester and responder on the same QP. */
 };
 
 /* Bind and drive the QP from the application's DPDK worker. Poll completion

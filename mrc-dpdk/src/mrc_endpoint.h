@@ -14,6 +14,20 @@ enum {
     MAX_WORK_REQUESTS = 4096,
 };
 
+struct rte_mbuf;
+
+struct mrc_endpoint_node {
+    uint32_t local_ports;
+    uint32_t peer_ports;
+    uint16_t token;
+    uint16_t pending[PATH_COUNT];
+    bool awaiting[PATH_COUNT];
+    bool peer_seen;
+    uint64_t next_poll;
+    uint64_t fast_poll_until;
+    uint64_t peer_valid_until;
+};
+
 struct mrc_endpoint_path {
     uint16_t port;
     struct rte_ether_addr local;
@@ -85,6 +99,11 @@ struct mrc_endpoint_config {
     struct rte_mempool *pool;
     uint8_t *data;
     struct mrc_provider_pd *pd;
+    /* Optional shared ingress. Receive transfers ownership of each returned
+     * mbuf to the endpoint, which performs full validation and frees it. */
+    uint16_t (*receive)(void *context, unsigned int path, struct rte_mbuf **packets, uint16_t max_packets);
+    void *receive_context;
+    struct mrc_endpoint_node *node;
 };
 
 struct mrc_endpoint_rx_counters {
@@ -130,6 +149,8 @@ struct mrc_endpoint_counters {
 struct mrc_requester;
 struct mrc_responder;
 
+bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *config, unsigned int path,
+                               const struct mrc_wire_packet *header);
 bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capacity,
                                uint32_t length, bool with_immediate,
                                uint32_t immediate);

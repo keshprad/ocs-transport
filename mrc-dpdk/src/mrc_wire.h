@@ -260,6 +260,11 @@ int mrc_wire_encode(uint8_t *frame, size_t capacity, const struct mrc_wire_packe
 int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet);
 int mrc_wire_decode_ip(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet);
 
+/* Returns IP, UDP and BTH fields for dispatch of unencapsulated packets.
+ * This accepts a physically present prefix, including trimmed packets.
+ * The receiving endpoint still validates lengths, iCRC and payload. */
+int mrc_wire_dispatch_header(const uint8_t *frame, size_t length, struct mrc_wire_packet *header);
+
 /*
  * Expand an already encoded bare IPv6/UDP MRC frame in place. The frame's
  * Ethernet header and complete inner datagram, including iCRC, are retained.

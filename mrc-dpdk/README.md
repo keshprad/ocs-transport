@@ -80,11 +80,16 @@ The application posts standard WRITE and WRITEIMM work requests and polls
 the public CQs. Keep the verbs context, PD, MRs, and DPDK resources live
 until their MRC uses have ended.
 
-The DPDK attachment currently gives one direction of one QP exclusive
-access to the port pair's queues. It supports a 1024-byte PMTU, registered
-send buffers with up to 16 SGEs, and payload-free WRITEIMM receive posts.
-Shared RX dispatch, solicited WRITEIMM notifications, and the remaining
-application and controller APIs are tracked in [conformance](CONFORMANCE.md).
+Attach a QP in one direction or set `bidirectional` after both directions
+are configured and the QP reaches RTS. QPs in the same process can share
+the two DPDK ports. The progress calls dispatch inbound packets by QPN
+and opcode and serialize I/O on the attached queues. Drive progress on
+each attached QP to process the packets dispatched to it. Use the same
+rail order for QPs to the same peer so they share node port status.
+
+The attachment supports a 1024-byte PMTU, registered send buffers with
+up to 16 SGEs, and payload-free WRITEIMM receive posts. Solicited WRITEIMM
+notifications and the remaining APIs are tracked in [conformance](CONFORMANCE.md).
 
 ### Driving the DPDK endpoint from a provider QP
 

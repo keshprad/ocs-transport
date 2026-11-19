@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <poll.h>
 #include <stdio.h>
@@ -24,6 +25,8 @@ enum {
     SEND_PSN = 0xfffffe,
     FIRST_IMMEDIATE = 0x01020304,
     SECOND_IMMEDIATE = 0x12345678,
+    DUPLEX_QPS = 2,
+    DUPLEX_BYTES = 2049,
 };
 
 struct address {
@@ -106,25 +109,25 @@ static void wait_for(const char *path)
     }
 }
 
-static struct connection peer_connection(const char *directory, bool requester)
+static void read_peer_connections(const char *directory, bool client,
+                                  struct connection *peers, size_t count)
 {
     char path[PATH_MAX];
-    path_for(path, directory, requester ? "rx.connection" : "tx.connection");
+    path_for(path, directory, client ? "rx.connection" : "tx.connection");
     wait_for(path);
     FILE *file = fopen(path, "rb");
     assert(file);
-    struct connection peer;
-    assert(fread(&peer, sizeof(peer), 1, file) == 1);
+    assert(fread(peers, sizeof(*peers), count, file) == count);
     assert(fclose(file) == 0);
-    return peer;
 }
 
 static void configure_qp(struct mrc_qp *qp, const struct address *address,
-                          const struct connection *peer, bool requester)
+                          const struct connection *peer, uint32_t send_psn,
+                          bool send, bool receive)
 {
     struct ibv_qp_attr verbs = {
         .qp_state = IBV_QPS_INIT,
-        .qp_access_flags = requester ? 0 : IBV_ACCESS_REMOTE_WRITE,
+        .qp_access_flags = receive ? IBV_ACCESS_REMOTE_WRITE : 0,
         .pkey_index = 0,
     };
     assert(mrc_modify_qp(qp, &verbs, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS,
@@ -138,14 +141,14 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
             .grh = { .dgid = peer->gid, .sgid_index = address->gid_index, .hop_limit = 64 },
         },
     };
-    struct mrc_qp_attr attrs = { .mpr.mpr_dest = 1, .wimm.max_wimm_dest = requester ? 0 : 1 };
+    struct mrc_qp_attr attrs = { .mpr.mpr_dest = 1, .wimm.max_wimm_dest = receive ? 1 : 0 };
     const int rtr_verbs = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
     assert(mrc_modify_qp(qp, &verbs, rtr_verbs, &attrs, MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST) == 0);
-    if (!requester)
+    if (!send)
         return;
 
     verbs.qp_state = IBV_QPS_RTS;
-    verbs.sq_psn = SEND_PSN;
+    verbs.sq_psn = send_psn;
     attrs = (struct mrc_qp_attr){
         .mpr.mpr = 1, .wimm.max_wimm = 1, .timeout = 16,
         .retry = { .linear_cnt = 3, .exp_cnt = 4 },
@@ -238,51 +241,72 @@ static uint8_t pattern(size_t offset)
     return (uint8_t)(offset ^ (offset >> 8) ^ 0xa7);
 }
 
-int main(int argc, char **argv)
-{
-    int consumed = rte_eal_init(argc, argv);
-    assert(consumed >= 0);
-    argc -= consumed;
-    argv += consumed;
-    assert(argc == 3 && (strcmp(argv[1], "tx") == 0 || strcmp(argv[1], "rx") == 0));
-    bool requester = strcmp(argv[1], "tx") == 0;
-    const char *directory = argv[2];
 
-    struct address address = {0};
-    struct ibv_context *verbs = open_verbs(&address);
-    if (!verbs) {
-        fputs("A verbs device with a usable Ethernet GID and pkey is required.\n", stderr);
-        return EXIT_FAILURE;
+static struct ibv_mr *register_memory(struct mrc_context *context, struct ibv_pd *pd,
+                                      uint8_t *memory, size_t length, int access)
+{
+    struct ibv_mr *mr = ibv_reg_mr(pd, memory, length, access);
+    assert(mr && mrc_dpdk_bind_mr(context, mr, (uintptr_t)memory, access) == 0);
+    return mr;
+}
+
+static void deregister_memory(struct mrc_context *context, struct ibv_mr *mr)
+{
+    assert(mrc_dpdk_unbind_mr(context, mr) == 0);
+    assert(ibv_dereg_mr(mr) == 0);
+}
+
+static struct mrc_dpdk_route path_route(struct rte_mempool *pool, bool client)
+{
+    struct mrc_dpdk_route route = { .ports = {0, 1}, .pool = pool };
+    uint8_t peer_mac_end = client ? 0x10 : 0x20;
+    for (unsigned int port = 0; port < 2; port++) {
+        route.peer_macs[port][0] = 2;
+        route.peer_macs[port][5] = peer_mac_end + port;
     }
-    struct ibv_pd *pd = ibv_alloc_pd(verbs);
-    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    return route;
+}
+
+static void attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route)
+{
+    int attached = mrc_dpdk_attach_qp(qp, route);
+    if (attached) {
+        fprintf(stderr, "Failed to attach QP: %s (%d)\n", strerror(attached), attached);
+        abort();
+    }
+}
+
+static void skip_local_qp_numbers(struct mrc_context *context, struct mrc_qp_init_attr *init,
+                                  unsigned int count)
+{
+    /* Make the two independent processes allocate disjoint QPNs. */
+    for (unsigned int i = 0; i < count; i++) {
+        struct mrc_qp *unused = mrc_create_qp(context, init);
+        assert(unused && mrc_destroy_qp(unused) == 0);
+    }
+}
+
+static void run_simplex(bool requester, const char *directory, const struct address *address,
+                       struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool)
+{
     struct mrc_comp_channel *channel = NULL;
     if (!requester)
         assert(mrc_create_comp_channel(context, &channel) == 0);
     struct mrc_cq *cq = mrc_create_cq(context, 4, NULL, channel, 0);
-    assert(pd && context && cq);
+    assert(cq);
 
     uint8_t first_data[TOTAL_BYTES], last_data[TOTAL_BYTES];
     int access_flags = requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
     size_t first_length = requester ? FIRST_BYTES + IMMEDIATE_FIRST_SGE_BYTES : TOTAL_BYTES;
     for (size_t i = 0; i < first_length; i++)
         first_data[i] = requester ? pattern(i) : 0;
-    struct ibv_mr *first = ibv_reg_mr(pd, first_data, first_length, access_flags);
-    assert(first && mrc_dpdk_bind_mr(context, first, (uintptr_t)first_data, access_flags) == 0);
+    struct ibv_mr *first = register_memory(context, pd, first_data, first_length, access_flags);
     struct ibv_mr *last = NULL;
     if (requester) {
         size_t length = TOTAL_BYTES - first_length;
         for (size_t i = 0; i < length; i++)
             last_data[i] = pattern(first_length + i);
-        last = ibv_reg_mr(pd, last_data, length, 0);
-        assert(last && mrc_dpdk_bind_mr(context, last, (uintptr_t)last_data, 0) == 0);
-    }
-
-    struct rte_mempool *pool = mrc_dpdk_packet_pool();
-    assert(pool);
-    for (unsigned int port = 0; port < 2; port++) {
-        struct rte_ether_addr local;
-        assert(mrc_dpdk_open_port(port, pool, &local) == 0);
+        last = register_memory(context, pd, last_data, length, 0);
     }
 
     struct mrc_qp_init_attr init = {
@@ -294,34 +318,24 @@ int main(int argc, char **argv)
             .max_recv_wr = requester ? 0 : 2,
         },
     };
-    /* Allocate different QPNs even though both this test's processes start fresh. */
-    if (!requester) {
-        struct mrc_qp *unused = mrc_create_qp(context, &init);
-        assert(unused && mrc_destroy_qp(unused) == 0);
-    }
+    if (!requester)
+        skip_local_qp_numbers(context, &init, 1);
     struct mrc_qp *qp = mrc_create_qp(context, &init);
     struct connection local = {
-        .gid = address.gid, .psn = requester ? SEND_PSN : 135,
+        .gid = address->gid, .psn = requester ? SEND_PSN : 135,
         .remote_address = requester ? 0 : (uintptr_t)first_data,
         .rkey = requester ? 0 : first->rkey,
     };
     assert(qp && mrc_get_qpn(qp, &local.qpn) == 0);
     publish(directory, requester ? "tx.connection" : "rx.connection", &local, sizeof(local));
-    struct connection peer = peer_connection(directory, requester);
+    struct connection peer;
+    read_peer_connections(directory, requester, &peer, 1);
     assert(local.qpn != peer.qpn);
-    configure_qp(qp, &address, &peer, requester);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester);
 
-    struct mrc_dpdk_route route = { .ports = {0, 1}, .pool = pool, .requester = requester };
-    uint8_t peer_mac_end = requester ? 0x10 : 0x20;
-    for (unsigned int port = 0; port < 2; port++) {
-        route.peer_macs[port][0] = 2;
-        route.peer_macs[port][5] = peer_mac_end + port;
-    }
-    int attached = mrc_dpdk_attach_qp(qp, &route);
-    if (attached) {
-        fprintf(stderr, "Failed to attach QP: %s (%d)\n", strerror(attached), attached);
-        return EXIT_FAILURE;
-    }
+    struct mrc_dpdk_route route = path_route(pool, requester);
+    route.requester = requester;
+    attach_qp(qp, &route);
 
     if (requester) {
         char ready[PATH_MAX];
@@ -353,12 +367,237 @@ int main(int argc, char **argv)
     assert(mrc_destroy_cq(cq) == 0);
     if (channel)
         assert(mrc_destroy_comp_channel(channel) == 0);
-    if (last) {
-        assert(mrc_dpdk_unbind_mr(context, last) == 0);
-        assert(ibv_dereg_mr(last) == 0);
+    if (last)
+        deregister_memory(context, last);
+    deregister_memory(context, first);
+    printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u}\n",
+           requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
+}
+
+struct duplex_qp {
+    struct mrc_qp *qp;
+    struct ibv_mr *source;
+    struct ibv_mr *target;
+    uint8_t sent[DUPLEX_BYTES];
+    uint8_t received[DUPLEX_BYTES];
+};
+
+static uint8_t duplex_pattern(size_t offset, unsigned int index, unsigned int round, bool client)
+{
+    return pattern(offset) ^ (uint8_t)(19 * index + 71 * round + 113 * client);
+}
+
+static uint32_t duplex_immediate(unsigned int index, unsigned int round, bool client)
+{
+    return UINT32_C(0xbadc0000) | ((uint32_t)client << 12) | (round << 8) | index;
+}
+
+static uint64_t duplex_wr_id(unsigned int index, unsigned int round, bool send)
+{
+    return 100 * (1 + round) + 10 * send + index;
+}
+
+static void post_duplex_write(struct duplex_qp *qp, const struct connection *peer,
+                              unsigned int index, unsigned int round, bool client)
+{
+    for (size_t offset = 0; offset < sizeof(qp->sent); offset++)
+        qp->sent[offset] = duplex_pattern(offset, index, round, client);
+    struct ibv_sge source = {
+        .addr = (uintptr_t)qp->sent, .length = sizeof(qp->sent), .lkey = qp->source->lkey,
+    };
+    struct ibv_send_wr write = {
+        .wr_id = duplex_wr_id(index, round, true), .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+        .num_sge = 1, .sg_list = &source, .send_flags = IBV_SEND_SIGNALED,
+        .imm_data = htonl(duplex_immediate(index, round, client)),
+        .wr.rdma = { .remote_addr = peer->remote_address, .rkey = peer->rkey },
+    };
+    struct ibv_recv_wr receive = { .wr_id = duplex_wr_id(index, round, false) };
+    struct ibv_recv_wr *bad_recv = NULL;
+    assert(mrc_post_recv(qp->qp, &receive, &bad_recv) == 0 && !bad_recv);
+    struct ibv_send_wr *bad_send = NULL;
+    assert(mrc_post_send(qp->qp, &write, &bad_send) == 0 && !bad_send);
+}
+
+static unsigned int duplex_completions(struct mrc_cq *cq, const struct connection *connections,
+                                       unsigned int round, unsigned int active, unsigned int completed,
+                                       bool client, bool send)
+{
+    struct ibv_wc entries[DUPLEX_QPS];
+    int count = mrc_poll_cq(cq, DUPLEX_QPS, entries);
+    assert(count >= 0);
+    for (int i = 0; i < count; i++) {
+        const struct ibv_wc *wc = &entries[i];
+        unsigned int index = 0;
+        while (index < DUPLEX_QPS && connections[index].qpn != wc->qp_num)
+            index++;
+        assert(index < DUPLEX_QPS);
+        unsigned int bit = 1u << index;
+        assert((active & bit) && !(completed & bit));
+        assert(wc->status == IBV_WC_SUCCESS && wc->wr_id == duplex_wr_id(index, round, send));
+        if (send) {
+            assert(wc->opcode == IBV_WC_RDMA_WRITE);
+        } else {
+            assert(wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM && wc->byte_len == DUPLEX_BYTES);
+            assert((wc->wc_flags & IBV_WC_WITH_IMM) &&
+                   ntohl(wc->imm_data) == duplex_immediate(index, round, !client));
+        }
+        completed |= bit;
     }
-    assert(mrc_dpdk_unbind_mr(context, first) == 0);
-    assert(ibv_dereg_mr(first) == 0);
+    return completed;
+}
+
+static void marker_name(char out[32], bool client, unsigned int round, const char *state)
+{
+    int count = snprintf(out, 32, "%s.%u.%s", client ? "tx" : "rx", round, state);
+    assert(count > 0 && count < 32);
+}
+
+static void duplex_round(struct duplex_qp *qps, const struct connection *local,
+                         const struct connection *peer, struct mrc_cq *send_cq,
+                         struct mrc_cq *recv_cq, const char *directory, bool client,
+                         unsigned int round, unsigned int first)
+{
+    unsigned int active = 0;
+    for (unsigned int index = first; index < DUPLEX_QPS; index++) {
+        post_duplex_write(&qps[index], &peer[index], index, round, client);
+        active |= 1u << index;
+    }
+
+    char marker[32], their_ready[PATH_MAX], their_done[PATH_MAX];
+    marker_name(marker, client, round, "ready");
+    publish(directory, marker, NULL, 0);
+    marker_name(marker, !client, round, "ready");
+    path_for(their_ready, directory, marker);
+    wait_for(their_ready);
+
+    marker_name(marker, !client, round, "done");
+    path_for(their_done, directory, marker);
+    marker_name(marker, client, round, "done");
+
+    uint64_t deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
+    unsigned int sends = 0, recvs = 0;
+    bool done = false;
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        for (unsigned int index = first; index < DUPLEX_QPS; index++) {
+            int progress = mrc_dpdk_progress_qp(qps[index].qp);
+            if (progress) {
+                fprintf(stderr, "Round %u, QPN %u progress failed: %s (%d)\n",
+                        round, local[index].qpn, strerror(progress), progress);
+                abort();
+            }
+        }
+        sends = duplex_completions(send_cq, local, round, active, sends, client, true);
+        recvs = duplex_completions(recv_cq, local, round, active, recvs, client, false);
+        if (!done && sends == active && recvs == active) {
+            for (unsigned int index = first; index < DUPLEX_QPS; index++) {
+                for (size_t offset = 0; offset < sizeof(qps[index].received); offset++)
+                    assert(qps[index].received[offset] == duplex_pattern(offset, index, round, !client));
+            }
+            publish(directory, marker, NULL, 0);
+            done = true;
+        }
+        rte_pause();
+    } while (!done || access(their_done, F_OK) != 0);
+}
+
+static void run_duplex(bool client, const char *directory, const struct address *address,
+                       struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool)
+{
+    struct mrc_cq *send_cq = mrc_create_cq(context, 8, NULL, NULL, 0);
+    struct mrc_cq *recv_cq = mrc_create_cq(context, 8, NULL, NULL, 0);
+    assert(send_cq && recv_cq);
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .protocol_version = MRC_PROTOCOL_VERSION_1,
+        .send_cq = send_cq, .recv_cq = recv_cq,
+        .cap = { .max_send_wr = 2, .max_recv_wr = 2, .max_send_sge = 1 },
+    };
+    if (!client)
+        skip_local_qp_numbers(context, &init, DUPLEX_QPS);
+
+    struct duplex_qp qps[DUPLEX_QPS];
+    struct connection local[DUPLEX_QPS];
+    const uint32_t psns[2][DUPLEX_QPS] = {{0x1240, 0x6900}, {0xffffff, 0x4100}};
+    for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
+        struct duplex_qp *qp = &qps[index];
+        qp->qp = mrc_create_qp(context, &init);
+        assert(qp->qp);
+        memset(qp->received, 0, sizeof(qp->received));
+        qp->source = register_memory(context, pd, qp->sent, sizeof(qp->sent), 0);
+        qp->target = register_memory(context, pd, qp->received, sizeof(qp->received),
+                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        local[index] = (struct connection){
+            .gid = address->gid, .psn = psns[client][index],
+            .remote_address = (uintptr_t)qp->received, .rkey = qp->target->rkey,
+        };
+        assert(mrc_get_qpn(qp->qp, &local[index].qpn) == 0);
+    }
+    publish(directory, client ? "tx.connection" : "rx.connection", local, sizeof(local));
+    struct connection peer[DUPLEX_QPS];
+    read_peer_connections(directory, client, peer, DUPLEX_QPS);
+
+    struct mrc_dpdk_route route = path_route(pool, client);
+    route.bidirectional = true;
+    for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
+        configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true);
+        attach_qp(qps[index].qp, &route);
+    }
+
+    duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0);
+    struct ibv_qp_attr reset = { .qp_state = IBV_QPS_RESET };
+    assert(mrc_modify_qp(qps[0].qp, &reset, IBV_QP_STATE, NULL, 0) == 0);
+    assert(mrc_dpdk_progress_qp(qps[0].qp) == ENOTCONN);
+    duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 1, 1);
+    for (size_t offset = 0; offset < sizeof(qps[0].received); offset++)
+        assert(qps[0].received[offset] == duplex_pattern(offset, 0, 0, !client));
+
+    for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
+        assert(mrc_destroy_qp(qps[index].qp) == 0);
+        deregister_memory(context, qps[index].target);
+        deregister_memory(context, qps[index].source);
+    }
+    assert(mrc_destroy_cq(send_cq) == 0);
+    assert(mrc_destroy_cq(recv_cq) == 0);
+    printf("{\"role\":\"%s\",\"bytes\":%u,\"send_completions\":3,\"recv_completions\":3,"
+           "\"qpns\":[%u,%u],\"reset_qpn\":%u}\n",
+           client ? "tx" : "rx", (unsigned int)(3 * DUPLEX_BYTES),
+           local[0].qpn, local[1].qpn, local[0].qpn);
+}
+
+int main(int argc, char **argv)
+{
+    int consumed = rte_eal_init(argc, argv);
+    assert(consumed >= 0);
+    argc -= consumed;
+    argv += consumed;
+    assert(argc == 4 && (strcmp(argv[1], "tx") == 0 || strcmp(argv[1], "rx") == 0));
+    bool client = strcmp(argv[1], "tx") == 0;
+    const char *directory = argv[2];
+    bool bidirectional = strcmp(argv[3], "duplex") == 0;
+    assert(bidirectional || strcmp(argv[3], "simplex") == 0);
+
+    struct address address = {0};
+    struct ibv_context *verbs = open_verbs(&address);
+    if (!verbs) {
+        fputs("A verbs device with a usable Ethernet GID and pkey is required.\n", stderr);
+        return EXIT_FAILURE;
+    }
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    assert(pd && context);
+
+    struct rte_mempool *pool = mrc_dpdk_packet_pool();
+    assert(pool);
+    for (unsigned int port = 0; port < 2; port++) {
+        struct rte_ether_addr local;
+        assert(mrc_dpdk_open_port(port, pool, &local) == 0);
+    }
+
+    if (bidirectional)
+        run_duplex(client, directory, &address, context, pd, pool);
+    else
+        run_simplex(client, directory, &address, context, pd, pool);
+
     assert(mrc_destroy_context(context) == 0);
     assert(ibv_dealloc_pd(pd) == 0);
     assert(ibv_close_device(verbs) == 0);
@@ -366,7 +605,5 @@ int main(int argc, char **argv)
         mrc_dpdk_close_port(port);
     rte_mempool_free(pool);
     assert(rte_eal_cleanup() == 0);
-    printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u}\n",
-           requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
     return 0;
 }

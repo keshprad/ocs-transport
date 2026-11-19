@@ -49,18 +49,6 @@ struct send_record {
     bool redundant_attempt;
 };
 
-struct node_status {
-    uint32_t local_ports;
-    uint32_t peer_ports;
-    uint16_t token;
-    uint16_t pending[PATH_COUNT];
-    bool awaiting[PATH_COUNT];
-    bool peer_seen;
-    uint64_t next_poll;
-    uint64_t fast_poll_until;
-    uint64_t peer_valid_until;
-};
-
 struct outstanding_probe {
     uint64_t sent_at;
     uint16_t id;
@@ -85,7 +73,8 @@ struct mrc_requester {
     int result;
     bool initial_probe;
     struct mrc_cc cc;
-    struct node_status node;
+    struct mrc_endpoint_node local_node;
+    struct mrc_endpoint_node *node;
     struct mrc_tx_qp qp;
     struct mrc_tx_packet slots[WINDOW];
     struct send_record metadata[WINDOW];
@@ -109,7 +98,8 @@ struct mrc_responder {
     struct mrc_rx_qp qp;
     struct mrc_wr_responder wr;
     struct mrc_mpr mpr;
-    struct node_status node;
+    struct mrc_endpoint_node local_node;
+    struct mrc_endpoint_node *node;
     struct mrc_wr_slot work[WINDOW];
     struct mrc_wr_staged staged[WINDOW];
     uint8_t slots[WINDOW];
@@ -318,7 +308,7 @@ static const uint8_t *read_frame(const struct rte_mbuf *mbuf,
     return rte_pktmbuf_read(mbuf, 0, (uint32_t)*length, scratch);
 }
 
-static bool peer_matches(const struct mrc_endpoint_config *transfer, unsigned int index,
+bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *transfer, unsigned int index,
                          const struct mrc_wire_packet *packet)
 {
     uint32_t expected_qpn = transfer->sender ? transfer->requestor_qpn : transfer->responder_qpn;
@@ -379,7 +369,7 @@ static bool decode(const struct mrc_endpoint_config *transfer, unsigned int inde
         counts->rejected++;
         return false;
     }
-    if (!peer_matches(transfer, index, packet)) {
+    if (!mrc_endpoint_peer_matches(transfer, index, packet)) {
         counts->other_peer++;
         return false;
     }
@@ -387,7 +377,7 @@ static bool decode(const struct mrc_endpoint_config *transfer, unsigned int inde
     return true;
 }
 
-static void poll_port_status(const struct mrc_endpoint_config *transfer, struct node_status *status,
+static void poll_port_status(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                              uint64_t now)
 {
     if (now < status->next_poll)
@@ -424,7 +414,7 @@ static void poll_port_status(const struct mrc_endpoint_config *transfer, struct 
     }
 }
 
-static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, struct node_status *status,
+static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                                 struct mrc_endpoint_counters *counts, unsigned int path,
                                 const struct mrc_wire_packet *packet)
 {
@@ -462,8 +452,8 @@ static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, stru
 
 static uint32_t available_paths(const struct mrc_requester *sender, uint64_t now)
 {
-    if (sender->node.peer_seen && now < sender->node.peer_valid_until)
-        return sender->node.peer_ports;
+    if (sender->node->peer_seen && now < sender->node->peer_valid_until)
+        return sender->node->peer_ports;
     return ALL_PATHS;
 }
 
@@ -757,18 +747,26 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
     }
 }
 
+static uint16_t receive_burst(const struct mrc_endpoint_config *config, unsigned int path,
+                               struct rte_mbuf **packets)
+{
+    if (config->receive)
+        return config->receive(config->receive_context, path, packets, BURST);
+    return rte_eth_rx_burst(config->paths[path].port, 0, packets, BURST);
+}
+
 static int receive_control(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                            struct mrc_endpoint_counters *counts)
 {
     int result = 0;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
         struct rte_mbuf *packets[BURST];
-        uint16_t n = rte_eth_rx_burst(transfer->paths[path].port, 0, packets, BURST);
+        uint16_t n = receive_burst(transfer, path, packets);
         for (uint16_t i = 0; i < n; i++) {
             uint8_t scratch[FRAME_CAPACITY];
             struct mrc_wire_packet packet;
             if (!result && decode(transfer, path, packets[i], scratch, &packet, &counts->rx[path]) &&
-                !receive_endpoint_op(transfer, &sender->node, counts, path, &packet))
+                !receive_endpoint_op(transfer, sender->node, counts, path, &packet))
                 result = apply_control(transfer, sender, counts, &packet);
             rte_pktmbuf_free(packets[i]);
         }
@@ -1136,7 +1134,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
                 packet.ipv6 = trimmed.ipv6;
             else
                 packet.ipv4 = trimmed.ipv4;
-            if (peer_matches(transfer, path, &packet)) {
+            if (mrc_endpoint_peer_matches(transfer, path, &packet)) {
                 rx->matched++;
                 *last_frame = rte_get_timer_cycles();
                 receive_trimmed(transfer, receiver, counts, path, &trimmed, reflect_entropy(&packet));
@@ -1149,12 +1147,12 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
 
     result = decode_routed(transfer, frame, length, &packet);
     if (!result) {
-        if (!peer_matches(transfer, path, &packet)) {
+        if (!mrc_endpoint_peer_matches(transfer, path, &packet)) {
             rx->other_peer++;
             return 0;
         }
         rx->matched++;
-        if (receive_endpoint_op(transfer, &receiver->node, counts, path, &packet))
+        if (receive_endpoint_op(transfer, receiver->node, counts, path, &packet))
             return 0;
         *last_frame = rte_get_timer_cycles();
         return receive_write(transfer, receiver, counts, path, &packet);
@@ -1166,7 +1164,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
             result = mrc_wire_decode_ipv6_header(frame, length, &packet.ipv6, &packet.bth);
         else
             result = mrc_wire_decode_header(frame, length, &packet.ipv4, &packet.bth);
-        if (!result && peer_matches(transfer, path, &packet) &&
+        if (!result && mrc_endpoint_peer_matches(transfer, path, &packet) &&
             !mrc_wire_is_write(packet.bth.opcode) && packet.bth.opcode < MRC_TRANSPORT_ACK) {
             rx->matched++;
             return reject_write(transfer, receiver, counts, path, &packet,
@@ -1273,6 +1271,7 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     sender->provider_qp = qp;
     sender->initial_probe = true;
     sender->transfer = *configuration;
+    sender->node = configuration->node ? configuration->node : &sender->local_node;
     struct mrc_endpoint_config *transfer = &sender->transfer;
     transfer->sender = true;
     transfer->work = NULL;
@@ -1351,7 +1350,7 @@ static int requester_step(struct mrc_requester *sender)
         }
         sender->next_profile_check = now + sender->profile_period;
     }
-    poll_port_status(transfer, &sender->node, now);
+    poll_port_status(transfer, sender->node, now);
     if (sender->qp.first_psn != previous_psn)
         sender->last_progress = now;
 
@@ -1486,6 +1485,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
         }
     }
     receiver->transfer = transfer;
+    receiver->node = transfer->node ? transfer->node : &receiver->local_node;
     receiver->counts = counts;
     receiver->provider_qp = qp;
     struct mrc_wr_config config = {
@@ -1520,7 +1520,7 @@ static int responder_step(struct mrc_responder *receiver)
     int result = 0;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
         struct rte_mbuf *packets[BURST];
-        uint16_t n = rte_eth_rx_burst(transfer->paths[path].port, 0, packets, BURST);
+        uint16_t n = receive_burst(transfer, path, packets);
         for (uint16_t i = 0; i < n; i++) {
             if (!result)
                 result = receive_frame(transfer, receiver, counts, path, packets[i],
@@ -1531,7 +1531,7 @@ static int responder_step(struct mrc_responder *receiver)
     if (result)
         return result;
     uint64_t now = rte_get_timer_cycles();
-    poll_port_status(transfer, &receiver->node, now);
+    poll_port_status(transfer, receiver->node, now);
     if (!transfer->packets)
         return 0;
     if (receiver->unique_packets != before)

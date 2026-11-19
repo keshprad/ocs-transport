@@ -425,6 +425,11 @@ static void test_trimmed_request(void)
     assert(trim.timestamp && trim.tsr && trim.tx_timestamp == 0x4567);
 
     size_t prefix_len = MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN;
+    assert(mrc_wire_dispatch_header(trim_frame, prefix_len - 1, &decoded) == -EBADMSG);
+    assert(mrc_wire_dispatch_header(trim_frame, prefix_len, &decoded) == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP4 && decoded.bth.dqp == trim.bth.dqp);
+    assert(decoded.bth.opcode == trim.bth.opcode && decoded.ipv4.dst_port == trim.ipv4.dst_port);
+
     /* Some switches leave the IPv4 total length untouched in a trim. */
     assert(mrc_wire_decode_trimmed(trim_frame, prefix_len, 47, &trim) == 0);
     assert(!trim.timestamp && trim.original_udp_len == 60);
@@ -575,6 +580,11 @@ static void test_ipv6_trimmed_request(void)
            -EPROTONOSUPPORT);
     assert(mrc_wire_decode_trimmed_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), 47, &trim) == 0);
     assert(trim.ip_version == MRC_WIRE_IP6 && trim.ipv6.flow_label == 0xabcde);
+    size_t prefix_len = MRC_WIRE_IPV6_HEADER_LEN + MRC_BTH_LEN;
+    assert(mrc_wire_dispatch_header(ipv6_trim_frame, prefix_len - 1, &decoded) == -EBADMSG);
+    assert(mrc_wire_dispatch_header(ipv6_trim_frame, prefix_len, &decoded) == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP6 && decoded.bth.dqp == trim.bth.dqp);
+    assert(decoded.bth.opcode == trim.bth.opcode && decoded.ipv6.dst_port == trim.ipv6.dst_port);
     assert(trim.bth.dqp == 0xc0ffee && trim.bth.psn == 0x00ff01 && trim.bth.retransmit);
     assert(trim.timestamp && trim.tsr && trim.tx_timestamp == 0x4567);
     assert(trim.original_udp_len == 60);

@@ -53,6 +53,7 @@ struct mrc_qp {
     union ibv_gid source_gid;
     struct mrc_abi_route *route;
     bool requester;
+    bool responder;
     uint32_t qpn;
 };
 

@@ -773,6 +773,23 @@ static void decode_ipv6(const uint8_t *frame, const struct wire_prefix *prefix,
     ipv6->hop_limit = ip[7];
 }
 
+int mrc_wire_dispatch_header(const uint8_t *frame, size_t length, struct mrc_wire_packet *header)
+{
+    if (!frame || !header)
+        return -EINVAL;
+    struct wire_prefix prefix;
+    int error = decode_prefix(frame, length, MRC_WIRE_IP_UNSPECIFIED, &prefix);
+    if (error)
+        return error;
+    header->ip_version = prefix.ip_version;
+    if (prefix.ip_version == MRC_WIRE_IP4)
+        decode_ipv4(frame, &prefix, &header->ipv4);
+    else
+        decode_ipv6(frame, &prefix, &header->ipv6);
+    decode_bth(prefix.udp + UDP_LEN, &header->bth);
+    return 0;
+}
+
 static int decode_header(const uint8_t *frame, size_t length, enum mrc_wire_ip_version version,
                          struct wire_prefix *prefix)
 {
