@@ -234,16 +234,21 @@ same diagnostics on success.
 With both contexts using the profile directory, a controller with effective
 `CAP_NET_ADMIN` can configure or query up to 32 CC profiles. Choose
 `uet-1.0-nscc` and set the profile OFFLINE, then supply a
-`struct mrc_ctl_cc_nscc_cfg` and set it ONLINE. Set `disable_qa` to a nonzero
-value. The provider uses the configured initial and maximum window, base
-RTT, target delay, byte and time thresholds, and increase and decrease
-coefficients. A NULL algorithm and configuration select disabled congestion
-control while retaining the QP's reliability window.
+`struct mrc_ctl_cc_nscc_cfg` and set it ONLINE. The provider uses the
+configured initial and maximum window, base RTT, target delay, byte and
+time thresholds, and increase and decrease coefficients. Set `disable_qa`
+to zero to enable Quick Adapt. `qa_gate` ranges from 0 to 31 and divides
+the maximum window by a power of two to set the achieved-byte gate.
+`qa_threshold` sets the average queuing-delay threshold in nanoseconds.
+Trim NACKs can also trigger a reduction. Quick Adapt preserves a smaller
+window already imposed by congestion or receiver flow control. A NULL
+algorithm and configuration select disabled congestion control while
+retaining the QP's reliability window.
 
 Select an ONLINE profile with `MRC_QP_CC_PROFILE_ID` when bringing a public
 QP to INIT. The QP leases the profile until reset or destruction. The
 controller can move the profile OFFLINE once all leases are released.
-An unset ID uses the built-in NSCC defaults. A CC query's configuration
+An unset ID uses the built-in NSCC defaults with Quick Adapt disabled. A CC query's configuration
 pointer is borrowed until the next configuration query on the same thread.
 
 An attached responder can use

@@ -46,6 +46,18 @@ struct mrc_cc_delay_window {
     uint64_t samples;
 };
 
+struct mrc_cc_quick_adapt {
+    uint64_t end_ns;
+    uint64_t achieved_bytes;
+    uint64_t bytes_ignored;
+    uint32_t bytes_to_ignore;
+    uint32_t threshold_ns;
+    uint32_t trim_delay_ns;
+    uint8_t gate;
+    bool enabled;
+    bool trim_pending;
+};
+
 struct mrc_cc_nscc {
     uint32_t max_wnd;
     uint32_t saved_cwnd;
@@ -67,6 +79,7 @@ struct mrc_cc_nscc {
     uint64_t delay_start_ns;
     struct mrc_cc_delay_window previous_delay;
     struct mrc_cc_delay_window current_delay;
+    struct mrc_cc_quick_adapt qa;
     bool clock_started;
     bool increase_mode;
 };
@@ -133,15 +146,15 @@ bool mrc_cc_configure_nscc(struct mrc_cc *cc, uint64_t sender_link_bytes_per_sec
                             uint64_t config_base_rtt_ns, uint64_t now_ns);
 bool mrc_cc_can_send(const struct mrc_cc *cc, uint32_t nominal_bytes);
 bool mrc_cc_on_send(struct mrc_cc *cc, uint32_t nominal_bytes);
-/* Evaluate after mrc_cc_on_send(). ACK threshold is expressed in bytes. */
-bool mrc_cc_ack_request(const struct mrc_cc *cc, uint32_t ack_trigger_bytes);
+/* Include the packet being prepared when computing the remaining window. */
+bool mrc_cc_ack_request(const struct mrc_cc *cc, uint32_t pending_bytes, uint32_t ack_trigger_bytes);
 
 /*
  * SACKs use local packet timestamps and the echoed RTX flag (OCP §8.4).
  * Use NULL for missing TX state or a probe response without a local timestamp.
  * ECN is the SACK SKIP mark, separate from an ALWAYS_SKIP path decision.
- * Fresh RTT/ECN feedback drives UE 1.0.1 §3.6.13 window updates. Quick adapt
- * is optional. Pass receiver flow-control feedback even when the RTT
+ * Fresh RTT/ECN feedback drives UE 1.0.1 §3.6.13 window updates, including
+ * Quick Adapt when enabled. Pass receiver flow-control feedback even when the RTT
  * sample is unavailable. The caller handles the recommended probe for
  * obtaining an unloaded RTT.
  */
@@ -151,8 +164,8 @@ bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
 
 /*
  * Declare each transmission lost at most once. Pass 0 to mrc_cc_on_nack if
- * delivery was already accounted for. Trimming lowers cwnd by one packet
- * in the absence of RCCC. Other NACK reasons only retire inflight bytes.
+ * delivery was already accounted for. Trimming can trigger Quick Adapt
+ * or lower cwnd by one packet. Other NACK reasons only retire inflight bytes.
  */
 bool mrc_cc_on_nack(struct mrc_cc *cc, uint32_t nominal_bytes, bool trimmed,
                     bool rtx, uint64_t arrive_ns, const struct mrc_cc_tx_sample *sample);

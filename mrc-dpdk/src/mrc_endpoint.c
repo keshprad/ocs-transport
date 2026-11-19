@@ -541,15 +541,15 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     struct mrc_wire_packet packet = packet_for(transfer, path, expected_opcode(work, index),
         mrc_psn_add(transfer->initial_psn, (int32_t)index));
     uint32_t length = length_at(work, index);
-    struct mrc_cc after_send = sender->cc;
-    if (!mrc_cc_on_send(&after_send, nominal_size(packet.bth.opcode, length, false)))
+    uint32_t nominal_bytes = nominal_size(packet.bth.opcode, length, false);
+    if (!mrc_cc_can_send(&sender->cc, nominal_bytes))
         return -EPROTO;
     packet.bth.retransmit = retry;
     packet.bth.solicited = write.solicited &&
         (packet.bth.opcode == MRC_WRITE_LAST_IMM || packet.bth.opcode == MRC_WRITE_ONLY_IMM);
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
                              index + 1 == transfer->packets ||
-                             mrc_cc_ack_request(&after_send, SACK_THRESHOLD);
+                             mrc_cc_ack_request(&sender->cc, nominal_bytes, SACK_THRESHOLD);
     uint32_t offset = (index - work->first_packet) * PMTU;
     packet.body.write = (struct mrc_wire_write){
         .rqmsn = write.with_immediate ?
@@ -576,7 +576,9 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
         counts->trimmed += inject_trim;
     }
 
-    sender->cc = after_send;
+    /* A rejected TX burst leaves the congestion window accounting untouched. */
+    if (!mrc_cc_on_send(&sender->cc, nominal_bytes))
+        return -EPROTO;
     if (retry)
         counts->retries[path]++;
     else

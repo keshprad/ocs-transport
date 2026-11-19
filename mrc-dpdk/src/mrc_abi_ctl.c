@@ -580,8 +580,6 @@ static int configure_cc(struct mrc_ctl_store_cc_profile *profile,
         return config ? -EINVAL : 0;
     if (!config)
         return -EINVAL;
-    if (!config->disable_qa)
-        return -EOPNOTSUPP;
     struct mrc_cc_config checked = { COPY_NSCC_FIELDS(config) };
     if (!mrc_cc_config_valid(&checked, MRC_NOMINAL_MTU))
         return -EINVAL;

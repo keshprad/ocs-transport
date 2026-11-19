@@ -49,13 +49,15 @@ static void test_window_and_scheduler(void)
     assert(!mrc_cc_on_send(&cc, 1501));
 
     assert(mrc_cc_on_send(&cc, 1500));
-    assert(!mrc_cc_ack_request(&cc, 3000));
-    assert(mrc_cc_ack_request(&cc, 3001));
+    assert(!mrc_cc_ack_request(&cc, 0, 3000));
+    assert(mrc_cc_ack_request(&cc, 0, 3001));
     assert(mrc_cc_scheduler_state(&cc, 1500, true) == MRC_CC_QP_READY);
+    assert(mrc_cc_ack_request(&cc, 1500, 3000));
+    assert(cc.inflight == 1500);
     assert(mrc_cc_on_send(&cc, 1500));
     assert(!mrc_cc_on_send(&cc, 48));
     assert(cc.inflight == 3000);
-    assert(mrc_cc_ack_request(&cc, 1));
+    assert(mrc_cc_ack_request(&cc, 0, 1));
     assert(mrc_cc_scheduler_state(&cc, 1500, true) == MRC_CC_QP_ACTIVE);
     assert(mrc_cc_scheduler_state(&cc, 0, true) == MRC_CC_QP_PENDING);
 
@@ -432,6 +434,122 @@ static void test_receiver_flow_control(void)
     assert(cc.cwnd == 3580); /* Half of (7168 inflight - 8 bytes penalty). */
 }
 
+static const struct mrc_cc_config qa_config = {
+    .adjust_bytes_threshold = 8192, .adjust_period_threshold = 1000,
+    .base_rtt = 1000, .target_delay = 1000, .max_cwnd = 16384,
+    .gamma = 0.8f, .max_md_jump = 0.5f, .qa_gate = 2, .qa_threshold = 2000,
+};
+
+static void init_quick_adapt(struct mrc_cc *cc, const struct mrc_cc_config *config)
+{
+    assert(mrc_cc_init(cc, 1024, 4096, 12000, 12000));
+    assert(mrc_cc_apply_config(cc, config));
+    for (unsigned int i = 0; i < 8; i++)
+        assert(mrc_cc_on_send(cc, 1024));
+}
+
+static void test_quick_adapt_delay(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = { .sent_at_ns = 1 };
+    struct mrc_cc_feedback feedback;
+    init_quick_adapt(&cc, &qa_config);
+
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 1001, &sample, NULL, &feedback));
+    assert(feedback.rtt_valid && cc.nscc.qa.end_ns == 3001);
+    assert(mrc_cc_on_sack(&cc, 8, false, false, 2601, &sample, NULL, NULL));
+    assert(cc.nscc.qa.achieved_bytes == 1024 && cc.cwnd == 16384);
+    assert(mrc_cc_on_sack(&cc, 12, false, false, 5001, &sample, NULL, &feedback));
+    assert(feedback.queue_delay_ns == 4000);
+    assert(cc.cwnd == 2048 && cc.inflight == 5120 && !mrc_cc_can_send(&cc, 1024));
+    assert(cc.nscc.qa.end_ns == 7001 && cc.nscc.qa.achieved_bytes == 0);
+    assert(cc.nscc.qa.bytes_to_ignore == 5120 && cc.nscc.qa.bytes_ignored == 0);
+    assert(cc.nscc.received_bytes == 0 && cc.nscc.inc_bytes == 0);
+
+    /* Feedback for the pre-reduction flight cannot cause another marked
+     * decrease. Delivery, inferred loss, and trim each retire ignored bytes. */
+    assert(mrc_cc_on_sack(&cc, 16, true, false, 5101, &sample, NULL, &feedback));
+    assert(feedback.rtt_valid && feedback.adjustment == MRC_CC_NO_ADJUSTMENT);
+    assert(cc.nscc.qa.bytes_ignored == 1024 && cc.cwnd == 2048);
+    assert(mrc_cc_on_inferred_loss(&cc, 1024));
+    assert(cc.nscc.qa.bytes_ignored == 2048 && cc.cwnd == 1024);
+    assert(mrc_cc_on_nack(&cc, 1024, true, false, 5201, NULL));
+    assert(cc.nscc.qa.bytes_ignored == 3072 && cc.nscc.qa.trim_pending);
+    assert(cc.nscc.qa.end_ns == 7001);
+
+    sample.sent_at_ns = 6301;
+    assert(mrc_cc_on_sack(&cc, 24, true, false, 7301, &sample, NULL, NULL));
+    assert(!cc.nscc.qa.trim_pending && cc.nscc.qa.end_ns == 9301);
+    assert(cc.nscc.qa.bytes_to_ignore == 0 && cc.nscc.qa.bytes_ignored == 0);
+    assert(cc.inflight == 0 && cc.cwnd == 1024);
+}
+
+static void test_quick_adapt_averages_delay(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = { .sent_at_ns = 1 };
+    struct mrc_cc_feedback feedback;
+    init_quick_adapt(&cc, &qa_config);
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 1001, &sample, NULL, NULL));
+
+    sample.sent_at_ns = 2000;
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 3000, &sample, NULL, NULL));
+    sample.sent_at_ns = 1;
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 3501, &sample, NULL, &feedback));
+    assert(feedback.queue_delay_ns == 2500 && cc.nscc.qa.end_ns == 5501);
+    assert(cc.cwnd == 16384); /* The low-delay sample keeps the average below 2000. */
+
+    assert(mrc_cc_on_sack(&cc, 8, false, false, 6001, &sample, NULL, NULL));
+    assert(cc.cwnd == cc.nominal_mtu);
+}
+
+static void test_quick_adapt_gate_and_flow(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_tx_sample sample = { .sent_at_ns = 1 };
+    init_quick_adapt(&cc, &qa_config);
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 1001, &sample, NULL, NULL));
+    assert(mrc_cc_on_sack(&cc, 16, false, false, 5001, &sample, NULL, NULL));
+    assert(cc.nscc.qa.end_ns == 7001);
+    assert(cc.cwnd == 16384); /* Achieved 4096, exactly MaxWnd >> 2. */
+
+    init_quick_adapt(&cc, &qa_config);
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 1001, &sample, NULL, NULL));
+    /* A penalty limits the window to 1024 here, below the 3840 bytes
+     * achieved in the same SACK. Quick Adapt must not widen it. */
+    const struct mrc_cc_receiver_flow penalty = { .penalty = 127 };
+    assert(mrc_cc_on_sack(&cc, 15, false, false, 5001, &sample, &penalty, NULL));
+    assert(cc.cwnd == 1024 && cc.nscc.saved_cwnd == 16384);
+
+    struct mrc_cc_config disabled = qa_config;
+    disabled.qa_gate = 32;
+    assert(!mrc_cc_config_valid(&disabled, 1024));
+    disabled.disable_qa = 1;
+    init_quick_adapt(&cc, &disabled);
+    assert(mrc_cc_on_sack(&cc, 0, false, false, 1001, &sample, NULL, NULL));
+    assert(mrc_cc_on_sack(&cc, 4, false, false, 5001, &sample, NULL, NULL));
+    assert(cc.cwnd == 16384 && cc.nscc.qa.end_ns == 0);
+}
+
+static void test_quick_adapt_trim(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_config config = qa_config;
+    config.qa_threshold = UINT32_MAX;
+    init_quick_adapt(&cc, &config);
+    assert(mrc_cc_on_nack(&cc, 1024, true, false, 1001, NULL));
+    assert(cc.nscc.qa.end_ns == 3001 && cc.nscc.qa.trim_pending);
+    assert(cc.cwnd == 15360); /* No prior epoch, use the ordinary trim reduction. */
+
+    assert(mrc_cc_on_sack(&cc, 8, false, false, 1501, NULL, NULL, NULL));
+    assert(cc.nscc.qa.achieved_bytes == 2048); /* RTT-free SACK still accounts bytes. */
+    assert(mrc_cc_on_nack(&cc, 1024, false, false, 2001, NULL));
+    assert(cc.cwnd == 15360 && cc.nscc.qa.bytes_ignored == 3072);
+    assert(mrc_cc_on_nack(&cc, 1024, true, false, 3501, NULL));
+    assert(cc.cwnd == 2048); /* An expired epoch uses Quick Adapt only. */
+    assert(!cc.nscc.qa.trim_pending && cc.nscc.qa.bytes_to_ignore == 3072);
+}
+
 int main(void)
 {
     test_nominal_size_and_receive_counter();
@@ -445,6 +563,10 @@ int main(void)
     test_nscc_link_derived_bounds();
     test_controller_config();
     test_receiver_flow_control();
+    test_quick_adapt_delay();
+    test_quick_adapt_averages_delay();
+    test_quick_adapt_gate_and_flow();
+    test_quick_adapt_trim();
     puts("MRC congestion accounting tests passed");
     return 0;
 }

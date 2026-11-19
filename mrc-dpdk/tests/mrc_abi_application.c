@@ -39,6 +39,9 @@ enum {
     WIRE_CC_STATE_LEN = 8,
     DUPLEX_BYTES = 2049,
     RX_FLOW_ROUNDS = 4,
+    QA_PRIMER_BYTES = 192,
+    QA_TRIGGER_BYTES = 160,
+    QA_BYTES = 2 * DUPLEX_BYTES + QA_PRIMER_BYTES + QA_TRIGGER_BYTES,
     RX_FLOW_RESTORE = 0x80,
     RX_FLOW_PENALTY_MASK = 0x7f,
 };
@@ -523,13 +526,21 @@ static uint64_t duplex_wr_id(unsigned int index, unsigned int round, bool send)
     return 100 * (1 + round) + 10 * send + index;
 }
 
-static void post_duplex_write(struct duplex_qp *qp, const struct connection *peer,
-                              unsigned int index, unsigned int round, bool client)
+static void post_duplex_recv(struct duplex_qp *qp, unsigned int index, unsigned int round)
 {
-    for (size_t offset = 0; offset < sizeof(qp->sent); offset++)
+    struct ibv_recv_wr receive = { .wr_id = duplex_wr_id(index, round, false) };
+    struct ibv_recv_wr *bad_recv = NULL;
+    assert(mrc_post_recv(qp->qp, &receive, &bad_recv) == 0 && !bad_recv);
+}
+
+static void post_duplex_send(struct duplex_qp *qp, const struct connection *peer,
+                             unsigned int index, unsigned int round, bool client, uint32_t length)
+{
+    assert(length <= sizeof(qp->sent));
+    for (size_t offset = 0; offset < length; offset++)
         qp->sent[offset] = duplex_pattern(offset, index, round, client);
     struct ibv_sge source = {
-        .addr = (uintptr_t)qp->sent, .length = sizeof(qp->sent), .lkey = qp->source->lkey,
+        .addr = (uintptr_t)qp->sent, .length = length, .lkey = qp->source->lkey,
     };
     struct ibv_send_wr write = {
         .wr_id = duplex_wr_id(index, round, true), .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
@@ -537,9 +548,6 @@ static void post_duplex_write(struct duplex_qp *qp, const struct connection *pee
         .imm_data = htonl(duplex_immediate(index, round, client)),
         .wr.rdma = { .remote_addr = peer->remote_address, .rkey = peer->rkey },
     };
-    struct ibv_recv_wr receive = { .wr_id = duplex_wr_id(index, round, false) };
-    struct ibv_recv_wr *bad_recv = NULL;
-    assert(mrc_post_recv(qp->qp, &receive, &bad_recv) == 0 && !bad_recv);
     struct ibv_send_wr *bad_send = NULL;
     assert(mrc_post_send(qp->qp, &write, &bad_send) == 0 && !bad_send);
 }
@@ -555,7 +563,7 @@ static unsigned int duplex_qp_index(const struct connection *connections, uint32
 
 static unsigned int duplex_completions(struct mrc_cq *cq, const struct connection *connections,
                                        unsigned int round, unsigned int active, unsigned int completed,
-                                       bool client, bool send)
+                                       bool client, bool send, uint32_t length)
 {
     struct ibv_wc entries[DUPLEX_QPS];
     int count = mrc_poll_cq(cq, DUPLEX_QPS, entries);
@@ -569,7 +577,7 @@ static unsigned int duplex_completions(struct mrc_cq *cq, const struct connectio
         if (send) {
             assert(wc->opcode == IBV_WC_RDMA_WRITE);
         } else {
-            assert(wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM && wc->byte_len == DUPLEX_BYTES);
+            assert(wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM && wc->byte_len == length);
             assert((wc->wc_flags & IBV_WC_WITH_IMM) &&
                    ntohl(wc->imm_data) == duplex_immediate(index, round, !client));
         }
@@ -625,6 +633,9 @@ static struct observed_udp read_udp(struct rte_mbuf *packet, uint8_t *prefix, si
 
 struct cc_window_witness {
     unsigned int writes;
+    unsigned int retries;
+    uint64_t first_sent_at;
+    uint8_t first_opcode;
     uint8_t first_flags;
     uint16_t first_udp_length;
 };
@@ -640,16 +651,29 @@ static uint16_t observe_write_frames(uint16_t port, uint16_t queue, struct rte_m
         uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN];
         struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
         const uint8_t *bth = udp.header + 8;
-        /* Observe each original WRITE and ignore probes, ACKs, and retries. */
-        if (bth[0] < 0xc6 || bth[0] > 0xcb || (bth[8] & 0x20))
+        if (bth[0] < WIRE_WRITE_FIRST || bth[0] > 0xcb)
             continue;
+        if (bth[8] & 0x20) {
+            observed->retries++;
+            continue;
+        }
         if (++observed->writes == 1) {
-            assert(bth[0] == 0xc6);
+            observed->first_sent_at = rte_get_timer_cycles();
+            observed->first_opcode = bth[0];
             observed->first_flags = bth[8];
             observed->first_udp_length = wire_be16(udp.header + 4);
         }
     }
     return count;
+}
+
+static void check_single_full_write(const struct cc_window_witness *observed)
+{
+    assert(observed->writes == 1 && observed->first_opcode == WIRE_WRITE_FIRST &&
+           (observed->first_flags & 0x80));
+    const uint16_t full_write_udp = 8 + 12 + 20 + 1024 + 4;
+    assert(observed->first_udp_length ==
+           full_write_udp + ((observed->first_flags & 0x10) ? 4 : 0));
 }
 
 static void check_cc_window(struct mrc_qp *qp, const char *directory, bool client)
@@ -683,9 +707,7 @@ static void check_cc_window(struct mrc_qp *qp, const char *directory, bool clien
         assert(mrc_dpdk_progress_qp(qp) == 0);
         rte_pause();
     } while (rte_get_timer_cycles() < deadline);
-    assert(observed.writes == 1 && (observed.first_flags & 0x80));
-    const uint16_t full_write_udp = 8 + 12 + 20 + 1024 + 4;
-    assert(observed.first_udp_length == full_write_udp + ((observed.first_flags & 0x10) ? 4 : 0));
+    check_single_full_write(&observed);
 
     for (uint16_t port = 0; port < 2; port++) {
         assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
@@ -702,7 +724,8 @@ static void duplex_round(struct duplex_qp *qps, const struct connection *local,
 {
     unsigned int active = 0;
     for (unsigned int index = first; index < DUPLEX_QPS; index++) {
-        post_duplex_write(&qps[index], &peer[index], index, round, client);
+        post_duplex_recv(&qps[index], index, round);
+        post_duplex_send(&qps[index], &peer[index], index, round, client, DUPLEX_BYTES);
         active |= 1u << index;
     }
 
@@ -732,8 +755,10 @@ static void duplex_round(struct duplex_qp *qps, const struct connection *local,
                 abort();
             }
         }
-        sends = duplex_completions(send_cq, local, round, active, sends, client, true);
-        recvs = duplex_completions(recv_cq, local, round, active, recvs, client, false);
+        sends = duplex_completions(send_cq, local, round, active, sends, client, true,
+                                   DUPLEX_BYTES);
+        recvs = duplex_completions(recv_cq, local, round, active, recvs, client, false,
+                                   DUPLEX_BYTES);
         if (!done && sends == active && recvs == active) {
             for (unsigned int index = first; index < DUPLEX_QPS; index++) {
                 for (size_t offset = 0; offset < sizeof(qps[index].received); offset++)
@@ -922,10 +947,206 @@ static void check_rx_flow(struct duplex_qp *qps, const struct connection *local,
     }
 }
 
+enum qa_round {
+    QA_BASELINE,
+    QA_PRIMER,
+    QA_TRIGGER,
+    QA_CAPPED,
+    QA_ROUNDS,
+};
+
+struct qa_feedback {
+    uint32_t qpn;
+    unsigned int probe_ports;
+    unsigned int sacks;
+    uint64_t last_sack_at;
+    uint32_t cack;
+    uint32_t received;
+};
+
+struct qa_result {
+    unsigned int baseline_burst;
+    unsigned int capped_burst;
+    uint64_t delayed_sack_us;
+};
+
+static uint16_t observe_qa_feedback(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                     uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)queue;
+    (void)capacity;
+    struct qa_feedback *feedback = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN + WIRE_SETH_LEN + WIRE_CC_STATE_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + 8;
+        assert(bth[0] != 0xdd);
+        if (bth[0] != WIRE_SACK)
+            continue;
+
+        assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_SETH_LEN + WIRE_CC_STATE_LEN);
+        assert(wire_be24(bth + 5) == feedback->qpn && !(bth[8] & 0x20));
+        const uint8_t *seth = bth + WIRE_BTH_LEN;
+        const uint8_t *cc_state = seth + WIRE_SETH_LEN;
+        assert(!(seth[1] & 0x60) && cc_state[4] == 0);
+        if (seth[1] & 0x02) {
+            feedback->probe_ports |= 1u << port;
+        } else {
+            feedback->sacks++;
+            feedback->last_sack_at = rte_get_timer_cycles();
+            feedback->cack = wire_be24(seth + 13);
+            feedback->received = wire_be24(cc_state + 5);
+        }
+    }
+    return count;
+}
+
+static void stage_qa_write(struct mrc_qp *qp, const char *directory, enum qa_round round,
+                           const struct cc_window_witness *window, const struct qa_feedback *feedback,
+                           struct qa_result *result)
+{
+    const uint64_t hz = rte_get_timer_hz();
+    const uint64_t deadline = rte_get_timer_cycles() + 4 * hz;
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+    } while (!window->writes);
+
+    if (round == QA_BASELINE) {
+        result->baseline_burst = window->writes;
+        assert(result->baseline_burst == 3);
+    }
+    if (round != QA_TRIGGER && round != QA_CAPPED)
+        return;
+
+    /* The peer has posted the receive but is waiting to poll these packets. */
+    const uint64_t hold = round == QA_TRIGGER ? hz / 100 : hz / 1000;
+    while (rte_get_timer_cycles() - window->first_sent_at < hold) {
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+        rte_pause();
+    }
+    assert(feedback->sacks == 0 && feedback->probe_ports == 0 && window->retries == 0);
+    if (round == QA_CAPPED) {
+        result->capped_burst = window->writes;
+        check_single_full_write(window);
+    } else {
+        assert(window->writes == 1 && window->first_opcode == 0xcb &&
+               (window->first_flags & 0x80));
+    }
+
+    char marker[32];
+    marker_name(marker, true, round, "release");
+    publish(directory, marker, NULL, 0);
+}
+
+static struct qa_result check_quick_adapt(struct duplex_qp *qp, const struct connection *local,
+                                          const struct connection *peer, struct mrc_cq *cq,
+                                          const char *directory, bool client)
+{
+    static const uint32_t lengths[QA_ROUNDS] = {
+        [QA_BASELINE] = DUPLEX_BYTES, [QA_PRIMER] = QA_PRIMER_BYTES,
+        [QA_TRIGGER] = QA_TRIGGER_BYTES, [QA_CAPPED] = DUPLEX_BYTES,
+    };
+    struct qa_result result = {0};
+    struct cc_window_witness window;
+    struct qa_feedback feedback;
+    const struct rte_eth_rxtx_callback *tx[DUPLEX_RAILS], *rx[DUPLEX_RAILS];
+    prepare_memif_links();
+    if (client) {
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            tx[port] = rte_eth_add_tx_callback(port, 0, observe_write_frames, &window);
+            rx[port] = rte_eth_add_rx_callback(port, 0, observe_qa_feedback, &feedback);
+            assert(tx[port] && rx[port]);
+        }
+    }
+
+    const uint64_t hz = rte_get_timer_hz();
+    uint32_t last_received = 0;
+    for (enum qa_round round = QA_BASELINE; round < QA_ROUNDS; round++) {
+        window = (struct cc_window_witness){0};
+        feedback = (struct qa_feedback){.qpn = local[0].qpn};
+        const uint32_t length = lengths[round];
+        char marker[32], receiver_ready[PATH_MAX], sender_release[PATH_MAX], sender_done[PATH_MAX];
+        marker_name(marker, false, round, "ready");
+        path_for(receiver_ready, directory, marker);
+        if (client) {
+            /* The short primer closes the baseline's accounting epoch with a
+             * normal RTT sample. The delayed WRITE then runs alone. */
+            if (round == QA_PRIMER)
+                rte_delay_us_sleep(1500);
+            wait_for(receiver_ready);
+            post_duplex_send(qp, peer, 0, round, true, length);
+            stage_qa_write(qp->qp, directory, round, &window, &feedback, &result);
+        } else {
+            post_duplex_recv(qp, 0, round);
+            publish(directory, marker, NULL, 0);
+            if (round == QA_TRIGGER || round == QA_CAPPED) {
+                marker_name(marker, true, round, "release");
+                path_for(sender_release, directory, marker);
+                wait_for(sender_release);
+            }
+        }
+
+        const uint64_t deadline = rte_get_timer_cycles() + 4 * hz;
+        do {
+            assert(rte_get_timer_cycles() < deadline);
+            assert(mrc_dpdk_progress_qp(qp->qp) == 0);
+            rte_pause();
+        } while (!duplex_completions(cq, local, round, 1, 0, client, client, length));
+
+        marker_name(marker, true, round, "done");
+        path_for(sender_done, directory, marker);
+        if (client) {
+            const unsigned int packets = (length + 1023) / 1024;
+            assert(window.writes == packets && !window.retries && feedback.sacks > 0);
+            const uint64_t elapsed = feedback.last_sack_at - window.first_sent_at;
+            if (round == QA_BASELINE) {
+                assert(feedback.probe_ports == (1u << DUPLEX_RAILS) - 1);
+                assert(elapsed < 3 * hz / 1000);
+            }
+            if (round == QA_PRIMER || round == QA_TRIGGER) {
+                assert(!feedback.probe_ports);
+                assert(feedback.sacks == 1 && feedback.received == last_received + 1);
+            }
+            if (round == QA_PRIMER)
+                assert(elapsed < 3 * hz / 1000);
+            if (round == QA_TRIGGER) {
+                assert(feedback.cack == ((local[0].psn + 4) & UINT32_C(0xffffff)));
+                assert(elapsed >= hz / 100);
+                result.delayed_sack_us = elapsed * UINT64_C(1000000) / hz;
+            }
+            last_received = feedback.received;
+            publish(directory, marker, NULL, 0);
+        } else {
+            for (size_t offset = 0; offset < length; offset++)
+                assert(qp->received[offset] == duplex_pattern(offset, 0, round, true));
+            wait_for(sender_done);
+        }
+    }
+
+    if (client) {
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            assert(rte_eth_remove_tx_callback(port, 0, tx[port]) == 0);
+            assert(rte_eth_remove_rx_callback(port, 0, rx[port]) == 0);
+            rte_free((void *)tx[port]);
+            rte_free((void *)rx[port]);
+        }
+    }
+    return result;
+}
+
+enum duplex_mode {
+    DUPLEX_NORMAL,
+    DUPLEX_RX_FLOW,
+    DUPLEX_QA,
+};
+
 static void run_duplex(bool client, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                       const char *profile_store, uint64_t cc_profile_id, bool rx_flow)
+                       const char *profile_store, uint64_t cc_profile_id, enum duplex_mode mode)
 {
+    const bool rx_flow = mode == DUPLEX_RX_FLOW;
+    const bool quick_adapt = mode == DUPLEX_QA;
     if (client && cc_profile_id)
         assert(mrc_dpdk_set_ev_store(context, profile_store) == 0);
     struct mrc_cq *send_cq = mrc_create_cq(context, 8, NULL, NULL, 0);
@@ -970,7 +1191,10 @@ static void run_duplex(bool client, const char *directory, const struct address 
         attach_qp(qps[index].qp, &route);
     }
 
-    if (rx_flow)
+    struct qa_result qa = {0};
+    if (quick_adapt)
+        qa = check_quick_adapt(&qps[0], local, peer, client ? send_cq : recv_cq, directory, client);
+    else if (rx_flow)
         check_rx_flow(qps, local, peer, send_cq, recv_cq, directory, client);
     else
         duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0, cc_profile_id != 0);
@@ -980,7 +1204,7 @@ static void run_duplex(bool client, const char *directory, const struct address 
     assert(mrc_dpdk_progress_qp(qps[0].qp) == ENOTCONN);
     if (rx_flow) {
         assert(mrc_dpdk_set_rx_flow_control(qps[0].qp, 1, false) == ENOTCONN);
-    } else {
+    } else if (!quick_adapt) {
         duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 1, 1, false);
         for (size_t offset = 0; offset < sizeof(qps[0].received); offset++)
             assert(qps[0].received[offset] == duplex_pattern(offset, 0, 0, !client));
@@ -993,6 +1217,13 @@ static void run_duplex(bool client, const char *directory, const struct address 
     }
     assert(mrc_destroy_cq(send_cq) == 0);
     assert(mrc_destroy_cq(recv_cq) == 0);
+    if (quick_adapt) {
+        printf("{\"role\":\"%s\",\"qpn\":%u,\"bytes\":%u,\"completions\":%u,"
+               "\"baseline_burst\":%u,\"capped_burst\":%u,\"delayed_sack_us\":%llu}\n",
+               client ? "tx" : "rx", local[0].qpn, (unsigned int)QA_BYTES, (unsigned int)QA_ROUNDS,
+               qa.baseline_burst, qa.capped_burst, (unsigned long long)qa.delayed_sack_us);
+        return;
+    }
     unsigned int completions = rx_flow ? RX_FLOW_ROUNDS * DUPLEX_QPS : 3;
     printf("{\"role\":\"%s\",\"bytes\":%u,\"send_completions\":%u,\"recv_completions\":%u,"
            "\"qpns\":[%u,%u],\"reset_qpn\":%u}\n",
@@ -1010,13 +1241,15 @@ int main(int argc, char **argv)
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
+    bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
-    bool bidirectional = cc_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
+    bool bidirectional = cc_profile || qa_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
+    enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW : DUPLEX_NORMAL;
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
     bool ev_profile = strcmp(argv[3], "ev_profile") == 0;
     const char *profile_store = NULL;
     uint64_t profile_id = 0;
-    if (ev_profile || cc_profile) {
+    if (ev_profile || cc_profile || qa_profile) {
         assert(argc == 6);
         profile_store = argv[4];
         char *end;
@@ -1045,7 +1278,7 @@ int main(int argc, char **argv)
     }
 
     if (bidirectional)
-        run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, rx_flow);
+        run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else
         run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store, profile_id);
 

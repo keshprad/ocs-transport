@@ -67,7 +67,8 @@ bool mrc_cc_init(struct mrc_cc *cc, uint32_t nominal_mtu, uint32_t initial_cwnd,
 
 bool mrc_cc_config_valid(const struct mrc_cc_config *config, uint32_t nominal_mtu)
 {
-    return config && config->disable_qa && config->adjust_bytes_threshold &&
+    return config && (config->disable_qa || config->qa_gate < 32) &&
+           config->adjust_bytes_threshold &&
            config->adjust_period_threshold && config->base_rtt && config->target_delay &&
            config->max_cwnd >= nominal_mtu && config->max_cwnd <= WINDOW_LIMIT &&
            isfinite(config->eta) && config->eta >= 0 &&
@@ -98,6 +99,10 @@ bool mrc_cc_apply_config(struct mrc_cc *cc, const struct mrc_cc_config *config)
         .adjust_bytes_threshold = config->adjust_bytes_threshold,
         .eta = config->eta, .fi = config->fi, .fi_scale = config->fi_scale,
         .gamma = config->gamma, .max_md_jump = config->max_md_jump,
+        .qa = {
+            .enabled = !config->disable_qa, .gate = config->qa_gate,
+            .threshold_ns = config->qa_threshold, .trim_delay_ns = config->base_rtt,
+        },
     };
     return true;
 }
@@ -151,9 +156,9 @@ bool mrc_cc_on_send(struct mrc_cc *cc, uint32_t nominal_bytes)
     return true;
 }
 
-bool mrc_cc_ack_request(const struct mrc_cc *cc, uint32_t ack_trigger_bytes)
+bool mrc_cc_ack_request(const struct mrc_cc *cc, uint32_t pending_bytes, uint32_t ack_trigger_bytes)
 {
-    return (int64_t)cc->cwnd - cc->inflight < cc->nominal_mtu ||
+    return (int64_t)cc->cwnd - cc->inflight - pending_bytes < cc->nominal_mtu ||
            cc->cwnd < ack_trigger_bytes;
 }
 
@@ -224,13 +229,46 @@ static double add_delay_sample(struct mrc_cc *cc, uint64_t now_ns, uint64_t queu
     return total / samples;
 }
 
-static uint64_t add_bytes(uint64_t total, uint32_t additional)
+static uint64_t saturating_add(uint64_t total, uint64_t additional)
 {
     return UINT64_MAX - total < additional ? UINT64_MAX : total + additional;
 }
 
+static bool quick_adapt(struct mrc_cc *cc, uint64_t now_ns, bool ecn, double average_delay)
+{
+    struct mrc_cc_nscc *state = &cc->nscc;
+    struct mrc_cc_quick_adapt *qa = &state->qa;
+    if (!qa->enabled)
+        return false;
+
+    /* UET 1.0.1 §3.6.13.6. ECN from flights already in progress after
+     * the previous reduction must not trigger an additional reduction. */
+    bool skip_adjustment = ecn && qa->bytes_ignored < qa->bytes_to_ignore;
+    if (!skip_adjustment && now_ns >= qa->end_ns) {
+        if (qa->end_ns && (qa->trim_pending || average_delay > qa->threshold_ns) &&
+            qa->achieved_bytes < (state->max_wnd >> qa->gate)) {
+            /* Quick Adapt must preserve a smaller window already imposed
+             * by congestion or a receiver flow-control penalty. */
+            cc->cwnd = bounded_window(qa->achieved_bytes, cc->nominal_mtu, cc->cwnd);
+            qa->bytes_to_ignore = cc->inflight > 0 ? (uint32_t)cc->inflight : 0;
+            qa->bytes_ignored = 0;
+            qa->trim_pending = false;
+            skip_adjustment = true;
+        }
+        qa->achieved_bytes = 0;
+        uint64_t interval = saturating_add(cc->base_rtt_ns, cc->target_queue_delay_ns);
+        qa->end_ns = saturating_add(now_ns, interval);
+    }
+
+    if (skip_adjustment) {
+        state->inc_bytes = 0;
+        state->received_bytes = 0;
+    }
+    return skip_adjustment;
+}
+
 static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
-                                 const struct mrc_cc_feedback *feedback, bool receiver_limited)
+                                 struct mrc_cc_feedback *feedback, bool ecn, bool receiver_limited)
 {
     struct mrc_cc_nscc *state = &cc->nscc;
     const uint64_t delay = feedback->queue_delay_ns;
@@ -243,12 +281,16 @@ static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
     }
     state->last_ack_ns = now_ns;
     const double average = add_delay_sample(cc, now_ns, delay);
+    if (quick_adapt(cc, now_ns, ecn, average))
+        return;
+    if (ecn || !receiver_limited)
+        feedback->adjustment = classify_adjustment(ecn, delay, cc->target_queue_delay_ns);
 
     switch (feedback->adjustment) {
     case MRC_CC_PROPORTIONAL_INCREASE:
         /* UE 1.0.1 §3.6.13.6 fast increase uses delay approximately zero. */
         if (delay <= NEAR_BASE_RTT_NS) {
-            state->fast_bytes = add_bytes(state->fast_bytes, newly_received);
+            state->fast_bytes = saturating_add(state->fast_bytes, newly_received);
             if (state->fast_bytes > cc->cwnd || state->increase_mode) {
                 const double growth = newly_received * state->fi_scale;
                 cc->cwnd = bounded_window(cc->cwnd + growth, mtu, state->max_wnd);
@@ -342,16 +384,18 @@ bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
         const bool receiver_limited = flow && flow->penalty;
         if (flow)
             apply_receiver_flow(cc, flow, result.newly_received_bytes);
-        cc->nscc.received_bytes = add_bytes(cc->nscc.received_bytes, result.newly_received_bytes);
+        struct mrc_cc_nscc *state = &cc->nscc;
+        state->received_bytes = saturating_add(state->received_bytes, result.newly_received_bytes);
+        if (state->qa.enabled) {
+            state->qa.achieved_bytes = saturating_add(state->qa.achieved_bytes, result.newly_received_bytes);
+            state->qa.bytes_ignored = saturating_add(state->qa.bytes_ignored, result.newly_received_bytes);
+        }
         if (!cc->nscc.clock_started || arrive_ns >= cc->nscc.last_ack_ns)
             result.rtt_ns = measure_rtt(cc, arrive_ns, sample, rtx);
         if (result.rtt_ns) {
             result.rtt_valid = true;
             result.queue_delay_ns = result.rtt_ns - cc->base_rtt_ns;
-            if (ecn || !receiver_limited)
-                result.adjustment = classify_adjustment(ecn, result.queue_delay_ns,
-                                                       cc->target_queue_delay_ns);
-            apply_ack_adjustment(cc, arrive_ns, &result, receiver_limited);
+            apply_ack_adjustment(cc, arrive_ns, &result, ecn, receiver_limited);
         }
     }
     if (feedback)
@@ -372,8 +416,16 @@ bool mrc_cc_on_nack(struct mrc_cc *cc, uint32_t nominal_bytes, bool trimmed,
         return false;
     if (cc->algorithm == MRC_CC_NSCC) {
         measure_rtt(cc, arrive_ns, sample, rtx);
-        if (trimmed)
-            reduce_cwnd(cc, nominal_bytes);
+        if (trimmed) {
+            struct mrc_cc_quick_adapt *qa = &cc->nscc.qa;
+            if (qa->enabled) {
+                add_delay_sample(cc, arrive_ns, qa->trim_delay_ns);
+                qa->bytes_ignored = saturating_add(qa->bytes_ignored, nominal_bytes);
+                qa->trim_pending = true;
+            }
+            if (!quick_adapt(cc, arrive_ns, true, 0))
+                reduce_cwnd(cc, nominal_bytes);
+        }
     }
     return true;
 }
@@ -383,8 +435,11 @@ bool mrc_cc_on_inferred_loss(struct mrc_cc *cc, uint32_t nominal_bytes)
     if (nominal_bytes == 0 || nominal_bytes > cc->nominal_mtu ||
         !retire_bytes(cc, nominal_bytes))
         return false;
-    if (cc->algorithm == MRC_CC_NSCC)
+    if (cc->algorithm == MRC_CC_NSCC) {
         reduce_cwnd(cc, nominal_bytes);
+        if (cc->nscc.qa.enabled)
+            cc->nscc.qa.bytes_ignored = saturating_add(cc->nscc.qa.bytes_ignored, nominal_bytes);
+    }
     return true;
 }
 

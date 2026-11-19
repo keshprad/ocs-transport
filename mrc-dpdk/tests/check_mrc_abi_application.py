@@ -66,7 +66,7 @@ def main():
         default=Path(__file__).resolve().parent / "mrc_abi_application",
     )
     parser.add_argument("--controller", type=Path,
-                        help="Path to test_mrc_ctl_abi for the live EV and NSCC profile cases")
+                        help="Path to test_mrc_ctl_abi for the live EV, NSCC window, and Quick Adapt cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -111,6 +111,18 @@ def main():
             tx, rx = run_case("cc_profile", store, profile_id)
         check_duplex(tx, rx)
         print(json.dumps({"case": "public_qp_nscc_window", "tx": tx, "rx": rx}))
+
+        with tempfile.TemporaryDirectory(prefix="mrc-abi-qa-") as store:
+            profile_id = control(controller, "--seed-qa", store)
+            require(profile_id.isdecimal() and int(profile_id) > 0,
+                    f"Invalid controller test QA profile ID: {profile_id!r}")
+            tx, rx = run_case("qa_profile", store, profile_id)
+        require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 4450
+                and tx["completions"] == rx["completions"] == 4
+                and tx["baseline_burst"] == 3 and tx["capped_burst"] == 1
+                and tx["delayed_sack_us"] >= 10000,
+                f"Unexpected public Quick Adapt results: {tx}, {rx}")
+        print(json.dumps({"case": "public_qp_nscc_quick_adapt", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":
