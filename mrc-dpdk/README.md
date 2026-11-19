@@ -16,10 +16,10 @@ probes, and congestion control are outside the scope of this prototype.
 ## Build and run on two hosts
 
 Install a C compiler, Make, pkg-config, and DPDK development libraries with the
-PMD for the target NIC. The build was checked with DPDK 23.11.7 on Linux AArch64.
+PMD for the target NIC. The build was checked with DPDK 23.11.7 on Linux AArch64. Run the commands below from the `mrc-dpdk` directory.
 
 ```sh
-make -C dpdk
+make
 ```
 
 On each host, identify the two data interfaces and their local MAC and PCI
@@ -34,7 +34,7 @@ port IDs and device names at startup. See the [mlx5 PMD documentation](https://d
 Start the receiver with the sender's MAC addresses.
 
 ```sh
-sudo ./dpdk/mrc_bench -l 2 -a <RX_PCI_0> -a <RX_PCI_1> -- \
+sudo ./mrc_bench -l 2 -a <RX_PCI_0> -a <RX_PCI_1> -- \
     rx 4194304 1 0 <TX_MAC_0> 1 <TX_MAC_1>
 ```
 
@@ -42,7 +42,7 @@ Start the sender with the receiver's MAC addresses and the same byte count and
 transfer ID.
 
 ```sh
-sudo ./dpdk/mrc_bench -l 2 -a <TX_PCI_0> -a <TX_PCI_1> -- \
+sudo ./mrc_bench -l 2 -a <TX_PCI_0> -a <TX_PCI_1> -- \
     tx 4194304 1 0 <RX_MAC_0> 1 <RX_MAC_1>
 ```
 

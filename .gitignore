@@ -12,4 +12,3 @@ results/**/local/
 results/**/peer/
 
 .perftest/
-/dpdk/mrc_bench

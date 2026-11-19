@@ -1,6 +1,6 @@
 # DGX Spark RDMA baseline
 
-See the [DPDK multipath prototype](dpdk/README.md) for a separate host-memory
+See the [DPDK multipath prototype](mrc-dpdk/README.md) for a separate host-memory
 transport and a behavioral comparison with the SRv6 MRC emulator.
 
 `rdma_bench.py` coordinates `ib_write_bw` and `ib_write_lat` on two Linux hosts.

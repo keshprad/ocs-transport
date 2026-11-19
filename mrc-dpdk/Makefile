@@ -7,7 +7,7 @@ DPDK_LIBS = $(shell $(PKG_CONFIG) --libs libdpdk)
 .PHONY: all clean
 all: mrc_bench
 
-mrc_bench: mrc_bench.c
+mrc_bench: src/mrc_bench.c
 	$(PKG_CONFIG) --exists libdpdk
 	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -std=gnu11 -Wall -Wextra -Werror $(LDFLAGS) -o $@ $< $(DPDK_LIBS) $(LDLIBS)
 

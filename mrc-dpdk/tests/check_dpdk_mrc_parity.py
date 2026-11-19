@@ -104,8 +104,8 @@ def check_reorder(rx, trace, flow_stats):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--emulator", type=Path, required=True, help="Local srv6-mrc-emulator checkout")
-    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1]
-                        / "dpdk" / "mrc_bench")
+    default_binary = Path(__file__).resolve().parents[1] / "mrc_bench"
+    parser.add_argument("--binary", type=Path, default=default_binary)
     options = parser.parse_args()
     require((options.emulator / "srv6_mrc" / "policy.py").is_file(),
             "The emulator path must contain srv6_mrc/policy.py")
