@@ -134,6 +134,29 @@ Use `mrc_dpdk_get_async_fd()` to poll the queue or set nonblocking retrieval
 with `O_NONBLOCK`. An active QP that shares a failed CQ enters ERROR when
 its next query, post, or progress call observes the overrun.
 
+### Connectionless endpoint operations
+
+Use `mrc_dpdk_attach_endpoint()` to bind a controller context to two
+started DPDK ports and a peer. Supply the local and peer RoCEv2 GIDs,
+the peer MAC on each rail, and the packet pool. Use IPv4-mapped GIDs
+for IPv4. Optionally supply per-rail SRv6 SIDs and return routes.
+The attachment can share the ports with public DPDK QPs.
+
+An administrator can then submit EV probes or Port Status Updates
+through `mrc_ctl_ep_batch_send_wait()` without creating a QP. Supply
+distinct request IDs and a configured rail number for each request.
+An EV probe takes the UDP, STEV, or SRv6 EV from the request. The
+request DSCP is selectable and the response uses the Control class.
+Port Status requests and replies both use the Control class. The
+controller's Port Status mask uses bits 1 and 2 for the two rails.
+The API reports replies in receive order, with the observed ingress
+rail and RTT. A timeout returns any replies that arrived before it.
+
+On the responder, call `mrc_dpdk_progress_endpoint()` to poll the
+ports when an attached QP is idle or absent. Endpoint request batches
+also poll their local ports while waiting. Detach the endpoint before
+destroying its context. The application owns the ports and pool.
+
 ### Driving the DPDK endpoint from a provider QP
 
 The internal interface in `src/mrc_endpoint.h` lets the application own the

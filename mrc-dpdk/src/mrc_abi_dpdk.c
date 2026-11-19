@@ -47,9 +47,9 @@ struct mrc_abi_route {
 };
 
 /* Shared ethdev RX and TX queue I/O, route lifetime, and node state are
- * serialized here. Callers already hold their own QP mutex. The dispatcher
- * never takes another QP's mutex. */
-static pthread_mutex_t dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
+ * serialized here. QP callers hold their own QP mutex. The dispatcher
+ * does not acquire QP or context mutexes. */
+pthread_mutex_t mrc_abi_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct mrc_abi_route *routes;
 static struct mrc_abi_route *routes_by_qpn[ROUTE_BUCKETS];
 
@@ -76,31 +76,58 @@ static void discard_packets(struct qp_direction *direction)
     }
 }
 
-static bool queue_packet(struct qp_direction *direction, uint16_t port,
-                          const struct mrc_wire_packet *header, const struct mrc_wire_srv6 *routing,
-                          struct mrc_endpoint_rx_packet packet, bool *matched)
+static int matched_path(const struct mrc_endpoint_config *config, uint16_t port,
+                         const struct mrc_wire_packet *header, const struct mrc_wire_srv6 *routing)
 {
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        if (direction->config.paths[path].port != port)
+        if (config->paths[path].port != port)
             continue;
-        if (!mrc_endpoint_peer_matches(&direction->config, path, header) ||
-            !mrc_endpoint_route_matches(&direction->config, path, routing))
-            return false;
-        if (matched)
-            *matched = true;
-        struct rx_queue *queue = &direction->ingress[path];
-        if (queue->count == RX_PENDING)
-            return false;
-        queue->packets[(queue->head + queue->count) % RX_PENDING] = packet;
-        queue->count++;
-        return true;
+        return mrc_endpoint_peer_matches(config, path, header) &&
+               mrc_endpoint_route_matches(config, path, routing) ? (int)path : -1;
     }
-    return false;
+    return -1;
+}
+
+static bool queue_packet(struct qp_direction *direction, unsigned int path,
+                          struct mrc_endpoint_rx_packet packet)
+{
+    struct rx_queue *queue = &direction->ingress[path];
+    if (queue->count == RX_PENDING)
+        return false;
+    queue->packets[(queue->head + queue->count) % RX_PENDING] = packet;
+    queue->count++;
+    return true;
 }
 
 static struct qp_direction *node_direction(struct mrc_abi_route *route)
 {
     return route->request ? &route->tx : &route->rx;
+}
+
+static bool route_node_packet(struct mrc_abi_route *route, uint16_t port,
+                               const struct mrc_wire_packet *packet, const struct mrc_wire_srv6 *routing,
+                               struct mrc_endpoint_rx_packet received, bool srv6, bool *matched)
+{
+    struct qp_direction *direction = node_direction(route);
+    if (direction->config.srv6 != srv6)
+        return false;
+    int path = matched_path(&direction->config, port, packet, routing);
+    if (path < 0)
+        return false;
+    if (matched)
+        *matched = true;
+    if (packet->bth.opcode == MRC_ENDPOINT_REQUEST &&
+        packet->body.endpoint_request.op == MRC_ENDPOINT_PORT_STATUS) {
+        /* Reachability belongs to the shared node. Reply even when this
+         * QP is idle and an endpoint worker is driving the ports. */
+        route->counts.rx[path].frames++;
+        route->counts.rx[path].matched++;
+        mrc_endpoint_receive_op(&direction->config, &route->node->state, &route->counts,
+                                (unsigned int)path, packet, received.arrival_cycles);
+        rte_pktmbuf_free(received.mbuf);
+        return true;
+    }
+    return queue_packet(direction, (unsigned int)path, received);
 }
 
 static bool queue_node_packet(struct mrc_abi_route *current, uint16_t port,
@@ -109,14 +136,12 @@ static bool queue_node_packet(struct mrc_abi_route *current, uint16_t port,
 {
     /* Prefer the QP already progressing. QPs on the same path to this peer
      * share node state, so one copy suffices and requests get one reply. */
-    struct qp_direction *direction = node_direction(current);
-    if (direction->config.srv6 == srv6 && queue_packet(direction, port, header, routing, packet, matched))
+    if (current && route_node_packet(current, port, header, routing, packet, srv6, matched))
         return true;
     for (struct mrc_abi_route *route = routes; route; route = route->next) {
         if (route == current || route->error)
             continue;
-        direction = node_direction(route);
-        if (direction->config.srv6 == srv6 && queue_packet(direction, port, header, routing, packet, matched))
+        if (route_node_packet(route, port, header, routing, packet, srv6, matched))
             return true;
     }
     return false;
@@ -144,6 +169,41 @@ static struct mrc_abi_route *find_route(uint32_t qpn)
     return route;
 }
 
+bool mrc_abi_qp_port_token_in_use(uint16_t token)
+{
+    for (struct mrc_abi_route *route = routes; route; route = route->next) {
+        if (route->error)
+            continue;
+        const struct mrc_endpoint_node *node = &route->node->state;
+        for (unsigned int i = 0; i < PATH_COUNT; i++) {
+            if (node->awaiting[i] && node->pending[i] == token)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool dispatch_node_packet(struct mrc_abi_route *current, uint16_t port,
+                                  struct mrc_endpoint_rx_packet received,
+                                  const uint8_t *frame, size_t length)
+{
+    struct mrc_wire_packet packet;
+    struct mrc_wire_srv6 routing;
+    if (mrc_wire_decode_srv6(frame, length, &packet, &routing))
+        return false;
+
+    bool status_request = packet.bth.opcode == MRC_ENDPOINT_REQUEST &&
+                          packet.body.endpoint_request.op == MRC_ENDPOINT_PORT_STATUS;
+    /* An existing QP needs the peer's reports for its rail reachability. */
+    if (status_request && node_packet(current, port, &packet, &routing, received))
+        return true;
+    if (mrc_abi_dispatch_endpoint(port, &packet, &routing, received.arrival_cycles)) {
+        rte_pktmbuf_free(received.mbuf);
+        return true;
+    }
+    return !status_request && node_packet(current, port, &packet, &routing, received);
+}
+
 static bool dispatch_packet(struct mrc_abi_route *current, uint16_t port,
                              struct mrc_endpoint_rx_packet packet)
 {
@@ -159,25 +219,31 @@ static bool dispatch_packet(struct mrc_abi_route *current, uint16_t port,
 
     if (header.bth.dqp == MRC_ENDPOINT_QPN)
         return (header.bth.opcode == MRC_ENDPOINT_REQUEST || header.bth.opcode == MRC_ENDPOINT_RESPONSE)
-               && node_packet(current, port, &header, &routing, packet);
+               && dispatch_node_packet(current, port, packet, frame, length);
     struct mrc_abi_route *target = find_route(header.bth.dqp);
     if (!target || target->error)
         return false;
+    struct qp_direction *direction;
     switch (header.bth.opcode) {
     case MRC_TRANSPORT_ACK:
     case MRC_RELIABILITY_SACK:
     case MRC_RELIABILITY_NACK:
-        return target->request && queue_packet(&target->tx, port, &header, &routing, packet, NULL);
+        direction = target->request ? &target->tx : NULL;
+        break;
     default:
-        return target->response && queue_packet(&target->rx, port, &header, &routing, packet, NULL);
+        direction = target->response ? &target->rx : NULL;
+        break;
     }
+    if (!direction)
+        return false;
+    int path = matched_path(&direction->config, port, &header, &routing);
+    return path >= 0 && queue_packet(direction, (unsigned int)path, packet);
 }
 
-static void receive_ports(struct mrc_abi_route *route)
+static void poll_ports(struct mrc_abi_route *route, const uint16_t ports[PATH_COUNT])
 {
-    const struct mrc_endpoint_config *config = &node_direction(route)->config;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        uint16_t port = config->paths[path].port;
+        uint16_t port = ports[path];
         struct rte_mbuf *packets[RX_BURST];
         uint16_t count = rte_eth_rx_burst(port, 0, packets, RX_BURST);
         uint64_t arrival_cycles = count ? rte_get_timer_cycles() : 0;
@@ -187,6 +253,18 @@ static void receive_ports(struct mrc_abi_route *route)
                 rte_pktmbuf_free(packets[i]);
         }
     }
+}
+
+static void receive_ports(struct mrc_abi_route *route)
+{
+    const struct mrc_endpoint_config *config = &node_direction(route)->config;
+    const uint16_t ports[PATH_COUNT] = { config->paths[0].port, config->paths[1].port };
+    poll_ports(route, ports);
+}
+
+void mrc_abi_poll_endpoint_ports(const uint16_t ports[2])
+{
+    poll_ports(NULL, ports);
 }
 
 static bool same_node_peer(const struct mrc_endpoint_config *a, const struct mrc_endpoint_config *b)
@@ -255,7 +333,7 @@ static void unregister_route(const struct mrc_abi_route *route)
     *entry = route->next;
 }
 
-static int configure_addresses(struct mrc_endpoint_config *config, const union ibv_gid *local,
+int mrc_abi_configure_addresses(struct mrc_endpoint_config *config, const union ibv_gid *local,
                                 const union ibv_gid *peer)
 {
     struct in6_addr source, dest;
@@ -287,7 +365,7 @@ static bool sid_is_zero(const uint8_t sid[MRC_IPV6_ADDR_LEN])
     return memcmp(sid, zero, sizeof(zero)) == 0;
 }
 
-static int prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
+int mrc_abi_prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
                               struct mrc_endpoint_srv6_path *prepared)
 {
     if (!paths)
@@ -352,6 +430,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         .drop_after = UINT32_MAX, .restore_after = UINT32_MAX, .trim_after = UINT32_MAX,
         .mpr_change_at = UINT32_MAX, .hz = rte_get_timer_hz(),
         .receive = take_packets, .receive_context = direction,
+        .port_status_token_in_use = mrc_abi_endpoint_port_token_in_use,
     };
     if (!config->hz)
         return EIO;
@@ -359,7 +438,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     /* The API uses the QP's configured retry budget across progress calls. */
     config->idle_timeout = UINT64_MAX;
 
-    error = configure_addresses(config, &qp->source_gid, &verbs->ah_attr.grh.dgid);
+    error = mrc_abi_configure_addresses(config, &qp->source_gid, &verbs->ah_attr.grh.dgid);
     if (error)
         return error;
     if (tx)
@@ -446,7 +525,7 @@ static int attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
     if (!error && rx)
         error = configure_route(qp, route, srv6, &object->rx, false);
 
-    pthread_mutex_lock(&dispatch_mutex);
+    pthread_mutex_lock(&mrc_abi_dispatch_mutex);
     if (!error) {
         object->node = join_peer_node(tx ? &object->tx.config : &object->rx.config);
         if (!object->node)
@@ -468,7 +547,7 @@ static int attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
         qp->responder = rx;
         qp->route = object;
     }
-    pthread_mutex_unlock(&dispatch_mutex);
+    pthread_mutex_unlock(&mrc_abi_dispatch_mutex);
 
 unlock:
     pthread_mutex_unlock(&qp->mutex);
@@ -484,7 +563,7 @@ MRC_PUBLIC int mrc_dpdk_attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_
                                       const struct mrc_dpdk_srv6_path paths[2])
 {
     struct mrc_endpoint_srv6_path prepared[PATH_COUNT];
-    int error = prepare_srv6_paths(paths, prepared);
+    int error = mrc_abi_prepare_srv6_paths(paths, prepared);
     return error ? error : attach_qp(qp, route, prepared);
 }
 
@@ -508,7 +587,7 @@ MRC_PUBLIC int mrc_dpdk_progress_qp(struct mrc_qp *qp)
     struct mrc_abi_route *route = qp->route;
     int error = ENOTCONN;
     if (route) {
-        pthread_mutex_lock(&dispatch_mutex);
+        pthread_mutex_lock(&mrc_abi_dispatch_mutex);
         if (!route->error) {
             int result = mrc_provider_qp_check_cqs(qp->provider);
             if (!result) {
@@ -525,7 +604,7 @@ MRC_PUBLIC int mrc_dpdk_progress_qp(struct mrc_qp *qp)
             }
         }
         error = route->error;
-        pthread_mutex_unlock(&dispatch_mutex);
+        pthread_mutex_unlock(&mrc_abi_dispatch_mutex);
     }
     pthread_mutex_unlock(&qp->mutex);
     return error;
@@ -535,10 +614,10 @@ void mrc_abi_release_route(struct mrc_qp *qp)
 {
     struct mrc_abi_route *route = qp->route;
     if (route) {
-        pthread_mutex_lock(&dispatch_mutex);
+        pthread_mutex_lock(&mrc_abi_dispatch_mutex);
         unregister_route(route);
         free_route(route);
-        pthread_mutex_unlock(&dispatch_mutex);
+        pthread_mutex_unlock(&mrc_abi_dispatch_mutex);
         qp->route = NULL;
     }
 }

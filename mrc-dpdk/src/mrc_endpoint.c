@@ -169,8 +169,9 @@ static uint64_t cycles_to_ns(const struct mrc_endpoint_config *transfer, uint64_
            (cycles % transfer->hz) * 1000000000 / transfer->hz;
 }
 
-static uint16_t feedback_timestamp(const struct mrc_endpoint_config *transfer, uint64_t arrival_cycles,
-                                    bool timestamp_present, bool tsr, uint16_t timestamp)
+uint16_t mrc_endpoint_feedback_timestamp(const struct mrc_endpoint_config *transfer,
+                                         uint64_t arrival_cycles, bool timestamp_present,
+                                         bool tsr, uint16_t timestamp)
 {
     uint64_t elapsed = transfer->report_service_time ?
         cycles_to_ns(transfer, rte_get_timer_cycles() - arrival_cycles) : 0;
@@ -181,7 +182,8 @@ static uint16_t write_feedback_timestamp(const struct mrc_endpoint_config *trans
                                           const struct mrc_wire_packet *request, uint64_t arrival_cycles)
 {
     const struct mrc_wire_write *write = &request->body.write;
-    return feedback_timestamp(transfer, arrival_cycles, request->bth.timestamp, write->tsr, write->tx_timestamp);
+    return mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, request->bth.timestamp,
+                                            write->tsr, write->tx_timestamp);
 }
 
 /* The requester keeps a local send time and sends neither TSETH nor a
@@ -302,15 +304,18 @@ static uint8_t packet_ecn(const struct mrc_wire_packet *packet)
     return packet->ip_version == MRC_WIRE_IP6 ? packet->ipv6.ecn : packet->ipv4.ecn;
 }
 
-static struct mrc_wire_packet packet_for(const struct mrc_endpoint_config *transfer, unsigned int index,
-                                          uint8_t opcode, uint32_t psn)
+struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config *transfer,
+                                               unsigned int index, uint8_t opcode, uint32_t psn)
 {
     const struct mrc_endpoint_path *path = &transfer->paths[index];
+    uint32_t dqp = transfer->sender ? transfer->responder_qpn : transfer->requestor_qpn;
+    if (opcode == MRC_ENDPOINT_REQUEST || opcode == MRC_ENDPOINT_RESPONSE)
+        dqp = MRC_ENDPOINT_QPN;
     struct mrc_wire_packet packet = {
         .ip_version = transfer->ip_version,
         .bth = {
             .opcode = opcode, .psn = psn, .p_key = transfer->partition_key,
-            .dqp = transfer->sender ? transfer->responder_qpn : transfer->requestor_qpn,
+            .dqp = dqp,
         },
     };
 
@@ -410,8 +415,8 @@ static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned 
     return mrc_dpdk_transmit(transfer->paths[path].port, mbuf);
 }
 
-static bool transmit(const struct mrc_endpoint_config *transfer, unsigned int path,
-                     const struct mrc_wire_packet *packet)
+bool mrc_endpoint_transmit(const struct mrc_endpoint_config *transfer, unsigned int path,
+                           const struct mrc_wire_packet *packet)
 {
     return transmit_frame(transfer, path, packet, false);
 }
@@ -500,6 +505,20 @@ static bool decode(const struct mrc_endpoint_config *transfer, unsigned int inde
     return true;
 }
 
+static bool next_port_status_token(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
+                                   uint16_t *token)
+{
+    for (uint32_t attempts = 0; attempts <= UINT16_MAX; attempts++) {
+        *token = ++status->token;
+        bool pending = false;
+        for (unsigned int path = 0; path < PATH_COUNT; path++)
+            pending |= status->awaiting[path] && status->pending[path] == *token;
+        if (!pending && (!transfer->port_status_token_in_use || !transfer->port_status_token_in_use(*token)))
+            return true;
+    }
+    return false;
+}
+
 static void poll_port_status(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                              uint64_t now)
 {
@@ -532,22 +551,23 @@ static void poll_port_status(const struct mrc_endpoint_config *transfer, struct 
         status->awaiting[path] = false;
         if (!(active & (1u << path)))
             continue;
-        uint16_t token = ++status->token;
-        struct mrc_wire_packet request = packet_for(transfer, path, MRC_ENDPOINT_REQUEST, token);
-        request.bth.dqp = MRC_ENDPOINT_QPN;
+        uint16_t token;
+        if (!next_port_status_token(transfer, status, &token))
+            continue;
+        struct mrc_wire_packet request = mrc_endpoint_packet_for(transfer, path, MRC_ENDPOINT_REQUEST, token);
         request.body.endpoint_request = (struct mrc_wire_endpoint_request){
             .op = MRC_ENDPOINT_PORT_STATUS, .port_status_mask = active,
         };
-        if (transmit(transfer, path, &request)) {
+        if (mrc_endpoint_transmit(transfer, path, &request)) {
             status->pending[path] = token;
             status->awaiting[path] = true;
         }
     }
 }
 
-static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
-                                struct mrc_endpoint_counters *counts, unsigned int path,
-                                const struct mrc_wire_packet *packet, uint64_t arrival_cycles)
+bool mrc_endpoint_receive_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
+                             struct mrc_endpoint_counters *counts, unsigned int path,
+                             const struct mrc_wire_packet *packet, uint64_t arrival_cycles)
 {
     if (packet->bth.opcode == MRC_ENDPOINT_RESPONSE) {
         if (packet->body.endpoint_response.op == MRC_ENDPOINT_PORT_STATUS) {
@@ -572,15 +592,14 @@ static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, stru
         status->peer_valid_until = rte_get_timer_cycles() + transfer->hz;
         counts->port_status_updates++;
     }
-    struct mrc_wire_packet response = packet_for(transfer, path, MRC_ENDPOINT_RESPONSE,
-                                                  (uint16_t)packet->bth.psn);
-    response.bth.dqp = MRC_ENDPOINT_QPN;
+    struct mrc_wire_packet response = mrc_endpoint_packet_for(transfer, path, MRC_ENDPOINT_RESPONSE,
+                                                              (uint16_t)packet->bth.psn);
     response.body.endpoint_response = (struct mrc_wire_endpoint_response){
         .op = request->op,
-        .tx_timestamp = feedback_timestamp(transfer, arrival_cycles, request->timestamp,
-                                           request->tsr, request->tx_timestamp),
+        .tx_timestamp = mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, request->timestamp,
+                                                        request->tsr, request->tx_timestamp),
     };
-    transmit(transfer, path, &response);
+    mrc_endpoint_transmit(transfer, path, &response);
     return true;
 }
 
@@ -636,8 +655,8 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     if (write.length != work->length || write.with_immediate != work->with_immediate)
         return -EPROTO;
 
-    struct mrc_wire_packet packet = packet_for(transfer, path, expected_opcode(work, index),
-        mrc_psn_add(transfer->initial_psn, (int32_t)index));
+    uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
+    struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, expected_opcode(work, index), psn);
     uint32_t length = length_at(work, index);
     uint32_t nominal_bytes = nominal_size(packet.bth.opcode, length, false);
     if (!mrc_cc_can_send(&sender->cc, nominal_bytes))
@@ -934,7 +953,7 @@ static int receive_control(const struct mrc_endpoint_config *transfer, struct mr
             uint8_t scratch[MRC_ENDPOINT_FRAME_CAPACITY];
             struct mrc_wire_packet packet;
             if (!result && decode(transfer, path, received->mbuf, scratch, &packet, &counts->rx[path]) &&
-                !receive_endpoint_op(transfer, sender->node, counts, path, &packet, received->arrival_cycles))
+                !mrc_endpoint_receive_op(transfer, sender->node, counts, path, &packet, received->arrival_cycles))
                 result = apply_control(transfer, sender, counts, &packet, received->arrival_cycles);
             rte_pktmbuf_free(received->mbuf);
         }
@@ -1034,12 +1053,12 @@ static bool request_probe(const struct mrc_endpoint_config *transfer, struct mrc
         for (unsigned int i = 0; i < PATH_COUNT; i++)
             outstanding |= sender->probes[i].pending && sender->probes[i].id == probe_id;
     } while (outstanding);
-    struct mrc_wire_packet packet = packet_for(transfer, path, MRC_RELIABILITY_PROBE, 0);
+    struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, MRC_RELIABILITY_PROBE, 0);
     packet.body.probe = (struct mrc_wire_probe){
         .probe_id = probe_id, .spdcid = (uint16_t)transfer->requestor_qpn,
         .dpdcid = (uint16_t)transfer->responder_qpn,
     };
-    if (!blackholed(transfer, sender, path) && !transmit(transfer, path, &packet))
+    if (!blackholed(transfer, sender, path) && !mrc_endpoint_transmit(transfer, path, &packet))
         return false;
     sender->probe_id = probe_id;
     sender->probes[path] = (struct outstanding_probe){
@@ -1070,9 +1089,9 @@ static void send_ack(const struct mrc_endpoint_config *transfer, struct mrc_endp
         counts->dropped_transport_acks++;
         return;
     }
-    struct mrc_wire_packet packet = packet_for(transfer, path, MRC_TRANSPORT_ACK, psn);
+    struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, MRC_TRANSPORT_ACK, psn);
     packet.body.aeth = (struct mrc_wire_aeth){ .syndrome = syndrome, .msn = msn };
-    if (transmit(transfer, path, &packet))
+    if (mrc_endpoint_transmit(transfer, path, &packet))
         counts->transport_acks++;
 }
 
@@ -1086,8 +1105,8 @@ static void send_sack(const struct mrc_endpoint_config *transfer, struct mrc_res
     else if (!mrc_rx_build_sack(&receiver->qp, request->bth.psn, &state))
         return;
 
-    struct mrc_wire_packet packet = packet_for(transfer, path, MRC_RELIABILITY_SACK,
-                                                 probe ? 0 : state.cack_psn);
+    struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, MRC_RELIABILITY_SACK,
+                                                            probe ? 0 : state.cack_psn);
     packet.bth.retransmit = !probe && request->bth.retransmit;
     packet.body.sack = (struct mrc_wire_sack){
         .mark = packet_ecn(request) == 3 ? MRC_SACK_SKIP : MRC_SACK_NONE,
@@ -1104,10 +1123,10 @@ static void send_sack(const struct mrc_endpoint_config *transfer, struct mrc_res
     };
     const struct mrc_wire_probe *probe_request = &request->body.probe;
     packet.body.sack.tx_timestamp = probe ?
-        feedback_timestamp(transfer, arrival_cycles, probe_request->timestamp,
-                           probe_request->tsr, probe_request->tx_timestamp) :
+        mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, probe_request->timestamp,
+                                        probe_request->tsr, probe_request->tx_timestamp) :
         write_feedback_timestamp(transfer, request, arrival_cycles);
-    if (transmit(transfer, path, &packet)) {
+    if (mrc_endpoint_transmit(transfer, path, &packet)) {
         counts->sacks++;
         mrc_rx_sack_sent(&receiver->qp, &state);
     }
@@ -1117,7 +1136,7 @@ static bool send_nack(const struct mrc_endpoint_config *transfer, struct mrc_end
                       const struct mrc_wire_bth *request, uint32_t entropy, uint8_t reason,
                       uint16_t original_udp_len, uint16_t tx_timestamp)
 {
-    struct mrc_wire_packet nack = packet_for(transfer, path, MRC_RELIABILITY_NACK, request->psn);
+    struct mrc_wire_packet nack = mrc_endpoint_packet_for(transfer, path, MRC_RELIABILITY_NACK, request->psn);
     nack.bth.retransmit = request->retransmit;
     nack.body.nack = (struct mrc_wire_nack){
         .reason = reason, .entropy = entropy,
@@ -1125,7 +1144,7 @@ static bool send_nack(const struct mrc_endpoint_config *transfer, struct mrc_end
         .nack_psn = request->psn, .tx_timestamp = tx_timestamp,
         .original_udp_len = original_udp_len,
     };
-    if (!transmit(transfer, path, &nack))
+    if (!mrc_endpoint_transmit(transfer, path, &nack))
         return false;
     counts->nack_sent_mask |= UINT32_C(1) << reason;
     return true;
@@ -1270,20 +1289,23 @@ static void receive_trimmed(const struct mrc_endpoint_config *transfer, const st
 {
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, trimmed->bth.psn);
     if (disposition == MRC_RX_OUTSIDE_WINDOW) {
+        uint16_t timestamp = mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
+                                                             trimmed->tsr, trimmed->tx_timestamp);
         send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_PSN_OOR_WINDOW,
-                  0, feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
-                                        trimmed->tsr, trimmed->tx_timestamp));
+                  0, timestamp);
         return;
     }
     if (disposition == MRC_RX_DUPLICATE || !mrc_cc_nominal_size(trimmed->original_udp_len))
         return;
 
     counts->trimmed++;
-    if (transfer->trim_nack_enabled && send_nack(transfer, counts, path, &trimmed->bth, entropy,
-                                               MRC_NACK_TRIMMED, trimmed->original_udp_len,
-                                               feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
-                                                                  trimmed->tsr, trimmed->tx_timestamp)))
-        counts->trim_nacks++;
+    if (transfer->trim_nack_enabled) {
+        uint16_t timestamp = mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
+                                                             trimmed->tsr, trimmed->tx_timestamp);
+        if (send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_TRIMMED,
+                      trimmed->original_udp_len, timestamp))
+            counts->trim_nacks++;
+    }
 }
 
 static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_responder *receiver,
@@ -1334,7 +1356,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
             return 0;
         }
         rx->matched++;
-        if (receive_endpoint_op(transfer, receiver->node, counts, path, &packet, arrival_cycles))
+        if (mrc_endpoint_receive_op(transfer, receiver->node, counts, path, &packet, arrival_cycles))
             return 0;
         receiver->last_frame = rte_get_timer_cycles();
         return receive_write(transfer, receiver, counts, path, &packet, arrival_cycles);

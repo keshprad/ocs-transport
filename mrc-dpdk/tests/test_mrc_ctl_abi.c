@@ -185,6 +185,7 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
            strcmp(extended.cc.algorithms[0], nscc_algorithm) == 0 && !extended.cc.algorithms[1]);
     assert(!((legacy.opt_attr | extended.opt_attr) & MRC_CTL_OPT_CAP_CC_PROFILE_MODIFY_ONLINE));
     assert((legacy.opt_attr & extended.opt_attr) & MRC_CTL_OPT_CAP_EV_EVENT);
+    assert((legacy.opt_attr & extended.opt_attr) & MRC_CTL_OPT_CAP_EP_OP_EV_PROBE);
     assert(!((legacy.opt_attr | extended.opt_attr) &
              (MRC_CTL_OPT_CAP_EV_PROFILE_MODIFY_ONLINE | MRC_CTL_OPT_CAP_EV_EVENT_PRECISE_DROP_CNT)));
 
@@ -1330,6 +1331,12 @@ int main(int argc, char **argv)
         struct mrc_ctl_ev_profile_attr events = { .ev_event_mask = MRC_CTL_EV_GOOD };
         assert(mrc_ctl_modify_ev_profile(controller, EVENT_PROFILE_ID, &events,
                                          MRC_CTL_EV_PROFILE_EVENT_MASK) == -1 && errno == EPERM);
+        struct mrc_ctl_ep_req probe = {0};
+        struct mrc_ctl_ep_rsp reply;
+        int replies = 1;
+        assert(mrc_ctl_ep_batch_send_wait(controller, 0, MRC_CTL_EP_OP_EV_PROBE, &probe, 1,
+                                          1000000, &reply, &replies) == -1 && errno == EPERM);
+        assert(replies == 0);
         struct mrc_ctl_cc_profile_attr cc = {0};
         assert(mrc_ctl_query_cc_profile(controller, CC_PROFILE_ID, &cc,
                                         MRC_CTL_CC_PROFILE_CUR_STATE) == -1 && errno == EPERM);

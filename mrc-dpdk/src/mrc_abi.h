@@ -17,6 +17,11 @@ enum {
 };
 
 struct mrc_abi_route;
+struct mrc_abi_endpoint;
+struct mrc_endpoint_config;
+struct mrc_endpoint_srv6_path;
+struct mrc_wire_packet;
+struct mrc_wire_srv6;
 struct mrc_abi_async_notice;
 struct mrc_abi_ev_cq;
 
@@ -49,6 +54,7 @@ struct mrc_context {
     struct mrc_abi_async_channel async;
     struct mrc_ctl_store profile_store;
     atomic_uint ctl_event_layout;
+    struct mrc_abi_endpoint *endpoint;
 };
 
 struct mrc_comp_channel {
@@ -107,5 +113,19 @@ void mrc_abi_release_route(struct mrc_qp *qp);
 int mrc_abi_bind_mr(const struct mrc_context *context, struct mrc_provider_pd *provider,
                      const struct ibv_pd *verbs_pd, const struct ibv_mr *mr,
                      uint64_t iova, unsigned int access);
+
+int mrc_abi_configure_addresses(struct mrc_endpoint_config *config, const union ibv_gid *local,
+                                const union ibv_gid *peer);
+int mrc_abi_prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
+                              struct mrc_endpoint_srv6_path *prepared);
+
+/* Serialize shared DPDK queue I/O and route state. The dispatcher
+ * never acquires context or QP locks. */
+extern pthread_mutex_t mrc_abi_dispatch_mutex;
+void mrc_abi_poll_endpoint_ports(const uint16_t ports[2]);
+bool mrc_abi_dispatch_endpoint(uint16_t port, const struct mrc_wire_packet *packet,
+                               const struct mrc_wire_srv6 *routing, uint64_t arrival_cycles);
+bool mrc_abi_qp_port_token_in_use(uint16_t token);
+bool mrc_abi_endpoint_port_token_in_use(uint16_t token);
 
 #endif

@@ -157,7 +157,7 @@ static int query_controller_device(struct ibv_context *verbs, struct mrc_context
         },
         .cc = { .cc_max_profiles = MRC_CTL_STORE_MAX_CC_PROFILES, .algorithms = cc_algorithms },
         .phy_port_mask = ports,
-        .opt_attr = MRC_CTL_OPT_CAP_EV_EVENT,
+        .opt_attr = MRC_CTL_OPT_CAP_EV_EVENT | MRC_CTL_OPT_CAP_EP_OP_EV_PROBE,
     };
     return 0;
 }

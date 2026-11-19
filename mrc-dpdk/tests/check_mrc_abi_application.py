@@ -54,6 +54,24 @@ def check_live_profile(binary, controller):
         print(json.dumps({"case": "public_qp_live_ev_update", "tx": tx, "rx": rx}))
 
 
+def check_endpoint_operations(binary, format_name):
+    def command(role, cpu, directory):
+        args = eal_args(binary, role, cpu, directory) + [
+            "--", role, str(directory), "endpoint_ops", format_name,
+        ]
+        if role == "tx":
+            # EAL treats the namespaced user as root and otherwise uses /var/run.
+            args = ["unshare", "-Ur", "env", f"RUNTIME_DIRECTORY={directory}", *args]
+        return args
+
+    tx, rx, _ = run_pair(command)
+    require(tx["role"] == "tx" and rx["role"] == "rx"
+            and tx["format"] == rx["format"] == format_name
+            and tx["endpoint_packets"] == rx["endpoint_packets"] == 7,
+            f"Unexpected connectionless endpoint operation batch: {tx}, {rx}")
+    print(json.dumps({"case": f"public_endpoint_ops_{format_name}", "tx": tx, "rx": rx}))
+
+
 def check_duplex(tx, rx, completions=3):
     require(len(set(tx["qpns"] + rx["qpns"])) == 4,
             f"The connected QPs need distinct QPNs: {tx}, {rx}")
@@ -80,7 +98,7 @@ def main():
         default=Path(__file__).resolve().parent / "mrc_abi_application",
     )
     parser.add_argument("--controller", type=Path,
-                        help="Path to test_mrc_ctl_abi for the live EV, NSCC window, and Quick Adapt cases")
+                        help="Path to test_mrc_ctl_abi for privileged controller and endpoint cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -127,6 +145,8 @@ def main():
     if args.controller:
         controller = args.controller.resolve()
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
+        for format_name in ("udp", "stev", "srv6", "shared"):
+            check_endpoint_operations(binary, format_name)
         check_live_profile(binary, controller)
         for mode, seed, expected in (
             ("generated_ev_udp", "--seed-gen", [0xC405, 0xC410]),

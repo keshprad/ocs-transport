@@ -61,6 +61,32 @@ struct mrc_dpdk_srv6_path {
     uint8_t segments_left;
 };
 
+/* Connectionless route over two application-owned, started DPDK ports.
+ * The port numbers in controller operations are 1 and 2, in route order.
+ * Zero pkey selects 0xffff. Zero peer_pkey uses pkey. Zero udp_port uses
+ * the OCP default. Optional SRv6 paths configure the return route and
+ * endpoint SIDs. A request supplies its own outgoing EV. */
+struct mrc_dpdk_endpoint_route {
+    uint16_t ports[2];
+    uint8_t peer_macs[2][6];
+    struct rte_mempool *pool;
+    union ibv_gid local_gid;
+    union ibv_gid peer_gid;
+    uint16_t pkey;
+    uint16_t peer_pkey;
+    uint16_t udp_port;
+};
+
+/* One connectionless route per context. Progress the endpoint to respond
+ * to incoming requests. A blocking controller batch drives its own RX/TX.
+ * The route can share DPDK queues with MRC QPs. Detach before stopping
+ * the ports, freeing the pool, or destroying the context. These calls
+ * return zero or a positive errno. */
+int mrc_dpdk_attach_endpoint(struct mrc_context *context, const struct mrc_dpdk_endpoint_route *route,
+                              const struct mrc_dpdk_srv6_path paths[2]);
+int mrc_dpdk_progress_endpoint(struct mrc_context *context);
+int mrc_dpdk_detach_endpoint(struct mrc_context *context);
+
 /* Bind and drive the QP from the application's DPDK worker. Poll completion
  * queues independently. These calls return zero or a positive errno. */
 int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route);

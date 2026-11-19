@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <mrc_ctl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -485,6 +486,379 @@ static void test_sid(uint8_t sid[16], uint16_t port, uint8_t endpoint)
 {
     const uint8_t value[16] = {0x20, 0x01, 0x0d, 0xb8, 0, port + 1, [15] = endpoint};
     memcpy(sid, value, sizeof(value));
+}
+
+enum endpoint_case {
+    EP_HELD,
+    EP_FIRST_REPLY,
+    EP_PARTIAL_REPLY,
+    EP_STALE,
+    EP_RETRY,
+    EP_STATUS_FIRST,
+    EP_STATUS_SECOND,
+    EP_CASES,
+};
+
+static const struct {
+    uint16_t token;
+    uint8_t rail;
+    uint32_t port_status;
+} endpoint_cases[EP_CASES] = {
+    [EP_HELD] = { 0xffff, 0, 0 },
+    [EP_FIRST_REPLY] = { 0x001b, 1, 0 },
+    [EP_PARTIAL_REPLY] = { 0x8246, 0, 0 },
+    [EP_STALE] = { 0, 1, 0 },
+    [EP_RETRY] = { 0x8011, 1, 0 },
+    [EP_STATUS_FIRST] = { 0x50f1, 0, 3 },
+    [EP_STATUS_SECOND] = { 0x10d3, 1, 2 },
+};
+
+enum {
+    EP_REQUEST_OPCODE = 0xd8,
+    EP_RESPONSE_OPCODE = 0xd9,
+    EP_REQUEST_HEADER_LEN = 16,
+    EP_RESPONSE_HEADER_LEN = 36,
+    EP_PROBE_DSCP = 27,
+    EP_CONTROL_DSCP = 48,
+    EP_UDP_PORT = 4810,
+    EP_TX_PKEY = 0x9912,
+    EP_RX_PKEY = 0xa932,
+    EP_ALL_CASES = (1 << EP_CASES) - 1,
+};
+
+struct endpoint_witness {
+    bool client;
+    enum mrc_ctl_ev_fmt_mode mode;
+    const char *directory;
+    char release[PATH_MAX];
+    struct mrc_dpdk_endpoint_route route;
+    struct mrc_dpdk_srv6_path paths[DUPLEX_RAILS];
+    struct rte_mbuf *held;
+    struct rte_mbuf *stale;
+    enum endpoint_case replies[EP_CASES];
+    unsigned int reply_count;
+    unsigned int seen;
+    unsigned int stamped;
+    unsigned int adjusted_rtts;
+};
+
+static uint32_t probe_entropy(enum mrc_ctl_ev_fmt_mode mode, uint16_t rail)
+{
+    const uint32_t ports[] = { 0x3197, 0x427c };
+    const uint32_t labels[] = { 0x16db, 0x259c };
+    return ports[rail] | (mode == MRC_CTL_EV_FMT_MODE_STEV ? labels[rail] << 16 : 0);
+}
+
+static enum endpoint_case observe_endpoint_packet(struct endpoint_witness *test, uint16_t rail,
+                                                  struct rte_mbuf *packet)
+{
+    uint8_t scratch[192];
+    size_t len = rte_pktmbuf_pkt_len(packet);
+    assert(rail < DUPLEX_RAILS && len <= sizeof(scratch) && len >= RTE_ETHER_HDR_LEN + 20 + 8 + 12);
+    const uint8_t *frame = rte_pktmbuf_read(packet, 0, len, scratch);
+    assert(frame && !memcmp(frame + RTE_ETHER_ADDR_LEN, test->route.peer_macs[rail], RTE_ETHER_ADDR_LEN));
+    bool ipv6 = test->mode != MRC_CTL_EV_FMT_MODE_UDP;
+    assert(wire_be16(frame + 12) == (ipv6 ? RTE_ETHER_TYPE_IPV6 : RTE_ETHER_TYPE_IPV4));
+    size_t offset = RTE_ETHER_HDR_LEN;
+    unsigned int outer_dscp = 0;
+    if (test->mode == MRC_CTL_EV_FMT_MODE_SRV6) {
+        const uint8_t *outer = frame + offset;
+        const struct mrc_dpdk_srv6_path *path = &test->paths[rail];
+        bool transit = !test->client && rail == 1;
+        assert(len >= offset + WIRE_IPV6_LEN);
+        assert((outer[0] >> 4) == 6 && wire_be16(outer + 4) == len - offset - WIRE_IPV6_LEN);
+        outer_dscp = (wire_be16(outer) >> 6) & 63;
+        assert(!memcmp(outer + 8, path->peer_sid, 16));
+        offset += WIRE_IPV6_LEN;
+        if (transit) {
+            uint8_t initial[16];
+            test_sid(initial, rail, 0x33);
+            const uint8_t *srh = frame + offset;
+            assert(len >= offset + WIRE_SINGLE_SRH_LEN);
+            assert(outer[6] == IPPROTO_ROUTING && !memcmp(outer + 24, initial, 16));
+            assert(srh[0] == IPPROTO_IPV6 && srh[1] == 2 && srh[2] == 4 && srh[3] == 1 && srh[4] == 0);
+            assert(!memcmp(srh + 8, path->local_sid, 16));
+            /* Model the last SRv6 hop before the peer's endpoint dispatch. */
+            uint8_t *data = rte_pktmbuf_mtod(packet, uint8_t *);
+            assert(rte_pktmbuf_is_contiguous(packet));
+            memcpy(data + RTE_ETHER_HDR_LEN + 24, path->local_sid, 16);
+            data[offset + 3] = 0;
+            offset += WIRE_SINGLE_SRH_LEN;
+        } else {
+            assert(outer[6] == IPPROTO_IPV6 && !memcmp(outer + 24, path->local_sid, 16));
+        }
+    }
+    size_t ip_len = ipv6 ? WIRE_IPV6_LEN : 20;
+    assert(len >= offset + ip_len + WIRE_UDP_LEN + WIRE_BTH_LEN);
+    const uint8_t *ip = frame + offset;
+    assert((ip[0] >> 4) == (ipv6 ? 6 : 4) && ip[ipv6 ? 6 : 9] == IPPROTO_UDP);
+    assert(!memcmp(ip + (ipv6 ? 8 : 12), test->route.peer_gid.raw + (ipv6 ? 0 : 12), ipv6 ? 16 : 4));
+    assert(!memcmp(ip + (ipv6 ? 24 : 16), test->route.local_gid.raw + (ipv6 ? 0 : 12), ipv6 ? 16 : 4));
+    const uint8_t *udp = ip + ip_len;
+    const uint8_t *bth = udp + WIRE_UDP_LEN;
+    assert(wire_be16(udp + 2) == EP_UDP_PORT);
+    assert(bth[0] == (test->client ? EP_RESPONSE_OPCODE : EP_REQUEST_OPCODE));
+    assert(wire_be16(bth + 2) == test->route.peer_pkey && wire_be24(bth + 5) == 2);
+    uint32_t token = wire_be24(bth + 9);
+    enum endpoint_case entry;
+    for (entry = 0; entry < EP_CASES; entry++) {
+        if (token == endpoint_cases[entry].token)
+            break;
+    }
+    assert(entry < EP_CASES && endpoint_cases[entry].rail == rail && !(test->seen & (1u << entry)));
+    test->seen |= 1u << entry;
+    const uint8_t *extension = bth + WIRE_BTH_LEN;
+    unsigned int dscp = ipv6 ? (wire_be16(ip) >> 6) & 63 : ip[1] >> 2;
+    uint32_t port_status = endpoint_cases[entry].port_status;
+    assert(dscp == (test->client || port_status ? EP_CONTROL_DSCP : EP_PROBE_DSCP));
+    if (test->mode == MRC_CTL_EV_FMT_MODE_SRV6)
+        assert(outer_dscp == dscp);
+    size_t udp_len = WIRE_UDP_LEN + WIRE_BTH_LEN + 4 +
+        (test->client ? EP_RESPONSE_HEADER_LEN : EP_REQUEST_HEADER_LEN);
+    assert(wire_be16(udp + 4) == udp_len && len == offset + ip_len + udp_len);
+    if (test->client) {
+        assert(extension[1] == (port_status ? 0 : 4));
+        if (wire_be16(extension + 28))
+            test->stamped |= 1u << entry;
+    } else {
+        assert(extension[1] == (port_status ? 0 : 1));
+        assert(wire_be32(extension + 4) == port_status);
+        assert((extension[15] & 15) == 0);
+        if (test->mode != MRC_CTL_EV_FMT_MODE_SRV6) {
+            uint32_t entropy = wire_be16(udp);
+            if (ipv6)
+                entropy |= (uint32_t)wire_be16(ip + 2) << 16;
+            assert(entropy == probe_entropy(test->mode, rail));
+        }
+    }
+    return entry;
+}
+
+static uint16_t observe_endpoint_batch(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                        uint16_t count, uint16_t capacity, void *context)
+{
+    (void)queue;
+    struct endpoint_witness *test = context;
+    uint16_t ready = 0;
+    uint16_t retry = UINT16_MAX;
+    for (uint16_t i = 0; i < count; i++) {
+        struct rte_mbuf *packet = packets[i];
+        enum endpoint_case entry = observe_endpoint_packet(test, port, packet);
+        if (test->client) {
+            assert(test->reply_count < EP_CASES);
+            test->replies[test->reply_count++] = entry;
+            if (entry == EP_FIRST_REPLY)
+                publish(test->directory, "tx.first-reply", NULL, 0);
+        } else if (entry == EP_HELD) {
+            test->held = packet;
+            continue;
+        } else if (entry == EP_STALE) {
+            test->stale = packet;
+            continue;
+        } else if (entry == EP_RETRY) {
+            retry = ready;
+        }
+        packets[ready++] = packet;
+    }
+    if (retry != UINT16_MAX) {
+        assert(ready < capacity && test->stale);
+        /* Deliver the old, valid EETH before the current reply. */
+        memmove(packets + retry + 1, packets + retry, (ready - retry) * sizeof(*packets));
+        packets[retry] = test->stale;
+        test->stale = NULL;
+        ready++;
+    }
+    if (!test->client && port == 0 && test->held && ready < capacity && access(test->release, F_OK) == 0) {
+        packets[ready++] = test->held;
+        test->held = NULL;
+    }
+    return ready;
+}
+
+static struct mrc_ctl_ep_req endpoint_request(const struct endpoint_witness *test, enum endpoint_case entry)
+{
+    uint16_t rail = endpoint_cases[entry].rail;
+    struct mrc_ctl_ep_req request = {
+        .req_id = endpoint_cases[entry].token, .sgid = test->route.local_gid,
+        .dgid = test->route.peer_gid, .ev_fmt_mode = test->mode, .req_ev.port = rail + 1,
+        .op.port_status_update.port_status = endpoint_cases[entry].port_status << 1,
+    };
+    if (test->mode == MRC_CTL_EV_FMT_MODE_SRV6) {
+        if (rail == 0) {
+            memcpy(request.req_ev.val, test->paths[rail].peer_sid, 16);
+        } else {
+            test_sid(request.req_ev.val, rail, 0x33);
+            memcpy(request.req_ev.val + 16, test->paths[rail].peer_sid, 16);
+        }
+    } else {
+        uint32_t encoded = htonl(probe_entropy(test->mode, rail));
+        memcpy(request.req_ev.val, &encoded, sizeof(encoded));
+    }
+    return request;
+}
+
+static void check_endpoint_reply(struct endpoint_witness *test, const struct mrc_ctl_ep_rsp *reply,
+                                  enum endpoint_case entry)
+{
+    assert(reply->req_id == endpoint_cases[entry].token && reply->port == endpoint_cases[entry].rail + 1);
+    assert(reply->rtt > 0 && reply->adj_svc_time == !!(test->stamped & (1u << entry)));
+    test->adjusted_rtts += reply->adj_svc_time;
+}
+
+static void run_endpoint_batches(struct mrc_context *context, struct endpoint_witness *test)
+{
+    char ready_path[PATH_MAX];
+    path_for(ready_path, test->directory, "rx.endpoint-ready");
+    wait_for(ready_path);
+    struct mrc_ctl_ep_rsp replies[DUPLEX_RAILS];
+    int returned = -1;
+    struct mrc_ctl_ep_req requests[DUPLEX_RAILS] = {
+        endpoint_request(test, EP_HELD), endpoint_request(test, EP_HELD),
+    };
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE, requests, 2,
+                                      1000000000, replies, &returned) == -1);
+    assert(errno == EINVAL && returned == 0);
+    requests[1] = endpoint_request(test, EP_FIRST_REPLY);
+    assert(mrc_ctl_ep_batch_send_wait(context, 64, MRC_CTL_EP_OP_EV_PROBE, requests, 2,
+                                      1000000000, replies, &returned) == -1);
+    assert(errno == EINVAL && returned == 0);
+    requests[1].dgid.raw[15] ^= 1;
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE, requests, 2,
+                                      1000000000, replies, &returned) == -1);
+    assert(errno == EINVAL && returned == 0);
+    requests[1] = endpoint_request(test, EP_FIRST_REPLY);
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE, requests, 2,
+                                      1000000000, replies, &returned) == 0);
+    assert(returned == 2);
+    check_endpoint_reply(test, &replies[0], EP_FIRST_REPLY);
+    check_endpoint_reply(test, &replies[1], EP_HELD);
+
+    requests[0] = endpoint_request(test, EP_PARTIAL_REPLY);
+    requests[1] = endpoint_request(test, EP_STALE);
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE, requests, 2,
+                                      100000000, replies, &returned) == -1);
+    assert(errno == ETIMEDOUT && returned == 1);
+    check_endpoint_reply(test, &replies[0], EP_PARTIAL_REPLY);
+
+    requests[0] = endpoint_request(test, EP_RETRY);
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE, requests, 1,
+                                      1000000000, replies, &returned) == 0);
+    assert(returned == 1);
+    check_endpoint_reply(test, &replies[0], EP_RETRY);
+    assert(test->reply_count == 5 && test->replies[3] == EP_STALE && test->replies[4] == EP_RETRY);
+
+    requests[0] = endpoint_request(test, EP_STATUS_FIRST);
+    requests[1] = endpoint_request(test, EP_STATUS_SECOND);
+    requests[1].op.port_status_update.port_status |= 1;
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_PORT_STATUS_UPDATE, requests, 2,
+                                      1000000000, replies, &returned) == -1);
+    assert(errno == EINVAL && returned == 0);
+    requests[1] = endpoint_request(test, EP_STATUS_SECOND);
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_PORT_STATUS_UPDATE, requests, 2,
+                                      1000000000, replies, &returned) == 0);
+    assert(returned == 2 && test->reply_count == EP_CASES);
+    check_endpoint_reply(test, &replies[0], test->replies[5]);
+    check_endpoint_reply(test, &replies[1], test->replies[6]);
+    publish(test->directory, "tx.endpoint-done", NULL, 0);
+}
+
+static void run_endpoint_ops(bool client, const char *directory, const char *format,
+                             const struct address *address, struct ibv_context *verbs,
+                             struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool)
+{
+    bool shared = !strcmp(format, "shared");
+    enum mrc_ctl_ev_fmt_mode mode = MRC_CTL_EV_FMT_MODE_UDP;
+    if (shared || !strcmp(format, "stev"))
+        mode = MRC_CTL_EV_FMT_MODE_STEV;
+    else if (!strcmp(format, "srv6"))
+        mode = MRC_CTL_EV_FMT_MODE_SRV6;
+    else
+        assert(!strcmp(format, "udp"));
+    struct endpoint_witness test = {
+        .client = client, .mode = mode, .directory = directory,
+        .route = {
+            .ports = {0, 1}, .pool = pool, .udp_port = EP_UDP_PORT,
+            .pkey = client ? EP_TX_PKEY : EP_RX_PKEY, .peer_pkey = client ? EP_RX_PKEY : EP_TX_PKEY,
+        },
+    };
+    const char *tx_gid = mode == MRC_CTL_EV_FMT_MODE_UDP ? "::ffff:10.9.0.1" : "2001:db8::11";
+    const char *rx_gid = mode == MRC_CTL_EV_FMT_MODE_UDP ? "::ffff:10.9.0.2" : "2001:db8::22";
+    assert(inet_pton(AF_INET6, client ? tx_gid : rx_gid, test.route.local_gid.raw) == 1);
+    assert(inet_pton(AF_INET6, client ? rx_gid : tx_gid, test.route.peer_gid.raw) == 1);
+    if (shared) {
+        uint16_t pkey;
+        assert(ibv_query_pkey(verbs, address->port, 0, &pkey) == 0);
+        const struct connection local = { .gid = address->gid };
+        struct connection peer;
+        publish(directory, client ? "tx.connection" : "rx.connection", &local, sizeof(local));
+        read_peer_connections(directory, client, &peer, 1);
+        test.route.local_gid = local.gid;
+        test.route.peer_gid = peer.gid;
+        test.route.pkey = test.route.peer_pkey = ntohs(pkey);
+    }
+    for (uint16_t rail = 0; rail < DUPLEX_RAILS; rail++) {
+        test.route.peer_macs[rail][0] = 2;
+        test.route.peer_macs[rail][5] = (client ? 0x10 : 0x20) + rail;
+        if (mode == MRC_CTL_EV_FMT_MODE_SRV6) {
+            test_sid(test.paths[rail].local_sid, rail, client ? 0x11 : 0x22);
+            test_sid(test.paths[rail].peer_sid, rail, client ? 0x22 : 0x11);
+        }
+    }
+    path_for(test.release, directory, "tx.first-reply");
+    const struct mrc_dpdk_srv6_path *paths = mode == MRC_CTL_EV_FMT_MODE_SRV6 ? test.paths : NULL;
+    struct mrc_ctl_device_attr capability;
+    int supported;
+    assert(mrc_ctl_query_device_ex(NULL, context, &capability, &supported) == 0 && supported);
+    assert(capability.opt_attr & MRC_CTL_OPT_CAP_EP_OP_EV_PROBE);
+    assert(mrc_dpdk_attach_endpoint(context, &test.route, paths) == 0);
+    struct mrc_cq *idle_cq = NULL;
+    struct mrc_qp *idle_qp = NULL;
+    if (shared && !client) {
+        idle_cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+        assert(idle_cq);
+        struct mrc_qp_init_attr init = {
+            .pd = pd, .protocol_version = MRC_PROTOCOL_VERSION_1, .recv_cq = idle_cq,
+            .cap.max_recv_wr = 1,
+        };
+        idle_qp = mrc_create_qp(context, &init);
+        assert(idle_qp);
+        const struct connection peer = { .gid = test.route.peer_gid, .qpn = 13 };
+        configure_qp(idle_qp, address, &peer, 0, false, true, 0, 0, 0);
+        struct mrc_dpdk_route route = path_route(pool, false);
+        route.peer_pkey = test.route.peer_pkey;
+        route.udp_port = test.route.udp_port;
+        attach_qp(idle_qp, &route);
+    }
+    prepare_memif_links();
+    const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS];
+    for (uint16_t rail = 0; rail < DUPLEX_RAILS; rail++) {
+        callbacks[rail] = rte_eth_add_rx_callback(rail, 0, observe_endpoint_batch, &test);
+        assert(callbacks[rail]);
+    }
+    if (client) {
+        run_endpoint_batches(context, &test);
+    } else {
+        char done[PATH_MAX];
+        path_for(done, directory, "tx.endpoint-done");
+        publish(directory, "rx.endpoint-ready", NULL, 0);
+        uint64_t deadline = rte_get_timer_cycles() + 4 * rte_get_timer_hz();
+        while (access(done, F_OK) != 0) {
+            assert(rte_get_timer_cycles() < deadline);
+            assert(mrc_dpdk_progress_endpoint(context) == 0);
+        }
+    }
+    assert(test.seen == EP_ALL_CASES && !test.held && !test.stale);
+    for (uint16_t rail = 0; rail < DUPLEX_RAILS; rail++) {
+        assert(rte_eth_remove_rx_callback(rail, 0, callbacks[rail]) == 0);
+        rte_free((void *)(uintptr_t)callbacks[rail]);
+    }
+    assert(mrc_dpdk_detach_endpoint(context) == 0);
+    if (idle_qp) {
+        assert(mrc_destroy_qp(idle_qp) == 0);
+        assert(mrc_destroy_cq(idle_cq) == 0);
+    }
+    printf("{\"role\":\"%s\",\"format\":\"%s\",\"endpoint_packets\":%u,\"adjusted_rtts\":%u}\n",
+           client ? "tx" : "rx", format, (unsigned int)__builtin_popcount(test.seen), test.adjusted_rtts);
 }
 
 static void attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
@@ -1602,6 +1976,7 @@ int main(int argc, char **argv)
     assert(argc >= 4 && (strcmp(argv[1], "tx") == 0 || strcmp(argv[1], "rx") == 0));
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
+    bool endpoint_ops = strcmp(argv[3], "endpoint_ops") == 0;
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
     bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
@@ -1627,7 +2002,9 @@ int main(int argc, char **argv)
         wire_mode = srv6_transit ? SIMPLEX_SRV6_TRANSIT : SIMPLEX_SRV6;
     const char *profile_store = NULL;
     uint64_t profile_id = 0;
-    if (ev_profile || cc_profile || qa_profile) {
+    if (endpoint_ops) {
+        assert(argc == 5);
+    } else if (ev_profile || cc_profile || qa_profile) {
         assert(argc == 6);
         profile_store = argv[4];
         char *end;
@@ -1639,15 +2016,17 @@ int main(int argc, char **argv)
                              strcmp(argv[3], "simplex") == 0));
     }
 
+    bool endpoint_shared = endpoint_ops && !strcmp(argv[4], "shared");
     struct address address = {0};
-    struct ibv_context *verbs = open_verbs(&address, generated_stev || srv6);
+    struct ibv_context *verbs = open_verbs(&address, generated_stev || srv6 || endpoint_shared);
     if (!verbs) {
         fputs("A verbs device with a usable Ethernet GID and pkey is required.\n", stderr);
         return EXIT_FAILURE;
     }
-    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    bool need_pd = !endpoint_ops || (endpoint_shared && !client);
+    struct ibv_pd *pd = need_pd ? ibv_alloc_pd(verbs) : NULL;
     struct mrc_context *context = mrc_create_context(verbs, NULL);
-    assert(pd && context);
+    assert((!need_pd || pd) && context);
 
     struct rte_mempool *pool = mrc_dpdk_packet_pool();
     assert(pool);
@@ -1656,14 +2035,17 @@ int main(int argc, char **argv)
         assert(mrc_dpdk_open_port(port, pool, &local) == 0);
     }
 
-    if (bidirectional)
+    if (endpoint_ops)
+        run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
+    else if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else
         run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store,
                     profile_id, wire_mode);
 
     assert(mrc_destroy_context(context) == 0);
-    assert(ibv_dealloc_pd(pd) == 0);
+    if (pd)
+        assert(ibv_dealloc_pd(pd) == 0);
     assert(ibv_close_device(verbs) == 0);
     for (unsigned int port = 0; port < 2; port++)
         mrc_dpdk_close_port(port);

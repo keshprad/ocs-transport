@@ -124,6 +124,10 @@ struct mrc_endpoint_config {
     uint16_t (*receive)(void *context, unsigned int path,
                         struct mrc_endpoint_rx_packet *packets, uint16_t max_packets);
     void *receive_context;
+    /* QP port status messages share the 16-bit identifier space with
+     * controller port status requests. The optional callback checks that
+     * space under the same lock as endpoint progress. */
+    bool (*port_status_token_in_use)(uint16_t token);
     struct mrc_endpoint_node *node;
 };
 
@@ -172,6 +176,16 @@ struct mrc_responder;
 
 uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path);
 bool mrc_endpoint_apply_ev_profile(struct mrc_endpoint_config *config);
+struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config *transfer,
+                                               unsigned int path, uint8_t opcode, uint32_t psn);
+bool mrc_endpoint_transmit(const struct mrc_endpoint_config *transfer, unsigned int path,
+                           const struct mrc_wire_packet *packet);
+uint16_t mrc_endpoint_feedback_timestamp(const struct mrc_endpoint_config *transfer,
+                                         uint64_t arrival_cycles, bool timestamp_present,
+                                         bool tsr, uint16_t timestamp);
+bool mrc_endpoint_receive_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
+                             struct mrc_endpoint_counters *counts, unsigned int path,
+                             const struct mrc_wire_packet *packet, uint64_t arrival_cycles);
 bool mrc_endpoint_route_matches(const struct mrc_endpoint_config *config, unsigned int path,
                                 const struct mrc_wire_srv6 *route);
 bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *config, unsigned int path,
