@@ -1,1 +1,4 @@
 /mrc_bench
+/mrc_write
+/tests/test_mrc_qp
+/tests/test_mrc_wire

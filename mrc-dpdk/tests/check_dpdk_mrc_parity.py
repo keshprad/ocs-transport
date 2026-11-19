@@ -4,35 +4,17 @@
 import argparse
 import csv
 import json
-import os
-import subprocess
 import sys
-import tempfile
-import time
 from pathlib import Path
+
+from memif_pair import MACS, eal_args, require, run_pair
 
 
 BYTES = 4 * 1024 * 1024
 FAULT_SEQ = 512
-MACS = {
-    "rx": ("02:00:00:00:00:10", "02:00:00:00:00:11"),
-    "tx": ("02:00:00:00:00:20", "02:00:00:00:00:21"),
-}
-
-
-def require(condition, message):
-    if not condition:
-        raise RuntimeError(message)
-
-
 def command(binary, role, cpu, directory, drop_after):
     other = "tx" if role == "rx" else "rx"
-    memif_role = "server" if role == "rx" else "client"
-    args = [str(binary), f"--lcores=0@{cpu}", "--no-huge", "--no-pci",
-            "--no-telemetry", f"--file-prefix={directory.name}-{role}", "-m", "64"]
-    for path, mac in enumerate(MACS[role]):
-        args += [f"--vdev=net_memif{path},role={memif_role},"
-                 f"socket={directory / f'path{path}.sock'},socket-abstract=no,mac={mac}"]
+    args = eal_args(binary, role, cpu, directory)
     args += ["--", role, str(BYTES), "1", "0", MACS[other][0], "1", MACS[other][1],
              "--rto-us", "50000", "--timeout-ms", "5000",
              "--trace", str(directory / f"{role}.csv")]
@@ -41,50 +23,21 @@ def command(binary, role, cpu, directory, drop_after):
     return args
 
 
-def start(binary, role, cpu, directory, drop_after):
-    env = {**os.environ, "XDG_RUNTIME_DIR": str(directory)}
-    return subprocess.Popen(command(binary, role, cpu, directory, drop_after),
-                            env=env, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
-
-
-def collect(process):
-    stdout, stderr = process.communicate(timeout=12)
-    require(process.returncode == 0,
-            f"Endpoint exited {process.returncode}\n{stdout}\n{stderr}")
-    return json.loads(stdout.strip().splitlines()[-1])
-
-
 def read_trace(path):
     with path.open(newline="") as stream:
         return [(row["event"], int(row["seq"]), int(row["path"]))
                 for row in csv.DictReader(stream)]
 
 
-def run_transfer(binary, cpus, drop_after=None):
-    with tempfile.TemporaryDirectory(prefix="mrc-") as temporary:
-        directory = Path(temporary)
-        processes = []
-        try:
-            receiver = start(binary, "rx", cpus[0], directory, drop_after)
-            processes.append(receiver)
-            deadline = time.monotonic() + 4
-            while not all((directory / f"path{path}.sock").exists() for path in range(2)):
-                if receiver.poll() is not None:
-                    collect(receiver)
-                    raise RuntimeError("Receiver exited before creating both memif sockets")
-                require(time.monotonic() < deadline, "Timed out waiting for memif sockets")
-                time.sleep(0.01)
-            sender = start(binary, "tx", cpus[1], directory, drop_after)
-            processes.append(sender)
-            tx = collect(sender)
-            rx = collect(receiver)
-            return tx, rx, read_trace(directory / "tx.csv"), read_trace(directory / "rx.csv")
-        finally:
-            for process in processes:
-                if process.poll() is None:
-                    process.kill()
-                process.communicate()
+def run_transfer(binary, drop_after=None):
+    def build(role, cpu, directory):
+        return command(binary, role, cpu, directory, drop_after)
+
+    def traces(directory):
+        return read_trace(directory / "tx.csv"), read_trace(directory / "rx.csv")
+
+    tx, rx, (sends, arrivals) = run_pair(build, traces)
+    return tx, rx, sends, arrivals
 
 
 def check_reorder(rx, trace, flow_stats):
@@ -116,8 +69,6 @@ def main():
     from srv6_mrc.reorder import FlowStats
     from srv6_mrc.topo import FlowKey
 
-    cpus = sorted(os.sched_getaffinity(0))
-    require(len(cpus) >= 2, "The two polling endpoints need at least two usable CPUs")
     binary = options.binary.resolve()
     require(binary.is_file(), f"Build the endpoint first: {binary}")
     flow = FlowKey("2001:db8::1", "2001:db8::2", 9000, 9001)
@@ -132,7 +83,7 @@ def main():
 
     topology = TwoPathTopology()
     ev_spray = EvSpray(topology=topology)
-    tx, rx, sends, arrivals = run_transfer(binary, cpus)
+    tx, rx, sends, arrivals = run_transfer(binary)
     check_reorder(rx, arrivals, FlowStats(flow))
     require(len(sends) == tx["packets"], "Healthy transfer retried or dropped a packet")
     for expected, (event, seq, path) in enumerate(sends):
@@ -140,7 +91,7 @@ def main():
                 f"Healthy packet {expected} differs from the emulator's path choice")
     print(json.dumps({"case": "healthy", "tx": tx, "rx": rx}))
 
-    tx, rx, sends, arrivals = run_transfer(binary, cpus, FAULT_SEQ)
+    tx, rx, sends, arrivals = run_transfer(binary, FAULT_SEQ)
     check_reorder(rx, arrivals, FlowStats(flow))
     require(rx["reordered"] > 0, "Fault did not exercise out-of-order placement")
     dropped = {seq for event, seq, path in sends if event == "drop" and path == 1}

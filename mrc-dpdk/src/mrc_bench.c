@@ -1,3 +1,5 @@
+#include "dpdk_io.h"
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -116,10 +118,7 @@ static bool send_frame(const struct bench *bench, unsigned int index, uint8_t ki
     if (length)
         memcpy(header + 1, payload + (size_t)seq * PAYLOAD, length);
 
-    if (rte_eth_tx_burst(path->port, 0, &packet, 1) == 1)
-        return true;
-    rte_pktmbuf_free(packet);
-    return false;
+    return mrc_dpdk_transmit(path->port, packet);
 }
 
 static const struct wire_header *read_header(const struct bench *bench,
@@ -376,37 +375,6 @@ static int receive_transfer(const struct bench *bench, uint8_t *data,
     return result;
 }
 
-static int configure_port(struct path *path, struct rte_mempool *pool)
-{
-    if (!rte_eth_dev_is_valid_port(path->port))
-        return -ENODEV;
-    struct rte_eth_conf config = {0};
-    int result = rte_eth_dev_configure(path->port, 1, 1, &config);
-    if (result)
-        return result;
-
-    uint16_t rx_desc = 1024, tx_desc = 1024;
-    result = rte_eth_dev_adjust_nb_rx_tx_desc(path->port, &rx_desc, &tx_desc);
-    int socket = rte_eth_dev_socket_id(path->port);
-    if (!result)
-        result = rte_eth_rx_queue_setup(path->port, 0, rx_desc, socket, NULL, pool);
-    if (!result)
-        result = rte_eth_tx_queue_setup(path->port, 0, tx_desc, socket, NULL);
-    if (!result)
-        result = rte_eth_macaddr_get(path->port, &path->local);
-    if (!result)
-        result = rte_eth_dev_start(path->port);
-    if (result) {
-        rte_eth_dev_close(path->port);
-        return result;
-    }
-
-    char name[RTE_ETH_NAME_MAX_LEN];
-    if (rte_eth_dev_get_name_by_port(path->port, name) == 0)
-        fprintf(stderr, "DPDK port %u: %s\n", path->port, name);
-    return 0;
-}
-
 static bool number(const char *text, uint32_t lower, uint32_t upper, uint32_t *value)
 {
     if (*text < '0' || *text > '9')
@@ -499,14 +467,14 @@ int main(int argc, char **argv)
             data[i] = payload_byte(i);
     }
 
-    bench.pool = rte_pktmbuf_pool_create("mrc_packets", 8191, 0, 0,
-                                        RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
+    bench.pool = mrc_dpdk_packet_pool();
     if (!bench.pool) {
         fprintf(stderr, "Could not allocate DPDK packet pool\n");
         goto done;
     }
     for (; started < PATHS; started++) {
-        int error = configure_port(&bench.paths[started], bench.pool);
+        struct path *path = &bench.paths[started];
+        int error = mrc_dpdk_open_port(path->port, bench.pool, &path->local);
         if (error) {
             fprintf(stderr, "Could not start port %u: %s\n", bench.paths[started].port,
                     strerror(-error));
@@ -545,10 +513,8 @@ int main(int argc, char **argv)
     result = EXIT_SUCCESS;
 
 done:
-    for (unsigned int i = 0; i < started; i++) {
-        rte_eth_dev_stop(bench.paths[i].port);
-        rte_eth_dev_close(bench.paths[i].port);
-    }
+    for (unsigned int i = 0; i < started; i++)
+        mrc_dpdk_close_port(bench.paths[i].port);
     if (bench.pool)
         rte_mempool_free(bench.pool);
     free(data);

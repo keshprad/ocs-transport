@@ -1,6 +1,9 @@
-# DPDK multipath transport prototype
+# DPDK multipath transport
 
-`mrc_bench` sends one host-memory buffer over two DPDK Ethernet ports.
+`mrc_write` is the in-progress OCP MRC 1.0 endpoint. See the
+[conformance status and verification](CONFORMANCE.md).
+
+`mrc_bench` is the original prototype. It sends one host-memory buffer over two DPDK Ethernet ports.
 It stripes 1,400-byte segments across the ports, places segments by sequence
 number, and sends selective ACKs as 64-segment bitmaps. When a segment's ACK
 times out, the sender retries it on the other path when available and temporarily
