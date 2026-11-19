@@ -11,7 +11,7 @@ from memif_pair import MACS, eal_args, require, run_pair
 
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
              trim_after=None, ipv6=False, work_requests=1, posted_receives=None,
-             expected_errors=None, negotiate=False):
+             expected_errors=None, negotiate=False, srv6=False):
     oob_port = None
     if negotiate:
         with socket.socket() as reserve:
@@ -27,6 +27,9 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
         args += ["--", role, str(size), local_ip, peer_ip, "0", MACS[peer][0],
                  "1", MACS[peer][1], "--ack-timeout", "16",
                  "--work-requests", str(work_requests), *options]
+        if srv6:
+            sids = {"tx": "2001:db8:aaaa::1", "rx": "2001:db8:bbbb::3"}
+            args += ["--srv6-local", sids[role], "--srv6-peer", sids[peer], "--srv6-srh", "1"]
         if negotiate:
             args += ["--oob-host", "127.0.0.1", "--oob-port", oob_port]
             if tx:
@@ -122,6 +125,12 @@ def main():
     tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8)
     require(rx["immediate_completions"] == 8, "Negotiated WRITEIMM sequence was incomplete")
     print(json.dumps({"case": "negotiated_qp", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 41989, "--immediate", "22", trim_after=16,
+                      ipv6=True, srv6=True)
+    require(rx["trimmed"] > 0 and tx["trim_nacks"] > 0 and rx["immediate_completed"],
+            f"Preserved SRv6 wrapper or outer trim recovery failed: {tx}, {rx}")
+    print(json.dumps({"case": "srv6_write_imm_trim_nack", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ enum {
     REQUESTOR_EV_PORT = 0xc000,
     RESPONDER_EV_PORT = 0xd000,
     EV_FLOW_LABEL = 0xa0100,
+    SINGLE_SEGMENT_SRH_LEN = 24,
     NOMINAL_MTU = PMTU + UDP_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN +
                   MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
     INITIAL_CWND = 128 * NOMINAL_MTU,
@@ -88,6 +89,10 @@ struct transfer {
     uint8_t local_ip6[MRC_IPV6_ADDR_LEN];
     uint8_t peer_ip6[MRC_IPV6_ADDR_LEN];
     enum mrc_wire_ip_version ip_version;
+    uint8_t local_sid[MRC_IPV6_ADDR_LEN];
+    uint8_t peer_sid[MRC_IPV6_ADDR_LEN];
+    bool srv6;
+    bool srv6_srh;
     uint32_t drop_after;
     uint32_t trim_after;
     uint32_t final_ack_drops;
@@ -299,9 +304,15 @@ static size_t simulate_trim(const struct transfer *transfer, uint8_t *frame)
         uint32_t vtc_flow = rte_be_to_cpu_32(header.vtc_flow);
         vtc_flow = (vtc_flow & ~(UINT32_C(63) << 22)) | (uint32_t)transfer->trim_dscp << 22;
         header.vtc_flow = rte_cpu_to_be_32(vtc_flow);
-        header.payload_len = rte_cpu_to_be_16((uint16_t)(UDP_HEADER_LEN + trim_headers));
+        size_t outer_payload = UDP_HEADER_LEN + trim_headers;
+        if (transfer->srv6) {
+            outer_payload += sizeof(struct rte_ipv6_hdr);
+            if (transfer->srv6_srh)
+                outer_payload += SINGLE_SEGMENT_SRH_LEN;
+        }
+        header.payload_len = rte_cpu_to_be_16((uint16_t)outer_payload);
         memcpy(ip, &header, sizeof(header));
-        return MRC_WIRE_IPV6_HEADER_LEN + trim_headers;
+        return RTE_ETHER_HDR_LEN + sizeof(header) + outer_payload;
     }
 
     struct rte_ipv4_hdr header;
@@ -323,7 +334,19 @@ static bool transmit_frame(const struct transfer *transfer, unsigned int path,
         return false;
     uint8_t *frame = rte_pktmbuf_mtod(mbuf, uint8_t *);
     size_t length;
-    int result = mrc_wire_encode(frame, rte_pktmbuf_tailroom(mbuf), packet, &length);
+    size_t capacity = rte_pktmbuf_tailroom(mbuf);
+    int result = mrc_wire_encode(frame, capacity, packet, &length);
+    if (!result && transfer->srv6) {
+        struct mrc_wire_srv6_tx route = {
+            .flow_label = packet->ipv6.flow_label,
+            .dscp = packet->ipv6.dscp, .ecn = packet->ipv6.ecn,
+            .segment_list = transfer->srv6_srh ? &transfer->peer_sid : NULL,
+            .segment_count = transfer->srv6_srh ? 1u : 0u,
+        };
+        memcpy(route.outer_src_ip, transfer->local_sid, MRC_IPV6_ADDR_LEN);
+        memcpy(route.outer_dst_ip, transfer->peer_sid, MRC_IPV6_ADDR_LEN);
+        result = mrc_wire_wrap_srv6(frame, capacity, length, &route, &length);
+    }
     if (result) {
         rte_pktmbuf_free(mbuf);
         return false;
@@ -379,13 +402,36 @@ static bool peer_matches(const struct transfer *transfer, unsigned int index,
            memcmp(ip->dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
 }
 
+static bool route_matches(const struct transfer *transfer, const struct mrc_wire_srv6 *route)
+{
+    return !route->encapsulated ||
+           (transfer->srv6 &&
+            memcmp(route->outer_src_ip, transfer->peer_sid, MRC_IPV6_ADDR_LEN) == 0 &&
+            memcmp(route->outer_dst_ip, transfer->local_sid, MRC_IPV6_ADDR_LEN) == 0);
+}
+
+static int decode_routed(const struct transfer *transfer, const uint8_t *frame, size_t length,
+                         struct mrc_wire_packet *packet)
+{
+    struct mrc_wire_srv6 route;
+    int result = mrc_wire_decode_srv6(frame, length, packet, &route);
+    if (result)
+        return result;
+    if (!route_matches(transfer, &route))
+        return -EHOSTUNREACH;
+    /* Propagate a fabric CE mark before building reliability feedback. */
+    if (route.encapsulated && route.outer_ecn == 3 && packet->ip_version == MRC_WIRE_IP6)
+        packet->ipv6.ecn = 3;
+    return 0;
+}
+
 static bool decode(const struct transfer *transfer, unsigned int index,
                    const struct rte_mbuf *mbuf, uint8_t scratch[FRAME_CAPACITY],
                    struct mrc_wire_packet *packet)
 {
     size_t length;
     const uint8_t *frame = read_frame(mbuf, scratch, &length);
-    return frame && !mrc_wire_decode_ip(frame, length, packet) &&
+    return frame && !decode_routed(transfer, frame, length, packet) &&
            peer_matches(transfer, index, packet);
 }
 
@@ -1037,10 +1083,11 @@ static int receive_frame(const struct transfer *transfer, struct responder *rece
         return 0;
 
     struct mrc_wire_trimmed trimmed;
-    int result = mrc_wire_decode_trimmed_ip(frame, length, transfer->trim_dscp, &trimmed);
+    struct mrc_wire_srv6 route;
+    int result = mrc_wire_decode_trimmed_srv6(frame, length, transfer->trim_dscp, &trimmed, &route);
     struct mrc_wire_packet packet;
     if (result != -EPROTONOSUPPORT) {
-        if (!result) {
+        if (!result && route_matches(transfer, &route)) {
             packet.bth = trimmed.bth;
             packet.ip_version = trimmed.ip_version;
             if (trimmed.ip_version == MRC_WIRE_IP6)
@@ -1055,7 +1102,7 @@ static int receive_frame(const struct transfer *transfer, struct responder *rece
         return 0;
     }
 
-    result = mrc_wire_decode_ip(frame, length, &packet);
+    result = decode_routed(transfer, frame, length, &packet);
     if (!result && peer_matches(transfer, path, &packet)) {
         if (receive_endpoint_op(transfer, &receiver->node, counts, path, &packet))
             return 0;
@@ -1229,7 +1276,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     transfer->remote_address = default_remote_address;
     transfer->remote_key = DEFAULT_REMOTE_KEY;
     uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
-    uint32_t oob_port = 0, trim_nack = 1;
+    uint32_t oob_port = 0, trim_nack = 1, srv6_srh = 0;
+    bool local_sid = false, peer_sid = false;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
     uint32_t mpr = WINDOW / MRC_MPR_UNIT, p_key = DEFAULT_PARTITION_KEY;
     for (int i = 9; i < argc; i += 2) {
@@ -1245,6 +1293,16 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
         if (!strcmp(key, "--oob-port") && number(value, 1, UINT16_MAX, &oob_port))
             continue;
         if (!strcmp(key, "--trim-nack") && number(value, 0, 1, &trim_nack))
+            continue;
+        if (!strcmp(key, "--srv6-local") && inet_pton(AF_INET6, value, transfer->local_sid) == 1) {
+            local_sid = true;
+            continue;
+        }
+        if (!strcmp(key, "--srv6-peer") && inet_pton(AF_INET6, value, transfer->peer_sid) == 1) {
+            peer_sid = true;
+            continue;
+        }
+        if (!strcmp(key, "--srv6-srh") && number(value, 0, 1, &srv6_srh))
             continue;
         if (!strcmp(key, "--trim-dscp") && number(value, 1, 63, &trim_dscp) &&
             trim_dscp != CONTROL_DSCP)
@@ -1302,7 +1360,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
         (transfer->drop_after != UINT32_MAX && transfer->drop_after >= total_packets) ||
         (transfer->trim_after != UINT32_MAX && transfer->trim_after >= total_packets) ||
         (transfer->drop_after != UINT32_MAX && transfer->trim_after != UINT32_MAX) ||
-        (!!transfer->oob_address != !!oob_port))
+        (!!transfer->oob_address != !!oob_port) || local_sid != peer_sid ||
+        (local_sid && transfer->ip_version != MRC_WIRE_IP6) || (srv6_srh && !local_sid))
         return false;
     transfer->bytes = (uint32_t)total_bytes;
     transfer->packets = (uint32_t)total_packets;
@@ -1317,6 +1376,8 @@ static bool parse_args(int argc, char **argv, struct transfer *transfer)
     transfer->timeout_ms = timeout_ms;
     transfer->oob_port = (uint16_t)oob_port;
     transfer->trim_nack_enabled = trim_nack != 0;
+    transfer->srv6 = local_sid;
+    transfer->srv6_srh = srv6_srh != 0;
     transfer->trim_dscp = (uint8_t)trim_dscp;
     transfer->timeout_exponent = exponent;
     transfer->linear_retries = linear_retries;
@@ -1405,7 +1466,8 @@ int main(int argc, char **argv)
                         "       [--ack-timeout N] [--linear-retries N]\n"
                         "       [--exp-retries N] [--timeout-ms N] [--drop-path-after N (tx)]\n"
                         "       [--trim-dscp N] [--trim-nack 0|1] [--trim-path-after N (tx)]\n"
-                        "       [--drop-final-acks N (rx)] [--oob-host IP --oob-port N]\n",
+                        "       [--drop-final-acks N (rx)] [--oob-host IP --oob-port N]\n"
+                        "       [--srv6-local SID --srv6-peer SID] [--srv6-srh 0|1]\n",
                 argv[0]);
         goto done;
     }

@@ -96,6 +96,34 @@ struct mrc_wire_ipv6 {
     uint8_t hop_limit; /* 0 requests 64 when encoding. */
 };
 
+/* Diagnostic routing metadata. Addresses are wire-order octets. */
+struct mrc_wire_srv6 {
+    bool encapsulated;
+    uint8_t outer_src_ip[MRC_IPV6_ADDR_LEN];
+    uint8_t outer_dst_ip[MRC_IPV6_ADDR_LEN];
+    uint8_t outer_dscp;
+    uint8_t outer_ecn;
+    uint8_t outer_hop_limit;
+    uint16_t srh_len; /* Zero when absent. */
+};
+
+/*
+ * Outer IPv6 fields for an already routed SRv6 packet. The segment list is
+ * made of prepacked RFC 9800 containers in RFC 8754 wire order. Set the
+ * destination address and Segments Left for the chosen full or reduced list.
+ */
+struct mrc_wire_srv6_tx {
+    uint8_t outer_src_ip[MRC_IPV6_ADDR_LEN];
+    uint8_t outer_dst_ip[MRC_IPV6_ADDR_LEN];
+    uint32_t flow_label;
+    uint8_t dscp;
+    uint8_t ecn;
+    uint8_t hop_limit; /* 0 requests 64 when encoding. */
+    const uint8_t (*segment_list)[MRC_IPV6_ADDR_LEN];
+    size_t segment_count; /* 0 omits the SRH. */
+    uint8_t segments_left;
+};
+
 struct mrc_wire_bth {
     uint8_t opcode;
     uint16_t p_key;
@@ -233,6 +261,27 @@ int mrc_wire_decode(const uint8_t *frame, size_t length, struct mrc_wire_packet 
 int mrc_wire_decode_ip(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet);
 
 /*
+ * Expand an already encoded bare IPv6/UDP MRC frame in place. The frame's
+ * Ethernet header and complete inner datagram, including iCRC, are retained.
+ * This validates inner bounds and framing. Use the ordinary receive decoder
+ * for end-to-end integrity validation.
+ */
+int mrc_wire_wrap_srv6(uint8_t *frame, size_t capacity, size_t inner_frame_len,
+                        const struct mrc_wire_srv6_tx *route, size_t *length);
+
+/*
+ * Receive a bare IP frame or preserved SRv6 encapsulation as in OCP 9.3.5.1.
+ * With an SRH, the packet must be at the end of its route (Segments Left 0).
+ * The optional routing output is zero for a bare frame. Packet MAC addresses
+ * describe the received Ethernet header. IP fields, RoCE iCRC, and zero-copy
+ * payload refer to the inner datagram. The caller remains responsible for
+ * local SID and inner address checks and any outer ECN handling. This
+ * function validates SRH lengths but does not process transit SIDs or HMAC.
+ */
+int mrc_wire_decode_srv6(const uint8_t *frame, size_t length, struct mrc_wire_packet *packet,
+                         struct mrc_wire_srv6 *routing);
+
+/*
  * Validate the envelope and iCRC of a complete datagram without interpreting
  * the opcode. Accepts matching IP/UDP lengths only. A responder can use this
  * after an unsupported opcode to match a QP and report an invalid request.
@@ -253,5 +302,13 @@ int mrc_wire_decode_trimmed(const uint8_t *frame, size_t length, uint8_t trim_ds
                             struct mrc_wire_trimmed *packet);
 int mrc_wire_decode_trimmed_ip(const uint8_t *frame, size_t length, uint8_t trim_dscp,
                                struct mrc_wire_trimmed *packet);
+
+/*
+ * Preserved encapsulation is classified by the outer IPv6 DSCP. Bare frames
+ * use their own DSCP. Output contains only reliability metadata and never a
+ * payload view. If requested, routing metadata is zero for a bare frame.
+ */
+int mrc_wire_decode_trimmed_srv6(const uint8_t *frame, size_t length, uint8_t trim_dscp,
+                                 struct mrc_wire_trimmed *packet, struct mrc_wire_srv6 *routing);
 
 #endif
