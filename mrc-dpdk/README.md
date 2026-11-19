@@ -57,6 +57,8 @@ tracked in [conformance](CONFORMANCE.md).
 ### Work completions
 
 The endpoint posts send work and WRITEIMM receive credits on a provider QP.
+First sends and retries read the posted work's source and remote address.
+Each registered send buffer stays pinned until retirement or flush.
 A successful Transport ACK retires completed WRITE requests. Ordered
 WRITEIMM placement consumes the next posted receive and publishes the
 immediate value through the receive completion queue. A terminal wire error

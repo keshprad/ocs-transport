@@ -130,7 +130,6 @@ struct transfer {
     uint8_t *data;
     struct mrc_provider_pd *pd;
     struct mrc_provider_mr_keys buffer_keys;
-    struct mrc_provider_mr_lease source_lease;
 };
 
 struct rx_counters {
@@ -236,12 +235,6 @@ static uint8_t pattern(uint32_t offset)
 static uint32_t request_index(const struct transfer *transfer, uint32_t index)
 {
     return index / transfer->wr_packets;
-}
-
-static uint32_t buffer_offset(const struct transfer *transfer, uint32_t index)
-{
-    return request_index(transfer, index) * transfer->wr_bytes +
-           (index % transfer->wr_packets) * PMTU;
 }
 
 static uint32_t length_at(const struct transfer *transfer, uint32_t index)
@@ -603,30 +596,36 @@ static enum mrc_ev_feedback ev_mark(uint8_t mark)
     }
 }
 
-static bool send_write(const struct transfer *transfer, struct sender *sender,
+static int send_write(const struct transfer *transfer, struct sender *sender,
                        struct counters *counts, unsigned int path, uint32_t index,
                        bool retry)
 {
+    uint32_t wr = request_index(transfer, index);
+    struct mrc_provider_write_view write;
+    int result = mrc_provider_qp_get_write(sender->provider_qp, wr + 1, &write);
+    if (result)
+        return result;
+    if (write.length != transfer->wr_bytes || write.with_immediate != transfer->with_immediate)
+        return -EPROTO;
+
     struct mrc_wire_packet packet = packet_for(transfer, path, expected_opcode(transfer, index),
         mrc_psn_add(transfer->initial_psn, (int32_t)index));
     struct mrc_cc after_send = sender->cc;
     if (!mrc_cc_on_send(&after_send, nominal_at(transfer, index)))
-        return false;
+        return -EPROTO;
     packet.bth.retransmit = retry;
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
                              index + 1 == transfer->packets ||
                              mrc_cc_ack_request(&after_send, SACK_THRESHOLD);
-    uint32_t wr = request_index(transfer, index);
-    uint32_t offset = buffer_offset(transfer, index);
+    uint32_t offset = (index % transfer->wr_packets) * PMTU;
     packet.body.write = (struct mrc_wire_write){
-        .rqmsn = transfer->with_immediate ? (uint16_t)(wr + 1) : 0,
+        .rqmsn = write.with_immediate ? (uint16_t)(wr + 1) : 0,
         .msn = (uint16_t)(wr + 1),
-        .va = transfer->remote_address + offset,
-        .r_key = transfer->remote_key,
-        .dma_len = transfer->wr_bytes,
-        .imm_data = transfer->immediate + wr,
-        .data = (const uint8_t *)(transfer->source_lease.owner ? transfer->source_lease.address
-                                                                 : transfer->data) + offset,
+        .va = write.remote_address + offset,
+        .r_key = write.rkey,
+        .dma_len = write.length,
+        .imm_data = write.immediate,
+        .data = write.data ? write.data + offset : NULL,
         .data_len = length_at(transfer, index),
     };
 
@@ -635,7 +634,7 @@ static bool send_write(const struct transfer *transfer, struct sender *sender,
     } else {
         bool inject_trim = path == 1 && sender->next >= transfer->trim_after;
         if (!transmit_frame(transfer, path, &packet, inject_trim))
-            return false;
+            return -EAGAIN;
         counts->trimmed += inject_trim;
     }
 
@@ -644,7 +643,7 @@ static bool send_write(const struct transfer *transfer, struct sender *sender,
         counts->retries[path]++;
     else
         counts->sent[path]++;
-    return true;
+    return 0;
 }
 
 static bool retire_redundant_attempt(const struct transfer *transfer, struct sender *sender,
@@ -1012,13 +1011,19 @@ static int retry_due_packets(const struct transfer *transfer, struct sender *sen
         if (picked < 0)
             continue;
         unsigned int path = (unsigned int)picked;
-        if (!send_write(transfer, sender, counts, path, index, true)) {
+        int sent = send_write(transfer, sender, counts, path, index, true);
+        if (sent == -EAGAIN) {
             available &= ~(UINT32_C(1) << path);
             picked = mrc_ev_pick(&sender->ev, available, avoid, now);
-            if (picked < 0 || !send_write(transfer, sender, counts, (unsigned int)picked, index, true))
+            if (picked < 0)
                 continue;
             path = (unsigned int)picked;
+            sent = send_write(transfer, sender, counts, path, index, true);
+            if (sent == -EAGAIN)
+                continue;
         }
+        if (sent)
+            return sent;
         mrc_ev_sent(&sender->ev, path);
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
@@ -1168,13 +1173,16 @@ static int poll_sender(const struct transfer *transfer, struct counters *counts,
             if (picked < 0)
                 break;
             unsigned int path = (unsigned int)picked;
-            if (!send_write(transfer, &sender, counts, path, index, false)) {
+            result = send_write(transfer, &sender, counts, path, index, false);
+            if (result == -EAGAIN) {
                 if (!sender.blocked_since[path])
                     sender.blocked_since[path] = now;
                 if (now - sender.blocked_since[path] >= transfer->initial_rto)
                     mrc_ev_timeout(&sender.ev, path, now);
                 break;
             }
+            if (result)
+                return result;
             sender.blocked_since[path] = 0;
             mrc_ev_sent(&sender.ev, path);
             if (!mrc_tx_track(&sender.qp, psn, now))
@@ -1195,10 +1203,20 @@ static int run_sender(const struct transfer *transfer, struct counters *counts)
     int result = mrc_provider_cq_create(transfer->work_requests, &cq);
     if (!result)
         result = open_provider_qp(transfer, cq, &qp);
-    for (uint32_t wr = 1; !result && wr <= transfer->work_requests; wr++) {
+    for (uint32_t wr = 0; !result && wr < transfer->work_requests; wr++) {
+        uint32_t offset = wr * transfer->wr_bytes;
+        const struct mrc_provider_write write = {
+            .wr_id = wr + 1,
+            .local_buffer = transfer->pd ? NULL : transfer->data + offset,
+            .local_iova = transfer->pd ? (uint64_t)(uintptr_t)(transfer->data + offset) : 0,
+            .remote_address = transfer->remote_address + offset,
+            .length = transfer->wr_bytes, .lkey = transfer->buffer_keys.lkey,
+            .rkey = transfer->remote_key, .with_immediate = transfer->with_immediate,
+            .immediate = transfer->immediate + wr,
+        };
         uint64_t sequence;
-        result = mrc_provider_qp_post_send(qp, wr, transfer->wr_bytes, false, &sequence);
-        if (!result && sequence != wr)
+        result = mrc_provider_qp_post_write(qp, &write, &sequence);
+        if (!result && sequence != wr + 1)
             result = -EPROTO;
     }
     if (!result)
@@ -1886,27 +1904,15 @@ static int register_buffer(struct transfer *transfer)
                                       flags, &transfer->buffer_keys);
     if (result)
         return result;
-    if (!transfer->sender) {
+    if (!transfer->sender)
         transfer->remote_key = transfer->buffer_keys.rkey;
-        return 0;
-    }
-
-    const struct mrc_provider_mr_access source = {
-        .iova = iova, .length = transfer->bytes, .key = transfer->buffer_keys.lkey,
-        .operation = MRC_PROVIDER_MR_READ_LOCAL,
-    };
-    return mrc_provider_mr_acquire(transfer->pd, &source, &transfer->source_lease);
+    return 0;
 }
 
 static int deregister_buffer(struct transfer *transfer)
 {
     if (!transfer->pd)
         return 0;
-    if (transfer->source_lease.owner) {
-        int result = mrc_provider_mr_release(&transfer->source_lease);
-        if (result)
-            return result;
-    }
     if (transfer->buffer_keys.lkey) {
         int result = mrc_provider_mr_deregister(transfer->pd, transfer->buffer_keys.lkey);
         if (result)

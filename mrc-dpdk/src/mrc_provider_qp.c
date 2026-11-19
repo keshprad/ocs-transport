@@ -6,9 +6,11 @@
 #include <stdlib.h>
 
 struct work_entry {
+    struct mrc_provider_mr_lease lease;
+    struct mrc_provider_write_view write;
     uint64_t id;
-    uint32_t length;
     bool signaled;
+    bool has_write;
 };
 
 struct work_queue {
@@ -119,19 +121,16 @@ int mrc_provider_qp_destroy(struct mrc_provider_qp *qp)
     return 0;
 }
 
-static int enqueue(struct work_queue *queue, struct work_entry work)
+static struct work_entry *next_entry(struct work_queue *queue)
 {
     if (queue->count == queue->capacity)
-        return -ENOSPC;
-    size_t tail = (queue->head + queue->count) % queue->capacity;
-    queue->entries[tail] = work;
-    queue->count++;
-    return 0;
+        return NULL;
+    return &queue->entries[(queue->head + queue->count) % queue->capacity];
 }
 
-static struct work_entry dequeue(struct work_queue *queue)
+static struct work_entry *dequeue(struct work_queue *queue)
 {
-    struct work_entry entry = queue->entries[queue->head];
+    struct work_entry *entry = &queue->entries[queue->head];
     queue->head = (queue->head + 1) % queue->capacity;
     queue->count--;
     return entry;
@@ -148,9 +147,11 @@ static int flush_qp(struct mrc_provider_qp *qp, uint64_t sequence,
     qp->state = MRC_PROVIDER_QP_ERROR;
     int result = 0;
     while (qp->send.count) {
-        struct work_entry work = dequeue(&qp->send);
+        struct work_entry *work = dequeue(&qp->send);
+        if (work->lease.owner)
+            mrc_provider_mr_release(&work->lease);
         const struct mrc_provider_wc wc = {
-            .wr_id = work.id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_WRITE,
+            .wr_id = work->id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_WRITE,
             .status = qp->first_sequence++ == sequence ? status : MRC_PROVIDER_WC_FLUSHED,
         };
         int error = mrc_provider_cq_push(qp->send.cq, &wc, false);
@@ -158,9 +159,9 @@ static int flush_qp(struct mrc_provider_qp *qp, uint64_t sequence,
             result = error;
     }
     while (qp->recv.count) {
-        struct work_entry work = dequeue(&qp->recv);
+        struct work_entry *work = dequeue(&qp->recv);
         const struct mrc_provider_wc wc = {
-            .wr_id = work.id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_RECV_WRITE_IMM,
+            .wr_id = work->id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_RECV_WRITE_IMM,
             .status = MRC_PROVIDER_WC_FLUSHED,
         };
         int error = mrc_provider_cq_push(qp->recv.cq, &wc, false);
@@ -193,23 +194,95 @@ int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_
     return result;
 }
 
+static int reserve_send(struct mrc_provider_qp *qp, struct work_entry **work)
+{
+    if (qp->state != MRC_PROVIDER_QP_RTS)
+        return -EINVAL;
+    if (qp->next_sequence == UINT64_MAX)
+        return -EOVERFLOW;
+    *work = next_entry(&qp->send);
+    return *work ? 0 : -ENOSPC;
+}
+
 int mrc_provider_qp_post_send(struct mrc_provider_qp *qp, uint64_t wr_id, uint32_t length,
                               bool signaled, uint64_t *sequence)
 {
     if (!qp || !sequence)
         return -EINVAL;
     pthread_mutex_lock(&qp->mutex);
-    int result;
-    if (qp->state != MRC_PROVIDER_QP_RTS) {
-        result = -EINVAL;
-    } else if (qp->next_sequence == UINT64_MAX) {
-        result = -EOVERFLOW;
+    struct work_entry *work;
+    int result = reserve_send(qp, &work);
+    if (!result) {
+        *work = (struct work_entry){ .id = wr_id, .write.length = length,
+                                     .signaled = signaled || qp->sq_sig_all };
+        qp->send.count++;
+        *sequence = qp->next_sequence++;
+    }
+    pthread_mutex_unlock(&qp->mutex);
+    return result;
+}
+
+int mrc_provider_qp_post_write(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                               uint64_t *sequence)
+{
+    if (!qp || !write || !sequence)
+        return -EINVAL;
+    if (write->length > UINT64_MAX - write->remote_address)
+        return -EOVERFLOW;
+    if (qp->pd) {
+        if (write->local_buffer || (!write->lkey && (write->local_iova || write->length)))
+            return -EINVAL;
     } else {
-        result = enqueue(&qp->send, (struct work_entry){
-            .id = wr_id, .length = length, .signaled = signaled || qp->sq_sig_all,
-        });
-        if (!result)
+        if (write->lkey || write->local_iova || (write->length && !write->local_buffer))
+            return -EINVAL;
+        if (write->length > UINTPTR_MAX - (uintptr_t)write->local_buffer)
+            return -EOVERFLOW;
+    }
+
+    pthread_mutex_lock(&qp->mutex);
+    struct work_entry *work;
+    int result = reserve_send(qp, &work);
+    if (!result) {
+        *work = (struct work_entry){0};
+        if (write->lkey) {
+            const struct mrc_provider_mr_access access = {
+                .iova = write->local_iova, .length = write->length, .key = write->lkey,
+                .operation = MRC_PROVIDER_MR_READ_LOCAL,
+            };
+            result = mrc_provider_mr_acquire(qp->pd, &access, &work->lease);
+        }
+        if (!result) {
+            work->write = (struct mrc_provider_write_view){
+                .data = work->lease.owner ? work->lease.address : write->local_buffer,
+                .remote_address = write->remote_address, .length = write->length,
+                .rkey = write->rkey, .immediate = write->immediate,
+                .with_immediate = write->with_immediate,
+            };
+            work->id = write->wr_id;
+            work->signaled = write->signaled || qp->sq_sig_all;
+            work->has_write = true;
+            qp->send.count++;
             *sequence = qp->next_sequence++;
+        }
+    }
+    pthread_mutex_unlock(&qp->mutex);
+    return result;
+}
+
+int mrc_provider_qp_get_write(struct mrc_provider_qp *qp, uint64_t sequence,
+                              struct mrc_provider_write_view *write)
+{
+    if (!qp || !write)
+        return -EINVAL;
+    pthread_mutex_lock(&qp->mutex);
+    int result = -ENOENT;
+    if (sequence >= qp->first_sequence && sequence < qp->next_sequence) {
+        size_t offset = (size_t)(sequence - qp->first_sequence);
+        struct work_entry *work = &qp->send.entries[(qp->send.head + offset) % qp->send.capacity];
+        if (work->has_write) {
+            *write = work->write;
+            result = 0;
+        }
     }
     pthread_mutex_unlock(&qp->mutex);
     return result;
@@ -221,8 +294,16 @@ int mrc_provider_qp_post_recv(struct mrc_provider_qp *qp, uint64_t wr_id)
         return -EINVAL;
     pthread_mutex_lock(&qp->mutex);
     int result = -EINVAL;
-    if (qp->state >= MRC_PROVIDER_QP_INIT && qp->state <= MRC_PROVIDER_QP_RTS)
-        result = enqueue(&qp->recv, (struct work_entry){ .id = wr_id });
+    if (qp->state >= MRC_PROVIDER_QP_INIT && qp->state <= MRC_PROVIDER_QP_RTS) {
+        struct work_entry *work = next_entry(&qp->recv);
+        if (work) {
+            *work = (struct work_entry){ .id = wr_id };
+            qp->recv.count++;
+            result = 0;
+        } else {
+            result = -ENOSPC;
+        }
+    }
     pthread_mutex_unlock(&qp->mutex);
     return result;
 }
@@ -238,12 +319,14 @@ int mrc_provider_qp_complete_send(struct mrc_provider_qp *qp, uint64_t sequence)
         result = -EINVAL;
     } else {
         while (!result && qp->first_sequence <= sequence) {
-            struct work_entry work = dequeue(&qp->send);
+            struct work_entry *work = dequeue(&qp->send);
+            if (work->lease.owner)
+                mrc_provider_mr_release(&work->lease);
             qp->first_sequence++;
-            if (work.signaled) {
+            if (work->signaled) {
                 const struct mrc_provider_wc wc = {
-                    .wr_id = work.id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_WRITE,
-                    .status = MRC_PROVIDER_WC_SUCCESS, .byte_length = work.length,
+                    .wr_id = work->id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_WRITE,
+                    .status = MRC_PROVIDER_WC_SUCCESS, .byte_length = work->write.length,
                 };
                 result = mrc_provider_cq_push(qp->send.cq, &wc, false);
             }
@@ -267,9 +350,9 @@ int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
     } else if (!qp->recv.count) {
         result = -ENOBUFS;
     } else {
-        struct work_entry work = dequeue(&qp->recv);
+        struct work_entry *work = dequeue(&qp->recv);
         const struct mrc_provider_wc wc = {
-            .wr_id = work.id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_RECV_WRITE_IMM,
+            .wr_id = work->id, .qpn = qp->qpn, .opcode = MRC_PROVIDER_WC_RECV_WRITE_IMM,
             .status = MRC_PROVIDER_WC_SUCCESS, .byte_length = length, .with_immediate = true,
             .immediate = immediate,
         };
@@ -277,7 +360,7 @@ int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
         if (result)
             flush_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
         else
-            *wr_id = work.id;
+            *wr_id = work->id;
     }
     pthread_mutex_unlock(&qp->mutex);
     return result;

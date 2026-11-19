@@ -313,6 +313,82 @@ static void test_qp_lifecycle_and_ordered_flush(void)
     assert(mrc_provider_pd_destroy(pd) == 0);
 }
 
+static void test_posted_write_buffer_lifetime(void)
+{
+    unsigned char buffer[32] = "0123456789abcdefghijklmnopqrst";
+    struct mrc_provider_pd *pd;
+    struct mrc_provider_cq *cq;
+    assert(mrc_provider_pd_create(1, &pd) == 0);
+    assert(mrc_provider_cq_create(3, &cq) == 0);
+    struct mrc_provider_mr_keys keys;
+    assert(mrc_provider_mr_register(pd, buffer, sizeof(buffer), 0x12000, 0, &keys) == 0);
+    struct mrc_provider_qp *qp;
+    const struct mrc_provider_qp_config config = {
+        .pd = pd, .send_cq = cq, .send_capacity = 3, .qpn = 46, .sq_sig_all = true,
+    };
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    ready_to_send(qp);
+
+    struct mrc_provider_write write = {
+        .wr_id = 201, .local_iova = 0x12004, .remote_address = 0x1900,
+        .length = 7, .lkey = keys.lkey, .rkey = 0xaabbccdd,
+        .immediate = 0x9988, .with_immediate = true,
+    };
+    uint64_t first = 0, second, zero_length;
+    write.local_buffer = buffer;
+    assert(mrc_provider_qp_post_write(qp, &write, &first) == -EINVAL);
+    write.local_buffer = NULL;
+    write.local_iova = 0x1201f;
+    assert(mrc_provider_qp_post_write(qp, &write, &first) == -EACCES);
+    write.local_iova = 0x12004;
+    write.lkey ^= UINT32_C(0x80000000);
+    assert(mrc_provider_qp_post_write(qp, &write, &first) == -EACCES);
+    write.lkey = keys.lkey;
+    write.remote_address = UINT64_MAX;
+    assert(mrc_provider_qp_post_write(qp, &write, &first) == -EOVERFLOW && first == 0);
+    write.remote_address = 0x1900;
+    assert(mrc_provider_qp_post_write(qp, &write, &first) == 0 && first == 1);
+
+    write.wr_id = 202;
+    write.local_iova = 0x12010;
+    write.remote_address = 0x2911;
+    write.length = 4;
+    write.rkey = 0xbbccddaa;
+    write.with_immediate = false;
+    assert(mrc_provider_qp_post_write(qp, &write, &second) == 0 && second == 2);
+    const struct mrc_provider_write empty = { .wr_id = 203, .remote_address = 0x800 };
+    assert(mrc_provider_qp_post_write(qp, &empty, &zero_length) == 0 && zero_length == 3);
+    assert(mrc_provider_qp_post_write(qp, &write, &zero_length) == -ENOSPC && zero_length == 3);
+    assert(mrc_provider_mr_deregister(pd, keys.lkey) == -EBUSY);
+
+    struct mrc_provider_write_view view;
+    assert(mrc_provider_qp_get_write(qp, first, &view) == 0);
+    assert(view.data == buffer + 4 && memcmp(view.data, "456789a", 7) == 0);
+    assert(view.remote_address == 0x1900 && view.rkey == 0xaabbccdd && view.length == 7);
+    assert(view.with_immediate && view.immediate == 0x9988);
+    assert(mrc_provider_qp_get_write(qp, second, &view) == 0);
+    assert(view.data == buffer + 16 && memcmp(view.data, "ghij", 4) == 0);
+    assert(view.remote_address == 0x2911 && view.rkey == 0xbbccddaa && view.length == 4);
+    assert(!view.with_immediate);
+    assert(mrc_provider_qp_get_write(qp, zero_length, &view) == 0 && !view.data && !view.length);
+
+    assert(mrc_provider_qp_complete_send(qp, first) == 0);
+    assert(mrc_provider_qp_get_write(qp, first, &view) == -ENOENT);
+    assert(mrc_provider_mr_deregister(pd, keys.lkey) == -EBUSY);
+    assert(mrc_provider_qp_fail(qp, second, MRC_PROVIDER_WC_RETRY_EXCEEDED) == 0);
+    assert(mrc_provider_qp_get_write(qp, second, &view) == -ENOENT);
+    assert(mrc_provider_mr_deregister(pd, keys.lkey) == 0);
+
+    struct mrc_provider_wc wc[3];
+    assert(mrc_provider_cq_poll(cq, wc, 3) == 3);
+    assert(wc[0].wr_id == 201 && wc[0].byte_length == 7 && wc[0].status == MRC_PROVIDER_WC_SUCCESS);
+    assert(wc[1].wr_id == 202 && wc[1].status == MRC_PROVIDER_WC_RETRY_EXCEEDED);
+    assert(wc[2].wr_id == 203 && wc[2].status == MRC_PROVIDER_WC_FLUSHED);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(cq) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
 static void test_qp_cq_overrun_flushes_other_queue(void)
 {
     struct mrc_provider_cq *send, *recv;
@@ -439,6 +515,7 @@ int main(void)
     test_cq_fifo_and_notifications();
     test_cq_overflow();
     test_qp_lifecycle_and_ordered_flush();
+    test_posted_write_buffer_lifetime();
     test_qp_cq_overrun_flushes_other_queue();
     test_completion_channel();
     puts("MRC provider resource tests passed");

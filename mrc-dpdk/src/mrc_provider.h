@@ -173,8 +173,8 @@ struct mrc_provider_qp_attr {
     size_t recv_pending;
 };
 
-/* The data plane owns the wire state and send buffers. The provider tracks
- * posted work and retains its CQ/PD handles until the QP is destroyed. */
+/* The data plane owns wire state. The provider tracks posted work, pins
+ * registered send buffers, and retains CQ/PD handles until QP destruction. */
 int mrc_provider_qp_create(const struct mrc_provider_qp_config *config,
                            struct mrc_provider_qp **qp);
 int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_attr *attr);
@@ -187,6 +187,37 @@ int mrc_provider_qp_destroy(struct mrc_provider_qp *qp);
 int mrc_provider_qp_post_send(struct mrc_provider_qp *qp, uint64_t wr_id, uint32_t length,
                               bool signaled, uint64_t *sequence);
 int mrc_provider_qp_post_recv(struct mrc_provider_qp *qp, uint64_t wr_id);
+
+struct mrc_provider_write {
+    uint64_t wr_id;
+    uint64_t local_iova;
+    const void *local_buffer; /* For a QP without a PD. */
+    uint64_t remote_address;
+    uint32_t length;
+    uint32_t lkey;
+    uint32_t rkey;
+    uint32_t immediate; /* Host byte order. */
+    bool with_immediate;
+    bool signaled;
+};
+
+struct mrc_provider_write_view {
+    const uint8_t *data;
+    uint64_t remote_address;
+    uint32_t length;
+    uint32_t rkey;
+    uint32_t immediate;
+    bool with_immediate;
+};
+
+/* A registered post acquires one MR lease until completion or flush. For a
+ * QP without a PD, the caller keeps the buffer valid over the same interval. */
+int mrc_provider_qp_post_write(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                               uint64_t *sequence);
+/* A wire worker serializes use of this borrowed view with retiring the post,
+ * putting the QP into ERROR, and destroying the QP. */
+int mrc_provider_qp_get_write(struct mrc_provider_qp *qp, uint64_t sequence,
+                              struct mrc_provider_write_view *write);
 
 /* Retire sends through an inclusive sequence after semantic ACK. Receive
  * completion consumes one posted WRITEIMM credit. */
