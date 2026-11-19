@@ -38,6 +38,7 @@ struct mrc_wr_message {
     bool uniform_rqmsn;
     bool final_seen;
     bool with_imm;
+    bool solicited;
 };
 
 struct mrc_wr_slot {
@@ -97,7 +98,7 @@ bool mrc_wr_post_receive(struct mrc_wr_responder *responder, uint64_t wr_id);
 /* Caller filters non-NEW PSNs using the reliability window. A successful receive
  * may retain an unanchored MIDDLE packet in caller-provided staging storage. */
 enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t psn,
-                                  uint8_t opcode, const struct mrc_wire_write *write);
+                                  uint8_t opcode, const struct mrc_wire_write *write, bool solicited);
 
 /* Pass the reliability cumulative ACK after accepting a packet. Poll again with
  * the same value while produced is true. Send a successful Transport ACK only

@@ -130,6 +130,7 @@ struct mrc_wire_bth {
     uint32_t dqp;
     uint32_t psn;
     bool ack_request;
+    bool solicited;
     bool retransmit;
     bool timestamp;
 };

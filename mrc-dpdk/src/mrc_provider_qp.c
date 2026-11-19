@@ -292,6 +292,8 @@ static int post_write(struct mrc_provider_qp *qp, const struct mrc_provider_writ
 {
     if (write->length > UINT64_MAX - write->remote_address)
         return -EOVERFLOW;
+    if (write->solicited && !write->with_immediate)
+        return -EINVAL;
 
     pthread_mutex_lock(&qp->mutex);
     struct work_entry *work;
@@ -304,7 +306,7 @@ static int post_write(struct mrc_provider_qp *qp, const struct mrc_provider_writ
                 .data = work->lease.owner ? work->lease.address : write->local_buffer,
                 .remote_address = write->remote_address, .length = write->length,
                 .rkey = write->rkey, .immediate = write->immediate,
-                .with_immediate = write->with_immediate,
+                .with_immediate = write->with_immediate, .solicited = write->solicited,
             };
             work->id = write->wr_id;
             work->signaled = write->signaled || qp->sq_sig_all;

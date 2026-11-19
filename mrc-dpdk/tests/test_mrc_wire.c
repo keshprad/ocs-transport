@@ -312,6 +312,16 @@ static void test_write(void)
 
     uint8_t encoded[128];
     size_t len;
+    assert(!decoded.bth.solicited);
+    packet.bth.solicited = true;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == 0);
+    assert(encoded[MRC_WIRE_IPV4_HEADER_LEN + 1] ==
+           (write_frame[MRC_WIRE_IPV4_HEADER_LEN + 1] | 0x80));
+    assert(mrc_wire_decode(encoded, len, &decoded) == 0 && decoded.bth.solicited);
+    packet.bth.opcode = MRC_WRITE_ONLY;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == -EINVAL);
+    packet.bth.solicited = false;
+
     packet.bth.opcode = MRC_WRITE_ONLY;
     packet.bth.timestamp = false;
     packet.body.write.data = NULL;

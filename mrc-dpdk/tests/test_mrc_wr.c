@@ -48,7 +48,7 @@ static enum mrc_wr_result offer_record(struct fixture *fixture, uint8_t opcode, 
                                        const struct mrc_wire_write *write)
 {
     assert(mrc_rx_classify(&fixture->qp, psn) == MRC_RX_NEW);
-    enum mrc_wr_result result = mrc_wr_receive(&fixture->responder, psn, opcode, write);
+    enum mrc_wr_result result = mrc_wr_receive(&fixture->responder, psn, opcode, write, false);
     if (result == MRC_WR_OK) {
         bool sack_due;
         mrc_rx_record(&fixture->qp, psn, write->data_len, 0, 4096, &sack_due);
@@ -146,7 +146,7 @@ static void test_reject_malformed_without_placement(void)
         .msn = 1, .va = VA, .r_key = KEY + 1,
         .dma_len = 1, .data = (const uint8_t *)"n", .data_len = 1,
     };
-    assert(mrc_wr_receive(&f.responder, 20, MRC_WRITE_ONLY, &bad_key) == MRC_WR_REMOTE_ACCESS);
+    assert(mrc_wr_receive(&f.responder, 20, MRC_WRITE_ONLY, &bad_key, false) == MRC_WR_REMOTE_ACCESS);
     assert(f.memory[0] == 0);
 }
 

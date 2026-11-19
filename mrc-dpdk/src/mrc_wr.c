@@ -265,7 +265,7 @@ static enum mrc_wr_result stage_middle(struct mrc_wr_responder *responder,
 }
 
 enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t psn,
-                                  uint8_t opcode, const struct mrc_wire_write *write)
+                                  uint8_t opcode, const struct mrc_wire_write *write, bool solicited)
 {
     if (responder->failed)
         return MRC_WR_QP_ERROR;
@@ -281,7 +281,7 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
     bool only = opcode == MRC_WRITE_ONLY || opcode == MRC_WRITE_ONLY_IMM;
     bool immediate = opcode == MRC_WRITE_LAST_IMM || opcode == MRC_WRITE_ONLY_IMM;
     if ((!first && !middle && !last && !only) || (only != (packets == 1)) ||
-        (middle && packets < 3) || packets >= MRC_PSN_HALF ||
+        (middle && packets < 3) || packets >= MRC_PSN_HALF || (solicited && !immediate) ||
         write->data_len != ((first || middle) ? pmtu : write->dma_len - final_offset))
         return fail(responder, MRC_WR_INVALID);
 
@@ -365,6 +365,7 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
                 return fail(responder, MRC_WR_IMM_LIMIT);
             candidate.final_seen = true;
             candidate.with_imm = immediate;
+            candidate.solicited = solicited;
             candidate.immediate = write->imm_data;
         }
         if (needs_anchor && responder->config.pd) {
@@ -416,7 +417,7 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
             if (responder->config.provider_qp) {
                 int completed = mrc_provider_qp_complete_recv(responder->config.provider_qp,
                                                                slot->dmalen, slot->immediate,
-                                                               false, &wr_id);
+                                                               slot->solicited, &wr_id);
                 if (completed)
                     return fail(responder, completed == -ENOBUFS ? MRC_WR_RQ_EMPTY : MRC_WR_QP_ERROR);
             } else {

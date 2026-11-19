@@ -452,8 +452,11 @@ static int post_write(struct mrc_qp *qp, const struct ibv_send_wr *wr)
     bool immediate = wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM;
     if (!immediate && wr->opcode != IBV_WR_RDMA_WRITE)
         return EOPNOTSUPP;
-    if (wr->send_flags & ~IBV_SEND_SIGNALED)
+    if (wr->send_flags & ~(IBV_SEND_SIGNALED | IBV_SEND_SOLICITED))
         return EOPNOTSUPP;
+    bool solicited = (wr->send_flags & IBV_SEND_SOLICITED) != 0;
+    if (solicited && !immediate)
+        return EINVAL;
     if (wr->num_sge < 0 || (unsigned int)wr->num_sge > qp->init.cap.max_send_sge ||
         (wr->num_sge && !wr->sg_list) || (immediate && !qp->attrs.wimm.max_wimm))
         return EINVAL;
@@ -469,7 +472,7 @@ static int post_write(struct mrc_qp *qp, const struct ibv_send_wr *wr)
         return EMSGSIZE;
     const struct mrc_provider_write write = {
         .wr_id = wr->wr_id, .remote_address = wr->wr.rdma.remote_addr, .rkey = wr->wr.rdma.rkey,
-        .length = (uint32_t)length, .with_immediate = immediate,
+        .length = (uint32_t)length, .with_immediate = immediate, .solicited = solicited,
         .immediate = immediate ? ntohl(wr->imm_data) : 0,
         .signaled = (wr->send_flags & IBV_SEND_SIGNALED) != 0,
     };

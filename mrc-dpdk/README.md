@@ -88,8 +88,10 @@ each attached QP to process the packets dispatched to it. Use the same
 rail order for QPs to the same peer so they share node port status.
 
 The attachment supports a 1024-byte PMTU, registered send buffers with
-up to 16 SGEs, and payload-free WRITEIMM receive posts. Solicited WRITEIMM
-notifications and the remaining APIs are tracked in [conformance](CONFORMANCE.md).
+up to 16 SGEs, and payload-free WRITEIMM receive posts. Use
+`IBV_SEND_SOLICITED` on a WRITEIMM to trigger an armed solicited-only
+receive CQ notification. The remaining APIs are tracked in
+[conformance](CONFORMANCE.md).
 
 ### Driving the DPDK endpoint from a provider QP
 

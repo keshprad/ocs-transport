@@ -208,6 +208,7 @@ struct mrc_provider_write {
     uint32_t rkey;
     uint32_t immediate; /* Host byte order. */
     bool with_immediate;
+    bool solicited;
     bool signaled;
 };
 
@@ -227,6 +228,7 @@ struct mrc_provider_write_view {
     uint32_t rkey;
     uint32_t immediate;
     bool with_immediate;
+    bool solicited;
 };
 
 /* A registered post acquires one MR lease until completion or flush. For a

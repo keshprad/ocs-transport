@@ -177,7 +177,8 @@ static void post_writes(struct mrc_qp *qp, const struct connection *peer,
             .wr.rdma = { .remote_addr = peer->remote_address, .rkey = peer->rkey },
         },
         {
-            .wr_id = 71, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM, .send_flags = IBV_SEND_SIGNALED,
+            .wr_id = 71, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+            .send_flags = IBV_SEND_SIGNALED | IBV_SEND_SOLICITED,
             .num_sge = 2, .sg_list = &sg[1], .imm_data = htonl(FIRST_IMMEDIATE),
             .wr.rdma = { .remote_addr = peer->remote_address + FIRST_BYTES, .rkey = peer->rkey },
         },
@@ -201,8 +202,25 @@ static void post_receives(struct mrc_qp *qp)
     assert(mrc_post_recv(qp, credits, &bad) == 0 && !bad);
 }
 
-static void complete(struct mrc_qp *qp, struct mrc_cq *cq, const char *directory,
-                     bool requester, uint32_t qpn)
+static int completion_fd(struct mrc_comp_channel *channel)
+{
+    int fd;
+    assert(mrc_get_comp_channel_fd(channel, &fd) == 0);
+    return fd;
+}
+
+static void acknowledge_notification(struct mrc_comp_channel *channel, struct mrc_cq *cq)
+{
+    struct pollfd wait = { .fd = completion_fd(channel), .events = POLLIN };
+    assert(poll(&wait, 1, 0) == 1 && (wait.revents & POLLIN));
+    struct mrc_cq *event = NULL;
+    void *event_context = NULL;
+    assert(mrc_get_cq_event(channel, &event, &event_context) == 0 && event == cq);
+    mrc_ack_cq_events(cq, 1);
+}
+
+static void complete(struct mrc_qp *qp, struct mrc_cq *cq, struct mrc_comp_channel *channel,
+                     const char *directory, bool requester, uint32_t qpn)
 {
     uint64_t deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
     char done[PATH_MAX];
@@ -228,6 +246,10 @@ static void complete(struct mrc_qp *qp, struct mrc_cq *cq, const char *directory
                 assert(wc[entry].wc_flags & IBV_WC_WITH_IMM);
                 assert(wc[entry].byte_len == (completed == 0 ? IMMEDIATE_BYTES : 0));
                 assert(ntohl(wc[entry].imm_data) == (completed == 0 ? FIRST_IMMEDIATE : SECOND_IMMEDIATE));
+                if (completed == 0) {
+                    acknowledge_notification(channel, cq);
+                    assert(mrc_req_notify_cq(cq, 1) == 0);
+                }
             }
         }
         rte_pause();
@@ -344,23 +366,17 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         post_writes(qp, &peer, first, last);
     } else {
         post_receives(qp);
-        assert(mrc_req_notify_cq(cq, 0) == 0);
+        assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
     }
-    complete(qp, cq, directory, requester, local.qpn);
+    complete(qp, cq, channel, directory, requester, local.qpn);
     if (requester) {
         publish(directory, "tx.done", NULL, 0);
     } else {
         for (size_t i = 0; i < TOTAL_BYTES; i++)
             assert(first_data[i] == pattern(i));
-        int fd;
-        assert(mrc_get_comp_channel_fd(channel, &fd) == 0);
-        struct pollfd wait = { .fd = fd, .events = POLLIN };
-        assert(poll(&wait, 1, 0) == 1 && (wait.revents & POLLIN));
-        struct mrc_cq *event = NULL;
-        void *event_context = NULL;
-        assert(mrc_get_cq_event(channel, &event, &event_context) == 0 && event == cq);
-        mrc_ack_cq_events(cq, 1);
+        struct pollfd wait = { .fd = completion_fd(channel), .events = POLLIN };
+        assert(poll(&wait, 1, 0) == 0);
     }
 
     assert(mrc_destroy_qp(qp) == 0);

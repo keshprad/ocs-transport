@@ -507,6 +507,8 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     if (!mrc_cc_on_send(&after_send, nominal_size(packet.bth.opcode, length, false)))
         return -EPROTO;
     packet.bth.retransmit = retry;
+    packet.bth.solicited = write.solicited &&
+        (packet.bth.opcode == MRC_WRITE_LAST_IMM || packet.bth.opcode == MRC_WRITE_ONLY_IMM);
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
                              index + 1 == transfer->packets ||
                              mrc_cc_ack_request(&after_send, SACK_THRESHOLD);
@@ -1048,7 +1050,8 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
         write->dma_len != transfer->work[request_index(transfer, index)].length))
         return reject_write(transfer, receiver, counts, path, packet, MRC_WR_INVALID, psn);
 
-    enum mrc_wr_result result = mrc_wr_receive(&receiver->wr, psn, packet->bth.opcode, write);
+    enum mrc_wr_result result = mrc_wr_receive(&receiver->wr, psn, packet->bth.opcode, write,
+                                               packet->bth.solicited);
     if (result != MRC_WR_OK)
         return reject_write(transfer, receiver, counts, path, packet, result, psn);
 

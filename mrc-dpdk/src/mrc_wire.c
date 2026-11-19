@@ -19,6 +19,7 @@ enum {
     SRH_PAD1 = 0,
     IPV4_DONT_FRAGMENT = 0x4000,
     IP_DEFAULT_HOP_LIMIT = 64,
+    BTH_SOLICITED = 0x80,
     BTH_ACK_REQUEST = 0x80,
     BTH_RETRANSMIT = 0x20,
     BTH_TIMESTAMP = 0x10,
@@ -166,7 +167,7 @@ static size_t write_header_len(const struct mrc_wire_bth *bth)
 static void encode_bth(uint8_t *bytes, const struct mrc_wire_bth *bth, uint8_t pad)
 {
     bytes[0] = bth->opcode;
-    bytes[1] = (uint8_t)(pad << 4);
+    bytes[1] = (uint8_t)(pad << 4) | (bth->solicited ? BTH_SOLICITED : 0);
     write_be16(bytes + 2, bth->p_key);
     write_be24(bytes + 5, bth->dqp);
     bytes[8] = (bth->ack_request ? BTH_ACK_REQUEST : 0) |
@@ -178,6 +179,7 @@ static void encode_bth(uint8_t *bytes, const struct mrc_wire_bth *bth, uint8_t p
 static void decode_bth(const uint8_t *bytes, struct mrc_wire_bth *bth)
 {
     bth->opcode = bytes[0];
+    bth->solicited = (bytes[1] & BTH_SOLICITED) != 0;
     bth->p_key = read_be16(bytes + 2);
     bth->dqp = read_be24(bytes + 5);
     bth->ack_request = (bytes[8] & BTH_ACK_REQUEST) != 0;
@@ -565,7 +567,8 @@ int mrc_wire_encode(uint8_t *frame, size_t capacity, const struct mrc_wire_packe
                     size_t *length)
 {
     if (!frame || !packet || !length || packet->bth.psn > MRC_WIRE_PSN_MASK ||
-        packet->bth.dqp > MRC_WIRE_PSN_MASK)
+        packet->bth.dqp > MRC_WIRE_PSN_MASK ||
+        (packet->bth.solicited && !has_imm_data(packet->bth.opcode)))
         return -EINVAL;
 
     size_t ip_header_len;
