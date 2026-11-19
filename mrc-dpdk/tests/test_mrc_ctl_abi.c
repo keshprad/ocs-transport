@@ -13,9 +13,26 @@
 
 enum {
     PROFILE_ID = 7,
+    CC_PROFILE_ID = 8,
+    DISABLED_CC_PROFILE_ID = 9,
     RAILS = 2,
     FIRST_EV = 0xc101,
     SECOND_EV = 0xc102,
+};
+
+static const char nscc_algorithm[] = "uet-1.0-nscc";
+static const struct mrc_ctl_cc_nscc_cfg nscc_config = {
+    .disable_qa = 1,
+    .adjust_bytes_threshold = 32768,
+    .adjust_period_threshold = 10000,
+    .base_rtt = 18000,
+    .eta = 0.375f,
+    .fi = 0.25f,
+    .fi_scale = 0.5f,
+    .gamma = 0.75f,
+    .max_md_jump = 0.5f,
+    .max_cwnd = 1112,
+    .target_delay = 9000,
 };
 
 static struct ibv_context *open_supported_device(void)
@@ -77,6 +94,12 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
     assert(extended.ev.ev_mode_mask & MRC_CTL_EV_MODE_EXP);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_UDP);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_STEV);
+    assert(legacy.cc.cc_max_profiles == 32 && extended.cc.cc_max_profiles == 32);
+    assert(legacy.cc.algorithms && legacy.cc.algorithms[0] &&
+           strcmp(legacy.cc.algorithms[0], nscc_algorithm) == 0 && !legacy.cc.algorithms[1]);
+    assert(extended.cc.algorithms && extended.cc.algorithms[0] &&
+           strcmp(extended.cc.algorithms[0], nscc_algorithm) == 0 && !extended.cc.algorithms[1]);
+    assert(!((legacy.opt_attr | extended.opt_attr) & MRC_CTL_OPT_CAP_CC_PROFILE_MODIFY_ONLINE));
 
     static const struct {
         uint64_t id;
@@ -300,6 +323,134 @@ static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context
     assert(mrc_destroy_context(controller) == 0);
 }
 
+static int configure_cc_algorithm(struct mrc_context *controller, uint64_t id,
+                                  const char *algorithm)
+{
+    struct mrc_ctl_cc_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_OFFLINE, .algorithm = algorithm,
+    };
+    return mrc_ctl_modify_cc_profile(controller, id, &attr,
+                                     MRC_CTL_CC_PROFILE_STATE | MRC_CTL_CC_PROFILE_ALGORITHM);
+}
+
+static int activate_cc(struct mrc_context *controller, uint64_t id,
+                       const struct mrc_ctl_cc_nscc_cfg *config)
+{
+    struct mrc_ctl_cc_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_ONLINE, .cc_config = config,
+    };
+    return mrc_ctl_modify_cc_profile(controller, id, &attr,
+                                     MRC_CTL_CC_PROFILE_STATE | MRC_CTL_CC_PROFILE_CONFIG);
+}
+
+static int set_cc_state(struct mrc_context *controller, uint64_t id, enum mrc_ctl_profile_state state)
+{
+    struct mrc_ctl_cc_profile_attr attr = { .profile_state = state };
+    return mrc_ctl_modify_cc_profile(controller, id, &attr, MRC_CTL_CC_PROFILE_STATE);
+}
+
+static struct mrc_ctl_cc_profile_attr query_cc(struct mrc_context *controller, uint64_t id)
+{
+    struct mrc_ctl_cc_profile_attr attr = {0};
+    assert(mrc_ctl_query_cc_profile(controller, id, &attr,
+                                   MRC_CTL_CC_PROFILE_CUR_STATE | MRC_CTL_CC_PROFILE_ALGORITHM |
+                                   MRC_CTL_CC_PROFILE_CONFIG) == 0);
+    return attr;
+}
+
+static void check_cc_config(struct mrc_context *controller)
+{
+    struct mrc_ctl_cc_profile_attr observed = query_cc(controller, CC_PROFILE_ID);
+    assert(observed.cur_profile_state == MRC_CTL_PROFILE_ONLINE);
+    assert(observed.algorithm && strcmp(observed.algorithm, nscc_algorithm) == 0);
+    const struct mrc_ctl_cc_nscc_cfg *config = observed.cc_config;
+    assert(config);
+    assert(config->disable_qa == nscc_config.disable_qa);
+    assert(config->adjust_bytes_threshold == nscc_config.adjust_bytes_threshold);
+    assert(config->adjust_period_threshold == nscc_config.adjust_period_threshold);
+    assert(config->base_rtt == nscc_config.base_rtt);
+    assert(config->eta == nscc_config.eta && config->fi == nscc_config.fi &&
+           config->fi_scale == nscc_config.fi_scale && config->gamma == nscc_config.gamma &&
+           config->max_md_jump == nscc_config.max_md_jump);
+    assert(config->max_cwnd == nscc_config.max_cwnd && config->target_delay == nscc_config.target_delay);
+    assert(config->qa_gate == nscc_config.qa_gate && config->qa_threshold == nscc_config.qa_threshold);
+}
+
+static void select_cc_profile(struct mrc_qp *qp, uint64_t id)
+{
+    struct ibv_qp_attr verbs = { .qp_state = IBV_QPS_INIT };
+    struct mrc_qp_attr attrs = { .profile.cc_profile_id = id };
+    assert(mrc_modify_qp(qp, &verbs, IBV_QP_STATE, &attrs, MRC_QP_CC_PROFILE_ID) == 0);
+
+    attrs = (struct mrc_qp_attr){0};
+    assert(mrc_query_qp(qp, &verbs, IBV_QP_STATE, &attrs, MRC_QP_CC_PROFILE_ID, NULL) == 0);
+    assert(verbs.qp_state == IBV_QPS_INIT && attrs.profile.cc_profile_id == id);
+}
+
+static void test_cc_lifecycle(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *controller = open_store(verbs, directory);
+    struct mrc_ctl_cc_profile_attr observed = query_cc(controller, CC_PROFILE_ID);
+    assert(observed.cur_profile_state == MRC_CTL_PROFILE_INIT && !observed.algorithm && !observed.cc_config);
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EINVAL);
+    assert(configure_cc_algorithm(controller, CC_PROFILE_ID, "unknown-cc") == -1 && errno == EINVAL);
+    assert(configure_cc_algorithm(controller, CC_PROFILE_ID, nscc_algorithm) == 0);
+    observed = query_cc(controller, CC_PROFILE_ID);
+    assert(observed.cur_profile_state == MRC_CTL_PROFILE_OFFLINE && !observed.cc_config);
+    assert(observed.algorithm && strcmp(observed.algorithm, nscc_algorithm) == 0);
+
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    struct mrc_ctl_cc_nscc_cfg invalid = nscc_config;
+    invalid.max_cwnd = 1111;
+    assert(activate_cc(controller, CC_PROFILE_ID, &invalid) == -1 && errno == EINVAL);
+    invalid = nscc_config;
+    invalid.disable_qa = 0;
+    assert(activate_cc(controller, CC_PROFILE_ID, &invalid) == -1 && errno == EOPNOTSUPP);
+    assert(query_cc(controller, CC_PROFILE_ID).cur_profile_state == MRC_CTL_PROFILE_OFFLINE);
+    assert(activate_cc(controller, CC_PROFILE_ID, &nscc_config) == 0);
+    struct mrc_ctl_cc_profile_attr replacement = { .cc_config = &nscc_config };
+    assert(mrc_ctl_modify_cc_profile(controller, CC_PROFILE_ID, &replacement,
+                                     MRC_CTL_CC_PROFILE_CONFIG) == -1 && errno == EBUSY);
+    check_cc_config(controller);
+
+    struct mrc_context *client = open_store(verbs, directory);
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    struct mrc_cq *cq = mrc_create_cq(client, 4, NULL, NULL, 0);
+    assert(pd && cq);
+    struct mrc_qp_init_attr init = {
+        .send_cq = cq, .pd = pd, .cap = { .max_send_wr = 1, .max_send_sge = 1 },
+    };
+    struct mrc_qp *qp = mrc_create_qp(client, &init);
+    assert(qp);
+    select_cc_profile(qp, CC_PROFILE_ID);
+    assert(mrc_destroy_context(controller) == 0);
+    controller = open_store(verbs, directory);
+    check_cc_config(controller);
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+
+    struct ibv_qp_attr reset = { .qp_state = IBV_QPS_RESET };
+    assert(mrc_modify_qp(qp, &reset, IBV_QP_STATE, NULL, 0) == 0);
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(activate_cc(controller, CC_PROFILE_ID, &nscc_config) == 0);
+    select_cc_profile(qp, CC_PROFILE_ID);
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    assert(mrc_destroy_qp(qp) == 0);
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_INIT) == 0);
+    observed = query_cc(controller, CC_PROFILE_ID);
+    assert(observed.cur_profile_state == MRC_CTL_PROFILE_INIT && !observed.algorithm && !observed.cc_config);
+
+    assert(configure_cc_algorithm(controller, DISABLED_CC_PROFILE_ID, NULL) == 0);
+    assert(activate_cc(controller, DISABLED_CC_PROFILE_ID, NULL) == 0);
+    observed = query_cc(controller, DISABLED_CC_PROFILE_ID);
+    assert(observed.cur_profile_state == MRC_CTL_PROFILE_ONLINE && !observed.algorithm && !observed.cc_config);
+
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(ibv_dealloc_pd(pd) == 0);
+    assert(mrc_destroy_context(client) == 0);
+    assert(mrc_destroy_context(controller) == 0);
+}
+
 static void seed_denied_profile(struct mrc_context *controller)
 {
     assert(configure_explicit(controller) == 0);
@@ -317,8 +468,10 @@ int main(int argc, char **argv)
     bool expect_no_cap = argc == 2 && strcmp(argv[1], "--expect-no-cap") == 0;
     bool seed = argc == 3 && strcmp(argv[1], "--seed-denied") == 0;
     bool unblock = argc == 3 && strcmp(argv[1], "--unblock") == 0;
-    if (argc != 1 && !expect_no_cap && !seed && !unblock) {
-        fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR]\n", argv[0]);
+    bool seed_cc = argc == 3 && strcmp(argv[1], "--seed-cc") == 0;
+    if (argc != 1 && !expect_no_cap && !seed && !unblock && !seed_cc) {
+        fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | --seed-cc DIR]\n",
+                argv[0]);
         return EXIT_FAILURE;
     }
     struct ibv_context *verbs = open_supported_device();
@@ -326,13 +479,17 @@ int main(int argc, char **argv)
         fputs("The MRC controller ABI test needs an accessible Ethernet verbs device.\n", stderr);
         return EXIT_FAILURE;
     }
-    if (seed || unblock) {
+    if (seed || unblock || seed_cc) {
         struct mrc_context *controller = open_store(verbs, argv[2]);
         if (seed) {
             seed_denied_profile(controller);
-        } else {
+        } else if (unblock) {
             assert(set_profile_state(controller, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
             set_ev_state(controller, MRC_CTL_EV_GOOD);
+        } else {
+            assert(configure_cc_algorithm(controller, CC_PROFILE_ID, nscc_algorithm) == 0);
+            assert(activate_cc(controller, CC_PROFILE_ID, &nscc_config) == 0);
+            printf("%u\n", (unsigned int)CC_PROFILE_ID);
         }
         assert(mrc_destroy_context(controller) == 0);
         assert(ibv_close_device(verbs) == 0);
@@ -345,11 +502,17 @@ int main(int argc, char **argv)
     if (expect_no_cap) {
         assert(configure_explicit(controller) == -1 && errno == EPERM);
         assert(profile_state(controller) == MRC_CTL_PROFILE_INIT);
+        struct mrc_ctl_cc_profile_attr cc = {0};
+        assert(mrc_ctl_query_cc_profile(controller, CC_PROFILE_ID, &cc,
+                                        MRC_CTL_CC_PROFILE_CUR_STATE) == -1 && errno == EPERM);
+        assert(configure_cc_algorithm(controller, CC_PROFILE_ID, nscc_algorithm) == -1 && errno == EPERM);
         assert(mrc_destroy_context(controller) == 0);
-        puts("Controller mutation without CAP_NET_ADMIN was rejected");
+        puts("Controller operations without CAP_NET_ADMIN were rejected");
     } else {
         test_profile_lifecycle(verbs, controller, directory);
         puts("OCP controller EV profiles, live EV state, persistence, and QP leases passed");
+        test_cc_lifecycle(verbs, directory);
+        puts("OCP controller CC profiles, persistence, and QP leases passed");
     }
 
     remove_test_store(directory);

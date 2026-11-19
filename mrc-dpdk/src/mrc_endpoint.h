@@ -1,6 +1,7 @@
 #ifndef MRC_ENDPOINT_H
 #define MRC_ENDPOINT_H
 
+#include "mrc_cc.h"
 #include "mrc_ctl_store.h"
 #include "mrc_provider.h"
 #include "mrc_wire.h"
@@ -10,6 +11,8 @@
 enum {
     PATH_COUNT = 2,
     PMTU = 1024,
+    MRC_NOMINAL_MTU = PMTU + 8 + MRC_BTH_LEN + MRC_METH_LEN +
+                      MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
     WINDOW = 1024,
     MAX_WORK_REQUESTS = 4096,
 };
@@ -80,6 +83,7 @@ struct mrc_endpoint_config {
     uint64_t profile_id;
     struct mrc_ctl_store profile_store;
     struct mrc_ctl_store_profile profile;
+    struct mrc_ctl_store_cc_profile cc_profile;
     uint32_t restore_after;
     uint32_t mpr_change_at;
     uint8_t mpr_change_to;

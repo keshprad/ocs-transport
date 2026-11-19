@@ -20,6 +20,27 @@ void mrc_cc_rx_record(struct mrc_cc_rx *rx, uint32_t nominal_bytes,
                       bool new_data, bool trimmed);
 uint32_t mrc_cc_rx_wire_count(const struct mrc_cc_rx *rx);
 
+enum mrc_cc_algorithm {
+    MRC_CC_DISABLED,
+    MRC_CC_NSCC,
+};
+
+struct mrc_cc_config {
+    uint8_t disable_qa;
+    uint32_t adjust_bytes_threshold;
+    uint32_t adjust_period_threshold;
+    uint32_t base_rtt;
+    float eta;
+    float fi;
+    float fi_scale;
+    float gamma;
+    float max_md_jump;
+    uint32_t max_cwnd;
+    uint8_t qa_gate;
+    uint32_t qa_threshold;
+    uint32_t target_delay;
+};
+
 struct mrc_cc_delay_window {
     double sum_ns;
     uint64_t samples;
@@ -27,7 +48,13 @@ struct mrc_cc_delay_window {
 
 struct mrc_cc_nscc {
     uint32_t max_wnd;
-    uint64_t config_base_rtt_ns;
+    uint64_t adjust_period_ns;
+    uint32_t adjust_bytes_threshold;
+    double eta;
+    double fi;
+    double fi_scale;
+    double gamma;
+    double max_md_jump;
     uint64_t sender_link_bytes_per_second;
     double scaling_a;
     double inc_bytes;
@@ -54,6 +81,7 @@ struct mrc_cc {
     uint32_t nominal_mtu;
     uint64_t base_rtt_ns;
     uint64_t target_queue_delay_ns;
+    enum mrc_cc_algorithm algorithm;
     struct mrc_cc_nscc nscc;
 };
 
@@ -86,6 +114,9 @@ enum mrc_cc_qp_state {
 
 bool mrc_cc_init(struct mrc_cc *cc, uint32_t nominal_mtu, uint32_t initial_cwnd,
                  uint64_t initial_base_rtt_ns, uint64_t target_queue_delay_ns);
+bool mrc_cc_config_valid(const struct mrc_cc_config *config, uint32_t nominal_mtu);
+/* Apply a controller configuration before sending. NULL disables NSCC. */
+bool mrc_cc_apply_config(struct mrc_cc *cc, const struct mrc_cc_config *config);
 /*
  * Set link-derived BDP and MaxWnd before sending. A zero receiver rate uses
  * the sender rate. With no explicit rate, init uses initial_cwnd as MaxWnd

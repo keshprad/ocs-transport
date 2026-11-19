@@ -152,7 +152,7 @@ value. The remaining bytes are zero. Port numbers 1 and 2 follow the attached
 DPDK route's rail order.
 
 Point the controller and the application at the same directory with
-`mrc_dpdk_set_ev_store()`. The controller needs effective `CAP_NET_ADMIN` to
+`mrc_dpdk_set_profile_store()`. The controller needs effective `CAP_NET_ADMIN` to
 mutate profiles. For separate service accounts, use a controller-owned
 directory with mode `02750` and the application group. Profile snapshots
 and a lock with that group get mode `0640`. Application processes take
@@ -224,6 +224,23 @@ On failure, the endpoint prints per-path application RX and DPDK port counter
 deltas, together with protocol progress. Pass `--port-stats 1` to include the
 same diagnostics on success.
 
+### Persistent congestion-control profiles
+
+With both contexts using the profile directory, a controller with effective
+`CAP_NET_ADMIN` can configure or query up to 32 CC profiles. Choose
+`uet-1.0-nscc` and set the profile OFFLINE, then supply a
+`struct mrc_ctl_cc_nscc_cfg` and set it ONLINE. Set `disable_qa` to a nonzero
+value. The provider uses the configured initial and maximum window, base
+RTT, target delay, byte and time thresholds, and increase and decrease
+coefficients. A NULL algorithm and configuration select disabled congestion
+control while retaining the QP's reliability window.
+
+Select an ONLINE profile with `MRC_QP_CC_PROFILE_ID` when bringing a public
+QP to INIT. The QP leases the profile until reset or destruction. The
+controller can move the profile OFFLINE once all leases are released.
+An unset ID uses the built-in NSCC defaults. A CC query's configuration
+pointer is borrowed until the next configuration query on the same thread.
+
 ### Concurrent three-Spark tests
 
 The cycle uses Spark-04 → Spark-02 → Spark-03 → Spark-04 on both Polatis
@@ -248,6 +265,9 @@ units per Spark and permits passwordless `/usr/bin/systemctl start UNIT` and
 `/usr/bin/systemctl stop UNIT` for those exact units. The four names are
 `ocs-mrc-cycle-rx-smoke.service`, `ocs-mrc-cycle-tx-smoke.service`,
 `ocs-mrc-cycle-rx-failover.service`, and `ocs-mrc-cycle-tx-failover.service`.
+All four units need `UnsetEnvironment=RUNTIME_DIRECTORY` in `[Service]`,
+as emitted by the renderer. Run `sudo systemctl daemon-reload` after updating
+the units.
 
 The harness reads each unit's journal. Where ordinary journal access is
 unavailable, permit this exact command separately for each of the four units.

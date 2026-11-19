@@ -45,7 +45,7 @@ struct mrc_context {
     size_t children;
     struct mrc_abi_pd *pds;
     struct mrc_abi_async_channel async;
-    struct mrc_ctl_store ev_store;
+    struct mrc_ctl_store profile_store;
 };
 
 struct mrc_comp_channel {
@@ -75,10 +75,12 @@ struct mrc_qp {
     bool responder;
     uint32_t qpn;
     struct mrc_ctl_store_ref ev_lease;
+    struct mrc_ctl_store_ref cc_lease;
+    struct mrc_ctl_store_cc_profile cc_profile;
     struct mrc_abi_async_source async;
 };
 
-struct mrc_ctl_store mrc_abi_ev_store(struct mrc_context *context);
+struct mrc_ctl_store mrc_abi_profile_store(struct mrc_context *context);
 int mrc_abi_retain_context(struct mrc_context *context);
 void mrc_abi_release_context(struct mrc_context *context);
 int mrc_abi_async_open(struct mrc_abi_async_channel *channel);

@@ -311,6 +311,59 @@ static void test_nscc_link_derived_bounds(void)
     assert(cc.cwnd == cc.nominal_mtu);
 }
 
+static void test_controller_config(void)
+{
+    struct mrc_cc cc;
+    struct mrc_cc_config config = {
+        .disable_qa = 1, .adjust_bytes_threshold = 1024, .adjust_period_threshold = 5000,
+        .base_rtt = 1000, .target_delay = 1000, .max_cwnd = 4000,
+        .fi = 200, .eta = 15, .fi_scale = 0.125f, .gamma = 1, .max_md_jump = 0.75f,
+    };
+    assert(mrc_cc_init(&cc, 1000, 10000, 12000, 12000));
+    assert(mrc_cc_apply_config(&cc, &config));
+    assert(cc.cwnd == 4000);
+    for (unsigned int i = 0; i < 4; i++)
+        assert(mrc_cc_on_send(&cc, 1000));
+    assert(!mrc_cc_can_send(&cc, 1000));
+
+    struct mrc_cc_tx_sample sample = { .sent_at_ns = 1 };
+    struct mrc_cc_feedback feedback;
+    assert(mrc_cc_on_sack(&cc, 4, true, false, 4001, &sample, &feedback));
+    assert(feedback.queue_delay_ns == 3000);
+    assert(cc.cwnd == 4000); /* First sample starts the decrease interval. */
+    assert(mrc_cc_on_sack(&cc, 8, true, false, 6001, &sample, NULL));
+    assert(cc.cwnd == 3000); /* Gamma reaches the configured 0.75 floor. */
+    assert(mrc_cc_on_sack(&cc, 12, false, false, 7001, &sample, NULL));
+    assert(cc.cwnd == 3000); /* Exactly the configured byte threshold. */
+    assert(mrc_cc_on_sack(&cc, 13, false, false, 7002, &sample, NULL));
+    assert(cc.cwnd == 3085); /* floor(200 * 1280 / 3000). */
+    assert(mrc_cc_on_sack(&cc, 13, false, false, 9001, &sample, NULL));
+    assert(cc.cwnd == 3100); /* Configured time threshold adds eta. */
+
+    sample.sent_at_ns = 8999;
+    assert(mrc_cc_on_sack(&cc, 29, false, false, 9001, &sample, NULL));
+    assert(cc.cwnd == 3612); /* Near-base RTT adds 4096 * 0.125. */
+    assert(mrc_cc_on_sack(&cc, 45, false, false, 9001, &sample, NULL));
+    assert(cc.cwnd == config.max_cwnd);
+
+    config.max_cwnd = 999;
+    assert(!mrc_cc_apply_config(&cc, &config));
+    assert(cc.cwnd == 4000);
+
+    assert(mrc_cc_init(&cc, 1000, 10000, 12000, 12000));
+    assert(mrc_cc_apply_config(&cc, NULL));
+    const uint32_t uncongested_cwnd = cc.cwnd;
+    assert(mrc_cc_on_send(&cc, 1000));
+    assert(mrc_cc_on_send(&cc, 1000));
+    assert(mrc_cc_on_send(&cc, 1000));
+    assert(mrc_cc_on_nack(&cc, 1000, true, false, 6000, NULL));
+    assert(mrc_cc_on_inferred_loss(&cc, 1000));
+    assert(mrc_cc_on_sack(&cc, 4, true, false, 9000, &sample, &feedback));
+    assert(feedback.newly_received_bytes == 1024);
+    assert(cc.inflight == -24);
+    assert(cc.cwnd == uncongested_cwnd);
+}
+
 int main(void)
 {
     test_nominal_size_and_receive_counter();
@@ -322,6 +375,7 @@ int main(void)
     test_nscc_decrease_and_staleness();
     test_nscc_decrease_uses_recent_delay_average();
     test_nscc_link_derived_bounds();
+    test_controller_config();
     puts("MRC congestion accounting tests passed");
     return 0;
 }

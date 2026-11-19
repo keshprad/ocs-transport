@@ -11,16 +11,17 @@ from pathlib import Path
 from memif_pair import eal_args, require, run_pair
 
 
+def control(controller, operation, store):
+    result = subprocess.run(["unshare", "-Ur", str(controller), operation, store],
+                            capture_output=True, text=True, timeout=4)
+    require(result.returncode == 0,
+            f"Controller {operation} failed: {result.stdout}\n{result.stderr}")
+    return result.stdout.strip()
+
+
 def check_live_profile(binary, controller):
     with tempfile.TemporaryDirectory(prefix="mrc-abi-ev-") as store:
-        def control(operation):
-            result = subprocess.run(["unshare", "-Ur", str(controller), operation, store],
-                                    capture_output=True, text=True, timeout=4)
-            require(result.returncode == 0,
-                    f"Controller {operation} failed: {result.stdout}\n{result.stderr}")
-            return result.stdout.strip()
-
-        profile_id = control("--seed-denied")
+        profile_id = control(controller, "--seed-denied", store)
         require(profile_id.isdecimal() and int(profile_id) > 0,
                 f"Invalid controller test profile ID: {profile_id!r}")
 
@@ -39,7 +40,7 @@ def check_live_profile(binary, controller):
                 require(time.monotonic() < deadline,
                         "Timed out checking that denied EVs blocked completion and remote placement")
                 time.sleep(0.01)
-            control("--unblock")
+            control(controller, "--unblock", store)
 
         tx, rx, _ = run_pair(command, sender_started=unblock)
         require(tx["role"] == "tx" and rx["role"] == "rx" and tx["qpn"] != rx["qpn"]
@@ -49,6 +50,15 @@ def check_live_profile(binary, controller):
         print(json.dumps({"case": "public_qp_live_ev_update", "tx": tx, "rx": rx}))
 
 
+def check_duplex(tx, rx):
+    require(len(set(tx["qpns"] + rx["qpns"])) == 4,
+            f"The connected QPs need distinct QPNs: {tx}, {rx}")
+    for result in (tx, rx):
+        require(result["bytes"] == 3 * 2049 and result["send_completions"] == 3
+                and result["recv_completions"] == 3 and result["reset_qpn"] == result["qpns"][0],
+                f"Unexpected public bidirectional QP results: {result}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -56,14 +66,14 @@ def main():
         default=Path(__file__).resolve().parent / "mrc_abi_application",
     )
     parser.add_argument("--controller", type=Path,
-                        help="Path to test_mrc_ctl_abi for the live EV update case")
+                        help="Path to test_mrc_ctl_abi for the live EV and NSCC profile cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
 
-    def run_case(mode):
+    def run_case(mode, *options):
         def command(role, cpu, directory):
-            return eal_args(binary, role, cpu, directory) + ["--", role, str(directory), mode]
+            return eal_args(binary, role, cpu, directory) + ["--", role, str(directory), mode, *options]
 
         tx, rx, _ = run_pair(command)
         require(tx["role"] == "tx" and rx["role"] == "rx",
@@ -77,12 +87,7 @@ def main():
     print(json.dumps({"case": "public_qp_over_dpdk", "tx": tx, "rx": rx}))
 
     tx, rx = run_case("duplex")
-    require(len(set(tx["qpns"] + rx["qpns"])) == 4,
-            f"The connected QPs need distinct QPNs: {tx}, {rx}")
-    for result in (tx, rx):
-        require(result["bytes"] == 3 * 2049 and result["send_completions"] == 3
-                and result["recv_completions"] == 3 and result["reset_qpn"] == result["qpns"][0],
-                f"Unexpected public bidirectional QP results: {result}")
+    check_duplex(tx, rx)
     print(json.dumps({"case": "public_bidirectional_qps_over_shared_dpdk_ports", "tx": tx, "rx": rx}))
 
     tx, rx = run_case("wire_error")
@@ -95,6 +100,13 @@ def main():
         controller = args.controller.resolve()
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
         check_live_profile(binary, controller)
+        with tempfile.TemporaryDirectory(prefix="mrc-abi-cc-") as store:
+            profile_id = control(controller, "--seed-cc", store)
+            require(profile_id.isdecimal() and int(profile_id) > 0,
+                    f"Invalid controller test CC profile ID: {profile_id!r}")
+            tx, rx = run_case("cc_profile", store, profile_id)
+        check_duplex(tx, rx)
+        print(json.dumps({"case": "public_qp_nscc_window", "tx": tx, "rx": rx}))
 
 
 if __name__ == "__main__":

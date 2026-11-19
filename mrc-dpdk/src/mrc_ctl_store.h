@@ -1,14 +1,16 @@
 #ifndef MRC_CTL_STORE_H
 #define MRC_CTL_STORE_H
 
+#include "mrc_cc.h"
 #include "mrc_ev.h"
 
 #include <stddef.h>
 
 /* Local Linux controller storage. The caller supplies the directory and
  * enforces its administrative policy. This interface is independent of the
- * upstream mrc_ctl ABI and stores expanded 32-bit EV values. */
+ * upstream mrc_ctl ABI and stores EV and congestion-control profiles. */
 #define MRC_CTL_STORE_MAX_PROFILES 32u
+#define MRC_CTL_STORE_MAX_CC_PROFILES 32u
 #define MRC_CTL_STORE_INITIALIZER { .fd = -1 }
 #define MRC_CTL_STORE_REF_INITIALIZER { .fd = -1 }
 
@@ -44,6 +46,14 @@ struct mrc_ctl_store_profile {
     uint64_t id;
     enum mrc_ctl_store_state state;
     struct mrc_ctl_store_config config;
+};
+
+struct mrc_ctl_store_cc_profile {
+    uint64_t id;
+    enum mrc_ctl_store_state state;
+    enum mrc_cc_algorithm algorithm;
+    bool configured;
+    struct mrc_cc_config config;
 };
 
 struct mrc_ctl_store {
@@ -91,5 +101,15 @@ int mrc_ctl_store_update_denied(const struct mrc_ctl_store *store, uint64_t id,
 int mrc_ctl_store_acquire(const struct mrc_ctl_store *store, uint64_t id,
                           struct mrc_ctl_store_ref *ref, struct mrc_ctl_store_profile *profile);
 void mrc_ctl_store_release(struct mrc_ctl_store_ref *ref);
+
+/* CC profiles have their own ID and lease slots. A missing profile is INIT
+ * inside an edit callback. A successful callback can clear its ID to remove
+ * it. An acquired CC profile is immutable until all leases are released. */
+int mrc_ctl_store_get_cc(const struct mrc_ctl_store *store, uint64_t id,
+                         struct mrc_ctl_store_cc_profile *profile);
+int mrc_ctl_store_edit_cc(const struct mrc_ctl_store *store, uint64_t id,
+                          int (*edit)(struct mrc_ctl_store_cc_profile *, void *), void *arg);
+int mrc_ctl_store_acquire_cc(const struct mrc_ctl_store *store, uint64_t id,
+                             struct mrc_ctl_store_ref *ref, struct mrc_ctl_store_cc_profile *profile);
 
 #endif

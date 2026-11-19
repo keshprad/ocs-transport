@@ -1,6 +1,7 @@
 #include "mrc_cc.h"
 
 #include <limits.h>
+#include <math.h>
 
 #define UDP_HEADER_SIZE 8u
 #define MAX_NOMINAL_SIZE (UINT16_MAX + MRC_CC_NOMINAL_HDRSIZE)
@@ -32,6 +33,17 @@ uint32_t mrc_cc_rx_wire_count(const struct mrc_cc_rx *rx)
     return (bytes / MRC_CC_RECVD_UNIT + extra) & MRC_CC_RECVD_MASK;
 }
 
+static struct mrc_cc_nscc nscc_defaults(uint32_t mtu, uint32_t maximum,
+                                         double scaling_a, uint64_t period)
+{
+    return (struct mrc_cc_nscc){
+        .max_wnd = maximum, .scaling_a = scaling_a,
+        .adjust_period_ns = period, .adjust_bytes_threshold = 8u * mtu,
+        .eta = 0.15 * mtu * scaling_a, .fi = 5.0 * mtu * scaling_a,
+        .fi_scale = 0.25 * scaling_a, .gamma = 0.8, .max_md_jump = 0.5,
+    };
+}
+
 bool mrc_cc_init(struct mrc_cc *cc, uint32_t nominal_mtu, uint32_t initial_cwnd,
                  uint64_t initial_base_rtt_ns, uint64_t target_queue_delay_ns)
 {
@@ -45,12 +57,47 @@ bool mrc_cc_init(struct mrc_cc *cc, uint32_t nominal_mtu, uint32_t initial_cwnd,
         .nominal_mtu = nominal_mtu,
         .base_rtt_ns = initial_base_rtt_ns,
         .target_queue_delay_ns = target_queue_delay_ns,
-        .nscc = {
-            .max_wnd = initial_cwnd,
-            .config_base_rtt_ns = initial_base_rtt_ns ? initial_base_rtt_ns :
-                                  target_queue_delay_ns,
-            .scaling_a = initial_cwnd / (1.5 * BASE_BDP_BYTES),
-        },
+        .algorithm = MRC_CC_NSCC,
+        .nscc = nscc_defaults(nominal_mtu, initial_cwnd,
+                              initial_cwnd / (1.5 * BASE_BDP_BYTES),
+                              initial_base_rtt_ns ? initial_base_rtt_ns : target_queue_delay_ns),
+    };
+    return true;
+}
+
+bool mrc_cc_config_valid(const struct mrc_cc_config *config, uint32_t nominal_mtu)
+{
+    return config && config->disable_qa && config->adjust_bytes_threshold &&
+           config->adjust_period_threshold && config->base_rtt && config->target_delay &&
+           config->max_cwnd >= nominal_mtu && config->max_cwnd <= WINDOW_LIMIT &&
+           isfinite(config->eta) && config->eta >= 0 &&
+           isfinite(config->fi) && config->fi >= 0 &&
+           isfinite(config->fi_scale) && config->fi_scale >= 0 &&
+           isfinite(config->gamma) && config->gamma >= 0 && config->gamma <= 1 &&
+           isfinite(config->max_md_jump) && config->max_md_jump >= 0 && config->max_md_jump <= 1;
+}
+
+bool mrc_cc_apply_config(struct mrc_cc *cc, const struct mrc_cc_config *config)
+{
+    if (!config) {
+        cc->algorithm = MRC_CC_DISABLED;
+        cc->cwnd = WINDOW_LIMIT;
+        return true;
+    }
+    if (!mrc_cc_config_valid(config, cc->nominal_mtu))
+        return false;
+    cc->algorithm = MRC_CC_NSCC;
+    cc->base_rtt_ns = config->base_rtt;
+    cc->target_queue_delay_ns = config->target_delay;
+    cc->cwnd = config->max_cwnd;
+    /* Infer the tuning BDP from MaxWnd when no link rates are supplied. */
+    cc->nscc = (struct mrc_cc_nscc){
+        .max_wnd = config->max_cwnd,
+        .scaling_a = config->max_cwnd / (1.5 * BASE_BDP_BYTES),
+        .adjust_period_ns = config->adjust_period_threshold,
+        .adjust_bytes_threshold = config->adjust_bytes_threshold,
+        .eta = config->eta, .fi = config->fi, .fi_scale = config->fi_scale,
+        .gamma = config->gamma, .max_md_jump = config->max_md_jump,
     };
     return true;
 }
@@ -79,16 +126,13 @@ bool mrc_cc_configure_nscc(struct mrc_cc *cc, uint64_t sender_link_bytes_per_sec
 
     cc->base_rtt_ns = config_base_rtt_ns;
     cc->cwnd = bounded_window(cc->cwnd, cc->nominal_mtu, maximum);
-    cc->nscc = (struct mrc_cc_nscc){
-        .max_wnd = maximum,
-        .config_base_rtt_ns = config_base_rtt_ns,
-        .sender_link_bytes_per_second = sender_link_bytes_per_second,
-        .scaling_a = bdp / BASE_BDP_BYTES,
-        .last_adjust_ns = now_ns,
-        .last_decrease_ns = now_ns,
-        .last_ack_ns = now_ns,
-        .clock_started = true,
-    };
+    cc->algorithm = MRC_CC_NSCC;
+    cc->nscc = nscc_defaults(cc->nominal_mtu, maximum, bdp / BASE_BDP_BYTES, config_base_rtt_ns);
+    cc->nscc.sender_link_bytes_per_second = sender_link_bytes_per_second;
+    cc->nscc.last_adjust_ns = now_ns;
+    cc->nscc.last_decrease_ns = now_ns;
+    cc->nscc.last_ack_ns = now_ns;
+    cc->nscc.clock_started = true;
     return true;
 }
 
@@ -206,7 +250,7 @@ static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
         if (delay <= NEAR_BASE_RTT_NS) {
             state->fast_bytes = add_bytes(state->fast_bytes, newly_received);
             if (state->fast_bytes > cc->cwnd || state->increase_mode) {
-                const double growth = newly_received * 0.25 * state->scaling_a;
+                const double growth = newly_received * state->fi_scale;
                 cc->cwnd = bounded_window(cc->cwnd + growth, mtu, state->max_wnd);
                 state->increase_mode = true;
                 break;
@@ -220,15 +264,15 @@ static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
                             newly_received * (cc->target_queue_delay_ns - delay);
         break;
     case MRC_CC_FAIR_INCREASE:
-        state->inc_bytes += 5.0 * mtu * state->scaling_a * newly_received;
+        state->inc_bytes += state->fi * newly_received;
         break;
     case MRC_CC_MULTIPLICATIVE_DECREASE:
         state->increase_mode = false;
         state->fast_bytes = 0;
         if (average > (double)cc->target_queue_delay_ns &&
             now_ns - state->last_decrease_ns > cc->base_rtt_ns) {
-            const double factor = 1.0 - 0.8 * (average - cc->target_queue_delay_ns) / average;
-            const double reduction = factor < 0.5 ? 0.5 : factor;
+            const double factor = 1.0 - state->gamma * (average - cc->target_queue_delay_ns) / average;
+            const double reduction = factor < state->max_md_jump ? state->max_md_jump : factor;
             cc->cwnd = bounded_window(cc->cwnd * reduction, mtu, state->max_wnd);
             state->last_decrease_ns = now_ns;
         }
@@ -237,12 +281,12 @@ static void apply_ack_adjustment(struct mrc_cc *cc, uint64_t now_ns,
         break;
     }
 
-    const bool period_elapsed = now_ns - state->last_adjust_ns >= state->config_base_rtt_ns;
-    if (period_elapsed || state->received_bytes > 8u * mtu) {
+    const bool period_elapsed = now_ns - state->last_adjust_ns >= state->adjust_period_ns;
+    if (period_elapsed || state->received_bytes > state->adjust_bytes_threshold) {
         double increase = state->inc_bytes / cc->cwnd;
         if (period_elapsed) {
             state->last_adjust_ns = now_ns;
-            increase += 0.15 * mtu * state->scaling_a;
+            increase += state->eta;
         }
         cc->cwnd = bounded_window(cc->cwnd + increase, mtu, state->max_wnd);
         state->inc_bytes = 0;
@@ -272,15 +316,17 @@ bool mrc_cc_on_sack(struct mrc_cc *cc, uint32_t rcvd_bytes, bool ecn, bool rtx,
         result.newly_received_bytes = newly_received;
     }
 
-    cc->nscc.received_bytes = add_bytes(cc->nscc.received_bytes, result.newly_received_bytes);
-    if (!cc->nscc.clock_started || arrive_ns >= cc->nscc.last_ack_ns)
-        result.rtt_ns = measure_rtt(cc, arrive_ns, sample, rtx);
-    if (result.rtt_ns) {
-        result.rtt_valid = true;
-        result.queue_delay_ns = result.rtt_ns - cc->base_rtt_ns;
-        result.adjustment = classify_adjustment(ecn, result.queue_delay_ns,
-                                                cc->target_queue_delay_ns);
-        apply_ack_adjustment(cc, arrive_ns, &result);
+    if (cc->algorithm == MRC_CC_NSCC) {
+        cc->nscc.received_bytes = add_bytes(cc->nscc.received_bytes, result.newly_received_bytes);
+        if (!cc->nscc.clock_started || arrive_ns >= cc->nscc.last_ack_ns)
+            result.rtt_ns = measure_rtt(cc, arrive_ns, sample, rtx);
+        if (result.rtt_ns) {
+            result.rtt_valid = true;
+            result.queue_delay_ns = result.rtt_ns - cc->base_rtt_ns;
+            result.adjustment = classify_adjustment(ecn, result.queue_delay_ns,
+                                                    cc->target_queue_delay_ns);
+            apply_ack_adjustment(cc, arrive_ns, &result);
+        }
     }
     if (feedback)
         *feedback = result;
@@ -298,9 +344,11 @@ bool mrc_cc_on_nack(struct mrc_cc *cc, uint32_t nominal_bytes, bool trimmed,
 {
     if (nominal_bytes > cc->nominal_mtu || !retire_bytes(cc, nominal_bytes))
         return false;
-    measure_rtt(cc, arrive_ns, sample, rtx);
-    if (trimmed)
-        reduce_cwnd(cc, nominal_bytes);
+    if (cc->algorithm == MRC_CC_NSCC) {
+        measure_rtt(cc, arrive_ns, sample, rtx);
+        if (trimmed)
+            reduce_cwnd(cc, nominal_bytes);
+    }
     return true;
 }
 
@@ -309,7 +357,8 @@ bool mrc_cc_on_inferred_loss(struct mrc_cc *cc, uint32_t nominal_bytes)
     if (nominal_bytes == 0 || nominal_bytes > cc->nominal_mtu ||
         !retire_bytes(cc, nominal_bytes))
         return false;
-    reduce_cwnd(cc, nominal_bytes);
+    if (cc->algorithm == MRC_CC_NSCC)
+        reduce_cwnd(cc, nominal_bytes);
     return true;
 }
 

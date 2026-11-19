@@ -44,8 +44,8 @@ tests/test_mrc_connect: tests/test_mrc_connect.c src/mrc_connect.c src/mrc_conne
 tests/test_mrc_ev: tests/test_mrc_ev.c src/mrc_ev.c src/mrc_ev.h
 tests/test_mrc_mpr: tests/test_mrc_mpr.c src/mrc_mpr.c src/mrc_qp.c src/mrc_connect.c src/mrc_mpr.h src/mrc_qp.h src/mrc_connect.h
 tests/test_mrc_provider: tests/test_mrc_provider.c src/mrc_provider.c src/mrc_provider_qp.c src/mrc_provider.h src/mrc_qp.h
-mrc_ctl_profile: src/mrc_ctl_profile.c src/mrc_ctl_store.c src/mrc_ctl_store.h src/mrc_ev.h
-tests/test_mrc_ctl_store: tests/test_mrc_ctl_store.c src/mrc_ctl_store.c src/mrc_ctl_store.h src/mrc_ev.h
+mrc_ctl_profile: src/mrc_ctl_profile.c src/mrc_ctl_store.c src/mrc_ctl_store.h src/mrc_ev.h src/mrc_cc.h
+tests/test_mrc_ctl_store: tests/test_mrc_ctl_store.c src/mrc_ctl_store.c src/mrc_ctl_store.h src/mrc_ev.h src/mrc_cc.h
 mrc_write tests/test_mrc_wr tests/test_mrc_provider tests/mrc_endpoint_application: CFLAGS += -pthread
 
 tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider mrc_ctl_profile tests/test_mrc_ctl_store:

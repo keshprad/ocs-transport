@@ -122,7 +122,7 @@ MRC_PUBLIC struct mrc_context *mrc_create_context(struct ibv_context *vcontext,
         errno = error;
         return NULL;
     }
-    context->ev_store.fd = -1;
+    context->profile_store.fd = -1;
     context->verbs = vcontext;
     return context;
 }
@@ -136,7 +136,7 @@ MRC_PUBLIC int mrc_destroy_context(struct mrc_context *context)
     pthread_mutex_unlock(&context->mutex);
     if (busy)
         return set_errno(EBUSY);
-    mrc_ctl_store_close(&context->ev_store);
+    mrc_ctl_store_close(&context->profile_store);
     mrc_abi_async_close(&context->async);
     pthread_mutex_destroy(&context->mutex);
     free(context);

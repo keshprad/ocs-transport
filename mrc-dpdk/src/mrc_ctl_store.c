@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
@@ -17,8 +18,6 @@ enum {
     ENTRY_HEADER_SIZE = 24,
     ENTROPY_SIZE = 4 * MRC_EV_MAX_PATHS,
     ENTRY_SIZE = ENTRY_HEADER_SIZE + ENTROPY_SIZE,
-    LEGACY_SNAPSHOT_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES *
-        (LEGACY_ENTRY_HEADER_SIZE + ENTROPY_SIZE),
     SNAPSHOT_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * ENTRY_SIZE,
 };
 
@@ -26,6 +25,20 @@ enum {
 static const char snapshot_name[] = "profiles.v1";
 static const char lock_name[] = "profiles.lock";
 static const uint8_t magic[] = { 'M', 'R', 'C', '-', 'E', 'V', 0 };
+
+enum {
+    CC_CONFIG_SIZE = 48,
+    CC_ENTRY_HEADER_SIZE = 16,
+    CC_ENTRY_SIZE = CC_ENTRY_HEADER_SIZE + CC_CONFIG_SIZE,
+    CC_SNAPSHOT_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_CC_PROFILES * CC_ENTRY_SIZE,
+};
+
+static const char cc_snapshot_name[] = "cc-profiles.v1";
+static const uint8_t cc_magic[] = { 'M', 'R', 'C', '-', 'C', 'C', 0, 1 };
+
+_Static_assert(sizeof(float) == sizeof(uint32_t) && FLT_RADIX == 2 &&
+               FLT_MANT_DIG == 24 && FLT_MAX_EXP == 128,
+               "Persistent CC profiles require IEEE binary32 floats");
 
 struct transaction {
     int fd;
@@ -201,27 +214,35 @@ static int sync_file(int fd)
     return result < 0 ? -errno : 0;
 }
 
-static int load_snapshot(const struct mrc_ctl_store *store, struct transaction *txn)
+static int read_snapshot_image(const struct mrc_ctl_store *store, const char *name,
+                                uint8_t *bytes, size_t capacity, size_t *length)
 {
-    int fd = openat(store->fd, snapshot_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    *length = 0;
+    int fd = openat(store->fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0)
         return errno == ENOENT ? 0 : -errno;
 
-    uint8_t bytes[SNAPSHOT_SIZE];
     struct stat status;
-    int result = 0;
-    size_t length = 0;
+    int result;
     if (fstat(fd, &status) < 0) {
         result = -errno;
-    } else if (!S_ISREG(status.st_mode) ||
-               (status.st_size != LEGACY_SNAPSHOT_SIZE && status.st_size != SNAPSHOT_SIZE)) {
+    } else if (!S_ISREG(status.st_mode) || status.st_size < HEADER_SIZE ||
+               status.st_size > (off_t)capacity) {
         result = -EBADMSG;
     } else {
-        length = (size_t)status.st_size;
-        result = read_all(fd, bytes, length);
+        *length = (size_t)status.st_size;
+        result = read_all(fd, bytes, *length);
     }
     close(fd);
-    if (result)
+    return result;
+}
+
+static int load_snapshot(const struct mrc_ctl_store *store, struct transaction *txn)
+{
+    uint8_t bytes[SNAPSHOT_SIZE];
+    size_t length;
+    int result = read_snapshot_image(store, snapshot_name, bytes, sizeof(bytes), &length);
+    if (result || !length)
         return result;
 
     uint8_t version = bytes[sizeof(magic)];
@@ -255,11 +276,10 @@ static int create_temp_file(const struct mrc_ctl_store *store, char *name, size_
     return -EEXIST;
 }
 
-static int set_file_permissions(const struct mrc_ctl_store *store, const struct transaction *txn,
-                                mode_t *snapshot_mode)
+static int set_file_permissions(const struct mrc_ctl_store *store, int lock_fd, mode_t *snapshot_mode)
 {
     struct stat directory, lock;
-    if (fstat(store->fd, &directory) < 0 || fstat(txn->fd, &lock) < 0)
+    if (fstat(store->fd, &directory) < 0 || fstat(lock_fd, &lock) < 0)
         return -errno;
 
     const mode_t shared = S_ISGID | S_IRGRP | S_IXGRP;
@@ -268,38 +288,33 @@ static int set_file_permissions(const struct mrc_ctl_store *store, const struct 
     /* A legacy lock may predate the directory's group assignment. Do not
      * make it readable by that other group. Preserve the stable lock inode. */
     mode_t lock_mode = share && lock.st_gid == directory.st_gid ? 0640 : 0600;
-    if ((lock.st_mode & 07777) != lock_mode && fchmod(txn->fd, lock_mode) < 0)
+    if ((lock.st_mode & 07777) != lock_mode && fchmod(lock_fd, lock_mode) < 0)
         return -errno;
     return 0;
 }
 
-static int save_snapshot(const struct mrc_ctl_store *store, const struct transaction *txn)
+static int publish_snapshot(const struct mrc_ctl_store *store, int lock_fd,
+                             const char *name, uint8_t *bytes, size_t length)
 {
     mode_t mode = 0600;
-    int result = set_file_permissions(store, txn, &mode);
+    int result = set_file_permissions(store, lock_fd, &mode);
     if (result)
         return result;
-
-    uint8_t bytes[SNAPSHOT_SIZE] = {0};
-    memcpy(bytes, magic, sizeof(magic));
-    bytes[sizeof(magic)] = TYPED_VERSION;
-    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++)
-        encode_profile(bytes + HEADER_SIZE + i * ENTRY_SIZE, &txn->profiles[i]);
-    write32(bytes + 8, checksum(bytes + HEADER_SIZE, sizeof(bytes) - HEADER_SIZE));
+    write32(bytes + 8, checksum(bytes + HEADER_SIZE, length - HEADER_SIZE));
 
     char temp_name[64];
     int fd = create_temp_file(store, temp_name, sizeof(temp_name));
     if (fd < 0)
         return fd;
 
-    result = write_all(fd, bytes, sizeof(bytes));
+    result = write_all(fd, bytes, length);
     if (!result && fchmod(fd, mode) < 0)
         result = -errno;
     if (!result)
         result = sync_file(fd);
     if (close(fd) < 0 && !result)
         result = -errno;
-    if (!result && renameat(store->fd, temp_name, store->fd, snapshot_name) < 0)
+    if (!result && renameat(store->fd, temp_name, store->fd, name) < 0)
         result = -errno;
     if (result) {
         unlinkat(store->fd, temp_name, 0);
@@ -308,6 +323,16 @@ static int save_snapshot(const struct mrc_ctl_store *store, const struct transac
 
     /* After rename, an fsync error means the commit's durability is uncertain. */
     return sync_file(store->fd);
+}
+
+static int save_snapshot(const struct mrc_ctl_store *store, const struct transaction *txn)
+{
+    uint8_t bytes[SNAPSHOT_SIZE] = {0};
+    memcpy(bytes, magic, sizeof(magic));
+    bytes[sizeof(magic)] = TYPED_VERSION;
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++)
+        encode_profile(bytes + HEADER_SIZE + i * ENTRY_SIZE, &txn->profiles[i]);
+    return publish_snapshot(store, txn->fd, snapshot_name, bytes, sizeof(bytes));
 }
 
 static int lock_file(int fd, int operation)
@@ -319,12 +344,11 @@ static int lock_file(int fd, int operation)
     return result < 0 ? -errno : 0;
 }
 
-static int begin(const struct mrc_ctl_store *store, struct transaction *txn, bool write)
+static int open_metadata_lock(const struct mrc_ctl_store *store, bool write)
 {
     if (!store || store->fd < 0)
         return -EINVAL;
 
-    *txn = (struct transaction){ .fd = -1 };
     int flags = write ? O_RDWR | O_CREAT : O_RDONLY;
     int fd = openat(store->fd, lock_name, flags | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (fd < 0)
@@ -338,8 +362,20 @@ static int begin(const struct mrc_ctl_store *store, struct transaction *txn, boo
         result = -EBADMSG;
     else
         result = lock_file(fd, write ? LOCK_EX : LOCK_SH);
-    if (!result)
-        result = load_snapshot(store, txn);
+    if (result) {
+        close(fd);
+        return result;
+    }
+    return fd;
+}
+
+static int begin(const struct mrc_ctl_store *store, struct transaction *txn, bool write)
+{
+    *txn = (struct transaction){ .fd = -1 };
+    int fd = open_metadata_lock(store, write);
+    if (fd < 0)
+        return fd;
+    int result = load_snapshot(store, txn);
     if (result)
         close(fd);
     else
@@ -382,14 +418,14 @@ static int begin_profile(const struct mrc_ctl_store *store, struct transaction *
 /* The metadata lock serializes slot reuse with acquisition of a lease.
  * Each lease is owned by its open file description, independent of the
  * store handle, and the kernel drops it when its last descriptor closes. */
-static int lock_reference(const struct transaction *txn, int slot, short type)
+static int lock_reference(int fd, int slot, short type)
 {
     struct flock lock = {
         .l_type = type, .l_whence = SEEK_SET, .l_start = slot, .l_len = 1,
     };
     int result;
     do {
-        result = fcntl(txn->fd, F_OFD_SETLK, &lock);
+        result = fcntl(fd, F_OFD_SETLK, &lock);
     } while (result < 0 && errno == EINTR);
     if (!result)
         return 0;
@@ -491,7 +527,7 @@ int mrc_ctl_store_configure(const struct mrc_ctl_store *store, uint64_t id,
     struct mrc_ctl_store_profile *profile = &txn.profiles[slot];
     if (profile->state == MRC_CTL_STORE_ONLINE)
         return finish(store, &txn, -EBUSY, false);
-    int result = lock_reference(&txn, slot, F_WRLCK);
+    int result = lock_reference(txn.fd, slot, F_WRLCK);
     if (!result) {
         profile->config = *config;
         profile->state = MRC_CTL_STORE_OFFLINE;
@@ -515,7 +551,7 @@ int mrc_ctl_store_set_state(const struct mrc_ctl_store *store, uint64_t id,
                    (state == MRC_CTL_STORE_ONLINE && config_ready(&profile->config))));
     if (!valid)
         return finish(store, &txn, -EINVAL, false);
-    int result = lock_reference(&txn, slot, F_WRLCK);
+    int result = lock_reference(txn.fd, slot, F_WRLCK);
     if (!result) {
         profile->state = state;
         if (state == MRC_CTL_STORE_INIT)
@@ -532,7 +568,7 @@ int mrc_ctl_store_remove(const struct mrc_ctl_store *store, uint64_t id)
         return slot;
     if (txn.profiles[slot].state == MRC_CTL_STORE_ONLINE)
         return finish(store, &txn, -EBUSY, false);
-    int result = lock_reference(&txn, slot, F_WRLCK);
+    int result = lock_reference(txn.fd, slot, F_WRLCK);
     if (!result)
         txn.profiles[slot] = (struct mrc_ctl_store_profile){0};
     return finish(store, &txn, result, true);
@@ -578,7 +614,7 @@ int mrc_ctl_store_edit(const struct mrc_ctl_store *store, uint64_t id,
         if (!same)
             return finish(store, &txn, -EBUSY, false);
     } else {
-        result = lock_reference(&txn, slot, F_WRLCK);
+        result = lock_reference(txn.fd, slot, F_WRLCK);
         if (result)
             return finish(store, &txn, result, false);
     }
@@ -617,7 +653,7 @@ int mrc_ctl_store_acquire(const struct mrc_ctl_store *store, uint64_t id,
         return slot;
     if (txn.profiles[slot].state != MRC_CTL_STORE_ONLINE)
         return finish(store, &txn, -EAGAIN, false);
-    int result = lock_reference(&txn, slot, F_RDLCK);
+    int result = lock_reference(txn.fd, slot, F_RDLCK);
     if (!result)
         result = lock_file(txn.fd, LOCK_UN);
     if (result)
@@ -633,4 +669,247 @@ void mrc_ctl_store_release(struct mrc_ctl_store_ref *ref)
         close(ref->fd);
         ref->fd = -1;
     }
+}
+
+static float read_float32(const uint8_t *bytes)
+{
+    uint32_t bits = read32(bytes);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void write_float32(uint8_t *bytes, float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    write32(bytes, bits);
+}
+
+static void encode_cc_config(uint8_t bytes[CC_CONFIG_SIZE], const struct mrc_cc_config *config)
+{
+    bytes[0] = config->disable_qa;
+    bytes[1] = config->qa_gate;
+    write32(bytes + 4, config->adjust_bytes_threshold);
+    write32(bytes + 8, config->adjust_period_threshold);
+    write32(bytes + 12, config->base_rtt);
+    write_float32(bytes + 16, config->eta);
+    write_float32(bytes + 20, config->fi);
+    write_float32(bytes + 24, config->fi_scale);
+    write_float32(bytes + 28, config->gamma);
+    write_float32(bytes + 32, config->max_md_jump);
+    write32(bytes + 36, config->max_cwnd);
+    write32(bytes + 40, config->qa_threshold);
+    write32(bytes + 44, config->target_delay);
+}
+
+static bool cc_profile_valid(const struct mrc_ctl_store_cc_profile *profile)
+{
+    if ((unsigned int)profile->state > MRC_CTL_STORE_ONLINE ||
+        (unsigned int)profile->algorithm > MRC_CC_NSCC)
+        return false;
+    if (!profile->id && profile->state != MRC_CTL_STORE_INIT)
+        return false;
+    if (profile->state == MRC_CTL_STORE_INIT && profile->algorithm != MRC_CC_DISABLED)
+        return false;
+    if (profile->configured)
+        return profile->algorithm == MRC_CC_NSCC;
+    if (profile->state == MRC_CTL_STORE_ONLINE && profile->algorithm == MRC_CC_NSCC)
+        return false;
+
+    uint8_t encoded[CC_CONFIG_SIZE] = {0};
+    const uint8_t empty[CC_CONFIG_SIZE] = {0};
+    encode_cc_config(encoded, &profile->config);
+    return memcmp(encoded, empty, sizeof(encoded)) == 0;
+}
+
+static bool decode_cc_profile(const uint8_t *bytes, struct mrc_ctl_store_cc_profile *profile)
+{
+    const uint8_t empty[5] = {0};
+    const uint8_t *config = bytes + CC_ENTRY_HEADER_SIZE;
+    if (bytes[10] > 1 || memcmp(bytes + 11, empty, sizeof(empty)) || config[2] || config[3])
+        return false;
+    *profile = (struct mrc_ctl_store_cc_profile){
+        .id = (uint64_t)read32(bytes) << 32 | read32(bytes + 4),
+        .state = bytes[8], .algorithm = bytes[9], .configured = bytes[10] != 0,
+        .config = {
+            .disable_qa = config[0], .qa_gate = config[1],
+            .adjust_bytes_threshold = read32(config + 4),
+            .adjust_period_threshold = read32(config + 8),
+            .base_rtt = read32(config + 12),
+            .eta = read_float32(config + 16),
+            .fi = read_float32(config + 20),
+            .fi_scale = read_float32(config + 24),
+            .gamma = read_float32(config + 28),
+            .max_md_jump = read_float32(config + 32),
+            .max_cwnd = read32(config + 36),
+            .qa_threshold = read32(config + 40),
+            .target_delay = read32(config + 44),
+        },
+    };
+    return cc_profile_valid(profile);
+}
+
+static void encode_cc_profile(uint8_t *bytes, const struct mrc_ctl_store_cc_profile *profile)
+{
+    write32(bytes, (uint32_t)(profile->id >> 32));
+    write32(bytes + 4, (uint32_t)profile->id);
+    bytes[8] = (uint8_t)profile->state;
+    bytes[9] = (uint8_t)profile->algorithm;
+    bytes[10] = profile->configured;
+    encode_cc_config(bytes + CC_ENTRY_HEADER_SIZE, &profile->config);
+}
+
+static int find_cc_profile(const struct mrc_ctl_store_cc_profile *profiles, uint64_t id)
+{
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_CC_PROFILES; i++) {
+        if (profiles[i].id == id)
+            return (int)i;
+    }
+    return -ENOENT;
+}
+
+static int load_cc_snapshot(const struct mrc_ctl_store *store,
+                            struct mrc_ctl_store_cc_profile *profiles)
+{
+    uint8_t bytes[CC_SNAPSHOT_SIZE];
+    size_t length;
+    int result = read_snapshot_image(store, cc_snapshot_name, bytes, sizeof(bytes), &length);
+    if (result || !length)
+        return result;
+    if (length != sizeof(bytes) || memcmp(bytes, cc_magic, sizeof(cc_magic)) ||
+        read32(bytes + 12) || read32(bytes + 8) != checksum(bytes + HEADER_SIZE, length - HEADER_SIZE))
+        return -EBADMSG;
+
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_CC_PROFILES; i++) {
+        struct mrc_ctl_store_cc_profile *profile = &profiles[i];
+        if (!decode_cc_profile(bytes + HEADER_SIZE + i * CC_ENTRY_SIZE, profile))
+            return -EBADMSG;
+        for (unsigned int j = 0; profile->id && j < i; j++) {
+            if (profile->id == profiles[j].id)
+                return -EBADMSG;
+        }
+    }
+    return 0;
+}
+
+static int save_cc_snapshot(const struct mrc_ctl_store *store, int lock_fd,
+                            const struct mrc_ctl_store_cc_profile *profiles)
+{
+    uint8_t bytes[CC_SNAPSHOT_SIZE] = {0};
+    memcpy(bytes, cc_magic, sizeof(cc_magic));
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_CC_PROFILES; i++)
+        encode_cc_profile(bytes + HEADER_SIZE + i * CC_ENTRY_SIZE, &profiles[i]);
+    return publish_snapshot(store, lock_fd, cc_snapshot_name, bytes, sizeof(bytes));
+}
+
+static bool cc_profiles_equal(const struct mrc_ctl_store_cc_profile *lhs,
+                              const struct mrc_ctl_store_cc_profile *rhs)
+{
+    uint8_t left[CC_ENTRY_SIZE] = {0}, right[CC_ENTRY_SIZE] = {0};
+    encode_cc_profile(left, lhs);
+    encode_cc_profile(right, rhs);
+    return memcmp(left, right, sizeof(left)) == 0;
+}
+
+int mrc_ctl_store_get_cc(const struct mrc_ctl_store *store, uint64_t id,
+                         struct mrc_ctl_store_cc_profile *profile)
+{
+    if (!store || store->fd < 0 || !id || !profile)
+        return -EINVAL;
+    struct mrc_ctl_store_cc_profile profiles[MRC_CTL_STORE_MAX_CC_PROFILES] = {0};
+    int result = load_cc_snapshot(store, profiles);
+    if (result)
+        return result;
+    int slot = find_cc_profile(profiles, id);
+    if (slot < 0)
+        return slot;
+    *profile = profiles[slot];
+    return 0;
+}
+
+int mrc_ctl_store_edit_cc(const struct mrc_ctl_store *store, uint64_t id,
+                          int (*edit)(struct mrc_ctl_store_cc_profile *, void *), void *arg)
+{
+    if (!id || !edit)
+        return -EINVAL;
+    int fd = open_metadata_lock(store, true);
+    if (fd < 0)
+        return fd;
+
+    struct mrc_ctl_store_cc_profile profiles[MRC_CTL_STORE_MAX_CC_PROFILES] = {0};
+    int result = load_cc_snapshot(store, profiles);
+    if (result)
+        goto done;
+    int slot = find_cc_profile(profiles, id);
+    struct mrc_ctl_store_cc_profile updated = slot >= 0 ? profiles[slot] :
+        (struct mrc_ctl_store_cc_profile){ .id = id };
+    result = edit(&updated, arg);
+    if (result)
+        goto done;
+
+    if (!updated.id) {
+        if (slot < 0)
+            goto done;
+        updated = (struct mrc_ctl_store_cc_profile){0};
+    } else if (updated.id != id || !cc_profile_valid(&updated)) {
+        result = -EINVAL;
+        goto done;
+    }
+
+    if (slot >= 0 && cc_profiles_equal(&profiles[slot], &updated))
+        goto done;
+    if (slot < 0) {
+        slot = find_cc_profile(profiles, 0);
+        if (slot < 0) {
+            result = -ENOSPC;
+            goto done;
+        }
+    }
+
+    /* CC and EV profiles may have the same IDs and slot indices. Their
+     * leases occupy disjoint byte ranges on the existing lock inode. */
+    result = lock_reference(fd, MRC_CTL_STORE_MAX_PROFILES + slot, F_WRLCK);
+    if (!result) {
+        profiles[slot] = updated;
+        result = save_cc_snapshot(store, fd, profiles);
+    }
+
+done:
+    close(fd);
+    return result;
+}
+
+int mrc_ctl_store_acquire_cc(const struct mrc_ctl_store *store, uint64_t id,
+                             struct mrc_ctl_store_ref *ref, struct mrc_ctl_store_cc_profile *profile)
+{
+    if (!id || !ref || !profile)
+        return -EINVAL;
+    if (ref->fd >= 0)
+        return -EBUSY;
+    int fd = open_metadata_lock(store, false);
+    if (fd < 0)
+        return fd;
+
+    struct mrc_ctl_store_cc_profile profiles[MRC_CTL_STORE_MAX_CC_PROFILES] = {0};
+    int result = load_cc_snapshot(store, profiles);
+    if (!result) {
+        int slot = find_cc_profile(profiles, id);
+        if (slot < 0) {
+            result = slot;
+        } else if (profiles[slot].state != MRC_CTL_STORE_ONLINE) {
+            result = -EAGAIN;
+        } else {
+            result = lock_reference(fd, MRC_CTL_STORE_MAX_PROFILES + slot, F_RDLCK);
+            if (!result)
+                result = lock_file(fd, LOCK_UN);
+            if (!result) {
+                *profile = profiles[slot];
+                ref->fd = fd;
+                return 0;
+            }
+        }
+    }
+    close(fd);
+    return result;
 }

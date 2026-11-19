@@ -22,6 +22,9 @@ _Static_assert((int)MRC_CTL_PROFILE_INIT == (int)MRC_CTL_STORE_INIT &&
                (int)MRC_CTL_PROFILE_ONLINE == (int)MRC_CTL_STORE_ONLINE,
                "Controller and persistent profile states must agree");
 
+static const char nscc_algorithm[] = "uet-1.0-nscc";
+static const char *cc_algorithms[] = { nscc_algorithm, NULL };
+
 struct ev_change {
     struct mrc_ctl_ev_profile_attr *attr;
     unsigned int mask;
@@ -43,20 +46,25 @@ static bool controller_capable(void)
     return (data[CAP_NET_ADMIN / 32].effective & (UINT32_C(1) << (CAP_NET_ADMIN % 32))) != 0;
 }
 
-MRC_PUBLIC int mrc_dpdk_set_ev_store(struct mrc_context *context, const char *directory)
+MRC_PUBLIC int mrc_dpdk_set_profile_store(struct mrc_context *context, const char *directory)
 {
     if (!context)
         return EINVAL;
     pthread_mutex_lock(&context->mutex);
-    int error = -mrc_ctl_store_open(&context->ev_store, directory);
+    int error = -mrc_ctl_store_open(&context->profile_store, directory);
     pthread_mutex_unlock(&context->mutex);
     return error;
 }
 
-struct mrc_ctl_store mrc_abi_ev_store(struct mrc_context *context)
+MRC_PUBLIC int mrc_dpdk_set_ev_store(struct mrc_context *context, const char *directory)
+{
+    return mrc_dpdk_set_profile_store(context, directory);
+}
+
+struct mrc_ctl_store mrc_abi_profile_store(struct mrc_context *context)
 {
     pthread_mutex_lock(&context->mutex);
-    struct mrc_ctl_store store = context->ev_store;
+    struct mrc_ctl_store store = context->profile_store;
     pthread_mutex_unlock(&context->mutex);
     return store;
 }
@@ -101,7 +109,7 @@ MRC_PUBLIC int mrc_ctl_query_device_ex(struct ibv_context *verbs, struct mrc_con
 
     size_t used = 0;
     if (context) {
-        struct mrc_ctl_store store = mrc_abi_ev_store(context);
+        struct mrc_ctl_store store = mrc_abi_profile_store(context);
         if (store.fd >= 0) {
             struct mrc_ctl_store_profile profiles[MRC_CTL_STORE_MAX_PROFILES];
             size_t count;
@@ -123,6 +131,7 @@ MRC_PUBLIC int mrc_ctl_query_device_ex(struct ibv_context *verbs, struct mrc_con
             .ev_mode_mask = MRC_CTL_EV_MODE_AUTO | MRC_CTL_EV_MODE_EXP,
             .ev_op_max_entries = EV_BATCH_LIMIT,
         },
+        .cc = { .cc_max_profiles = MRC_CTL_STORE_MAX_CC_PROFILES, .algorithms = cc_algorithms },
         .phy_port_mask = ports,
     };
     return 0;
@@ -433,7 +442,7 @@ MRC_PUBLIC int mrc_ctl_modify_ev_profile(struct mrc_context *context, uint64_t i
         return set_errno(EINVAL);
     if (!controller_capable())
         return set_errno(EPERM);
-    struct mrc_ctl_store store = mrc_abi_ev_store(context);
+    struct mrc_ctl_store store = mrc_abi_profile_store(context);
     if (store.fd < 0)
         return set_errno(ENODEV);
     struct ev_change change = { .attr = attr, .mask = (unsigned int)mask };
@@ -483,7 +492,7 @@ MRC_PUBLIC int mrc_ctl_query_ev_profile(struct mrc_context *context, uint64_t id
 {
     if (!context || !id || !attr || !valid_mask(mask))
         return set_errno(EINVAL);
-    struct mrc_ctl_store store = mrc_abi_ev_store(context);
+    struct mrc_ctl_store store = mrc_abi_profile_store(context);
     if (store.fd < 0)
         return set_errno(ENODEV);
     struct mrc_ctl_store_profile profile = {0};
@@ -540,4 +549,139 @@ MRC_PUBLIC int mrc_ctl_query_ev_profile(struct mrc_context *context, uint64_t id
             attr->ev_fields_op.fields[i] = (struct mrc_ctl_ev_field){ .width = 16, .mask = UINT16_MAX };
     }
     return error ? set_errno(-error) : 0;
+}
+
+enum {
+    CC_STATE_ATTRS = MRC_CTL_CC_PROFILE_STATE | MRC_CTL_CC_PROFILE_CUR_STATE,
+    CC_ATTRS = CC_STATE_ATTRS | MRC_CTL_CC_PROFILE_ALGORITHM | MRC_CTL_CC_PROFILE_CONFIG,
+};
+
+struct cc_change {
+    const struct mrc_ctl_cc_profile_attr *attr;
+    unsigned int mask;
+};
+
+/* Keep the two representations independent so the store stays usable
+ * without OCP headers, including when the public structures change. */
+#define COPY_NSCC_FIELDS(src) \
+    .disable_qa = (src)->disable_qa, \
+    .adjust_bytes_threshold = (src)->adjust_bytes_threshold, \
+    .adjust_period_threshold = (src)->adjust_period_threshold, \
+    .base_rtt = (src)->base_rtt, \
+    .eta = (src)->eta, .fi = (src)->fi, .fi_scale = (src)->fi_scale, \
+    .gamma = (src)->gamma, .max_md_jump = (src)->max_md_jump, \
+    .max_cwnd = (src)->max_cwnd, .qa_gate = (src)->qa_gate, \
+    .qa_threshold = (src)->qa_threshold, .target_delay = (src)->target_delay
+
+static int configure_cc(struct mrc_ctl_store_cc_profile *profile,
+                         const struct mrc_ctl_cc_nscc_cfg *config)
+{
+    if (profile->algorithm == MRC_CC_DISABLED)
+        return config ? -EINVAL : 0;
+    if (!config)
+        return -EINVAL;
+    if (!config->disable_qa)
+        return -EOPNOTSUPP;
+    struct mrc_cc_config checked = { COPY_NSCC_FIELDS(config) };
+    if (!mrc_cc_config_valid(&checked, MRC_NOMINAL_MTU))
+        return -EINVAL;
+    profile->config = checked;
+    profile->configured = true;
+    return 0;
+}
+
+static int edit_cc_profile(struct mrc_ctl_store_cc_profile *profile, void *argument)
+{
+    const struct cc_change *change = argument;
+    const struct mrc_ctl_cc_profile_attr *attr = change->attr;
+    const unsigned int mask = change->mask;
+    const enum mrc_ctl_store_state from = profile->state;
+    enum mrc_ctl_store_state to = from;
+    if (mask & MRC_CTL_CC_PROFILE_STATE) {
+        if ((unsigned int)attr->profile_state > MRC_CTL_PROFILE_ONLINE)
+            return -EINVAL;
+        to = (enum mrc_ctl_store_state)attr->profile_state;
+    }
+    if (!valid_transition(from, to) ||
+        ((mask & MRC_CTL_CC_PROFILE_CUR_STATE) && (int)attr->cur_profile_state != (int)from))
+        return -EINVAL;
+    if (to == MRC_CTL_STORE_INIT) {
+        if (mask & ~CC_STATE_ATTRS)
+            return -EINVAL;
+        *profile = (struct mrc_ctl_store_cc_profile){0};
+        return 0;
+    }
+    if (from == MRC_CTL_STORE_ONLINE && (mask & ~CC_STATE_ATTRS))
+        return -EBUSY;
+    if (from == MRC_CTL_STORE_INIT && !(mask & MRC_CTL_CC_PROFILE_ALGORITHM))
+        return -EINVAL;
+    if (from == MRC_CTL_STORE_OFFLINE && to == MRC_CTL_STORE_ONLINE &&
+        !(mask & MRC_CTL_CC_PROFILE_CONFIG))
+        return -EINVAL;
+
+    if (mask & MRC_CTL_CC_PROFILE_ALGORITHM) {
+        enum mrc_cc_algorithm algorithm = MRC_CC_DISABLED;
+        if (attr->algorithm) {
+            if (strcmp(attr->algorithm, nscc_algorithm))
+                return -EINVAL;
+            algorithm = MRC_CC_NSCC;
+        }
+        if (profile->algorithm != algorithm) {
+            profile->algorithm = algorithm;
+            profile->configured = false;
+            profile->config = (struct mrc_cc_config){0};
+        }
+    }
+    if (mask & MRC_CTL_CC_PROFILE_CONFIG) {
+        int error = configure_cc(profile, attr->cc_config);
+        if (error)
+            return error;
+    }
+    profile->state = to;
+    return 0;
+}
+
+MRC_PUBLIC int mrc_ctl_modify_cc_profile(struct mrc_context *context, uint64_t id,
+                                         struct mrc_ctl_cc_profile_attr *attr, int mask)
+{
+    if (!context || !id || !attr || ((unsigned int)mask & ~CC_ATTRS))
+        return set_errno(EINVAL);
+    if (!controller_capable())
+        return set_errno(EPERM);
+    struct mrc_ctl_store store = mrc_abi_profile_store(context);
+    if (store.fd < 0)
+        return set_errno(ENODEV);
+    struct cc_change change = { .attr = attr, .mask = (unsigned int)mask };
+    int error = mrc_ctl_store_edit_cc(&store, id, edit_cc_profile, &change);
+    return error ? set_errno(-error) : 0;
+}
+
+MRC_PUBLIC int mrc_ctl_query_cc_profile(struct mrc_context *context, uint64_t id,
+                                        struct mrc_ctl_cc_profile_attr *attr, int mask)
+{
+    if (!context || !id || !attr || ((unsigned int)mask & ~CC_ATTRS))
+        return set_errno(EINVAL);
+    if (!controller_capable())
+        return set_errno(EPERM);
+    struct mrc_ctl_store store = mrc_abi_profile_store(context);
+    if (store.fd < 0)
+        return set_errno(ENODEV);
+    struct mrc_ctl_store_cc_profile profile = {0};
+    int error = mrc_ctl_store_get_cc(&store, id, &profile);
+    if (error && error != -ENOENT)
+        return set_errno(-error);
+
+    if (mask & MRC_CTL_CC_PROFILE_STATE)
+        attr->profile_state = (enum mrc_ctl_profile_state)profile.state;
+    if (mask & MRC_CTL_CC_PROFILE_CUR_STATE)
+        attr->cur_profile_state = (enum mrc_ctl_profile_state)profile.state;
+    if (mask & MRC_CTL_CC_PROFILE_ALGORITHM)
+        attr->algorithm = profile.algorithm == MRC_CC_NSCC ? nscc_algorithm : NULL;
+    if (mask & MRC_CTL_CC_PROFILE_CONFIG) {
+        static _Thread_local struct mrc_ctl_cc_nscc_cfg config;
+        const struct mrc_cc_config *stored = &profile.config;
+        config = (struct mrc_ctl_cc_nscc_cfg){ COPY_NSCC_FIELDS(stored) };
+        attr->cc_config = profile.configured ? &config : NULL;
+    }
+    return 0;
 }

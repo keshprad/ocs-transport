@@ -449,6 +449,123 @@ static void test_legacy_shared_store(void)
     remove_fixture(&store, directory);
 }
 
+static int configure_unconfigured_cc(struct mrc_ctl_store_cc_profile *profile, void *arg)
+{
+    const uint64_t *expected_id = arg;
+    assert(profile->id == *expected_id && profile->state == MRC_CTL_STORE_INIT);
+    assert(profile->algorithm == MRC_CC_DISABLED && !profile->configured);
+    profile->state = MRC_CTL_STORE_OFFLINE;
+    profile->algorithm = MRC_CC_NSCC;
+    return 0;
+}
+
+static int replace_cc(struct mrc_ctl_store_cc_profile *profile, void *arg)
+{
+    *profile = *(const struct mrc_ctl_store_cc_profile *)arg;
+    return 0;
+}
+
+static int delete_cc(struct mrc_ctl_store_cc_profile *profile, void *arg)
+{
+    (void)arg;
+    profile->id = 0;
+    return 0;
+}
+
+static void assert_cc_parameters(const struct mrc_cc_config *a, const struct mrc_cc_config *b)
+{
+    assert(a->disable_qa == b->disable_qa && a->qa_gate == b->qa_gate);
+    assert(a->adjust_bytes_threshold == b->adjust_bytes_threshold);
+    assert(a->adjust_period_threshold == b->adjust_period_threshold && a->base_rtt == b->base_rtt);
+    assert(a->eta == b->eta && a->fi == b->fi && a->fi_scale == b->fi_scale);
+    assert(a->gamma == b->gamma && a->max_md_jump == b->max_md_jump);
+    assert(a->max_cwnd == b->max_cwnd && a->qa_threshold == b->qa_threshold);
+    assert(a->target_delay == b->target_delay);
+}
+
+static void test_cc_profiles(void)
+{
+    char directory[] = "/tmp/mrc-ctl-cc.XXXXXX";
+    assert(mkdtemp(directory));
+    assert(chmod(directory, 02750) == 0);
+    struct mrc_ctl_store store = MRC_CTL_STORE_INITIALIZER;
+    struct mrc_ctl_store_ref ev = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_ref cc = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_ref second_cc = MRC_CTL_STORE_REF_INITIALIZER;
+    struct mrc_ctl_store_profile ev_profile;
+    struct mrc_ctl_store_cc_profile record;
+    uint64_t id = UINT64_C(0x0123456789abcdef);
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+    assert(mrc_ctl_store_get_cc(&store, id, &record) == -ENOENT);
+    assert(mrc_ctl_store_acquire_cc(&store, id, &cc, &record) == -ENOENT);
+    assert(mrc_ctl_store_edit_cc(&store, id, delete_cc, NULL) == 0);
+
+    /* Place the same ID in the first EV and CC slots, then hold the EV lease
+     * while configuring CC and vice versa. */
+    struct mrc_ctl_store_config ev_config = explicit_config();
+    assert(mrc_ctl_store_create(&store, id) == 0);
+    assert(mrc_ctl_store_configure(&store, id, &ev_config) == 0);
+    assert(mrc_ctl_store_set_state(&store, id, MRC_CTL_STORE_ONLINE) == 0);
+    assert(mrc_ctl_store_acquire(&store, id, &ev, &ev_profile) == 0);
+    assert(mrc_ctl_store_edit_cc(&store, id, configure_unconfigured_cc, &id) == 0);
+    assert(mrc_ctl_store_get_cc(&store, id, &record) == 0);
+    assert(record.state == MRC_CTL_STORE_OFFLINE && record.algorithm == MRC_CC_NSCC && !record.configured);
+    assert(mrc_ctl_store_acquire_cc(&store, id, &cc, &record) == -EAGAIN);
+
+    struct mrc_ctl_store_cc_profile updated = record;
+    updated.state = MRC_CTL_STORE_ONLINE;
+    assert(mrc_ctl_store_edit_cc(&store, id, replace_cc, &updated) == -EINVAL);
+    updated.config = (struct mrc_cc_config){
+        .disable_qa = 1, .qa_gate = 4, .adjust_bytes_threshold = 8721,
+        .adjust_period_threshold = 30001, .base_rtt = 10240, .eta = 0.75f,
+        .fi = 0.31f, .fi_scale = 0.67f, .gamma = 0.43f, .max_md_jump = 0.65f,
+        .max_cwnd = 0x001a2607, .qa_threshold = 6200, .target_delay = 20000,
+    };
+    updated.configured = true;
+    assert(mrc_ctl_store_edit_cc(&store, id, replace_cc, &updated) == 0);
+    assert_mode(&store, "cc-profiles.v1", 0640);
+    assert(mrc_ctl_store_acquire_cc(&store, id, &cc, &record) == 0);
+    assert((fcntl(cc.fd, F_GETFL) & O_ACCMODE) == O_RDONLY);
+    assert(mrc_ctl_store_acquire_cc(&store, id, &cc, &record) == -EBUSY);
+    assert(mrc_ctl_store_acquire_cc(&store, id, &second_cc, &record) == 0);
+    assert(record.id == id && record.state == MRC_CTL_STORE_ONLINE && record.configured);
+    assert_cc_parameters(&record.config, &updated.config);
+
+    mrc_ctl_store_close(&store);
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+    assert(mrc_ctl_store_get_cc(&store, id, &record) == 0);
+    assert_cc_parameters(&record.config, &updated.config);
+    assert(mrc_ctl_store_edit_cc(&store, id, replace_cc, &updated) == 0);
+    updated.config.target_delay++;
+    assert(mrc_ctl_store_edit_cc(&store, id, replace_cc, &updated) == -EBUSY);
+    updated.state = MRC_CTL_STORE_OFFLINE;
+    assert(mrc_ctl_store_edit_cc(&store, id, replace_cc, &updated) == -EBUSY);
+    mrc_ctl_store_release(&cc);
+    assert(mrc_ctl_store_edit_cc(&store, id, delete_cc, NULL) == -EBUSY);
+    mrc_ctl_store_release(&ev);
+    assert(mrc_ctl_store_set_state(&store, id, MRC_CTL_STORE_OFFLINE) == 0);
+    mrc_ctl_store_release(&second_cc);
+    assert(mrc_ctl_store_edit_cc(&store, id, delete_cc, NULL) == 0);
+    assert(mrc_ctl_store_get_cc(&store, id, &record) == -ENOENT);
+
+    updated = (struct mrc_ctl_store_cc_profile){ .id = id, .state = MRC_CTL_STORE_ONLINE };
+    assert(mrc_ctl_store_edit_cc(&store, id, replace_cc, &updated) == 0);
+    assert(mrc_ctl_store_acquire_cc(&store, id, &cc, &record) == 0);
+    assert(record.algorithm == MRC_CC_DISABLED && !record.configured);
+    mrc_ctl_store_release(&cc);
+
+    int fd = openat(store.fd, "cc-profiles.v1", O_RDWR);
+    assert(fd >= 0);
+    uint8_t corrupt = 10;
+    assert(pwrite(fd, &corrupt, 1, 24) == 1);
+    assert(close(fd) == 0);
+    assert(mrc_ctl_store_get_cc(&store, id, &record) == -EBADMSG);
+    assert(mrc_ctl_store_edit_cc(&store, id, delete_cc, NULL) == -EBADMSG);
+    assert(mrc_ctl_store_get(&store, id, &ev_profile) == 0 && ev_profile.state == MRC_CTL_STORE_OFFLINE);
+    assert(unlinkat(store.fd, "cc-profiles.v1", 0) == 0);
+    remove_fixture(&store, directory);
+}
+
 int main(void)
 {
     test_lifecycle();
@@ -457,6 +574,7 @@ int main(void)
     test_failed_update_and_corruption();
     test_typed_edits();
     test_legacy_shared_store();
+    test_cc_profiles();
     puts("MRC controller profile store tests passed");
     return 0;
 }

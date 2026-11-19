@@ -22,8 +22,10 @@ int mrc_dpdk_get_async_fd(struct mrc_context *context, int *fd);
 #define MRC_DPDK_EV_FORMAT_UDP UINT64_C(1)
 #define MRC_DPDK_EV_FORMAT_STEV UINT64_C(2)
 
-/* Select a stable controller directory once per MRC context. Both the
- * controller and application contexts use the same storage. */
+/* Select a stable EV and CC profile directory once per MRC context.
+ * Both the controller and application contexts use the same storage. */
+int mrc_dpdk_set_profile_store(struct mrc_context *context, const char *directory);
+/* Compatibility name for mrc_dpdk_set_profile_store. */
 int mrc_dpdk_set_ev_store(struct mrc_context *context, const char *directory);
 
 struct rte_mempool;

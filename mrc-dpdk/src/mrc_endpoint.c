@@ -27,9 +27,7 @@ enum {
     RESPONDER_EV_PORT = 0xd000,
     EV_FLOW_LABEL = 0xa0100,
     SINGLE_SEGMENT_SRH_LEN = 24,
-    NOMINAL_MTU = PMTU + UDP_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN +
-                  MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
-    INITIAL_CWND = 128 * NOMINAL_MTU,
+    INITIAL_CWND = 128 * MRC_NOMINAL_MTU,
     TARGET_QUEUE_NS = 20000,
     FAST_LOSS_GAP = 16,
     ALL_PATHS = (1 << PATH_COUNT) - 1,
@@ -1299,7 +1297,10 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     transfer->sender = true;
     transfer->work = NULL;
     if (!mrc_tx_init(&sender->qp, transfer->initial_psn, transfer->window, sender->slots) ||
-        !mrc_cc_init(&sender->cc, NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS) ||
+        !mrc_cc_init(&sender->cc, MRC_NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS) ||
+        (transfer->cc_profile.id &&
+         !mrc_cc_apply_config(&sender->cc, transfer->cc_profile.configured ?
+                              &transfer->cc_profile.config : NULL)) ||
         !mrc_ev_init(&sender->ev, PATH_COUNT, transfer->profile.config.min_active,
                      transfer->initial_rto / 8 + 1, transfer->initial_rto / 2 + 1) ||
         !mrc_mpr_init(&sender->mpr, transfer->dynamic_mpr, transfer->mpr_max)) {
