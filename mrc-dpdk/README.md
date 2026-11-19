@@ -86,6 +86,11 @@ the two DPDK ports. The progress calls dispatch inbound packets by QPN
 and opcode and serialize I/O on the attached queues. Drive progress on
 each attached QP to process the packets dispatched to it. Use the same
 rail order for QPs to the same peer so they share node port status.
+Port status bits 0 and 1 correspond to the first and second route rails.
+An endpoint announces the current mask on reachable rails when it changes
+and refreshes it about every 250 ms. A peer report restricts path selection
+for one second. When it expires, the requester resumes path selection
+using its local link and EV state.
 
 The attachment supports a 1024-byte PMTU, registered send buffers with
 up to 16 SGEs, and payload-free WRITEIMM receive posts. Use

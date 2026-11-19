@@ -21,12 +21,13 @@ struct rte_mbuf;
 
 struct mrc_endpoint_node {
     uint32_t local_ports;
+    uint32_t local_down;
     uint32_t peer_ports;
     uint16_t token;
     uint16_t pending[PATH_COUNT];
     bool awaiting[PATH_COUNT];
-    bool peer_seen;
     uint64_t next_poll;
+    uint64_t next_announce;
     uint64_t fast_poll_until;
     uint64_t peer_valid_until;
 };

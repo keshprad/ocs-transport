@@ -40,6 +40,10 @@ REJECTED_PACKET = 1
 TRIM = 0x01
 NO_PKT_BUFFER = 0x07
 RTX = 0x20
+ENDPOINT_QPN = 2
+ENDPOINT_REQUEST = 0xD8
+ENDPOINT_RESPONSE = 0xD9
+CONTROL_DSCP = 48
 
 
 def psn(index):
@@ -74,7 +78,7 @@ class ReferenceResponder:
         self.finished = False
 
     def reply(self, rail, opcode, number, body, flags=0, *, original_udp_size=None):
-        qp = 2 if opcode == 0xD9 else REQUESTOR
+        qp = ENDPOINT_QPN if opcode in (ENDPOINT_REQUEST, ENDPOINT_RESPONSE) else REQUESTOR
         source, destination = self.peers["rx"][rail], self.peers["tx"][rail]
         header = Bth(opcode, PKEY, qp, number, flags)
         if self.ipv6:
@@ -136,7 +140,7 @@ class ReferenceResponder:
         data = packet.body[at:]
         require(data == payload(offset, data_length), f"Incorrect payload at WRITE packet {index}")
 
-        if index == REJECTED_PACKET and not is_retry:
+        if self.nack_reason is not None and index == REJECTED_PACKET and not is_retry:
             require(self.rejected_rail is None, "Repeated first transmission without the RTX bit")
             self.rejected_rail = rail
             body = struct.pack("!HBBIHHI", 0, self.nack_reason, 0, packet.entropy,
@@ -145,7 +149,7 @@ class ReferenceResponder:
             original = packet.udp_size if self.nack_reason == TRIM else None
             self.reply(rail, 0xDD, packet.bth.psn, body, original_udp_size=original)
             return
-        if index == REJECTED_PACKET and index not in self.received:
+        if self.nack_reason is not None and index == REJECTED_PACKET and index not in self.received:
             require(is_retry and self.rejected_rail is not None and rail != self.rejected_rail,
                     "Mandatory NACK did not cause an alternate-rail retransmission")
             self.retry_rail = rail
@@ -153,7 +157,8 @@ class ReferenceResponder:
         if index in self.received:
             require(is_retry, f"Duplicate WRITE packet {index} lacked RTX")
             self.sack(rail, packet, index=index)
-            if index == 0 and self.cumulative == FIRST_WRITE_END and not self.first_write_acked:
+            if (self.nack_reason is not None and index == 0 and self.cumulative == FIRST_WRITE_END
+                    and not self.first_write_acked):
                 self.transport_ack(rail, 1)
                 self.first_write_acked = True
             return
@@ -168,6 +173,15 @@ class ReferenceResponder:
         if self.cumulative == len(OPCODES) - 1:
             self.transport_ack(rail, 2)
             self.finished = True
+
+    def port_status_request(self, rail, token, mask):
+        self.reply(rail, ENDPOINT_RESPONSE, token, bytes(36))
+
+    def port_status_response(self, rail, token):
+        raise RuntimeError(f"Unexpected Port Status response on rail {rail} for identifier {token:#06x}")
+
+    def tick(self, now):
+        pass
 
     def receive(self, message):
         require(len(message) > 1 and message[0] < 2, "Invalid relay datagram")
@@ -187,9 +201,18 @@ class ReferenceResponder:
         expected_entropy = ((expected_flow & 0xFFFF) << 16) | (0xC000 + rail)
         require(bth.pkey == PKEY and packet.entropy == expected_entropy and packet.flow_label == expected_flow,
                 "Incorrect requester partition or path entropy")
-        require(bth.qp == (2 if bth.opcode == 0xD8 else RESPONDER), "Incorrect destination QP")
-        if bth.opcode == 0xD8 and len(packet.body) == 16 and packet.body[1] == 0:
-            self.reply(rail, 0xD9, bth.psn, bytes(36))
+        endpoint_op = bth.opcode in (ENDPOINT_REQUEST, ENDPOINT_RESPONSE)
+        require(bth.qp == (ENDPOINT_QPN if endpoint_op else RESPONDER), "Incorrect destination QP")
+        if endpoint_op:
+            require(packet.traffic_class >> 2 == CONTROL_DSCP, "Port Status did not use Control traffic class")
+            token = bth.psn & 0xffff
+            if bth.opcode == ENDPOINT_REQUEST:
+                require(len(packet.body) == 16 and not packet.body[1] & 3, "Invalid Port Status ERTH")
+                mask, = struct.unpack_from("!I", packet.body, 4)
+                self.port_status_request(rail, token, mask)
+            else:
+                require(len(packet.body) == 36 and not (packet.body[1] >> 2) & 3, "Invalid Port Status EETH")
+                self.port_status_response(rail, token)
         elif bth.opcode == 0xDE:
             require(len(packet.body) == 16 and struct.unpack_from("!HH", packet.body, 8) == PDC_IDS,
                     "Invalid PETH identifiers")
@@ -200,7 +223,84 @@ class ReferenceResponder:
             self.write(rail, packet)
 
 
-def run_requester(binary, relay_binary, mode, nack_reason):
+class PortStatusResponder(ReferenceResponder):
+    RAIL = 1
+    # The second identifier appears older even under 16-bit serial-number arithmetic.
+    BLOCK_TOKEN = 0x7123
+    FOLLOWUP_TOKEN = 0x0029
+
+    def __init__(self, wire, mode, expire):
+        super().__init__(wire, mode, nack_reason=None)
+        self.expire = expire
+        self.first_report = None
+        self.report_interval = None
+        self.block_sent = False
+        self.blocked_at = None
+        self.followup_sent_at = None
+        self.followup_echoed = False
+        self.resume_delay = None
+
+    def advertise(self, token, mask):
+        body = struct.pack("!IIII", 0, mask, 0, 0)
+        self.reply(self.RAIL, ENDPOINT_REQUEST, token, body)
+
+    def port_status_request(self, rail, token, mask):
+        require(mask & (1 << rail) and not mask & ~3, f"Invalid local reachability mask {mask:#x}")
+        if rail != self.RAIL:
+            return
+        now = time.monotonic()
+        if self.first_report is None:
+            if mask == 3:
+                # Withhold this EETH to exercise another independent update.
+                self.first_report = (token, now)
+        elif self.report_interval is None:
+            require(mask == 3 and token != self.first_report[0],
+                    "The next local update must retain both links and use a fresh identifier")
+            self.report_interval = now - self.first_report[1]
+            require(0.15 <= self.report_interval <= 0.50,
+                    f"Local Port Status refresh interval {self.report_interval:.3f}s was outside the expected cadence")
+            super().port_status_request(rail, token, mask)
+
+    def port_status_response(self, rail, token):
+        require(rail == self.RAIL, "Port Status response changed rails")
+        if token == self.BLOCK_TOKEN:
+            require(self.block_sent and self.blocked_at is None, "Duplicate or unsolicited zero-mask response")
+            self.blocked_at = time.monotonic()
+            self.first_write_acked = True
+            self.transport_ack(rail, 1)
+        else:
+            require(token == self.FOLLOWUP_TOKEN and self.followup_sent_at is not None and not self.followup_echoed,
+                    f"Port Status response did not echo the follow-up identifier: {token:#06x}")
+            self.followup_echoed = True
+
+    def tick(self, now):
+        # The credit is available for a measurable interval with no reachable rails.
+        if self.blocked_at is None or self.report_interval is None or self.followup_sent_at is not None:
+            return
+        pause = 0.35 if self.expire else 0.10
+        if now - self.blocked_at >= pause:
+            self.followup_sent_at = now
+            self.advertise(self.FOLLOWUP_TOKEN, 0 if self.expire else 1 << self.RAIL)
+
+    def write(self, rail, packet):
+        if packet.bth.psn == psn(FIRST_WRITE_END + 1):
+            require(self.followup_echoed, "WRITE progressed while the peer still advertised no reachable rails")
+            now = time.monotonic()
+            self.resume_delay = now - self.followup_sent_at
+            if self.expire:
+                require(0.85 <= self.resume_delay <= 1.45,
+                        f"Refreshed zero mask became stale after {self.resume_delay:.3f}s")
+            else:
+                require(rail == self.RAIL, f"Only rail {self.RAIL} was advertised after the second update")
+                require(self.resume_delay <= 0.4 and now - self.blocked_at < 0.9,
+                        f"The lower identifier did not promptly unblock sending ({self.resume_delay:.3f}s)")
+        super().write(rail, packet)
+        if self.cumulative == FIRST_WRITE_END and not self.block_sent:
+            self.block_sent = True
+            self.advertise(self.BLOCK_TOKEN, 0)
+
+
+def run_requester(binary, relay_binary, mode, nack_reason=None, *, port_status=None):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -223,13 +323,15 @@ def run_requester(binary, relay_binary, mode, nack_reason):
                 time.sleep(0.01)
             wire.connect(str(relay_socket))
             command = eal_args(binary, "tx", cpus[1], directory)
-            responder = ReferenceResponder(wire, mode, nack_reason)
+            responder = (ReferenceResponder(wire, mode, nack_reason) if port_status is None else
+                         PortStatusResponder(wire, mode, expire=port_status == "expire"))
             command += ["--", "tx", "4111@0xffffffff,7@0x6b",
                         str(responder.addresses["tx"]), str(responder.addresses["rx"]),
                         "0", MACS["rx"][0], "1", MACS["rx"][1], "--initial-psn", str(INITIAL_PSN),
                         "--requestor-qpn", hex(REQUESTOR), "--responder-qpn", hex(RESPONDER),
                         "--p-key", hex(PKEY), "--remote-address", hex(ADDRESS), "--remote-key", hex(RKEY),
-                        "--ack-timeout", "16", "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
+                        "--ack-timeout", "16" if port_status is None else "20",
+                        "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
             if responder.srv6:
                 command += ["--srv6-local", str(SIDS["tx"]), "--srv6-peer", str(SIDS["rx"])]
                 if responder.srh:
@@ -237,7 +339,9 @@ def run_requester(binary, relay_binary, mode, nack_reason):
             requester = start(command, directory)
             deadline = time.monotonic() + 4
             while not responder.finished:
-                require(time.monotonic() < deadline, "Independent peer did not complete the exchange")
+                now = time.monotonic()
+                require(now < deadline, "Independent peer did not complete the exchange")
+                responder.tick(now)
                 try:
                     message = wire.recv(2048)
                 except TimeoutError:
@@ -251,14 +355,21 @@ def run_requester(binary, relay_binary, mode, nack_reason):
 
             counters = collect(requester)
             require(responder.memory == payload(0, sum(WRITE_LENGTHS)), "Incomplete peer memory placement")
-            require(responder.retry_rail is not None and responder.first_write_acked,
-                    "Fixture did not exercise both retransmission and delayed semantic completion")
             require(counters["bytes"] == sum(WRITE_LENGTHS) and counters["packets"] == len(OPCODES) and
-                    counters["nack_received_mask"] == 1 << nack_reason and
-                    counters["trim_nacks"] == (nack_reason == TRIM) and
                     counters["probe_replies"] > 0 and counters["transport_acks"] == 2 and
                     counters["write_completions"] == 2,
                     f"Unexpected requester counters: {counters}")
+            if port_status is None:
+                require(responder.retry_rail is not None and responder.first_write_acked,
+                        "Fixture did not exercise both retransmission and delayed semantic completion")
+                require(counters["nack_received_mask"] == 1 << nack_reason and
+                        counters["trim_nacks"] == (nack_reason == TRIM),
+                        f"Unexpected NACK counters: {counters}")
+            else:
+                require(counters["port_status_updates"] == 2 and counters["port_status_replies"] == 1,
+                        f"Unexpected Port Status counters: {counters}")
+                counters["status_report_interval_ms"] = round(1000 * responder.report_interval)
+                counters["status_resume_delay_ms"] = round(1000 * responder.resume_delay)
             wire.send(b"")
             _, error = relay.communicate(timeout=3)
             require(relay.returncode == 0, f"memif relay failed\n{error}")
@@ -277,12 +388,19 @@ def main():
     parser.add_argument("--binary", type=Path, default=root / "mrc_write")
     parser.add_argument("--relay", type=Path, default=root / "tests" / "mrc_memif_relay")
     parser.add_argument("--mode", choices=MODES, action="append", help="Run only this mode")
+    parser.add_argument("--port-status-only", action="store_true", help="Run only the Port Status cases")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
-    for mode in args.mode or MODES:
-        for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim")):
-            counters = run_requester(args.binary.resolve(), args.relay.resolve(), mode, reason)
-            print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
+    binary, relay = args.binary.resolve(), args.relay.resolve()
+    if not args.port_status_only:
+        for mode in args.mode or MODES:
+            for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim")):
+                counters = run_requester(binary, relay, mode, reason)
+                print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
+    mode = (args.mode or ("ipv6",))[0]
+    for case in ("replace", "expire"):
+        counters = run_requester(binary, relay, mode, port_status=case)
+        print(json.dumps({"mode": mode, "port_status": case, **counters}))
 
 
 if __name__ == "__main__":

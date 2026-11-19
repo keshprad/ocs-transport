@@ -410,18 +410,26 @@ static void poll_port_status(const struct mrc_endpoint_config *transfer, struct 
     if (!status->fast_poll_until)
         status->fast_poll_until = now + transfer->hz / 50;
     bool connecting = now < status->fast_poll_until || !status->local_ports;
-    status->next_poll = now + transfer->hz / (connecting ? 1000 : 10);
+    status->next_poll = now + transfer->hz / (connecting ? 1000 : 20);
 
-    uint32_t active = 0;
+    uint32_t active = 0, down = 0;
     for (unsigned int i = 0; i < PATH_COUNT; i++) {
         struct rte_eth_link link;
-        if (!rte_eth_link_get_nowait(transfer->paths[i].port, &link) && link.link_status)
+        if (rte_eth_link_get_nowait(transfer->paths[i].port, &link))
+            continue;
+        if (link.link_status)
             active |= 1u << i;
+        else
+            down |= 1u << i;
     }
-    if (active == status->local_ports)
+    status->local_down = down;
+    if (active == status->local_ports && now < status->next_announce)
         return;
 
+    /* Publish fresh snapshots even when nothing changes. Neither endpoint
+     * requests nor their acknowledgements have delivery guarantees. */
     status->local_ports = active;
+    status->next_announce = now + transfer->hz / 4;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
         status->awaiting[path] = false;
         if (!(active & (1u << path)))
@@ -460,8 +468,9 @@ static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, stru
 
     const struct mrc_wire_endpoint_request *request = &packet->body.endpoint_request;
     if (request->op == MRC_ENDPOINT_PORT_STATUS) {
+        /* The identifier is private to the peer; its value gives no
+         * ordering guarantee. Refresh soft state on each valid report. */
         status->peer_ports = request->port_status_mask & ALL_PATHS;
-        status->peer_seen = true;
         status->peer_valid_until = rte_get_timer_cycles() + transfer->hz;
         counts->port_status_updates++;
     }
@@ -477,9 +486,11 @@ static bool receive_endpoint_op(const struct mrc_endpoint_config *transfer, stru
 
 static uint32_t available_paths(const struct mrc_requester *sender, uint64_t now)
 {
-    if (sender->node->peer_seen && now < sender->node->peer_valid_until)
-        return sender->node->peer_ports;
-    return ALL_PATHS;
+    const struct mrc_endpoint_node *node = sender->node;
+    uint32_t local = ALL_PATHS & ~node->local_down;
+    if (now < node->peer_valid_until)
+        return local & node->peer_ports;
+    return local;
 }
 
 static bool blackholed(const struct mrc_endpoint_config *transfer, const struct mrc_requester *sender,
@@ -1412,6 +1423,8 @@ static int requester_step(struct mrc_requester *sender)
          !mrc_cc_can_send(&sender->cc, nominal_at(transfer, sender->next))));
     bool sent_probe = false;
     for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        if (sender->node->local_down & (1u << path))
+            continue;
         bool due = mrc_ev_probe_due(&sender->ev, path, now);
         if (due || (general_probe && mrc_ev_probe_allowed(&sender->ev, path) &&
                     sender->ev.paths[path].state != MRC_EV_ASSUMED_BAD)) {
