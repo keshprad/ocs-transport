@@ -95,7 +95,7 @@ int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_att
     pthread_mutex_lock(&qp->mutex);
     *attr = (struct mrc_provider_qp_attr){
         .state = qp->state, .qpn = qp->qpn, .send_pending = qp->send.count,
-        .recv_pending = qp->recv.count,
+        .recv_pending = qp->recv.count, .send_first_sequence = qp->first_sequence,
     };
     pthread_mutex_unlock(&qp->mutex);
     return 0;

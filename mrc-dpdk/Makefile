@@ -15,14 +15,21 @@ MRC_ABI_DEPS = src/mrc_abi.h src/mrc_provider.h src/mrc_qp.h $(MRC_HEADERS)
 all: mrc_bench mrc_write mrc_ctl_profile
 
 mrc_bench: src/mrc_bench.c src/dpdk_io.c src/dpdk_io.h
-mrc_write: src/mrc_write.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.c src/mrc_wr.c \
-           src/mrc_connect.c src/mrc_oob.c src/mrc_ev.c src/mrc_mpr.c src/mrc_provider.c src/mrc_provider_qp.c src/mrc_ctl_store.c \
-           src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h src/mrc_connect.h src/mrc_oob.h src/mrc_ev.h src/mrc_mpr.h src/mrc_provider.h src/mrc_ctl_store.h
+MRC_ENDPOINT_SRC = src/mrc_endpoint.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.c src/mrc_wr.c \
+                   src/mrc_ev.c src/mrc_mpr.c src/mrc_provider.c src/mrc_provider_qp.c src/mrc_ctl_store.c
+MRC_ENDPOINT_HEADERS = src/mrc_endpoint.h src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h \
+                       src/mrc_ev.h src/mrc_mpr.h src/mrc_provider.h src/mrc_ctl_store.h
+
+mrc_write: src/mrc_write.c src/mrc_connect.c src/mrc_oob.c src/mrc_connect.h src/mrc_oob.h \
+           $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
+
+tests/mrc_endpoint_application: tests/mrc_endpoint_application.c $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
+tests/mrc_endpoint_application: CPPFLAGS += -Isrc
 
 tests/mrc_memif_relay: tests/mrc_memif_relay.c src/dpdk_io.c src/dpdk_io.h
 tests/mrc_memif_relay: CPPFLAGS += -Isrc
 
-mrc_bench mrc_write tests/mrc_memif_relay:
+mrc_bench mrc_write tests/mrc_memif_relay tests/mrc_endpoint_application:
 	$(PKG_CONFIG) --exists libdpdk
 	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(LDLIBS)
 
@@ -39,7 +46,7 @@ tests/test_mrc_mpr: tests/test_mrc_mpr.c src/mrc_mpr.c src/mrc_qp.c src/mrc_conn
 tests/test_mrc_provider: tests/test_mrc_provider.c src/mrc_provider.c src/mrc_provider_qp.c src/mrc_provider.h src/mrc_qp.h
 mrc_ctl_profile: src/mrc_ctl_profile.c src/mrc_ctl_store.c src/mrc_ctl_store.h src/mrc_ev.h
 tests/test_mrc_ctl_store: tests/test_mrc_ctl_store.c src/mrc_ctl_store.c src/mrc_ctl_store.h src/mrc_ev.h
-mrc_write tests/test_mrc_wr tests/test_mrc_provider: CFLAGS += -pthread
+mrc_write tests/test_mrc_wr tests/test_mrc_provider tests/mrc_endpoint_application: CFLAGS += -pthread
 
 tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider mrc_ctl_profile tests/test_mrc_ctl_store:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -std=c11 $(WARNINGS) -pedantic $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
@@ -69,4 +76,4 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_ctl_store
 
 clean:
-	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
+	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store

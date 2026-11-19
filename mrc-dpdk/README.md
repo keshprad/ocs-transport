@@ -76,6 +76,19 @@ rkey, and lease lifetime. Keep the application's verbs context open until
 its MRC children have been destroyed. Device discovery, public QP and MR
 integration, and controller APIs are tracked in [conformance](CONFORMANCE.md).
 
+### Driving the DPDK endpoint from a provider QP
+
+The internal interface in `src/mrc_endpoint.h` lets the application own the
+provider QP and poll its completion queues. Post a batch of writes before
+creating the requester. The packet engine derives the lengths, segmentation,
+and immediate sequence from the posted work and progresses one round per
+call. A responder configured without a total packet count can keep receiving
+work until the application stops it.
+
+Build `make tests/mrc_endpoint_application` and run
+`python3 tests/check_mrc_application.py` with the memif PMD. The application
+uses its own work IDs and registered source buffer and polls its own send CQ.
+
 ### Work completions
 
 The endpoint posts send work and WRITEIMM receive credits on a provider QP.
@@ -158,6 +171,56 @@ circuits.
 On failure, the endpoint prints per-path application RX and DPDK port counter
 deltas, together with protocol progress. Pass `--port-stats 1` to include the
 same diagnostics on success.
+
+### Concurrent three-Spark tests
+
+The cycle uses Spark-04 → Spark-02 → Spark-03 → Spark-04 on both Polatis
+rings. Each Spark receives one WRITE and sends another using separate PCI
+functions, lcores, and DPDK runtime directories. Both profiles send 256 MiB
+on each edge. In `failover`, Spark-04 injects a path-1 blackhole on its
+outgoing edge from scheduled segments 512 through 2047. The other two
+edges carry traffic throughout the run.
+
+The test uses the installed root-owned endpoint snapshots. Render the unit
+files for each Spark, substituting its host number and snapshot directory.
+
+```sh
+python3 tests/render_spark_cycle_units.py --host 04 \
+    --snapshot /opt/ocs-mrc/6a02243.H5ywnLiu --output-dir /tmp/spark-04-cycle-units
+```
+
+The existing snapshots are `/opt/ocs-mrc/6a02243.UZbqJcYi` on Spark-02,
+`/opt/ocs-mrc/6a02243.wLVmTv97` on Spark-03, and
+`/opt/ocs-mrc/6a02243.H5ywnLiu` on Spark-04. An administrator installs four
+units per Spark and permits passwordless `/usr/bin/systemctl start UNIT` and
+`/usr/bin/systemctl stop UNIT` for those exact units. The four names are
+`ocs-mrc-cycle-rx-smoke.service`, `ocs-mrc-cycle-tx-smoke.service`,
+`ocs-mrc-cycle-rx-failover.service`, and `ocs-mrc-cycle-tx-failover.service`.
+
+The harness reads each unit's journal. Where ordinary journal access is
+unavailable, permit this exact command separately for each of the four units.
+Escape the commas in the option value when writing a sudoers rule.
+
+```sh
+/usr/bin/journalctl --quiet --no-pager --output=json --output-fields=MESSAGE,_SYSTEMD_INVOCATION_ID,__REALTIME_TIMESTAMP --unit UNIT --lines=200
+```
+
+Run the test from Spark-04. Use the full revision of the installed snapshots
+and the corresponding detached test worktrees.
+
+```sh
+revision=6a02243b88b8bac406a4877230cfc185f0c7fa7f
+python3 tests/check_spark_cycle.py --revision "$revision" --profile smoke --preflight-only
+python3 tests/check_spark_cycle.py --revision "$revision" --profile smoke
+python3 tests/check_spark_cycle.py --revision "$revision" --profile failover
+```
+
+Before each run, the harness checks all three Git revisions and compares the
+installed endpoint checksums. It waits for both ports on every receiver,
+then starts the senders in parallel. It validates delivered packets on both
+rails, successful WRITEs on each edge, overlapping sender intervals from
+port initialization to completion, and EV failure and recovery on the
+injected edge.
 
 ## Original multipath prototype
 

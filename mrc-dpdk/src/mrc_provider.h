@@ -176,6 +176,7 @@ struct mrc_provider_qp_attr {
     enum mrc_provider_qp_state state;
     uint32_t qpn;
     size_t send_pending;
+    uint64_t send_first_sequence;
     size_t recv_pending;
 };
 
