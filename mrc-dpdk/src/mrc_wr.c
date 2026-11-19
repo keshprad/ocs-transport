@@ -1,6 +1,7 @@
 #include "mrc_wr.h"
 #include "mrc_qp.h"
 
+#include <errno.h>
 #include <string.h>
 
 #define NO_STAGE SIZE_MAX
@@ -11,12 +12,15 @@ bool mrc_wr_init(struct mrc_wr_responder *responder, const struct mrc_wr_config 
         config->initial_psn > MRC_PSN_MASK || config->initial_msn > MRC_PSN_MASK ||
         !config->work || !config->work_capacity || config->work_capacity > MRC_MPR_MAX ||
         config->max_wimm_inflight > config->work_capacity ||
-        config->region.length > UINT64_MAX - config->region.address ||
-        (config->region.length && !config->region.memory) ||
+        (!config->pd && (config->region.length > UINT64_MAX - config->region.address ||
+                         (config->region.length && !config->region.memory))) ||
         config->staged_capacity > MRC_MPR_MAX ||
         config->staged_capacity > SIZE_MAX / config->pmtu ||
         (config->staged_capacity && (!config->staged || !config->staged_payload)) ||
         (config->recv_capacity && !config->recv_queue))
+        return false;
+
+    if (config->pd && mrc_provider_pd_retain(config->pd))
         return false;
 
     memset(config->work, 0, config->work_capacity * sizeof(*config->work));
@@ -34,6 +38,29 @@ bool mrc_wr_init(struct mrc_wr_responder *responder, const struct mrc_wr_config 
     return true;
 }
 
+static void release_work(struct mrc_wr_slot *slot)
+{
+    if (slot->lease.owner)
+        mrc_provider_mr_release(&slot->lease);
+    slot->message = (struct mrc_wr_message){0};
+}
+
+static void release_all_work(struct mrc_wr_responder *responder)
+{
+    for (size_t i = 0; i < responder->config.work_capacity; i++)
+        release_work(&responder->config.work[i]);
+}
+
+void mrc_wr_destroy(struct mrc_wr_responder *responder)
+{
+    if (!responder)
+        return;
+    release_all_work(responder);
+    if (responder->config.pd)
+        mrc_provider_pd_release(responder->config.pd);
+    *responder = (struct mrc_wr_responder){ .failed = true };
+}
+
 bool mrc_wr_post_receive(struct mrc_wr_responder *responder, uint64_t wr_id)
 {
     size_t capacity = responder->config.recv_capacity;
@@ -48,6 +75,7 @@ bool mrc_wr_post_receive(struct mrc_wr_responder *responder, uint64_t wr_id)
 
 static enum mrc_wr_result fail(struct mrc_wr_responder *responder, enum mrc_wr_result error)
 {
+    release_all_work(responder);
     responder->failed = true;
     return error;
 }
@@ -59,18 +87,42 @@ static bool within_region(const struct mrc_wr_region *region, uint64_t va, size_
     return length <= region->length - (va - region->address);
 }
 
-static bool could_fit_middle(const struct mrc_wr_responder *responder, uint64_t va,
-                             uint32_t packets, uint32_t dmalen)
+static bool could_fit_middle(uint64_t region_iova, size_t region_length, uint32_t pmtu,
+                             uint64_t va, uint32_t packets, uint32_t dmalen)
 {
-    const struct mrc_wr_region *region = &responder->config.region;
-    if (dmalen > region->length)
+    if (dmalen > region_length)
         return false;
 
-    uint64_t offset = va - region->address;
-    uint64_t latest_base = region->length - dmalen;
-    uint32_t pmtu = responder->config.pmtu;
+    uint64_t offset = va - region_iova;
+    uint64_t latest_base = region_length - dmalen;
     uint64_t first_index = offset > latest_base ? 1 + (offset - latest_base - 1) / pmtu : 1;
     return first_index <= packets - 2 && first_index <= offset / pmtu;
+}
+
+static int acquire_write(struct mrc_provider_pd *pd, uint32_t key, uint64_t va, size_t length,
+                         struct mrc_provider_mr_lease *lease)
+{
+    if (!key)
+        return -EACCES;
+    const struct mrc_provider_mr_access access = {
+        .iova = va, .length = length, .key = key, .operation = MRC_PROVIDER_MR_WRITE_REMOTE,
+    };
+    return mrc_provider_mr_acquire(pd, &access, lease);
+}
+
+static int validate_unanchored(const struct mrc_wr_responder *responder,
+                               const struct mrc_wire_write *write, uint32_t packets)
+{
+    struct mrc_provider_mr_lease lease = {0};
+    int result = acquire_write(responder->config.pd, write->r_key, write->va,
+                               write->data_len, &lease);
+    if (!result) {
+        if (!could_fit_middle(lease.region_iova, lease.region_length, responder->config.pmtu,
+                              write->va, packets, write->dma_len))
+            result = -EACCES;
+        mrc_provider_mr_release(&lease);
+    }
+    return result;
 }
 
 static struct mrc_wr_slot *find_work(const struct mrc_wr_responder *responder, uint16_t msn,
@@ -78,15 +130,15 @@ static struct mrc_wr_slot *find_work(const struct mrc_wr_responder *responder, u
 {
     for (size_t i = 0; i < responder->config.work_capacity; i++) {
         struct mrc_wr_slot *slot = &responder->config.work[i];
-        if (slot->used && slot->msn == msn)
+        if (slot->message.used && slot->message.msn == msn)
             return slot;
-        if (available && !slot->used && !*available)
+        if (available && !slot->message.used && !*available)
             *available = slot;
     }
     return NULL;
 }
 
-static bool valid_position(const struct mrc_wr_slot *slot, uint32_t pmtu, uint32_t psn,
+static bool valid_position(const struct mrc_wr_message *slot, uint32_t pmtu, uint32_t psn,
                            uint64_t va, bool middle)
 {
     int32_t offset = mrc_psn_delta(psn, slot->first_psn);
@@ -97,13 +149,13 @@ static bool valid_position(const struct mrc_wr_slot *slot, uint32_t pmtu, uint32
     return va == slot->base_va + (uint64_t)(uint32_t)offset * pmtu;
 }
 
-static bool covers(const struct mrc_wr_slot *slot, uint32_t psn)
+static bool covers(const struct mrc_wr_message *slot, uint32_t psn)
 {
     int32_t offset = mrc_psn_delta(psn, slot->first_psn);
     return offset >= 0 && (uint32_t)offset < slot->packets;
 }
 
-static bool valid_anchor(const struct mrc_wr_responder *responder, const struct mrc_wr_slot *candidate)
+static bool valid_anchor(const struct mrc_wr_responder *responder, const struct mrc_wr_message *candidate)
 {
     uint32_t first = (uint32_t)mrc_psn_delta(candidate->first_psn, responder->next_psn);
     uint16_t message = (uint16_t)(candidate->msn - (uint16_t)responder->next_msn);
@@ -113,7 +165,7 @@ static bool valid_anchor(const struct mrc_wr_responder *responder, const struct 
 
     uint32_t end = first + candidate->packets;
     for (size_t i = 0; i < responder->config.work_capacity; i++) {
-        const struct mrc_wr_slot *other = &responder->config.work[i];
+        const struct mrc_wr_message *other = &responder->config.work[i].message;
         if (!other->used || other->msn == candidate->msn)
             continue;
 
@@ -142,7 +194,7 @@ static bool valid_anchor(const struct mrc_wr_responder *responder, const struct 
     return true;
 }
 
-static bool valid_staged(const struct mrc_wr_responder *responder, const struct mrc_wr_slot *slot)
+static bool valid_staged(const struct mrc_wr_responder *responder, const struct mrc_wr_message *slot)
 {
     for (size_t index = slot->staged_head; index != NO_STAGE;
          index = responder->config.staged[index].next) {
@@ -153,30 +205,39 @@ static bool valid_staged(const struct mrc_wr_responder *responder, const struct 
     return true;
 }
 
-static void place(const struct mrc_wr_region *region, uint64_t va, const uint8_t *data,
+static void place(const struct mrc_wr_responder *responder, const struct mrc_wr_message *message,
+                  const struct mrc_provider_mr_lease *lease, uint64_t va, const uint8_t *data,
                   size_t length)
 {
-    if (length)
+    if (!length)
+        return;
+    if (responder->config.pd) {
+        uint8_t *memory = lease->address;
+        memcpy(memory + (va - message->base_va), data, length);
+    } else {
+        const struct mrc_wr_region *region = &responder->config.region;
         memcpy(region->memory + (va - region->address), data, length);
+    }
 }
 
-static void place_staged(struct mrc_wr_responder *responder, struct mrc_wr_slot *slot)
+static void place_staged(struct mrc_wr_responder *responder, struct mrc_wr_message *message,
+                         const struct mrc_provider_mr_lease *lease)
 {
-    while (slot->staged_head != NO_STAGE) {
-        size_t index = slot->staged_head;
+    while (message->staged_head != NO_STAGE) {
+        size_t index = message->staged_head;
         struct mrc_wr_staged *packet = &responder->config.staged[index];
         uint32_t pmtu = responder->config.pmtu;
-        place(&responder->config.region, packet->va,
+        place(responder, message, lease, packet->va,
               responder->config.staged_payload + index * pmtu, pmtu);
-        slot->staged_head = packet->next;
+        message->staged_head = packet->next;
         packet->next = responder->free_stage;
         responder->free_stage = index;
-        slot->placed++;
+        message->placed++;
     }
 }
 
 static enum mrc_wr_result stage_middle(struct mrc_wr_responder *responder,
-                                       struct mrc_wr_slot *slot, uint32_t psn,
+                                       struct mrc_wr_message *slot, uint32_t psn,
                                        const struct mrc_wire_write *write)
 {
     size_t index = responder->free_stage;
@@ -184,7 +245,7 @@ static enum mrc_wr_result stage_middle(struct mrc_wr_responder *responder,
         return MRC_WR_NO_RESOURCE;
 
     for (size_t i = 0; i < responder->config.work_capacity; i++) {
-        const struct mrc_wr_slot *other = &responder->config.work[i];
+        const struct mrc_wr_message *other = &responder->config.work[i].message;
         if (other->used && other->anchored && other->msn != slot->msn && covers(other, psn))
             return fail(responder, MRC_WR_INVALID);
     }
@@ -220,8 +281,10 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
         return fail(responder, MRC_WR_INVALID);
 
     const struct mrc_wr_region *region = &responder->config.region;
-    if (write->r_key != region->r_key || !within_region(region, write->va, write->data_len) ||
-        (middle && !could_fit_middle(responder, write->va, packets, write->dma_len)))
+    if (!responder->config.pd &&
+        (write->r_key != region->r_key || !within_region(region, write->va, write->data_len) ||
+         (middle && !could_fit_middle(region->address, region->length, pmtu,
+                                      write->va, packets, write->dma_len))))
         return fail(responder, MRC_WR_REMOTE_ACCESS);
 
     uint16_t message = (uint16_t)(write->msn - (uint16_t)responder->next_msn);
@@ -240,10 +303,14 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
     if (!slot && !available)
         return MRC_WR_NO_RESOURCE;
 
-    struct mrc_wr_slot candidate = slot ? *slot : (struct mrc_wr_slot) {
+    struct mrc_wr_slot *target = slot ? slot : available;
+    struct mrc_wr_message candidate = slot ? slot->message : (struct mrc_wr_message) {
         .staged_head = NO_STAGE, .dmalen = write->dma_len, .packets = packets,
-        .msn = write->msn, .rqmsn = write->rqmsn, .used = true, .uniform_rqmsn = true,
+        .r_key = write->r_key, .msn = write->msn, .rqmsn = write->rqmsn,
+        .used = true, .uniform_rqmsn = true,
     };
+    if (candidate.r_key != write->r_key)
+        return fail(responder, MRC_WR_REMOTE_ACCESS);
     if (candidate.dmalen != write->dma_len || ((last || only) && candidate.final_seen))
         return fail(responder, MRC_WR_INVALID);
 
@@ -252,14 +319,23 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
         return fail(responder, MRC_WR_INVALID);
 
     if (middle && !candidate.anchored) {
+        if (responder->config.pd) {
+            int result = validate_unanchored(responder, write, packets);
+            if (result == -EOVERFLOW)
+                return MRC_WR_NO_RESOURCE;
+            if (result)
+                return fail(responder, MRC_WR_REMOTE_ACCESS);
+        }
         enum mrc_wr_result result = stage_middle(responder, &candidate, psn, write);
         if (result != MRC_WR_OK)
             return result;
     } else {
+        bool needs_anchor = !candidate.anchored;
         if (!middle) {
             uint64_t offset = last ? final_offset : 0;
-            if (write->va < offset ||
-                !within_region(region, write->va - offset, write->dma_len))
+            if (write->va < offset || write->va - offset > UINT64_MAX - write->dma_len ||
+                (!responder->config.pd &&
+                 !within_region(region, write->va - offset, write->dma_len)))
                 return fail(responder, MRC_WR_REMOTE_ACCESS);
 
             uint32_t first_psn = mrc_psn_add(psn, last ? -(int32_t)(packets - 1) : 0);
@@ -268,7 +344,7 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
                 (candidate.first_psn != first_psn || candidate.base_va != base_va))
                 return fail(responder, MRC_WR_INVALID);
 
-            if (!candidate.anchored) {
+            if (needs_anchor) {
                 candidate.anchored = true;
                 candidate.base_va = base_va;
                 candidate.first_psn = first_psn;
@@ -285,14 +361,23 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
             candidate.final_seen = true;
             candidate.with_imm = immediate;
             candidate.immediate = write->imm_data;
-            responder->wimm_inflight += immediate;
         }
-        place(region, write->va, write->data, write->data_len);
+        if (needs_anchor && responder->config.pd) {
+            int result = acquire_write(responder->config.pd, candidate.r_key, candidate.base_va,
+                                       candidate.dmalen, &target->lease);
+            if (result == -EOVERFLOW)
+                return MRC_WR_NO_RESOURCE;
+            if (result)
+                return fail(responder, MRC_WR_REMOTE_ACCESS);
+        }
+
+        responder->wimm_inflight += immediate;
+        place(responder, &candidate, &target->lease, write->va, write->data, write->data_len);
         candidate.placed++;
-        place_staged(responder, &candidate);
+        place_staged(responder, &candidate, &target->lease);
     }
 
-    *(slot ? slot : available) = candidate;
+    target->message = candidate;
     return MRC_WR_OK;
 }
 
@@ -306,8 +391,11 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
         return fail(responder, MRC_WR_INVALID);
 
     while (mrc_psn_delta(delivery_cack, responder->next_psn) >= 0) {
-        struct mrc_wr_slot *slot = find_work(responder, (uint16_t)responder->next_msn, NULL);
-        if (!slot || !slot->anchored || slot->first_psn != responder->next_psn)
+        struct mrc_wr_slot *work = find_work(responder, (uint16_t)responder->next_msn, NULL);
+        if (!work)
+            return fail(responder, MRC_WR_INVALID);
+        const struct mrc_wr_message *slot = &work->message;
+        if (!slot->anchored || slot->first_psn != responder->next_psn)
             return fail(responder, MRC_WR_INVALID);
 
         uint32_t last = mrc_psn_add(slot->first_psn, (int32_t)(slot->packets - 1));
@@ -335,7 +423,7 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
         }
         responder->next_psn = mrc_psn_add(last, 1);
         responder->next_msn = mrc_psn_add(responder->next_msn, 1);
-        slot->used = false;
+        release_work(work);
         if (*produced)
             break;
     }

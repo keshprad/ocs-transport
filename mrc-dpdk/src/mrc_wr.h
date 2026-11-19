@@ -1,6 +1,7 @@
 #ifndef MRC_WR_H
 #define MRC_WR_H
 
+#include "mrc_provider.h"
 #include "mrc_wire.h"
 
 enum mrc_wr_result {
@@ -20,11 +21,12 @@ struct mrc_wr_region {
     uint32_t r_key;
 };
 
-struct mrc_wr_slot {
+struct mrc_wr_message {
     uint64_t base_va;
     size_t staged_head;
     uint32_t first_psn;
     uint32_t dmalen;
+    uint32_t r_key;
     uint32_t packets;
     uint32_t placed;
     uint32_t immediate;
@@ -37,6 +39,11 @@ struct mrc_wr_slot {
     bool with_imm;
 };
 
+struct mrc_wr_slot {
+    struct mrc_wr_message message;
+    struct mrc_provider_mr_lease lease;
+};
+
 struct mrc_wr_staged {
     uint64_t va;
     size_t next;
@@ -45,6 +52,7 @@ struct mrc_wr_staged {
 
 struct mrc_wr_config {
     struct mrc_wr_region region;
+    struct mrc_provider_pd *pd; /* If set, use this registered-memory domain. */
     uint32_t pmtu;
     uint32_t initial_psn;
     uint32_t initial_msn; /* Full 24-bit MSN; METH carries its low 16 bits. */
@@ -80,6 +88,8 @@ struct mrc_wr_completion {
 };
 
 bool mrc_wr_init(struct mrc_wr_responder *responder, const struct mrc_wr_config *config);
+/* Required after successful init. Also safe on zeroed or destroyed responders. */
+void mrc_wr_destroy(struct mrc_wr_responder *responder);
 bool mrc_wr_post_receive(struct mrc_wr_responder *responder, uint64_t wr_id);
 
 /* Caller filters non-NEW PSNs using the reliability window. A successful receive

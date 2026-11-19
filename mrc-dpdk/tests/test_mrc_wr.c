@@ -2,6 +2,8 @@
 #include "mrc_wr.h"
 
 #include <assert.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -18,8 +20,8 @@ struct fixture {
     uint8_t qp_slots[128];
 };
 
-static void init(struct fixture *fixture, uint32_t psn, uint32_t msn, uint16_t rqmsn,
-                 size_t max_wimm)
+static void init_responder(struct fixture *fixture, uint32_t psn, uint32_t msn, uint16_t rqmsn,
+                           size_t max_wimm, struct mrc_provider_pd *pd)
 {
     memset(fixture->memory, 0, sizeof(fixture->memory));
     struct mrc_wr_config config = {
@@ -27,7 +29,7 @@ static void init(struct fixture *fixture, uint32_t psn, uint32_t msn, uint16_t r
             .memory = fixture->memory, .address = VA,
             .length = sizeof(fixture->memory), .r_key = KEY,
         },
-        .pmtu = PMTU, .initial_psn = psn, .initial_msn = msn, .initial_rqmsn = rqmsn,
+        .pd = pd, .pmtu = PMTU, .initial_psn = psn, .initial_msn = msn, .initial_rqmsn = rqmsn,
         .max_wimm_inflight = max_wimm, .work = fixture->work, .work_capacity = WORK,
         .staged = fixture->staged, .staged_payload = fixture->staged_payload,
         .staged_capacity = STAGE, .recv_queue = fixture->recv_queue, .recv_capacity = RECEIVE,
@@ -36,22 +38,34 @@ static void init(struct fixture *fixture, uint32_t psn, uint32_t msn, uint16_t r
     assert(mrc_rx_init(&fixture->qp, psn, sizeof(fixture->qp_slots), fixture->qp_slots));
 }
 
+static void init(struct fixture *fixture, uint32_t psn, uint32_t msn, uint16_t rqmsn,
+                 size_t max_wimm)
+{
+    init_responder(fixture, psn, msn, rqmsn, max_wimm, NULL);
+}
+
+static enum mrc_wr_result offer_record(struct fixture *fixture, uint8_t opcode, uint32_t psn,
+                                       const struct mrc_wire_write *write)
+{
+    assert(mrc_rx_classify(&fixture->qp, psn) == MRC_RX_NEW);
+    enum mrc_wr_result result = mrc_wr_receive(&fixture->responder, psn, opcode, write);
+    if (result == MRC_WR_OK) {
+        bool sack_due;
+        mrc_rx_record(&fixture->qp, psn, write->data_len, 0, 4096, &sack_due);
+    }
+    return result;
+}
+
 static enum mrc_wr_result offer(struct fixture *fixture, uint8_t opcode, uint32_t psn,
                                 uint16_t msn, uint16_t rqmsn, uint64_t va, uint32_t dmalen,
                                 uint32_t immediate, const char *data, size_t length)
 {
-    assert(mrc_rx_classify(&fixture->qp, psn) == MRC_RX_NEW);
-    struct mrc_wire_write write = {
+    const struct mrc_wire_write write = {
         .msn = msn, .rqmsn = rqmsn, .va = va, .r_key = KEY,
         .dma_len = dmalen, .imm_data = immediate,
         .data = (const uint8_t *)data, .data_len = length,
     };
-    enum mrc_wr_result result = mrc_wr_receive(&fixture->responder, psn, opcode, &write);
-    if (result == MRC_WR_OK) {
-        bool sack_due;
-        mrc_rx_record(&fixture->qp, psn, length, 0, 4096, &sack_due);
-    }
-    return result;
+    return offer_record(fixture, opcode, psn, &write);
 }
 
 static enum mrc_wr_result advance(struct fixture *fixture, struct mrc_wr_completion *completion,
@@ -186,11 +200,163 @@ static void test_work_and_staging_bounds(void)
     assert(offer(&f, MRC_WRITE_ONLY, 28, 5, 0, VA + 96, 1, 0, "z", 1) == MRC_WR_OK);
 }
 
+struct deregistration {
+    struct mrc_provider_pd *pd;
+    uint32_t key;
+    int result;
+};
+
+static void *try_deregister(void *argument)
+{
+    struct deregistration *request = argument;
+    request->result = mrc_provider_mr_deregister(request->pd, request->key);
+    return NULL;
+}
+
+static struct mrc_provider_mr_keys register_write(struct mrc_provider_pd *pd,
+                                                     uint8_t *memory, size_t length)
+{
+    struct mrc_provider_mr_keys keys;
+    unsigned int flags = MRC_PROVIDER_MR_LOCAL_WRITE | MRC_PROVIDER_MR_REMOTE_WRITE;
+    assert(mrc_provider_mr_register(pd, memory, length, VA, flags, &keys) == 0);
+    return keys;
+}
+
+static void test_provider_ordered_leases(void)
+{
+    struct mrc_provider_pd *pd = NULL;
+    uint8_t first[24] = {0}, second[24] = {0};
+    assert(mrc_provider_pd_create(2, &pd) == 0);
+    struct mrc_provider_mr_keys a = register_write(pd, first, sizeof(first));
+    struct mrc_provider_mr_keys b = register_write(pd, second, sizeof(second));
+    struct fixture f;
+    init_responder(&f, 20, 1, 1, 1, pd);
+    assert(mrc_wr_post_receive(&f.responder, 101));
+
+    const struct mrc_wire_write later = {
+        .msn = 2, .rqmsn = 1, .va = VA + 8, .r_key = b.rkey,
+        .dma_len = 3, .imm_data = 19, .data = (const uint8_t *)"xyz", .data_len = 3,
+    };
+    assert(offer_record(&f, MRC_WRITE_ONLY_IMM, 23, &later) == MRC_WR_OK);
+    assert(memcmp(second + 8, "xyz", 3) == 0 && first[8] == 0 && f.memory[8] == 0);
+
+    struct mrc_wr_completion completion;
+    bool produced;
+    assert(advance(&f, &completion, &produced) == MRC_WR_OK && !produced);
+    struct deregistration request = { .pd = pd, .key = b.lkey };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, try_deregister, &request) == 0);
+    assert(pthread_join(thread, NULL) == 0 && request.result == -EBUSY);
+
+    struct mrc_wire_write earlier = {
+        .msn = 1, .va = VA + 8, .r_key = a.rkey, .dma_len = 17,
+        .data = (const uint8_t *)"ijklmnop", .data_len = 8,
+    };
+    assert(offer_record(&f, MRC_WRITE_MIDDLE, 21, &earlier) == MRC_WR_OK);
+    assert(first[8] == 0);
+    earlier.va = VA + 16;
+    earlier.data = (const uint8_t *)"q";
+    earlier.data_len = 1;
+    assert(offer_record(&f, MRC_WRITE_LAST, 22, &earlier) == MRC_WR_OK);
+    assert(memcmp(first + 8, "ijklmnopq", 9) == 0);
+    assert(mrc_provider_mr_deregister(pd, a.lkey) == -EBUSY);
+
+    earlier.va = VA;
+    earlier.data = (const uint8_t *)"abcdefgh";
+    earlier.data_len = 8;
+    assert(offer_record(&f, MRC_WRITE_FIRST, 20, &earlier) == MRC_WR_OK);
+    assert(memcmp(first, "abcdefghijklmnopq", 17) == 0);
+    assert(advance(&f, &completion, &produced) == MRC_WR_OK && produced);
+    assert(completion.wr_id == 101 && completion.msn == 2 && completion.immediate == 19);
+    assert(mrc_provider_mr_deregister(pd, a.lkey) == 0);
+    assert(mrc_provider_mr_deregister(pd, b.lkey) == 0);
+    assert(mrc_provider_pd_destroy(pd) == -EBUSY);
+    mrc_wr_destroy(&f.responder);
+    mrc_wr_destroy(&f.responder);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
+static void test_provider_rejects_staged_key_or_geometry(void)
+{
+    struct mrc_provider_pd *pd = NULL;
+    uint8_t memory[24] = {0};
+    assert(mrc_provider_pd_create(1, &pd) == 0);
+    struct mrc_provider_mr_keys a = register_write(pd, memory, sizeof(memory));
+    struct fixture f;
+    init_responder(&f, 20, 1, 1, 1, pd);
+
+    struct mrc_wire_write write = {
+        .msn = 1, .va = VA + 8, .r_key = a.rkey, .dma_len = 17,
+        .data = (const uint8_t *)"abcdefgh", .data_len = 8,
+    };
+    assert(offer_record(&f, MRC_WRITE_MIDDLE, 21, &write) == MRC_WR_OK);
+    assert(memory[8] == 0);
+    assert(mrc_provider_mr_deregister(pd, a.lkey) == 0);
+    struct mrc_provider_mr_keys b = register_write(pd, memory, sizeof(memory));
+    assert(b.rkey != a.rkey);
+    write.va = VA;
+    assert(offer_record(&f, MRC_WRITE_FIRST, 20, &write) == MRC_WR_REMOTE_ACCESS);
+    assert(memory[0] == 0 && memory[8] == 0);
+    mrc_wr_destroy(&f.responder);
+
+    init_responder(&f, 20, 1, 1, 1, pd);
+    write.r_key = b.rkey;
+    write.va = VA + 9;
+    assert(offer_record(&f, MRC_WRITE_MIDDLE, 21, &write) == MRC_WR_OK);
+    write.va = VA;
+    assert(offer_record(&f, MRC_WRITE_FIRST, 20, &write) == MRC_WR_INVALID);
+    assert(memory[0] == 0 && memory[9] == 0);
+    mrc_wr_destroy(&f.responder);
+
+    init_responder(&f, 20, 1, 1, 1, pd);
+    write.va = VA + 8;
+    assert(offer_record(&f, MRC_WRITE_FIRST, 20, &write) == MRC_WR_REMOTE_ACCESS);
+    assert(memory[8] == 0);
+    mrc_wr_destroy(&f.responder);
+    assert(mrc_provider_mr_deregister(pd, b.lkey) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
+static void test_provider_releases_on_error_and_destroy(void)
+{
+    struct mrc_provider_pd *pd = NULL;
+    uint8_t first[24] = {0}, second[24] = {0};
+    assert(mrc_provider_pd_create(2, &pd) == 0);
+    struct mrc_provider_mr_keys a = register_write(pd, first, sizeof(first));
+    struct mrc_provider_mr_keys b = register_write(pd, second, sizeof(second));
+    struct fixture f;
+    init_responder(&f, 20, 1, 1, 1, pd);
+
+    struct mrc_wire_write write = {
+        .msn = 1, .va = VA, .r_key = a.rkey, .dma_len = 17,
+        .data = (const uint8_t *)"abcdefgh", .data_len = 8,
+    };
+    assert(offer_record(&f, MRC_WRITE_FIRST, 20, &write) == MRC_WR_OK);
+    assert(mrc_provider_mr_deregister(pd, a.lkey) == -EBUSY);
+    write.va = VA + 8;
+    write.r_key = b.rkey;
+    assert(offer_record(&f, MRC_WRITE_MIDDLE, 21, &write) == MRC_WR_REMOTE_ACCESS);
+    assert(first[8] == 0 && second[8] == 0);
+    assert(mrc_provider_mr_deregister(pd, a.lkey) == 0);
+    mrc_wr_destroy(&f.responder);
+
+    init_responder(&f, 20, 1, 1, 1, pd);
+    write.va = VA;
+    assert(offer_record(&f, MRC_WRITE_FIRST, 20, &write) == MRC_WR_OK);
+    assert(mrc_provider_mr_deregister(pd, b.lkey) == -EBUSY);
+    mrc_wr_destroy(&f.responder);
+    assert(mrc_provider_mr_deregister(pd, b.lkey) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
 int main(void)
 {
     test_out_of_order_and_wrap();
     test_reject_malformed_without_placement();
     test_imm_resource_errors();
     test_work_and_staging_bounds();
+    test_provider_ordered_leases();
+    test_provider_rejects_staged_key_or_geometry();
+    test_provider_releases_on_error_and_destroy();
     puts("MRC responder work request tests passed");
 }

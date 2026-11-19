@@ -207,7 +207,9 @@ static int acquire_region(struct mrc_provider_pd *pd, struct region *slot,
 
     slot->leases++;
     *lease = (struct mrc_provider_mr_lease){
-        .address = address, .length = access->length, .owner = pd, .lkey = slot->keys.lkey,
+        .address = address, .length = access->length,
+        .region_iova = slot->iova, .region_length = slot->length,
+        .owner = pd, .lkey = slot->keys.lkey,
     };
     return 0;
 }

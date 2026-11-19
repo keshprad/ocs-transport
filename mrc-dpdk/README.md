@@ -24,7 +24,7 @@ Add `--oob-host IP --oob-port N` on both endpoints to exchange the QP
 parameters over TCP. On the receiver, the IP is the local management address
 to bind. On the sender, it is the receiver's management address. The peers
 exchange QPN, initial PSN, receive limits, P_Key, trim capability, and
-registered-memory information before the data transfer. The exchange record
+registered-memory information before the data transfer. TCP setup uses the provider-generated rkey. Use `--remote-key` with manual setup. The exchange record
 is specific to this benchmark. OCP leaves the out-of-band encoding to the
 application. To exercise Dynamic MPR, pass `--dynamic-mpr 1` on both peers
 with TCP setup enabled. On the receiver, `--mpr-change-at PACKETS` and
@@ -54,6 +54,11 @@ The configured IP pair identifies the QP across both circuits, while each
 circuit uses its corresponding peer MAC. First run with both paths healthy.
 Use `--drop-path-after N` on the sender for an in-process path-1 blackhole
 that leaves the Polatis configuration untouched.
+
+On failure, the endpoint prints per-path application RX and DPDK port counter
+deltas, together with protocol progress. Pass `--port-stats 1` to include the
+same diagnostics on success. Use the same `--udp-port` on both peers when
+comparing the documented RoCEv2 port 4791 with the OCP prose value 4971.
 
 ## Original multipath prototype
 

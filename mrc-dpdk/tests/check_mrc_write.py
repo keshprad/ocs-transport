@@ -37,7 +37,7 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
                          "--p-key", "0x2345"]
             else:
                 args += ["--responder-qpn", "0x250102", "--initial-psn", "16777212",
-                         "--remote-key", "0x3458", "--remote-address", "0x123456781000",
+                         "--remote-address", "0x123456781000",
                          "--p-key", "0xa345", "--mpr", "1", "--max-wimm-inflight", "2"]
         if tx and drop_after is not None:
             args += ["--drop-path-after", str(drop_after)]
@@ -55,6 +55,7 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
     require(tx["bytes"] == rx["bytes"] == size * work_requests, "Incorrect completed byte count")
     require(tx["packets"] == sum(rx["received"]), "Receiver missed or double-counted a segment")
     require(tx["transport_acks"] > 0, "Requester did not receive a semantic transport ACK")
+    require(tx["write_completions"] == work_requests, "Requester CQ did not report every WRITE")
     return tx, rx
 
 
@@ -121,11 +122,13 @@ def main():
     print(json.dumps({"case": "ordered_write_imm_completions", "tx": tx, "rx": rx}))
 
     transfer(binary, 1024, "--immediate", "23", posted_receives=0,
-             expected_errors={"tx": "syndrome 0x63", "rx": "Protocol error"})
+             expected_errors={"tx": "syndrome 0x63", "rx": "MRC path 0: RX frames="})
     print(json.dumps({"case": "write_imm_without_receive_credit"}))
 
     tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8)
     require(rx["immediate_completions"] == 8, "Negotiated WRITEIMM sequence was incomplete")
+    require(tx["registered_memory"] and rx["registered_memory"],
+            "Negotiated transfer did not use provider-registered memory")
     print(json.dumps({"case": "negotiated_qp", "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 41989, "--immediate", "22", trim_after=16,

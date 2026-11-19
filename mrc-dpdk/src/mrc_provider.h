@@ -62,6 +62,8 @@ struct mrc_provider_mr_access {
 struct mrc_provider_mr_lease {
     void *address;
     size_t length;
+    uint64_t region_iova; /* Bounds of the pinned registration, in IOVA space. */
+    size_t region_length;
     struct mrc_provider_pd *owner;
     uint32_t lkey;
 };
