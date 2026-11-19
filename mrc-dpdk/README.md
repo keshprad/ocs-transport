@@ -88,9 +88,10 @@ For the healthy baseline, run a 4 MiB WRITE (4194304 bytes) with both paths
 active. For a controlled recovery run, use 16777216 bytes and
 `--ack-timeout 13` on both peers. Add `--drop-path-after 512
 --restore-path-after 2048` on the sender. This injects a temporary path-1
-blackhole in the endpoint. Check for retransmissions, a failed EV, a
-recovered EV, and traffic resuming on path 1. The test uses the existing
-Polatis circuits.
+blackhole in the endpoint. Check for retransmissions and traffic resuming
+on path 1. Bit 1 in `ev_failed_mask` and `ev_recovered_mask` identifies
+that path's failure and recovery. The test uses the existing Polatis
+circuits.
 
 On failure, the endpoint prints per-path application RX and DPDK port counter
 deltas, together with protocol progress. Pass `--port-stats 1` to include the

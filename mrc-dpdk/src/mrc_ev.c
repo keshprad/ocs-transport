@@ -46,6 +46,7 @@ void mrc_ev_timeout(struct mrc_ev_profile *profile, unsigned int path, uint64_t 
     }
     transition(ev, MRC_EV_ASSUMED_BAD, now, now);
     profile->failed++;
+    profile->failed_mask |= UINT32_C(1) << path;
 }
 
 void mrc_ev_feedback(struct mrc_ev_profile *profile, unsigned int path,
@@ -65,6 +66,7 @@ void mrc_ev_feedback(struct mrc_ev_profile *profile, unsigned int path,
             return;
         transition(ev, MRC_EV_GOOD, now, 0);
         profile->recovered++;
+        profile->recovered_mask |= UINT32_C(1) << path;
     }
 
     if (feedback == MRC_EV_SKIP_ONCE) {

@@ -24,7 +24,8 @@ int main(void)
 
     mrc_ev_timeout(&profile, 1, 20);
     assert(profile.paths[1].state == MRC_EV_ASSUMED_BAD);
-    assert(profile.failed == 1 && mrc_ev_probe_due(&profile, 1, 20));
+    assert(profile.failed == 1 && profile.failed_mask == 2);
+    assert(mrc_ev_probe_due(&profile, 1, 20));
     mrc_ev_probe_attempt(&profile, 1, 20);
     assert(!mrc_ev_probe_due(&profile, 1, 29));
     assert(mrc_ev_probe_due(&profile, 1, 30));
@@ -38,7 +39,8 @@ int main(void)
     mrc_ev_feedback(&profile, 1, MRC_EV_ALWAYS_SKIP, false, 0, 38);
     assert(profile.failed == 2 && mrc_ev_active(&profile, 3, 39) == 1);
     mrc_ev_feedback(&profile, 1, MRC_EV_UNMARKED, true, 40, 41);
-    assert(profile.recovered == 2 && mrc_ev_active(&profile, 3, 41) == 3);
+    assert(profile.recovered == 2 && profile.recovered_mask == 2);
+    assert(mrc_ev_active(&profile, 3, 41) == 3);
 
     mrc_ev_deny(&profile, 1, true, 42);
     mrc_ev_feedback(&profile, 1, MRC_EV_UNMARKED, true, 42, 43);

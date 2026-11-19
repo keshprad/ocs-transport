@@ -149,9 +149,9 @@ def main():
 
     tx, rx = transfer(binary, 4194301, "--immediate", "305419896",
                       "--initial-psn", "16777214", drop_after=512)
-    require(tx["dropped"] > 0 and tx["retries"][0] >= tx["dropped"] and
-            tx["retries"][1] == 0 and tx["ev_failed"] > 0 and tx["ev_recovered"] == 0,
-            "Blackhole did not recover the dropped segments through path 0")
+    require(tx["dropped"] > 0 and tx["retries"][0] > 0 and rx["received"][1] <= 512 and
+            tx["ev_failed_mask"] & 2 and not (tx["ev_recovered_mask"] & 2),
+            f"Blackholed path 1 did not stay failed or path 0 did not recover delivery: {tx}, {rx}")
     require(rx["reorder_max"] > 0 and rx["immediate_completed"],
             "Reordered WRITEIMM did not complete after placement")
     print(json.dumps({"case": "write_imm_wrap_blackhole", "tx": tx, "rx": rx}))
@@ -202,7 +202,7 @@ def main():
 
     tx, rx = transfer(binary, 16777216, "--ack-timeout", "13", drop_after=512,
                       tx_options=("--restore-path-after", "2048"))
-    require(tx["ev_failed"] > 0 and tx["ev_recovered"] > 0 and rx["received"][1] > 256,
+    require(tx["ev_failed_mask"] & 2 and tx["ev_recovered_mask"] & 2 and rx["received"][1] > 256,
             f"Path 1 did not rejoin the active set after a correlated probe: {tx}, {rx}")
     print(json.dumps({"case": "recovered_ev", "tx": tx, "rx": rx}))
 

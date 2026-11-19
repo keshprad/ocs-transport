@@ -150,6 +150,7 @@ struct counters {
     uint32_t probe_replies;
     uint32_t probe_sent[PATH_COUNT];
     uint32_t ev_skipped, ev_failed, ev_recovered, ev_admin_updates;
+    uint32_t ev_failed_mask, ev_recovered_mask;
     uint32_t mpr_updates;
     uint32_t fast_retries;
     uint32_t sacks;
@@ -1036,6 +1037,8 @@ static int poll_sender(const struct transfer *transfer, struct counters *counts,
             counts->ev_skipped = sender.ev.skipped;
             counts->ev_failed = sender.ev.failed;
             counts->ev_recovered = sender.ev.recovered;
+            counts->ev_failed_mask = sender.ev.failed_mask;
+            counts->ev_recovered_mask = sender.ev.recovered_mask;
             return counts->write_completions == transfer->work_requests ? 0 : -EPROTO;
         }
         if (now - last_progress >= transfer->idle_timeout) {
@@ -1928,7 +1931,7 @@ int main(int argc, char **argv)
                "\"port_status_updates\":%u,\"port_status_replies\":%u,"
                "\"probe_requests\":%u,\"probe_replies\":%u,\"probe_sent\":[%u,%u],"
                "\"ev_skipped\":%u,\"ev_failed\":%u,\"ev_recovered\":%u,\"ev_admin_updates\":%u,"
-               "\"mpr_updates\":%u,"
+               "\"ev_failed_mask\":%u,\"ev_recovered_mask\":%u,\"mpr_updates\":%u,"
                "\"dropped_transport_acks\":%u,"
                "\"duplicates\":%u,\"fast_retries\":%u,"
                "\"reorder_max\":%u,\"write_completions\":%u,\"immediate_completions\":%u,"
@@ -1940,7 +1943,8 @@ int main(int argc, char **argv)
                counts.port_status_updates, counts.port_status_replies, counts.probe_requests,
                counts.probe_replies, counts.probe_sent[0], counts.probe_sent[1],
                counts.ev_skipped, counts.ev_failed, counts.ev_recovered, counts.ev_admin_updates,
-               counts.mpr_updates, counts.dropped_transport_acks,
+               counts.ev_failed_mask, counts.ev_recovered_mask, counts.mpr_updates,
+               counts.dropped_transport_acks,
                counts.duplicates, counts.fast_retries,
                counts.reorder_max, counts.write_completions, counts.immediate_completions,
                counts.immediate_completions ? "true" : "false", transfer.pd ? "true" : "false");
