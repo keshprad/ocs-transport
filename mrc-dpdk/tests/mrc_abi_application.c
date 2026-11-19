@@ -1608,7 +1608,8 @@ int main(int argc, char **argv)
     bool bidirectional = cc_profile || qa_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
     enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW : DUPLEX_NORMAL;
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
-    bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0;
+    bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0 ||
+        strcmp(argv[3], "generated_ev_custom_stev") == 0;
     bool generated_ev = generated_stev || strcmp(argv[3], "generated_ev_udp") == 0;
     bool srv6_transit = strcmp(argv[3], "srv6_transit") == 0;
     bool explicit_srv6 = strcmp(argv[3], "explicit_ev_srv6") == 0;

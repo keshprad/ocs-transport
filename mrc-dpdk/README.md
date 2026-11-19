@@ -226,6 +226,25 @@ zero-padded on the left. The provider skips unspecified and multicast
 destinations and SRH segments. It assigns the first two distinct usable
 values to rails 1 and 2.
 
+To define a different field layout, use `mrc_ctl_modify_ev_fmt_profile()`
+with a format ID above 4. Move the format to OFFLINE with its UDP, STEV,
+or SRv6 mode. Supply the field widths with
+`MRC_CTL_EV_FMT_OP_MODIFY_FIELDS`, then move the format ONLINE. Bind that
+format ID when configuring an explicit or generated EV profile.
+
+Custom formats accept up to 16 fields, each 1 to 32 bits wide. The
+fields are concatenated in wire order and must total 16 bits for UDP,
+32 for STEV, or 128 or 256 for SRv6. In a 256-bit layout, the two
+containers have a field boundary between them. Generated fields narrower
+than their format slot are zero-padded on the left. Omitted trailing slots
+are zero. Explicit values use the same wire representation as the
+corresponding built-in mode.
+
+An ONLINE EV profile keeps its format ONLINE. Before editing a custom
+format, take its dependent EV profiles OFFLINE. After changing the
+layout, rebind the format ID and configure the EV values again before
+returning those profiles ONLINE.
+
 The benchmark CLI uses the same storage. Create a private directory on the
 sender and bring a profile online.
 

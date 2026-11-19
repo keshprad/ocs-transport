@@ -16,6 +16,7 @@ enum {
     TYPED_VERSION = 2,
     GENERATED_FIELDS_VERSION = 3,
     SRV6_VERSION = 4,
+    CUSTOM_FORMAT_VERSION = 5,
     LEGACY_ENTRY_HEADER_SIZE = 20,
     ENTRY_HEADER_SIZE = 24,
     ENTROPY_SIZE = 4 * MRC_EV_MAX_PATHS,
@@ -25,13 +26,23 @@ enum {
     GENERATED_FIELDS_ENTRY_SIZE = ENTRY_SIZE + GENERATED_FIELDS_SLOTS * EV_FIELD_SIZE,
     SRV6_VALUES_OFFSET = ENTRY_SIZE + MRC_CTL_STORE_MAX_EV_FIELDS * EV_FIELD_SIZE,
     SRV6_ENTRY_SIZE = SRV6_VALUES_OFFSET + MRC_EV_MAX_PATHS * MRC_CTL_STORE_SRV6_EV_BYTES,
-    SNAPSHOT_MAX_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * SRV6_ENTRY_SIZE,
+    CUSTOM_FORMAT_ENTRY_SIZE = SRV6_ENTRY_SIZE + 32,
+    SNAPSHOT_MAX_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * CUSTOM_FORMAT_ENTRY_SIZE,
 };
 
 /* Use the existing filename and lock inode when migrating the wire version. */
 static const char snapshot_name[] = "profiles.v1";
 static const char lock_name[] = "profiles.lock";
 static const uint8_t magic[] = { 'M', 'R', 'C', '-', 'E', 'V', 0 };
+
+enum {
+    FORMAT_ENTRY_HEADER_SIZE = 16,
+    FORMAT_ENTRY_SIZE = FORMAT_ENTRY_HEADER_SIZE + MRC_CTL_STORE_MAX_EV_FIELDS,
+    FORMAT_SNAPSHOT_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_CUSTOM_FORMATS * FORMAT_ENTRY_SIZE,
+};
+
+static const char format_snapshot_name[] = "ev-formats.v1";
+static const uint8_t format_magic[] = { 'M', 'R', 'C', '-', 'E', 'F', 0, 1 };
 
 enum {
     CC_CONFIG_SIZE = 48,
@@ -79,7 +90,7 @@ bool mrc_ctl_store_srv6_ev_valid(enum mrc_ctl_store_format format,
 
 bool mrc_ctl_store_ev_field_valid(const struct mrc_ctl_store_ev_field *field)
 {
-    if (!field || !field->width || field->width > 16)
+    if (!field || !field->width || field->width > 32)
         return false;
     uint32_t width_mask = path_mask(field->width);
     uint32_t compact_mask = path_mask(__builtin_popcount(field->mask));
@@ -87,10 +98,67 @@ bool mrc_ctl_store_ev_field_valid(const struct mrc_ctl_store_ev_field *field)
            field->min_val <= field->max_val && field->max_val <= compact_mask;
 }
 
+bool mrc_ctl_store_format_geometry_valid(enum mrc_ctl_store_format format,
+                                         const uint8_t *widths, unsigned int count)
+{
+    if (!widths || !count || count > MRC_CTL_STORE_MAX_EV_FIELDS)
+        return false;
+    unsigned int total;
+    switch (format) {
+    case MRC_CTL_STORE_FORMAT_UDP:
+        total = 16;
+        break;
+    case MRC_CTL_STORE_FORMAT_STEV:
+        total = 32;
+        break;
+    case MRC_CTL_STORE_FORMAT_SRV6:
+        total = MRC_CTL_STORE_SRV6_SID_BYTES * 8;
+        break;
+    case MRC_CTL_STORE_FORMAT_SRV6_SRH:
+        total = MRC_CTL_STORE_SRV6_EV_BYTES * 8;
+        break;
+    default:
+        return false;
+    }
+
+    const unsigned int sid_bits = MRC_CTL_STORE_SRV6_SID_BYTES * 8;
+    unsigned int bits = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        unsigned int width = widths[i];
+        if (!width || width > 32 || bits + width > total ||
+            (format == MRC_CTL_STORE_FORMAT_SRV6_SRH && bits < sid_bits && bits + width > sid_bits))
+            return false;
+        bits += width;
+    }
+    return bits == total;
+}
+
+static bool format_binding_valid(const struct mrc_ctl_store_config *config)
+{
+    if (!config->format_id)
+        return !config->format_field_count && bytes_are_zero(config->format_widths, sizeof(config->format_widths));
+    unsigned int count = config->format_field_count;
+    return config->format_id > MRC_CTL_STORE_BUILTIN_FORMATS && config->mode != MRC_CTL_STORE_AUTO &&
+           mrc_ctl_store_format_geometry_valid(config->format, config->format_widths, count) &&
+           bytes_are_zero(config->format_widths + count, sizeof(config->format_widths) - count);
+}
+
 static bool ev_fields_valid(const struct mrc_ctl_store_config *config, bool srv6)
 {
     if (!config->field_count)
-        return !srv6 || config->mode != MRC_CTL_STORE_GENERATED || !config->populated;
+        return (!srv6 && !config->format_id) || config->mode != MRC_CTL_STORE_GENERATED || !config->populated;
+    if (config->mode != MRC_CTL_STORE_GENERATED)
+        return false;
+    if (config->format_id) {
+        if (config->field_count > config->format_field_count)
+            return false;
+        for (unsigned int i = 0; i < config->field_count; i++) {
+            if (config->fields[i].width > config->format_widths[i] ||
+                !mrc_ctl_store_ev_field_valid(&config->fields[i]))
+                return false;
+        }
+        return true;
+    }
     unsigned int count;
     switch (config->format) {
     case MRC_CTL_STORE_FORMAT_UDP:
@@ -108,10 +176,10 @@ static bool ev_fields_valid(const struct mrc_ctl_store_config *config, bool srv6
     default:
         return false;
     }
-    if (config->mode != MRC_CTL_STORE_GENERATED || config->field_count != count)
+    if (config->field_count != count)
         return false;
     for (unsigned int i = 0; i < count; i++) {
-        if (!mrc_ctl_store_ev_field_valid(&config->fields[i]))
+        if (config->fields[i].width > 16 || !mrc_ctl_store_ev_field_valid(&config->fields[i]))
             return false;
     }
     return true;
@@ -124,7 +192,7 @@ static bool config_valid(const struct mrc_ctl_store_config *config)
         (unsigned int)config->format > MRC_CTL_STORE_FORMAT_SRV6_SRH ||
         (srv6 && config->mode == MRC_CTL_STORE_AUTO) ||
         !config->count || config->count > MRC_EV_MAX_PATHS || config->min_active > config->count ||
-        !ev_fields_valid(config, srv6))
+        !format_binding_valid(config) || !ev_fields_valid(config, srv6))
         return false;
 
     uint32_t paths = path_mask(config->count);
@@ -135,6 +203,10 @@ static bool config_valid(const struct mrc_ctl_store_config *config)
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
         bool populated = config->populated & (UINT32_C(1) << i);
         if ((srv6 || !populated) && config->entropy[i])
+            return false;
+        if (config->format_id && populated && !srv6 &&
+            (!(uint16_t)config->entropy[i] ||
+             (config->format == MRC_CTL_STORE_FORMAT_UDP && config->entropy[i] > UINT16_MAX)))
             return false;
         if (srv6 && populated) {
             if (!mrc_ctl_store_srv6_ev_valid(config->format, config->srv6[i]))
@@ -156,8 +228,8 @@ static bool profile_valid(const struct mrc_ctl_store_profile *profile)
     const struct mrc_ctl_store_config *config = &profile->config;
     switch (profile->state) {
     case MRC_CTL_STORE_INIT:
-        if (config->mode || config->format || config->count || config->min_active ||
-            config->populated || config->denied || config->field_count)
+        if (config->mode || config->format || config->format_id || config->count || config->min_active ||
+            config->populated || config->denied || config->field_count || !format_binding_valid(config))
             return false;
         for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
             if (config->entropy[i] || !bytes_are_zero(config->srv6[i], sizeof(config->srv6[i])))
@@ -187,10 +259,18 @@ static bool same_fields(const struct mrc_ctl_store_config *previous,
     return true;
 }
 
+static bool same_format_binding(const struct mrc_ctl_store_config *previous,
+                                 const struct mrc_ctl_store_config *updated)
+{
+    return previous->format == updated->format && previous->format_id == updated->format_id &&
+           previous->format_field_count == updated->format_field_count &&
+           memcmp(previous->format_widths, updated->format_widths, sizeof(previous->format_widths)) == 0;
+}
+
 static bool same_layout(const struct mrc_ctl_store_config *previous,
                         const struct mrc_ctl_store_config *updated)
 {
-    return previous->mode == updated->mode && previous->format == updated->format &&
+    return previous->mode == updated->mode && same_format_binding(previous, updated) &&
            previous->count == updated->count && previous->min_active == updated->min_active &&
            previous->populated == updated->populated && same_fields(previous, updated) &&
            memcmp(previous->entropy, updated->entropy, sizeof(previous->entropy)) == 0 &&
@@ -209,6 +289,17 @@ static void write32(uint8_t *bytes, uint32_t value)
     bytes[1] = (uint8_t)(value >> 16);
     bytes[2] = (uint8_t)(value >> 8);
     bytes[3] = (uint8_t)value;
+}
+
+static uint64_t read64(const uint8_t *bytes)
+{
+    return (uint64_t)read32(bytes) << 32 | read32(bytes + 4);
+}
+
+static void write64(uint8_t *bytes, uint64_t value)
+{
+    write32(bytes, (uint32_t)(value >> 32));
+    write32(bytes + 4, (uint32_t)value);
 }
 
 static uint32_t checksum(const uint8_t *bytes, size_t length)
@@ -230,6 +321,8 @@ static unsigned int ev_entry_size(uint8_t version)
         return GENERATED_FIELDS_ENTRY_SIZE;
     case SRV6_VERSION:
         return SRV6_ENTRY_SIZE;
+    case CUSTOM_FORMAT_VERSION:
+        return CUSTOM_FORMAT_ENTRY_SIZE;
     default:
         return 0;
     }
@@ -265,7 +358,7 @@ static void encode_ev_fields(uint8_t *bytes, const struct mrc_ctl_store_config *
 static bool decode_profile(const uint8_t *bytes, uint8_t version,
                            struct mrc_ctl_store_profile *profile)
 {
-    uint64_t id = (uint64_t)read32(bytes) << 32 | read32(bytes + 4);
+    uint64_t id = read64(bytes);
     if (!id || bytes[8] == MRC_CTL_STORE_INIT) {
         /* Empty slots and INIT profiles never contain configuration. */
         for (unsigned int i = 8; i < ev_entry_size(version); i++) {
@@ -277,8 +370,8 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
     }
 
     bool typed = version != LEGACY_VERSION;
-    bool srv6 = version == SRV6_VERSION;
-    bool fields = version == GENERATED_FIELDS_VERSION || srv6;
+    bool srv6 = version >= SRV6_VERSION;
+    bool fields = version >= GENERATED_FIELDS_VERSION;
     unsigned int header_size = typed ? ENTRY_HEADER_SIZE : LEGACY_ENTRY_HEADER_SIZE;
     if (typed && ((!fields && bytes[21]) || bytes[22] || bytes[23]))
         return false;
@@ -297,6 +390,16 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
         memcpy(profile->config.srv6, bytes + SRV6_VALUES_OFFSET, sizeof(profile->config.srv6));
     else if (mrc_ctl_store_format_is_srv6(profile->config.format))
         return false;
+    if (version == CUSTOM_FORMAT_VERSION) {
+        const uint8_t *binding = bytes + SRV6_ENTRY_SIZE;
+        const size_t widths = sizeof(profile->config.format_widths);
+        size_t used = 9 + widths;
+        if (!bytes_are_zero(binding + used, CUSTOM_FORMAT_ENTRY_SIZE - SRV6_ENTRY_SIZE - used))
+            return false;
+        profile->config.format_id = read64(binding);
+        profile->config.format_field_count = binding[8];
+        memcpy(profile->config.format_widths, binding + 9, widths);
+    }
     unsigned int slots = srv6 ? MRC_CTL_STORE_MAX_EV_FIELDS : GENERATED_FIELDS_SLOTS;
     return (!fields || decode_ev_fields(bytes + ENTRY_SIZE, slots, &profile->config)) && profile_valid(profile);
 }
@@ -304,8 +407,7 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
 static void encode_profile(uint8_t *bytes, uint8_t version, const struct mrc_ctl_store_profile *profile)
 {
     const struct mrc_ctl_store_config *config = &profile->config;
-    write32(bytes, (uint32_t)(profile->id >> 32));
-    write32(bytes + 4, (uint32_t)profile->id);
+    write64(bytes, profile->id);
     bytes[8] = (uint8_t)profile->state;
     bytes[9] = (uint8_t)config->mode;
     bytes[10] = config->count;
@@ -319,8 +421,14 @@ static void encode_profile(uint8_t *bytes, uint8_t version, const struct mrc_ctl
         bytes[21] = config->field_count;
         encode_ev_fields(bytes + ENTRY_SIZE, config);
     }
-    if (version == SRV6_VERSION)
+    if (version >= SRV6_VERSION)
         memcpy(bytes + SRV6_VALUES_OFFSET, config->srv6, sizeof(config->srv6));
+    if (version == CUSTOM_FORMAT_VERSION) {
+        uint8_t *binding = bytes + SRV6_ENTRY_SIZE;
+        write64(binding, config->format_id);
+        binding[8] = config->format_field_count;
+        memcpy(binding + 9, config->format_widths, sizeof(config->format_widths));
+    }
 }
 
 static int read_all(int fd, uint8_t *bytes, size_t length)
@@ -385,6 +493,92 @@ static int read_snapshot_image(const struct mrc_ctl_store *store, const char *na
     }
     close(fd);
     return result;
+}
+
+static bool ev_format_valid(const struct mrc_ctl_store_ev_format *format)
+{
+    if (!format->id || format->state == MRC_CTL_STORE_INIT)
+        return format->state == MRC_CTL_STORE_INIT && !format->format && !format->field_count &&
+               (!format->id || format->id > MRC_CTL_STORE_BUILTIN_FORMATS) &&
+               bytes_are_zero(format->widths, sizeof(format->widths));
+    if (format->id <= MRC_CTL_STORE_BUILTIN_FORMATS ||
+        (format->state != MRC_CTL_STORE_OFFLINE && format->state != MRC_CTL_STORE_ONLINE) ||
+        format->format < MRC_CTL_STORE_FORMAT_UDP || format->format > MRC_CTL_STORE_FORMAT_SRV6_SRH)
+        return false;
+    unsigned int count = format->field_count;
+    if (!count)
+        return format->state == MRC_CTL_STORE_OFFLINE && bytes_are_zero(format->widths, sizeof(format->widths));
+    return mrc_ctl_store_format_geometry_valid(format->format, format->widths, count) &&
+           bytes_are_zero(format->widths + count, sizeof(format->widths) - count);
+}
+
+static int find_format(const struct mrc_ctl_store_ev_format *formats, uint64_t id)
+{
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_CUSTOM_FORMATS; i++) {
+        if (formats[i].id == id)
+            return (int)i;
+    }
+    return -ENOENT;
+}
+
+static int load_format_snapshot(const struct mrc_ctl_store *store, struct mrc_ctl_store_ev_format *formats)
+{
+    uint8_t bytes[FORMAT_SNAPSHOT_SIZE];
+    size_t length;
+    int result = read_snapshot_image(store, format_snapshot_name, bytes, sizeof(bytes), &length);
+    if (result || !length)
+        return result;
+    if (length != sizeof(bytes) || memcmp(bytes, format_magic, sizeof(format_magic)) ||
+        read32(bytes + 12) || read32(bytes + 8) != checksum(bytes + HEADER_SIZE, length - HEADER_SIZE))
+        return -EBADMSG;
+
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_CUSTOM_FORMATS; i++) {
+        const uint8_t *entry = bytes + HEADER_SIZE + i * FORMAT_ENTRY_SIZE;
+        struct mrc_ctl_store_ev_format *format = &formats[i];
+        *format = (struct mrc_ctl_store_ev_format){
+            .id = read64(entry), .state = entry[8], .format = entry[9], .field_count = entry[10],
+        };
+        memcpy(format->widths, entry + FORMAT_ENTRY_HEADER_SIZE, sizeof(format->widths));
+        if (!bytes_are_zero(entry + 11, FORMAT_ENTRY_HEADER_SIZE - 11) || !ev_format_valid(format))
+            return -EBADMSG;
+        if (format->id && find_format(formats, format->id) != (int)i)
+            return -EBADMSG;
+    }
+    return 0;
+}
+
+int mrc_ctl_store_get_format(const struct mrc_ctl_store *store, uint64_t id,
+                             struct mrc_ctl_store_ev_format *format)
+{
+    if (!store || store->fd < 0 || id <= MRC_CTL_STORE_BUILTIN_FORMATS || !format)
+        return -EINVAL;
+    struct mrc_ctl_store_ev_format formats[MRC_CTL_STORE_MAX_CUSTOM_FORMATS] = {0};
+    int result = load_format_snapshot(store, formats);
+    if (result)
+        return result;
+    int slot = find_format(formats, id);
+    if (slot < 0)
+        return slot;
+    *format = formats[slot];
+    return 0;
+}
+
+/* The caller holds the metadata lock so the format cannot change between
+ * matching its geometry and publishing an ONLINE EV profile. */
+static int check_bound_format(const struct mrc_ctl_store *store, const struct mrc_ctl_store_config *config)
+{
+    if (!config->format_id)
+        return 0;
+    struct mrc_ctl_store_ev_format format;
+    int result = mrc_ctl_store_get_format(store, config->format_id, &format);
+    if (result)
+        return result;
+    if (format.state != MRC_CTL_STORE_ONLINE)
+        return -EAGAIN;
+    if (format.format != config->format || format.field_count != config->format_field_count ||
+        memcmp(format.widths, config->format_widths, sizeof(format.widths)))
+        return -EINVAL;
+    return 0;
 }
 
 static int load_snapshot(const struct mrc_ctl_store *store, struct transaction *txn)
@@ -474,16 +668,35 @@ static int publish_snapshot(const struct mrc_ctl_store *store, int lock_fd,
     return sync_file(store->fd);
 }
 
+static int save_format_snapshot(const struct mrc_ctl_store *store, int lock_fd,
+                                const struct mrc_ctl_store_ev_format *formats)
+{
+    uint8_t bytes[FORMAT_SNAPSHOT_SIZE] = {0};
+    memcpy(bytes, format_magic, sizeof(format_magic));
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_CUSTOM_FORMATS; i++) {
+        const struct mrc_ctl_store_ev_format *format = &formats[i];
+        uint8_t *entry = bytes + HEADER_SIZE + i * FORMAT_ENTRY_SIZE;
+        write64(entry, format->id);
+        entry[8] = (uint8_t)format->state;
+        entry[9] = (uint8_t)format->format;
+        entry[10] = format->field_count;
+        memcpy(entry + FORMAT_ENTRY_HEADER_SIZE, format->widths, sizeof(format->widths));
+    }
+    return publish_snapshot(store, lock_fd, format_snapshot_name, bytes, sizeof(bytes));
+}
+
 static int save_snapshot(const struct mrc_ctl_store *store, const struct transaction *txn)
 {
     uint8_t version = TYPED_VERSION;
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
         const struct mrc_ctl_store_config *config = &txn->profiles[i].config;
-        if (mrc_ctl_store_format_is_srv6(config->format)) {
-            version = SRV6_VERSION;
+        if (config->format_id) {
+            version = CUSTOM_FORMAT_VERSION;
             break;
         }
-        if (config->field_count)
+        if (mrc_ctl_store_format_is_srv6(config->format))
+            version = SRV6_VERSION;
+        else if (config->field_count && version < GENERATED_FIELDS_VERSION)
             version = GENERATED_FIELDS_VERSION;
     }
 
@@ -615,6 +828,57 @@ void mrc_ctl_store_close(struct mrc_ctl_store *store)
     }
 }
 
+static bool ev_format_equal(const struct mrc_ctl_store_ev_format *a, const struct mrc_ctl_store_ev_format *b)
+{
+    return a->id == b->id && a->state == b->state && a->format == b->format &&
+           a->field_count == b->field_count && memcmp(a->widths, b->widths, sizeof(a->widths)) == 0;
+}
+
+int mrc_ctl_store_edit_format(const struct mrc_ctl_store *store, uint64_t id,
+                              int (*edit)(struct mrc_ctl_store_ev_format *, void *), void *arg)
+{
+    if (id <= MRC_CTL_STORE_BUILTIN_FORMATS || !edit)
+        return -EINVAL;
+    struct transaction txn;
+    int result = begin(store, &txn, true);
+    if (result)
+        return result;
+
+    struct mrc_ctl_store_ev_format formats[MRC_CTL_STORE_MAX_CUSTOM_FORMATS] = {0};
+    result = load_format_snapshot(store, formats);
+    if (result)
+        return finish(store, &txn, result, false);
+    int slot = find_format(formats, id);
+    struct mrc_ctl_store_ev_format updated = slot >= 0 ? formats[slot] :
+        (struct mrc_ctl_store_ev_format){ .id = id };
+    result = edit(&updated, arg);
+    if (result)
+        return finish(store, &txn, result, false);
+
+    if (!updated.id) {
+        if (slot < 0)
+            return finish(store, &txn, 0, false);
+        updated = (struct mrc_ctl_store_ev_format){0};
+    } else if (updated.id != id || !ev_format_valid(&updated)) {
+        return finish(store, &txn, -EINVAL, false);
+    }
+    if (slot >= 0 && ev_format_equal(&updated, &formats[slot]))
+        return finish(store, &txn, 0, false);
+    for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
+        const struct mrc_ctl_store_profile *profile = &txn.profiles[i];
+        if (profile->state == MRC_CTL_STORE_ONLINE && profile->config.format_id == id)
+            return finish(store, &txn, -EBUSY, false);
+    }
+    if (slot < 0) {
+        slot = find_format(formats, 0);
+        if (slot < 0)
+            return finish(store, &txn, -ENOSPC, false);
+    }
+    formats[slot] = updated;
+    result = save_format_snapshot(store, txn.fd, formats);
+    return finish(store, &txn, result, false);
+}
+
 int mrc_ctl_store_create(const struct mrc_ctl_store *store, uint64_t id)
 {
     if (!id)
@@ -689,7 +953,9 @@ int mrc_ctl_store_configure(const struct mrc_ctl_store *store, uint64_t id,
     struct mrc_ctl_store_profile *profile = &txn.profiles[slot];
     if (profile->state == MRC_CTL_STORE_ONLINE)
         return finish(store, &txn, -EBUSY, false);
-    int result = lock_reference(txn.fd, slot, F_WRLCK);
+    int result = check_bound_format(store, config);
+    if (!result)
+        result = lock_reference(txn.fd, slot, F_WRLCK);
     if (!result) {
         profile->config = *config;
         profile->state = MRC_CTL_STORE_OFFLINE;
@@ -713,7 +979,9 @@ int mrc_ctl_store_set_state(const struct mrc_ctl_store *store, uint64_t id,
                    (state == MRC_CTL_STORE_ONLINE && config_ready(&profile->config))));
     if (!valid)
         return finish(store, &txn, -EINVAL, false);
-    int result = lock_reference(txn.fd, slot, F_WRLCK);
+    int result = state == MRC_CTL_STORE_ONLINE ? check_bound_format(store, &profile->config) : 0;
+    if (!result)
+        result = lock_reference(txn.fd, slot, F_WRLCK);
     if (!result) {
         profile->state = state;
         if (state == MRC_CTL_STORE_INIT)
@@ -766,6 +1034,11 @@ int mrc_ctl_store_edit(const struct mrc_ctl_store *store, uint64_t id,
     if (slot >= 0 && updated.id && same && updated.state == previous.state &&
         updated.config.denied == previous.config.denied)
         return finish(store, &txn, 0, false);
+    if (updated.state == MRC_CTL_STORE_ONLINE || !same_format_binding(&previous.config, &updated.config)) {
+        result = check_bound_format(store, &updated.config);
+        if (result)
+            return finish(store, &txn, result, false);
+    }
     if (slot < 0) {
         slot = find_profile(&txn, 0);
         if (slot < 0)
@@ -815,7 +1088,9 @@ int mrc_ctl_store_acquire(const struct mrc_ctl_store *store, uint64_t id,
         return slot;
     if (txn.profiles[slot].state != MRC_CTL_STORE_ONLINE)
         return finish(store, &txn, -EAGAIN, false);
-    int result = lock_reference(txn.fd, slot, F_RDLCK);
+    int result = check_bound_format(store, &txn.profiles[slot].config);
+    if (!result)
+        result = lock_reference(txn.fd, slot, F_RDLCK);
     if (!result)
         result = lock_file(txn.fd, LOCK_UN);
     if (result)

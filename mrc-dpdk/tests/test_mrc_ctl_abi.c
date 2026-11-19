@@ -22,6 +22,12 @@ enum {
     EXP_SRV6_SRH_PROFILE_ID = 14,
     GEN_SRV6_PROFILE_ID = 15,
     GEN_SRV6_SRH_PROFILE_ID = 16,
+    GEN_CUSTOM_STEV_PROFILE_ID = 17,
+    GEN_CUSTOM_SRV6_PROFILE_ID = 18,
+    EXP_CUSTOM_UDP_PROFILE_ID = 19,
+    CUSTOM_STEV_FORMAT_ID = 100,
+    CUSTOM_SRV6_FORMAT_ID = 101,
+    CUSTOM_UDP_FORMAT_ID = 102,
     SRV6_SID_BYTES = 16,
     SRV6_SID_FIELDS = SRV6_SID_BYTES / 2,
     SRV6_MAX_FIELDS = MRC_CTL_EV_MAX_BYTES / 2,
@@ -34,7 +40,7 @@ struct generated_profile {
     unsigned int id;
     uint64_t format;
     int field_count;
-    struct mrc_ctl_ev_field fields[2];
+    struct mrc_ctl_ev_field fields[3];
     uint32_t values[RAILS];
 };
 
@@ -55,6 +61,18 @@ static const struct generated_profile generated_stev = {
         { .width = 16, .init_val = 0xe499 },
     },
     .values = { 0x0a00e499, 0x0a20e499 },
+};
+
+static const struct generated_profile generated_custom_stev = {
+    .id = GEN_CUSTOM_STEV_PROFILE_ID,
+    .format = CUSTOM_STEV_FORMAT_ID,
+    .field_count = 3,
+    .fields = {
+        { .width = 9, .init_val = 0x1ab },
+        { .width = 8, .init_val = 0xa3 },
+        { .width = 8, .init_val = 0xc0, .min_val = 1, .max_val = 2, .mask = 3 },
+    },
+    .values = { 0x1ab28cc1, 0x1ab28cc2 },
 };
 
 enum {
@@ -154,7 +172,7 @@ static void test_controller_discovery(struct ibv_context *verbs, struct mrc_cont
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_UDP);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_STEV);
     assert(extended.ev.ev_fmt_mode_mask & MRC_CTL_EV_FMT_MODE_SRV6);
-    assert(extended.ev.ev_max_fmt_profiles == 4 && extended.ev.ev_max_width == 256);
+    assert(extended.ev.ev_max_fmt_profiles > 4 && extended.ev.ev_max_width == 256);
     assert(legacy.cc.cc_max_profiles == 32 && extended.cc.cc_max_profiles == 32);
     assert(legacy.cc.algorithms && legacy.cc.algorithms[0] &&
            strcmp(legacy.cc.algorithms[0], nscc_algorithm) == 0 && !legacy.cc.algorithms[1]);
@@ -412,6 +430,62 @@ static int configure_generated(struct mrc_context *context, struct generated_pro
     return mrc_ctl_modify_ev_profile(context, profile.id, &attr, GENERATED_PROFILE_ATTRS);
 }
 
+static int set_format_state(struct mrc_context *context, uint64_t id, enum mrc_ctl_profile_state state)
+{
+    struct mrc_ctl_ev_fmt_profile_attr attr = { .profile_state = state };
+    return mrc_ctl_modify_ev_fmt_profile(context, id, &attr, MRC_CTL_EV_FMT_PROFILE_STATE);
+}
+
+static int configure_format(struct mrc_context *context, uint64_t id, enum mrc_ctl_ev_fmt_mode mode)
+{
+    struct mrc_ctl_ev_fmt_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_OFFLINE, .ev_fmt_mode = mode,
+    };
+    return mrc_ctl_modify_ev_fmt_profile(context, id, &attr, MRC_CTL_EV_FMT_PROFILE_STATE |
+                                         MRC_CTL_EV_FMT_PROFILE_MODE);
+}
+
+static int activate_format(struct mrc_context *context, uint64_t id,
+                            struct mrc_ctl_ev_fmt_field *fields, int count)
+{
+    struct mrc_ctl_ev_fmt_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_ONLINE,
+        .ev_fmt_op = {
+            .op = MRC_CTL_EV_FMT_OP_MODIFY_FIELDS, .fmt_fields = fields, .fmt_field_count = count,
+        },
+    };
+    return mrc_ctl_modify_ev_fmt_profile(context, id, &attr, MRC_CTL_EV_FMT_PROFILE_STATE |
+                                         MRC_CTL_EV_FMT_PROFILE_OP);
+}
+
+static void check_format(struct mrc_context *context, uint64_t id, enum mrc_ctl_ev_fmt_mode mode,
+                          const struct mrc_ctl_ev_fmt_field *expected, int count)
+{
+    struct mrc_ctl_ev_fmt_field fields[SRV6_MAX_FIELDS] = {0};
+    struct mrc_ctl_ev_fmt_profile_attr attr = {
+        .ev_fmt_op = {
+            .op = MRC_CTL_EV_FMT_OP_QUERY_FIELDS, .fmt_fields = fields, .fmt_field_count = count - 1,
+        },
+    };
+    const int mask = MRC_CTL_EV_FMT_PROFILE_CUR_STATE | MRC_CTL_EV_FMT_PROFILE_MODE |
+        MRC_CTL_EV_FMT_PROFILE_OP;
+    assert(mrc_ctl_query_ev_fmt_profile(context, id, &attr, mask) == -1 && errno == E2BIG);
+    assert(attr.ev_fmt_op.fmt_field_count == count);
+    assert(mrc_ctl_query_ev_fmt_profile(context, id, &attr, mask) == 0);
+    assert(attr.cur_profile_state == MRC_CTL_PROFILE_ONLINE && attr.ev_fmt_mode == mode);
+    assert(attr.ev_fmt_op.fmt_field_count == count);
+    for (int i = 0; i < count; i++)
+        assert(fields[i].width == expected[i].width);
+}
+
+static void prepare_custom_stev_format(struct mrc_context *context)
+{
+    const uint64_t id = CUSTOM_STEV_FORMAT_ID;
+    struct mrc_ctl_ev_fmt_field widths[] = {{12}, {10}, {10}};
+    assert(configure_format(context, id, MRC_CTL_EV_FMT_MODE_STEV) == 0);
+    assert(activate_format(context, id, widths, 3) == 0);
+}
+
 static void check_generated_fields(struct mrc_context *context, uint64_t id,
                                      const struct mrc_ctl_ev_field *expected, int count)
 {
@@ -544,6 +618,143 @@ static void test_generated_profiles(struct ibv_context *verbs, const char *direc
     assert(ibv_dealloc_pd(pd) == 0);
     assert(mrc_destroy_context(client) == 0);
     assert(mrc_destroy_context(controller) == 0);
+}
+
+static void test_custom_stev_format(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *context = open_store(verbs, directory);
+    const uint64_t format = CUSTOM_STEV_FORMAT_ID;
+    const uint64_t profile = GEN_CUSTOM_STEV_PROFILE_ID;
+    assert(set_format_state(context, MRC_DPDK_EV_FORMAT_STEV, MRC_CTL_PROFILE_OFFLINE) == -1 &&
+           errno == EOPNOTSUPP);
+    assert(set_format_state(context, format, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    assert(configure_format(context, format, MRC_CTL_EV_FMT_MODE_STEV) == 0);
+    assert(configure_generated(context, generated_custom_stev) == -1 && errno == EINVAL);
+
+    struct mrc_ctl_ev_fmt_field widths[] = {{12}, {10}, {9}};
+    assert(activate_format(context, format, widths, 3) == -1 && errno == E2BIG);
+    assert(set_format_state(context, format, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    widths[2].width = 10;
+    assert(activate_format(context, format, widths, 3) == 0);
+
+    struct generated_profile compact = generated_custom_stev;
+    compact.field_count = 2;
+    compact.fields[0] = (struct mrc_ctl_ev_field){ .width = 12, .max_val = 0xfff, .mask = 0xfff };
+    compact.fields[1] = (struct mrc_ctl_ev_field){ .width = 10, .max_val = 15, .mask = 0x3c0 };
+    /* All variable bits are in the flow label and the omitted UDP bits are zero. */
+    assert(configure_generated(context, compact) == -1 && errno == EINVAL);
+    compact.fields[0] = generated_custom_stev.fields[0];
+    compact.fields[1] = (struct mrc_ctl_ev_field){ .width = 8, .init_val = 0xa0, .max_val = 1, .mask = 3 };
+    compact.values[0] = 0x1ab28000;
+    compact.values[1] = 0x1ab28400;
+    assert(configure_generated(context, compact) == 0);
+    check_generated(context, &compact);
+
+    assert(configure_generated(context, generated_custom_stev) == 0);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(set_format_state(context, format, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+    assert(mrc_destroy_context(context) == 0);
+
+    context = open_store(verbs, directory);
+    check_format(context, format, MRC_CTL_EV_FMT_MODE_STEV, widths, 3);
+    assert(profile_state(context, profile) == MRC_CTL_PROFILE_ONLINE);
+    check_generated(context, &generated_custom_stev);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_format_state(context, format, MRC_CTL_PROFILE_OFFLINE) == 0);
+    widths[0].width = 10;
+    widths[1].width = 12;
+    assert(activate_format(context, format, widths, 3) == 0);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    assert(profile_state(context, profile) == MRC_CTL_PROFILE_OFFLINE);
+
+    assert(configure_generated(context, generated_custom_stev) == 0);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_ONLINE) == 0);
+    struct generated_profile rebound = generated_custom_stev;
+    rebound.values[0] = 0x6ac28cc1;
+    rebound.values[1] = 0x6ac28cc2;
+    check_generated(context, &rebound);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_INIT) == 0);
+    assert(set_format_state(context, format, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_format_state(context, format, MRC_CTL_PROFILE_INIT) == 0);
+    assert(mrc_destroy_context(context) == 0);
+}
+
+static void test_custom_udp_format(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *context = open_store(verbs, directory);
+    const uint64_t format = CUSTOM_UDP_FORMAT_ID;
+    const uint64_t profile = EXP_CUSTOM_UDP_PROFILE_ID;
+    struct mrc_ctl_ev_fmt_field widths[] = {{3}, {5}, {8}};
+    assert(configure_format(context, format, MRC_CTL_EV_FMT_MODE_UDP) == 0);
+    assert(activate_format(context, format, widths, 3) == 0);
+    assert(configure_explicit(context, profile, format) == 0);
+
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {
+        { .ev = ev(1, 0), .ev_new = ev(1, 0x5421), .state = MRC_CTL_EV_GOOD },
+        { .ev = ev(2, 0), .ev_new = ev(2, 0x9123), .state = MRC_CTL_EV_DENIED },
+    };
+    assert(replace_evs(context, profile, entries, RAILS) == 0);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(mrc_destroy_context(context) == 0);
+
+    context = open_store(verbs, directory);
+    check_format(context, format, MRC_CTL_EV_FMT_MODE_UDP, widths, 3);
+    query_evs(context, profile, MRC_CTL_EV_MODE_EXP, format, entries);
+    assert(entries[0].ev.port == 1 && ev_value(&entries[0].ev) == 0x5421 && entries[0].state == MRC_CTL_EV_GOOD);
+    assert(entries[1].ev.port == 2 && ev_value(&entries[1].ev) == 0x9123 && entries[1].state == MRC_CTL_EV_DENIED);
+    assert(mrc_destroy_context(context) == 0);
+}
+
+static void test_custom_srv6_format(struct ibv_context *verbs, const char *directory)
+{
+    struct mrc_context *context = open_store(verbs, directory);
+    const uint64_t format = CUSTOM_SRV6_FORMAT_ID;
+    const uint64_t profile = GEN_CUSTOM_SRV6_PROFILE_ID;
+    assert(configure_format(context, format, MRC_CTL_EV_FMT_MODE_SRV6) == 0);
+    struct mrc_ctl_ev_fmt_field widths[] = {
+        {11}, {21}, {32}, {32}, {31}, {30}, {3}, {32}, {32}, {16}, {16},
+    };
+    const int slots = (int)(sizeof(widths) / sizeof(widths[0]));
+    /* The original widths total 256 but the sixth slot crosses the 128-bit boundary. */
+    assert(activate_format(context, format, widths, slots) == -1 && errno == E2BIG);
+    widths[4].width = 32;
+    widths[5].width = 29;
+    assert(activate_format(context, format, widths, slots) == 0);
+
+    struct mrc_ctl_ev_field fields[] = {
+        { .width = 11, .init_val = 0x100 },
+        { .width = 21, .init_val = 0x10db8 },
+        { .width = 32, .init_val = 0x12345678 },
+        { .width = 32, .init_val = 0x9abc0000 },
+        { .width = 32, .init_val = 1 },
+        { .width = 29, .init_val = 0x040021b7 },
+        { .width = 3, .init_val = 5 },
+        { .width = 32, .init_val = 0xc001d00d },
+        { .width = 32, .init_val = 0x12345678 },
+        { .width = 16, .init_val = 0xbe00, .min_val = 1, .max_val = 2, .mask = 3 },
+    };
+    const int count = (int)(sizeof(fields) / sizeof(fields[0]));
+    struct mrc_ctl_ev_profile_attr attr = generated_attributes(format, fields, count);
+    assert(mrc_ctl_modify_ev_profile(context, profile, &attr, GENERATED_PROFILE_ATTRS) == 0);
+    assert(set_profile_state(context, profile, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(mrc_destroy_context(context) == 0);
+
+    context = open_store(verbs, directory);
+    check_format(context, format, MRC_CTL_EV_FMT_MODE_SRV6, widths, slots);
+    assert(profile_state(context, profile) == MRC_CTL_PROFILE_ONLINE);
+    check_generated_fields(context, profile, fields, count);
+    struct mrc_ctl_ev_op_entry entries[RAILS] = {0};
+    query_evs(context, profile, MRC_CTL_EV_MODE_GEN, format, entries);
+    for (uint8_t i = 0; i < RAILS; i++) {
+        const uint8_t expected[MRC_CTL_EV_MAX_BYTES] = {
+            0x20, 1, 0x0d, 0xb8, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0, 0, 0, 0, 0, 1,
+            0x20, 1, 0x0d, 0xbd, 0xc0, 1, 0xd0, 0x0d, 0x12, 0x34, 0x56, 0x78, 0xbe, i + 1, 0, 0,
+        };
+        assert(entries[i].ev.port == i + 1 && entries[i].state == MRC_CTL_EV_GOOD);
+        assert(!memcmp(entries[i].ev.val, expected, sizeof(expected)));
+    }
+    assert(mrc_destroy_context(context) == 0);
 }
 
 static struct mrc_ctl_ev srv6_fixture_ev(uint8_t rail, bool srh)
@@ -920,10 +1131,12 @@ int main(int argc, char **argv)
         generated = &generated_udp;
     else if (argc == 3 && strcmp(argv[1], "--seed-gen-stev") == 0)
         generated = &generated_stev;
+    else if (argc == 3 && strcmp(argv[1], "--seed-gen-custom-stev") == 0)
+        generated = &generated_custom_stev;
     bool fixture = seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 || seed_srv6_srh;
     if (argc != 1 && !expect_no_cap && !fixture) {
         fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | "
-                        "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR | "
+                        "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR | --seed-gen-custom-stev DIR | "
                         "--seed-explicit-srv6 DIR | --unblock-explicit-srv6 DIR | --seed-generated-srv6-srh DIR]\n",
                         argv[0]);
         return EXIT_FAILURE;
@@ -949,6 +1162,8 @@ int main(int argc, char **argv)
             prepare_generated_srv6(controller, true);
             printf("%u\n", (unsigned int)GEN_SRV6_SRH_PROFILE_ID);
         } else if (generated) {
+            if (generated == &generated_custom_stev)
+                prepare_custom_stev_format(controller);
             assert(configure_generated(controller, *generated) == 0);
             assert(set_profile_state(controller, generated->id, MRC_CTL_PROFILE_ONLINE) == 0);
             printf("%u\n", generated->id);
@@ -972,6 +1187,7 @@ int main(int argc, char **argv)
         assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
         assert(configure_generated(controller, generated_udp) == -1 && errno == EPERM);
         assert(profile_state(controller, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_INIT);
+        assert(configure_format(controller, CUSTOM_STEV_FORMAT_ID, MRC_CTL_EV_FMT_MODE_STEV) == -1 && errno == EPERM);
         struct mrc_ctl_cc_profile_attr cc = {0};
         assert(mrc_ctl_query_cc_profile(controller, CC_PROFILE_ID, &cc,
                                         MRC_CTL_CC_PROFILE_CUR_STATE) == -1 && errno == EPERM);
@@ -985,6 +1201,10 @@ int main(int argc, char **argv)
         puts("OCP controller UDP and STEV generation, persistence, and QP leases passed");
         test_srv6_profiles(verbs, directory);
         puts("OCP controller explicit and generated SRv6 EVs, wire byte order, and persistence passed");
+        test_custom_udp_format(verbs, directory);
+        test_custom_stev_format(verbs, directory);
+        test_custom_srv6_format(verbs, directory);
+        puts("OCP controller custom UDP, STEV, and SRv6 geometry, lifecycle, generation, and persistence passed");
         test_cc_lifecycle(verbs, directory);
         puts("OCP controller CC profiles, persistence, and QP leases passed");
         test_qa_lifecycle(verbs, directory);

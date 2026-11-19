@@ -81,6 +81,9 @@ struct mrc_qp {
 };
 
 struct mrc_ctl_store mrc_abi_profile_store(struct mrc_context *context);
+bool mrc_abi_controller_capable(void);
+enum mrc_ctl_store_format mrc_abi_builtin_ev_format(uint64_t id);
+unsigned int mrc_abi_builtin_ev_fields(enum mrc_ctl_store_format format);
 int mrc_abi_retain_context(struct mrc_context *context);
 void mrc_abi_release_context(struct mrc_context *context);
 int mrc_abi_async_open(struct mrc_abi_async_channel *channel);

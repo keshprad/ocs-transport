@@ -131,6 +131,7 @@ def main():
         for mode, seed, expected in (
             ("generated_ev_udp", "--seed-gen", [0xC405, 0xC410]),
             ("generated_ev_stev", "--seed-gen-stev", [0x0A00E499, 0x0A20E499]),
+            ("generated_ev_custom_stev", "--seed-gen-custom-stev", [0x1AB28CC1, 0x1AB28CC2]),
         ):
             with tempfile.TemporaryDirectory(prefix="mrc-abi-gen-") as store:
                 profile_id = control(controller, seed, store)

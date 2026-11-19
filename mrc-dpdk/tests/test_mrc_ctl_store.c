@@ -669,6 +669,147 @@ static void test_srv6_profiles(void)
     remove_fixture(&store, directory);
 }
 
+static int replace_ev_format(struct mrc_ctl_store_ev_format *format, void *arg)
+{
+    *format = *(const struct mrc_ctl_store_ev_format *)arg;
+    return 0;
+}
+
+static void test_format_activation_race(const struct mrc_ctl_store *store, uint64_t ev_id,
+                                         struct mrc_ctl_store_ev_format format)
+{
+    int ready[2];
+    assert(pipe(ready) == 0);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (!pid) {
+        close(ready[1]);
+        char start;
+        assert(read(ready[0], &start, 1) == 1);
+        close(ready[0]);
+        format.state = MRC_CTL_STORE_OFFLINE;
+        int result = mrc_ctl_store_edit_format(store, format.id, replace_ev_format, &format);
+        assert(result == 0 || result == -EBUSY);
+        _exit(result == 0);
+    }
+    close(ready[0]);
+    assert(write(ready[1], "x", 1) == 1);
+    close(ready[1]);
+    int activate = mrc_ctl_store_set_state(store, ev_id, MRC_CTL_STORE_ONLINE);
+    int child_changed = child_status(pid);
+    assert((!activate && !child_changed) || (activate == -EAGAIN && child_changed));
+    assert(mrc_ctl_store_set_state(store, ev_id, MRC_CTL_STORE_OFFLINE) == 0);
+}
+
+static void test_custom_ev_formats(void)
+{
+    char directory[] = "/tmp/mrc-ctl-formats.XXXXXX";
+    assert(mkdtemp(directory));
+    assert(chmod(directory, 02750) == 0);
+    struct mrc_ctl_store store = MRC_CTL_STORE_INITIALIZER;
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+
+    struct mrc_ctl_store_ev_format format = {
+        .id = UINT64_C(0x1020304050607080),
+        .state = MRC_CTL_STORE_ONLINE, .format = MRC_CTL_STORE_FORMAT_STEV,
+        .field_count = 1, .widths = { 32 },
+    };
+    struct mrc_ctl_store_ev_format saved_format;
+    assert(mrc_ctl_store_get_format(&store, format.id, &saved_format) == -ENOENT);
+    assert(mrc_ctl_store_edit_format(&store, MRC_CTL_STORE_BUILTIN_FORMATS, replace_ev_format, &format) == -EINVAL);
+    struct mrc_ctl_store_ev_format invalid = format;
+    invalid.widths[0] = 33;
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &invalid) == -EINVAL);
+    const uint8_t crossing[] = { 32, 32, 32, 31, 32, 32, 32, 32, 1 };
+    const uint8_t aligned[] = { 32, 32, 32, 32, 32, 32, 32, 32 };
+    assert(!mrc_ctl_store_format_geometry_valid(MRC_CTL_STORE_FORMAT_SRV6_SRH, crossing, sizeof(crossing)));
+    assert(mrc_ctl_store_format_geometry_valid(MRC_CTL_STORE_FORMAT_SRV6_SRH, aligned, sizeof(aligned)));
+
+    const struct mrc_ctl_store_config srv6 = {
+        .mode = MRC_CTL_STORE_EXPLICIT, .format = MRC_CTL_STORE_FORMAT_SRV6,
+        .count = 2, .min_active = 1, .populated = 3,
+        .srv6 = {{ 0x20, 1, [15] = 1 }, { 0x20, 1, [15] = 2 }},
+    };
+    assert(mrc_ctl_store_create(&store, 10) == 0);
+    assert(mrc_ctl_store_configure(&store, 10, &srv6) == 0);
+    assert(mrc_ctl_store_set_state(&store, 10, MRC_CTL_STORE_ONLINE) == 0);
+    expect_ev_snapshot_version(&store, 4);
+
+    const uint64_t ev_id = 20;
+    struct mrc_ctl_store_config config = {
+        .mode = MRC_CTL_STORE_GENERATED, .format = MRC_CTL_STORE_FORMAT_STEV, .format_id = format.id,
+        .count = 2, .min_active = 1, .populated = 3,
+        .format_field_count = 1, .format_widths = { 32 },
+        .field_count = 1,
+        .fields = {{ .width = 32, .min_val = 0xfff00001, .max_val = 0xfff00002, .mask = UINT32_MAX }},
+        .entropy = { 0xfff00001, 0xfff00002 },
+    };
+    assert(mrc_ctl_store_create(&store, ev_id) == 0);
+    assert(mrc_ctl_store_configure(&store, ev_id, &config) == -ENOENT);
+    struct mrc_ctl_store_ev_format offline = format;
+    offline.state = MRC_CTL_STORE_OFFLINE;
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &offline) == 0);
+    assert(mrc_ctl_store_configure(&store, ev_id, &config) == -EAGAIN);
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &format) == 0);
+    assert_mode(&store, "ev-formats.v1", 0640);
+
+    struct mrc_ctl_store_config missing_fields = config;
+    missing_fields.field_count = 0;
+    assert(mrc_ctl_store_configure(&store, ev_id, &missing_fields) == -EINVAL);
+    assert(mrc_ctl_store_configure(&store, ev_id, &config) == 0);
+    expect_ev_snapshot_version(&store, 5);
+    assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_ONLINE) == 0);
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &offline) == -EBUSY);
+    assert(mrc_ctl_store_update_denied(&store, ev_id, 1, 0) == 0);
+
+    mrc_ctl_store_close(&store);
+    assert(mrc_ctl_store_open(&store, directory) == 0);
+    assert(mrc_ctl_store_get_format(&store, format.id, &saved_format) == 0);
+    assert(saved_format.state == MRC_CTL_STORE_ONLINE && saved_format.format == format.format);
+    assert(saved_format.field_count == 1 && saved_format.widths[0] == 32);
+    struct mrc_ctl_store_profile saved;
+    struct mrc_ctl_store_ref ref = MRC_CTL_STORE_REF_INITIALIZER;
+    assert(mrc_ctl_store_acquire(&store, ev_id, &ref, &saved) == 0);
+    assert(saved.config.format_id == format.id && saved.config.denied == 1);
+    assert(saved.config.format_field_count == 1 && saved.config.format_widths[0] == 32);
+    check_ev_fields(&saved.config, &config);
+    mrc_ctl_store_release(&ref);
+    assert(mrc_ctl_store_get(&store, 10, &saved) == 0 && saved.state == MRC_CTL_STORE_ONLINE);
+    assert(memcmp(saved.config.srv6, srv6.srv6, sizeof(srv6.srv6)) == 0);
+
+    assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_OFFLINE) == 0);
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &offline) == 0);
+    assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_ONLINE) == -EAGAIN);
+    format.field_count = 2;
+    format.widths[0] = 20;
+    format.widths[1] = 12;
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &format) == 0);
+    assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_ONLINE) == -EINVAL);
+    assert(mrc_ctl_store_get(&store, ev_id, &saved) == 0 && saved.state == MRC_CTL_STORE_OFFLINE);
+    assert(saved.config.format_widths[0] == 32);
+
+    config.format_field_count = 2;
+    memcpy(config.format_widths, format.widths, sizeof(config.format_widths));
+    config.fields[0] = (struct mrc_ctl_store_ev_field){
+        .width = 17, .min_val = 0x10211, .max_val = 0x10212, .mask = 0x1ffff,
+    };
+    config.entropy[0] = 0x10211000;
+    config.entropy[1] = 0x10212000;
+    struct mrc_ctl_store_profile updated = { .id = ev_id, .state = MRC_CTL_STORE_ONLINE, .config = config };
+    assert(mrc_ctl_store_edit(&store, ev_id, replace_profile, &updated) == 0);
+    assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_OFFLINE) == 0);
+    test_format_activation_race(&store, ev_id, format);
+
+    struct mrc_ctl_store_ev_format removed = {0};
+    assert(mrc_ctl_store_edit_format(&store, format.id, replace_ev_format, &removed) == 0);
+    assert(mrc_ctl_store_get_format(&store, format.id, &saved_format) == -ENOENT);
+    assert(mrc_ctl_store_set_state(&store, ev_id, MRC_CTL_STORE_ONLINE) == -ENOENT);
+    assert(mrc_ctl_store_remove(&store, ev_id) == 0);
+    expect_ev_snapshot_version(&store, 4);
+    assert(unlinkat(store.fd, "ev-formats.v1", 0) == 0);
+    remove_fixture(&store, directory);
+}
+
 static int configure_unconfigured_cc(struct mrc_ctl_store_cc_profile *profile, void *arg)
 {
     const uint64_t *expected_id = arg;
@@ -796,6 +937,7 @@ int main(void)
     test_legacy_shared_store();
     test_generated_fields();
     test_srv6_profiles();
+    test_custom_ev_formats();
     test_cc_profiles();
     puts("MRC controller profile store tests passed");
     return 0;

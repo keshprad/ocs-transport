@@ -11,6 +11,8 @@
  * upstream mrc_ctl ABI and stores EV and congestion-control profiles. */
 #define MRC_CTL_STORE_MAX_PROFILES 32u
 #define MRC_CTL_STORE_MAX_EV_FIELDS 16u
+#define MRC_CTL_STORE_BUILTIN_FORMATS 4u
+#define MRC_CTL_STORE_MAX_CUSTOM_FORMATS 32u
 #define MRC_CTL_STORE_MAX_CC_PROFILES 32u
 #define MRC_CTL_STORE_SRV6_SID_BYTES 16u
 #define MRC_CTL_STORE_SRV6_EV_BYTES (2u * MRC_CTL_STORE_SRV6_SID_BYTES)
@@ -61,6 +63,7 @@ bool mrc_ctl_store_ev_field_valid(const struct mrc_ctl_store_ev_field *field);
 struct mrc_ctl_store_config {
     enum mrc_ctl_store_mode mode;
     enum mrc_ctl_store_format format;
+    uint64_t format_id; /* Zero uses the built-in layout for format. */
     uint8_t count;
     uint8_t min_active;
     uint32_t populated; /* Bit i identifies a configured entropy slot. */
@@ -69,6 +72,8 @@ struct mrc_ctl_store_config {
     uint8_t srv6[MRC_EV_MAX_PATHS][MRC_CTL_STORE_SRV6_EV_BYTES]; /* Network byte order. */
     uint8_t field_count; /* Zero for profiles with no generated field metadata. */
     struct mrc_ctl_store_ev_field fields[MRC_CTL_STORE_MAX_EV_FIELDS];
+    uint8_t format_field_count;
+    uint8_t format_widths[MRC_CTL_STORE_MAX_EV_FIELDS];
 };
 
 struct mrc_ctl_store_profile {
@@ -76,6 +81,18 @@ struct mrc_ctl_store_profile {
     enum mrc_ctl_store_state state;
     struct mrc_ctl_store_config config;
 };
+
+struct mrc_ctl_store_ev_format {
+    uint64_t id;
+    enum mrc_ctl_store_state state;
+    enum mrc_ctl_store_format format;
+    uint8_t field_count;
+    uint8_t widths[MRC_CTL_STORE_MAX_EV_FIELDS];
+};
+
+/* Validate the configured field geometry of a complete custom format. */
+bool mrc_ctl_store_format_geometry_valid(enum mrc_ctl_store_format format,
+                                         const uint8_t *widths, unsigned int count);
 
 struct mrc_ctl_store_cc_profile {
     uint64_t id;
@@ -131,6 +148,14 @@ int mrc_ctl_store_update_denied(const struct mrc_ctl_store *store, uint64_t id,
 int mrc_ctl_store_acquire(const struct mrc_ctl_store *store, uint64_t id,
                           struct mrc_ctl_store_ref *ref, struct mrc_ctl_store_profile *profile);
 void mrc_ctl_store_release(struct mrc_ctl_store_ref *ref);
+
+/* Custom formats use IDs above the built-in range. An absent format starts
+ * in INIT inside the edit callback. Clear the ID to remove it. Formats
+ * cannot change while referenced by an ONLINE EV profile. */
+int mrc_ctl_store_get_format(const struct mrc_ctl_store *store, uint64_t id,
+                             struct mrc_ctl_store_ev_format *format);
+int mrc_ctl_store_edit_format(const struct mrc_ctl_store *store, uint64_t id,
+                              int (*edit)(struct mrc_ctl_store_ev_format *, void *), void *arg);
 
 /* CC profiles have their own ID and lease slots. A missing profile is INIT
  * inside an edit callback. A successful callback can clear its ID to remove
