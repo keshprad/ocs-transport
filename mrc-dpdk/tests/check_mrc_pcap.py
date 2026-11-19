@@ -8,9 +8,11 @@ import os
 import struct
 import subprocess
 import tempfile
-import zlib
 from pathlib import Path
 
+
+from memif_pair import require
+from mrc_wire_reference import Bth, IPv4Peer, decode_ipv4, encode_ipv4
 
 REQUESTOR = 0x120345
 RESPONDER = 0x230456
@@ -27,36 +29,11 @@ ENTROPIES = [0xE241, 0xE3B2]
 PDC_IDS = (REQUESTOR & 0xFFFF, RESPONDER & 0xFFFF)
 
 
-def require(condition, message):
-    if not condition:
-        raise RuntimeError(message)
-
-
-def ipv4_checksum(header):
-    value = sum(struct.unpack("!10H", header))
-    while value >> 16:
-        value = (value & 0xFFFF) + (value >> 16)
-    return value ^ 0xFFFF
-
-
-def icrc(protected):
-    # RoCEv2 IPv4 invariant fields, including the all-ones masked LRH.
-    ip_udp_bth = bytearray(protected[:40])
-    for index in (1, 8, 10, 11, 26, 27, 32):
-        ip_udp_bth[index] = 0xFF
-    return struct.pack("<I", zlib.crc32(b"\xff" * 8 + ip_udp_bth + protected[40:]))
-
-
 def request(path, opcode, psn, body, flags=0):
-    pad = (-len(body)) % 4
-    bth = struct.pack("!BBHII", opcode, pad << 4, PKEY, RESPONDER, flags << 24 | psn)
-    transport = bth + body + b"\0" * pad
-    udp_size = 8 + len(transport) + 4
-    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + udp_size, 0, 0x4000,
-                     63, 17, 0, PEER_IPV4, LOCAL_IPV4)
-    ip = ip[:10] + struct.pack("!H", ipv4_checksum(ip)) + ip[12:]
-    protected = ip + struct.pack("!4H", ENTROPIES[path], UDP_PORT, udp_size, 0) + transport
-    return PCAP_MACS[path] + PEER_MACS[path] + b"\x08\x00" + protected + icrc(protected)
+    source = IPv4Peer(PEER_MACS[path], PEER_IPV4)
+    destination = IPv4Peer(PCAP_MACS[path], LOCAL_IPV4)
+    return encode_ipv4(source, destination, ENTROPIES[path], UDP_PORT,
+                       Bth(opcode, PKEY, RESPONDER, psn, flags), body)
 
 
 def write_request(path, opcode, psn, msn, rqmsn, offset, length, payload, immediate=None, flags=0x80):
@@ -110,22 +87,13 @@ def read_capture(path):
 
 
 def decode_response(path, frame):
-    require(frame[:14] == PEER_MACS[path] + PCAP_MACS[path] + b"\x08\x00",
-            f"Reply used the wrong Ethernet path {path}")
-    ip = frame[14:]
-    require(len(ip) >= 44, "Truncated MRC response")
-    require(ip[0] == 0x45 and ip[9] == 17 and ip[12:20] == LOCAL_IPV4 + PEER_IPV4,
-            "Unexpected response IP envelope")
-    require(ipv4_checksum(ip[:20]) == 0 and int.from_bytes(ip[2:4], "big") == len(ip),
-            "Response has an invalid IPv4 checksum or length")
-    _, destination, udp_size, checksum = struct.unpack_from("!4H", ip, 20)
-    require((destination, udp_size, checksum) == (UDP_PORT, len(ip) - 20, 0),
-            "Unexpected UDP port, length, or checksum")
-    require(ip[-4:] == icrc(ip[:-4]), "Response iCRC did not match the independent calculation")
-    opcode, _, pkey, qp, flags_psn = struct.unpack_from("!BBHII", ip, 28)
-    require(pkey == PKEY and qp == (2 if opcode in (0xD8, 0xD9) else REQUESTOR),
+    source = IPv4Peer(PCAP_MACS[path], LOCAL_IPV4)
+    destination = IPv4Peer(PEER_MACS[path], PEER_IPV4)
+    packet = decode_ipv4(frame, source, destination, UDP_PORT)
+    bth = packet.bth
+    require(bth.pkey == PKEY and bth.qp == (2 if bth.opcode in (0xD8, 0xD9) else REQUESTOR),
             "Response used the wrong partition or destination QP")
-    return opcode, flags_psn & 0xFFFFFF, flags_psn >> 24, ip[40:-4]
+    return bth.opcode, bth.psn, bth.flags, packet.body
 
 
 def check_responses(output_paths, outside):

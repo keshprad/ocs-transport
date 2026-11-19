@@ -42,7 +42,7 @@ in-process path-1 blackhole, pair `--drop-path-after N` with
 `--restore-path-after M`. Recovery is driven by a correlated reliability
 probe reply.
 
-### Independent wire replay
+### Independent wire tests
 
 With DPDK's `net_pcap` PMD available, run `python3 tests/check_mrc_pcap.py`.
 The test generates IPv4 WRITE, WRITEIMM, and probe packets in Python and
@@ -50,6 +50,13 @@ feeds them to the DPDK receiver. It checks the receiver's packet placement
 and reads the captured replies with its own decoder. It covers selective
 and transport ACKs, the out-of-window NACK, reflected entropy and probe
 timestamps, and iCRC without using the endpoint's codec in the test peer.
+
+With the `net_memif` PMD available, run `make tests/mrc_memif_relay` and
+run `python3 tests/check_mrc_requester.py`. The independent peer checks
+payload and WRITEIMM fields across PSN wrap. It sends a packet-buffer
+NACK and checks that the requester retries on the other rail. The peer
+withholds a transport ACK after confirming delivery by SACK and verifies
+that the next WRITEIMM waits for the receive credit to be released.
 
 ### OCP application completion APIs
 

@@ -5,8 +5,8 @@ The conformance target is the [OCP Multipath Reliable Connection 1.0 specificati
 | Scope | Verified in the current slice | Remaining evidence or implementation |
 | --- | --- | --- |
 | §§6.1–6.4, 10.1.2, request and completion semantics | A QP with configurable or TCP-negotiated QPNs, PSN, static MPR, partition, and memory attributes carries mixed WRITE and WRITEIMM requests with independent lengths and receive sequence numbers. The responder validates per-WR geometry and the registered region, consumes posted receive credits, and emits WRITEIMM completions in order. With zero posted receive credits, the sender receives Remote Operational Error. Negotiated transfers use a protection-domain MR registry. Posted WRs retain their source leases through semantic acknowledgement or flush, and the responder retains destination leases through ordered completion. A local provider QP holds bounded send and receive queues, supports RESET/INIT/RTR/RTS/ERROR, and publishes ordered success, error, and flush completions. A Linux completion channel signals a pollable FD for armed CQ events across multiple CQs and waits for acknowledgement of fetched events when destroying a CQ. Verified remote access errors and WRITEIMM without receive credits over memif. The optional shared library implements the OCP context and CQ/channel signatures using a real libibverbs context, including WC field translation, blocking and nonblocking event retrieval, and parent lifetime checks. Tests bind a real verbs MR to the software PD using its original keys and verify local posting, remote lookup, and independent lease lifetimes. | Public libmrc QP ABI and MR integration, device and QP attributes, asynchronous events, and provider interoperability for out-of-band attributes. |
-| §§6.2.2, 7.5.5, wire format | Independent byte vectors for IPv4/UDP, IPv6/UDP, and preserved SRv6 envelopes, iCRC, WRITE with immediate and TSETH, AETH, SETH, NETH, and PETH. Independent IPv4 pcap stimulus and response checks exercise the actual DPDK responder, including a corrupt iCRC, PSN wrap, reordering, and an out-of-window NACK. | An independent live peer in both directions, transit routing on an independent SRv6 fabric, and remaining edge-case packet validation. |
-| §§7.2, 7.4–7.5, packet reliability | 24-bit PSN and window checks, wrap, selective SACK bitmaps, separate AETH, duplicate suppression, retransmit marking, logical timers, SACK-driven fast loss, reliability probe request/response matching and RTT sampling (probe exchanges observed on the Spark pair), and separately classified trimmed packets with TRIM NACK recovery. Negotiated Dynamic MPR advertises each change in SACKs and gates both first transmissions and retries, while preserving outstanding receive state. Over memif, all five mandatory Table 7-3 NACK reasons were generated and handled, including retry-budget exhaustion and terminal CQ overrun. | Independent live NACK interoperability and recovery after an actual port transition. Both Sparks verified a 16 MiB WRITE after an injected path-1 blackhole. Provider QP errors and typed send completions are verified for retry exhaustion and UNEXP_EVENT. Trim NACK generation and service time are capability-gated. |
+| §§6.2.2, 7.5.5, wire format | Independent byte vectors for IPv4/UDP, IPv6/UDP, and preserved SRv6 envelopes, iCRC, WRITE with immediate and TSETH, AETH, SETH, NETH, and PETH. Independent IPv4 pcap stimulus and response checks exercise the actual DPDK responder, including a corrupt iCRC, PSN wrap, reordering, and an out-of-window NACK. A live Python responder on two memif rails validates the DPDK requester's IPv4 output and supplies independent control messages. | Interoperability with an external MRC implementation, independent IPv6/SRv6 exchange, transit routing on an independent SRv6 fabric, and remaining edge-case packet validation. |
+| §§7.2, 7.4–7.5, packet reliability | 24-bit PSN and window checks, wrap, selective SACK bitmaps, separate AETH, duplicate suppression, retransmit marking, logical timers, SACK-driven fast loss, reliability probe request/response matching and RTT sampling (probe exchanges observed on the Spark pair), and separately classified trimmed packets with TRIM NACK recovery. Negotiated Dynamic MPR advertises each change in SACKs and gates both first transmissions and retries, while preserving outstanding receive state. Over memif, all five mandatory Table 7-3 NACK reasons were generated and handled, including retry-budget exhaustion and terminal CQ overrun. | Independent live NACK interoperability and recovery after an actual port transition. Both receiver Sparks verified a 16 MiB WRITE after an injected path-1 blackhole. An independent memif peer checks alternate-rail retry on a packet-buffer NACK and confirms that a WRITEIMM credit stays occupied until a semantic ACK. Provider QP errors and typed send completions are verified for retry exhaustion and UNEXP_EVENT. Trim NACK generation and service time are capability-gated. |
 | §§7.3, 7.4.7–7.4.8, 7.5.6, endpoint operations | ERTH/EETH byte fixtures and a two-path Port Status Update exchange using reserved QPN 2 and echoed tokens, observed over memif and the Spark pair. | Physical port transitions, out-of-order status handling, and optional EV probe initiation. |
 | §8, congestion control | Nominal per-packet accounting, modulo 24-bit feedback, congestion-window admission and RTT/ECN-driven NSCC adjustments. | Full negotiated per-QP control, deployment measurements, and optional receiver penalty and quick adaptation. Verify ECN and trimming on a packet-switching fabric or with controlled injection. |
 | §§9–10, EVs and APIs | Two paths with configurable UDP source-port EVs, IPv6 flow-label reflection, preserved or already decapsulated SRv6 receive, and alternate-path retransmission. A persistent local controller binds an online profile to an active QP and applies administrative deny/allow changes during transfer. Active-only rotation distinguishes denied, congestion-skipped, and failed EVs. A fresh correlated probe can restore a failed EV. | Controller events and OCP application/controller interfaces. Verify supported optional routing and EV modes separately. |
@@ -25,6 +25,10 @@ From `mrc-dpdk/`, run `make check` for wire, QP, work-request, congestion, conne
 
 With DPDK's pcap PMD, `python3 tests/check_mrc_pcap.py` tests the IPv4
 responder through independent capture generation and interpretation.
+Build `tests/mrc_memif_relay` with a memif-enabled DPDK and run
+`python3 tests/check_mrc_requester.py` to exercise the requester with an
+independent live peer. The relay moves Ethernet frames and the Python peer
+owns the wire encoding, memory placement, and feedback.
 
 Use Spark-04 as the implementation source. After pushing the exact clean commit, run `tests/verify_spark_revisions.sh --sync "$(git rev-parse HEAD)"` to advance the detached test worktrees on Spark-02 and Spark-03. Run the same command without `--sync` immediately before each live test. The script checks that all three worktrees are clean and at the requested commit.
 
@@ -53,5 +57,27 @@ correlated probe replies, one EV failure, and one EV recovery. The receiver
 placed 7289 segments on path 1, confirming that transmission resumed after
 the blackhole. Port counters reported zero misses, errors, and receive
 buffer exhaustion on both Sparks.
+
+### Scoped runner verification on Spark-02, Spark-03, and Spark-04
+
+The `mrc-test` systemd runner passed the smoke and injected-loss profiles
+on both pairs. Before each run, all three test worktrees matched
+`6a02243b88b8bac406a4877230cfc185f0c7fa7f`. The three root-owned snapshots
+and the verified Spark-04 build had the same SHA-256 for `mrc_write`
+(`fa07413417ffc2d4542a5353d5837d5ed751ae8499f8bde4c3e15b839f8889d0`).
+The smoke and failover units explicitly load the ring mempool and mlx5 PMDs.
+
+| Pair | Smoke, 4 MiB, segments by rail | Failover, 16 MiB, segments by rail | Failover duplicate packets |
+| --- | --- | --- | --- |
+| Spark-04 to Spark-02 | 2048 / 2048 | 9122 / 7262 | 30 |
+| Spark-04 to Spark-03 | 2048 / 2048 | 9062 / 7322 | 6 |
+
+The receivers verified all expected data and reported zero port misses,
+errors, and receive buffer exhaustion. The failure profile suppressed
+rail-1 transmission between scheduled segments 512 and 2047. The rail-1
+delivery totals show that both pairs resumed use of the affected rail.
+Receiver journals and sender unit state supplied the scoped runner
+evidence. Spark-04 journal access is needed to inspect the sender's
+individual retry and EV counters for these runs.
 
 mlx5 setup requires `CAP_NET_RAW` and `CAP_NET_ADMIN` or an administrator-run endpoint. [DPDK mlx5 privilege documentation](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root)

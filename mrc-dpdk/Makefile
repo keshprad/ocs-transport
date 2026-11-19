@@ -19,7 +19,10 @@ mrc_write: src/mrc_write.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.
            src/mrc_connect.c src/mrc_oob.c src/mrc_ev.c src/mrc_mpr.c src/mrc_provider.c src/mrc_provider_qp.c src/mrc_ctl_store.c \
            src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h src/mrc_connect.h src/mrc_oob.h src/mrc_ev.h src/mrc_mpr.h src/mrc_provider.h src/mrc_ctl_store.h
 
-mrc_bench mrc_write:
+tests/mrc_memif_relay: tests/mrc_memif_relay.c src/dpdk_io.c src/dpdk_io.h
+tests/mrc_memif_relay: CPPFLAGS += -Isrc
+
+mrc_bench mrc_write tests/mrc_memif_relay:
 	$(PKG_CONFIG) --exists libdpdk
 	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(LDLIBS)
 
@@ -66,4 +69,4 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_ctl_store
 
 clean:
-	$(RM) mrc_bench mrc_write mrc_ctl_profile libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
+	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store
