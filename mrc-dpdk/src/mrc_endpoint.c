@@ -20,7 +20,6 @@
 
 enum {
     BURST = 32,
-    FRAME_CAPACITY = 1514,
     SACK_THRESHOLD = 4096,
     UDP_HEADER_LEN = 8,
     REQUESTOR_EV_PORT = 0xc000,
@@ -275,12 +274,12 @@ static struct mrc_wire_packet packet_for(const struct mrc_endpoint_config *trans
     return packet;
 }
 
-static size_t simulate_trim(const struct mrc_endpoint_config *transfer, uint8_t *frame)
+static size_t simulate_trim(const struct mrc_endpoint_config *transfer, unsigned int path, uint8_t *frame)
 {
     /* Preserve the nominal UDP length but truncate the body before the RETH. */
     uint8_t *ip = frame + RTE_ETHER_HDR_LEN;
     size_t trim_headers = MRC_BTH_LEN + MRC_METH_LEN;
-    if (transfer->ip_version == MRC_WIRE_IP6) {
+    if (transfer->srv6 || transfer->ip_version == MRC_WIRE_IP6) {
         struct rte_ipv6_hdr header;
         memcpy(&header, ip, sizeof(header));
         uint32_t vtc_flow = rte_be_to_cpu_32(header.vtc_flow);
@@ -288,8 +287,9 @@ static size_t simulate_trim(const struct mrc_endpoint_config *transfer, uint8_t 
         header.vtc_flow = rte_cpu_to_be_32(vtc_flow);
         size_t outer_payload = UDP_HEADER_LEN + trim_headers;
         if (transfer->srv6) {
-            outer_payload += sizeof(struct rte_ipv6_hdr);
-            if (transfer->srv6_srh)
+            outer_payload += transfer->ip_version == MRC_WIRE_IP6 ?
+                sizeof(struct rte_ipv6_hdr) : sizeof(struct rte_ipv4_hdr);
+            if (transfer->paths[path].srv6.segment_count)
                 outer_payload += SINGLE_SEGMENT_SRH_LEN;
         }
         header.payload_len = rte_cpu_to_be_16((uint16_t)outer_payload);
@@ -319,14 +319,17 @@ static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned 
     size_t capacity = rte_pktmbuf_tailroom(mbuf);
     int result = mrc_wire_encode(frame, capacity, packet, &length);
     if (!result && transfer->srv6) {
+        const struct mrc_endpoint_srv6_path *selected = &transfer->paths[path].srv6;
+        bool ipv6 = packet->ip_version == MRC_WIRE_IP6;
         struct mrc_wire_srv6_tx route = {
-            .flow_label = packet->ipv6.flow_label,
-            .dscp = packet->ipv6.dscp, .ecn = packet->ipv6.ecn,
-            .segment_list = transfer->srv6_srh ? &transfer->peer_sid : NULL,
-            .segment_count = transfer->srv6_srh ? 1u : 0u,
+            .flow_label = ipv6 ? packet->ipv6.flow_label : 0,
+            .dscp = ipv6 ? packet->ipv6.dscp : packet->ipv4.dscp,
+            .ecn = packet_ecn(packet),
+            .segment_list = selected->segment_count ? selected->segments : NULL,
+            .segment_count = selected->segment_count, .segments_left = selected->segments_left,
         };
-        memcpy(route.outer_src_ip, transfer->local_sid, MRC_IPV6_ADDR_LEN);
-        memcpy(route.outer_dst_ip, transfer->peer_sid, MRC_IPV6_ADDR_LEN);
+        memcpy(route.outer_src_ip, selected->local_sid, MRC_IPV6_ADDR_LEN);
+        memcpy(route.outer_dst_ip, selected->initial_dst, MRC_IPV6_ADDR_LEN);
         result = mrc_wire_wrap_srv6(frame, capacity, length, &route, &length);
     }
     if (result) {
@@ -334,7 +337,7 @@ static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned 
         return false;
     }
     if (inject_trim)
-        length = simulate_trim(transfer, frame);
+        length = simulate_trim(transfer, path, frame);
     if (!rte_pktmbuf_append(mbuf, (uint16_t)length)) {
         rte_pktmbuf_free(mbuf);
         return false;
@@ -349,10 +352,10 @@ static bool transmit(const struct mrc_endpoint_config *transfer, unsigned int pa
 }
 
 static const uint8_t *read_frame(const struct rte_mbuf *mbuf,
-                                  uint8_t scratch[FRAME_CAPACITY], size_t *length)
+                                  uint8_t scratch[MRC_ENDPOINT_FRAME_CAPACITY], size_t *length)
 {
     *length = rte_pktmbuf_pkt_len(mbuf);
-    if (*length > FRAME_CAPACITY)
+    if (*length > MRC_ENDPOINT_FRAME_CAPACITY)
         return NULL;
     return rte_pktmbuf_read(mbuf, 0, (uint32_t)*length, scratch);
 }
@@ -384,37 +387,43 @@ bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *transfer, unsig
            memcmp(ip->dst_mac, path->local.addr_bytes, MRC_MAC_LEN) == 0;
 }
 
-static bool route_matches(const struct mrc_endpoint_config *transfer, const struct mrc_wire_srv6 *route)
+bool mrc_endpoint_route_matches(const struct mrc_endpoint_config *transfer, unsigned int path,
+                                const struct mrc_wire_srv6 *route)
 {
+    const struct mrc_endpoint_srv6_path *selected = &transfer->paths[path].srv6;
     return !route->encapsulated ||
            (transfer->srv6 &&
-            memcmp(route->outer_src_ip, transfer->peer_sid, MRC_IPV6_ADDR_LEN) == 0 &&
-            memcmp(route->outer_dst_ip, transfer->local_sid, MRC_IPV6_ADDR_LEN) == 0);
+            memcmp(route->outer_src_ip, selected->peer_sid, MRC_IPV6_ADDR_LEN) == 0 &&
+            memcmp(route->outer_dst_ip, selected->local_sid, MRC_IPV6_ADDR_LEN) == 0);
 }
 
-static int decode_routed(const struct mrc_endpoint_config *transfer, const uint8_t *frame, size_t length,
-                         struct mrc_wire_packet *packet)
+static int decode_routed(const struct mrc_endpoint_config *transfer, unsigned int path,
+                         const uint8_t *frame, size_t length, struct mrc_wire_packet *packet)
 {
     struct mrc_wire_srv6 route;
     int result = mrc_wire_decode_srv6(frame, length, packet, &route);
     if (result)
         return result;
-    if (!route_matches(transfer, &route))
+    if (!mrc_endpoint_route_matches(transfer, path, &route))
         return -EHOSTUNREACH;
     /* Propagate a fabric CE mark before building reliability feedback. */
-    if (route.encapsulated && route.outer_ecn == 3 && packet->ip_version == MRC_WIRE_IP6)
-        packet->ipv6.ecn = 3;
+    if (route.encapsulated && route.outer_ecn == 3) {
+        if (packet->ip_version == MRC_WIRE_IP6)
+            packet->ipv6.ecn = 3;
+        else
+            packet->ipv4.ecn = 3;
+    }
     return 0;
 }
 
 static bool decode(const struct mrc_endpoint_config *transfer, unsigned int index,
-                   const struct rte_mbuf *mbuf, uint8_t scratch[FRAME_CAPACITY],
+                   const struct rte_mbuf *mbuf, uint8_t scratch[MRC_ENDPOINT_FRAME_CAPACITY],
                    struct mrc_wire_packet *packet, struct mrc_endpoint_rx_counters *counts)
 {
     size_t length;
     counts->frames++;
     const uint8_t *frame = read_frame(mbuf, scratch, &length);
-    if (!frame || decode_routed(transfer, frame, length, packet)) {
+    if (!frame || decode_routed(transfer, index, frame, length, packet)) {
         counts->rejected++;
         return false;
     }
@@ -857,7 +866,7 @@ static int receive_control(const struct mrc_endpoint_config *transfer, struct mr
         uint16_t n = receive_burst(transfer, path, packets);
         for (uint16_t i = 0; i < n; i++) {
             const struct mrc_endpoint_rx_packet *received = &packets[i];
-            uint8_t scratch[FRAME_CAPACITY];
+            uint8_t scratch[MRC_ENDPOINT_FRAME_CAPACITY];
             struct mrc_wire_packet packet;
             if (!result && decode(transfer, path, received->mbuf, scratch, &packet, &counts->rx[path]) &&
                 !receive_endpoint_op(transfer, sender->node, counts, path, &packet, received->arrival_cycles))
@@ -1219,7 +1228,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
     uint64_t arrival_cycles = received->arrival_cycles;
     struct mrc_endpoint_rx_counters *rx = &counts->rx[path];
     rx->frames++;
-    uint8_t scratch[FRAME_CAPACITY];
+    uint8_t scratch[MRC_ENDPOINT_FRAME_CAPACITY];
     size_t length;
     const uint8_t *frame = read_frame(received->mbuf, scratch, &length);
     if (!frame) {
@@ -1232,7 +1241,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
     int result = mrc_wire_decode_trimmed_srv6(frame, length, transfer->trim_dscp, &trimmed, &route);
     struct mrc_wire_packet packet;
     if (result != -EPROTONOSUPPORT) {
-        if (result || !route_matches(transfer, &route)) {
+        if (result || !mrc_endpoint_route_matches(transfer, path, &route)) {
             rx->rejected++;
         } else {
             packet.bth = trimmed.bth;
@@ -1253,7 +1262,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
         return 0;
     }
 
-    result = decode_routed(transfer, frame, length, &packet);
+    result = decode_routed(transfer, path, frame, length, &packet);
     if (!result) {
         if (!mrc_endpoint_peer_matches(transfer, path, &packet)) {
             rx->other_peer++;
@@ -1268,7 +1277,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
 
     if (result == -EPROTONOSUPPORT &&
         !mrc_wire_decode_unsupported_opcode(frame, length, &packet, &route) &&
-        route_matches(transfer, &route) && mrc_endpoint_peer_matches(transfer, path, &packet)) {
+        mrc_endpoint_route_matches(transfer, path, &route) && mrc_endpoint_peer_matches(transfer, path, &packet)) {
         rx->matched++;
         return reject_write(transfer, receiver, counts, path, &packet, MRC_WR_INVALID,
                             packet.bth.psn, arrival_cycles);

@@ -251,11 +251,12 @@ def main():
             "Negotiated transfer did not use provider-registered memory")
     print(json.dumps({"case": "negotiated_qp", "tx": tx, "rx": rx}))
 
-    tx, rx = transfer(binary, 41989, "--immediate", "22", trim_after=16,
-                      ipv6=True, srv6=True)
-    require(rx["trimmed"] > 0 and tx["trim_nacks"] > 0 and rx["immediate_completed"],
-            f"Preserved SRv6 wrapper or outer trim recovery failed: {tx}, {rx}")
-    print(json.dumps({"case": "srv6_write_imm_trim_nack", "tx": tx, "rx": rx}))
+    for ipv6, case in ((True, "srv6_write_imm_trim_nack"), (False, "srv6_ipv4_write_imm_trim_nack")):
+        tx, rx = transfer(binary, 41989, "--immediate", "22", trim_after=16,
+                          ipv6=ipv6, srv6=True)
+        require(rx["trimmed"] > 0 and tx["trim_nacks"] > 0 and rx["immediate_completed"],
+                f"Preserved SRv6 wrapper or outer trim recovery failed: {tx}, {rx}")
+        print(json.dumps({"case": case, "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 1048576, tx_options=("--deny-path-mask", "2"))
     require(tx["sent"] == [1024, 0] and rx["received"] == [1024, 0],

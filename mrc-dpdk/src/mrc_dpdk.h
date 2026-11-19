@@ -44,9 +44,22 @@ struct mrc_dpdk_route {
     bool bidirectional; /* Attach requester and responder on the same QP. */
 };
 
+/* Per-rail IPv6 outer addresses and optional single-segment SRH. An all-zero
+ * initial destination selects peer_sid. An all-zero SRH segment omits the
+ * header. An SRH may start with zero or one segment left. */
+struct mrc_dpdk_srv6_path {
+    uint8_t local_sid[16];
+    uint8_t peer_sid[16];
+    uint8_t initial_dst[16];
+    uint8_t srh_segment[16];
+    uint8_t segments_left;
+};
+
 /* Bind and drive the QP from the application's DPDK worker. Poll completion
- * queues independently. Both calls return zero or a positive errno. */
+ * queues independently. These calls return zero or a positive errno. */
 int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route);
+int mrc_dpdk_attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
+                           const struct mrc_dpdk_srv6_path paths[2]);
 int mrc_dpdk_progress_qp(struct mrc_qp *qp);
 
 /* Advertise a 0-127 receiver window penalty in subsequent SACKs for this

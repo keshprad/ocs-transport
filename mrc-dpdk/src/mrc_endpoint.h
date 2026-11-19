@@ -10,6 +10,7 @@
 
 enum {
     PATH_COUNT = 2,
+    MRC_ENDPOINT_FRAME_CAPACITY = 1514,
     PMTU = 1024,
     MRC_NOMINAL_MTU = PMTU + 8 + MRC_BTH_LEN + MRC_METH_LEN +
                       MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
@@ -37,10 +38,20 @@ struct mrc_endpoint_node {
     uint64_t peer_valid_until;
 };
 
+struct mrc_endpoint_srv6_path {
+    uint8_t local_sid[MRC_IPV6_ADDR_LEN];
+    uint8_t peer_sid[MRC_IPV6_ADDR_LEN];
+    uint8_t initial_dst[MRC_IPV6_ADDR_LEN];
+    uint8_t segments[1][MRC_IPV6_ADDR_LEN];
+    uint8_t segment_count;
+    uint8_t segments_left;
+};
+
 struct mrc_endpoint_path {
     uint16_t port;
     struct rte_ether_addr local;
     struct rte_ether_addr peer;
+    struct mrc_endpoint_srv6_path srv6;
 };
 
 struct mrc_endpoint_write {
@@ -82,10 +93,7 @@ struct mrc_endpoint_config {
     uint8_t local_ip6[MRC_IPV6_ADDR_LEN];
     uint8_t peer_ip6[MRC_IPV6_ADDR_LEN];
     enum mrc_wire_ip_version ip_version;
-    uint8_t local_sid[MRC_IPV6_ADDR_LEN];
-    uint8_t peer_sid[MRC_IPV6_ADDR_LEN];
     bool srv6;
-    bool srv6_srh;
     uint32_t drop_after;
     uint32_t ev_deny_mask;
     uint64_t profile_id;
@@ -164,6 +172,8 @@ struct mrc_responder;
 
 uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path);
 bool mrc_endpoint_ev_profile_valid(const struct mrc_endpoint_config *config);
+bool mrc_endpoint_route_matches(const struct mrc_endpoint_config *config, unsigned int path,
+                                const struct mrc_wire_srv6 *route);
 bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *config, unsigned int path,
                                const struct mrc_wire_packet *header);
 bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capacity,

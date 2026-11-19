@@ -673,6 +673,78 @@ static void test_srv6_receive(void)
     assert(mrc_wire_decode_srv6(write_frame, sizeof(write_frame), &decoded, NULL) == 0);
 }
 
+static void test_srv6_dispatch(void)
+{
+    static const struct {
+        const uint8_t *frame;
+        enum mrc_wire_ip_version version;
+        bool encapsulated;
+        size_t srh_len;
+        uint8_t outer_dscp;
+    } cases[] = {
+        { write_frame, MRC_WIRE_IP4, false, 0, 0 },
+        { ipv6_write_frame, MRC_WIRE_IP6, false, 0, 0 },
+        { srv6_ipv4_frame, MRC_WIRE_IP4, true, 0, 40 },
+        { srv6_usid_frame, MRC_WIRE_IP6, true, 0, 40 },
+        { srv6_srh_frame, MRC_WIRE_IP6, true, 48, 40 },
+        { srv6_outer_trim_frame, MRC_WIRE_IP6, true, 48, 47 },
+        { trim_frame, MRC_WIRE_IP4, false, 0, 0 },
+        { ipv6_trim_frame, MRC_WIRE_IP6, false, 0, 0 },
+    };
+    struct mrc_wire_packet header;
+    struct mrc_wire_srv6 routing;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const uint8_t *frame = cases[i].frame;
+        size_t length = (cases[i].version == MRC_WIRE_IP4 ? MRC_WIRE_IPV4_HEADER_LEN :
+                         MRC_WIRE_IPV6_HEADER_LEN) + MRC_BTH_LEN;
+        if (cases[i].encapsulated)
+            length += 40 + cases[i].srh_len;
+        assert(mrc_wire_dispatch_srv6_header(frame, length - 1, &header, &routing) == -EBADMSG);
+        assert(mrc_wire_dispatch_srv6_header(frame, length, &header, &routing) == 0);
+        assert(mrc_wire_dispatch_srv6_header(frame, length, &header, NULL) == 0);
+        assert(header.ip_version == cases[i].version && header.bth.opcode == MRC_WRITE_ONLY_IMM);
+        assert(header.bth.dqp == 0xc0ffee && header.bth.psn == 0x00ff01 && header.bth.timestamp);
+        if (header.ip_version == MRC_WIRE_IP4) {
+            assert(header.ipv4.src_ip == 0xc0000201 && header.ipv4.src_port == 0xc123);
+            assert(header.ipv4.dst_port == 4791);
+            assert(memcmp(header.ipv4.src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN) == 0);
+        } else {
+            assert(header.ipv6.flow_label == 0xabcde && header.ipv6.src_port == 0xe741);
+            assert(header.ipv6.dst_port == 4791);
+            assert(memcmp(header.ipv6.src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN) == 0);
+        }
+        assert(routing.encapsulated == cases[i].encapsulated && routing.srh_len == cases[i].srh_len);
+        assert(routing.outer_dscp == cases[i].outer_dscp);
+        if (routing.encapsulated) {
+            assert(memcmp(routing.outer_src_ip, frame + 22, MRC_IPV6_ADDR_LEN) == 0);
+            assert(memcmp(routing.outer_dst_ip, frame + 38, MRC_IPV6_ADDR_LEN) == 0);
+            assert(routing.outer_hop_limit == frame[21] && routing.outer_ecn == ((frame[15] >> 4) & 3));
+        } else {
+            static const uint8_t zero[MRC_IPV6_ADDR_LEN] = {0};
+            assert(!routing.outer_ecn && !routing.outer_hop_limit);
+            assert(memcmp(routing.outer_src_ip, zero, sizeof(zero)) == 0);
+            assert(memcmp(routing.outer_dst_ip, zero, sizeof(zero)) == 0);
+        }
+    }
+
+    assert(mrc_wire_dispatch_header(srv6_srh_frame, sizeof(srv6_srh_frame), &header) == -EPROTONOSUPPORT);
+    uint8_t corrupted[sizeof(srv6_srh_frame)];
+    memcpy(corrupted, srv6_srh_frame, sizeof(corrupted));
+    corrupted[sizeof(corrupted) - 1] ^= 1;
+    assert(mrc_wire_dispatch_srv6_header(corrupted, sizeof(corrupted), &header, &routing) == 0);
+    assert(mrc_wire_decode_srv6(corrupted, sizeof(corrupted), &header, NULL) == -EBADMSG);
+
+    /* Pad a terminal SRH with Pad1 through its largest encoded length. */
+    uint8_t maximum[MRC_WIRE_SRV6_MAX_PREFIX_LEN] = {0};
+    memcpy(maximum, srv6_srh_frame, 54 + 8 + 2 * MRC_IPV6_ADDR_LEN);
+    maximum[18] = 0x08;
+    maximum[19] = 0x64;
+    maximum[55] = UINT8_MAX;
+    memcpy(maximum + 54 + 2048, ipv6_write_frame + 14, 40 + 8 + MRC_BTH_LEN);
+    assert(mrc_wire_dispatch_srv6_header(maximum, sizeof(maximum), &header, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 2048 && header.ip_version == MRC_WIRE_IP6);
+}
+
 static void test_bad_srv6(void)
 {
     struct mrc_wire_packet decoded;
@@ -690,23 +762,30 @@ static void test_bad_srv6(void)
 
     frame[55] = 255; /* SRH Hdr Ext Len overruns the outer payload. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
     frame[55] = srv6_srh_frame[55];
     frame[58] = 2; /* Last Entry would require another 128-bit container. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
     frame[58] = srv6_srh_frame[58];
     frame[57] = 3; /* Segments Left exceeds Last Entry + 1. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
     frame[57] = 1; /* Valid SRH requiring transit forwarding. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
     frame[57] = 0;
     frame[96] = 255; /* TLV exceeds the SRH length. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
     frame[96] = srv6_srh_frame[96];
     frame[56] = 5; /* A routing header other than type 4 is outside this codec. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
     frame[56] = srv6_srh_frame[56];
     frame[54] = 43; /* A second routing header is unsupported. */
     assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
     frame[54] = srv6_srh_frame[54];
 
     frame[21]--; /* Outer hop limit is outside the inner iCRC. */
@@ -762,6 +841,38 @@ static void test_srv6_transmit(void)
     assert(decoded.body.write.data_len == 5 && decoded.body.write.imm_data == 0xf00dcafe);
 }
 
+static void test_srv6_ipv4_transmit(void)
+{
+    uint8_t frame[sizeof(write_frame) + 40 + 24];
+    size_t len;
+    struct mrc_wire_srv6_tx route = srv6_route();
+    memcpy(frame, write_frame, sizeof(write_frame));
+    memcpy(frame, srv6_ipv4_frame, 2 * MRC_MAC_LEN);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame), &route, &len) == 0);
+    assert(len == sizeof(srv6_ipv4_frame) && memcmp(frame, srv6_ipv4_frame, len) == 0);
+
+    static const uint8_t segments[][MRC_IPV6_ADDR_LEN] = {{0xfc, 0xbb, 0xbb, 0, 0, 0x44}};
+    route.segment_count = 1;
+    route.segment_list = segments;
+    memcpy(frame, write_frame, sizeof(write_frame));
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame), &route, &len) == 0);
+    assert(len == sizeof(frame));
+    assert(memcmp(frame, write_frame, 2 * MRC_MAC_LEN) == 0 && frame[12] == 0x86 && frame[13] == 0xdd);
+    assert(frame[20] == 43 && frame[54] == 4 && frame[55] == 2 && frame[56] == 4);
+    assert(!frame[57] && !frame[58]);
+    assert(memcmp(frame + 62, segments[0], MRC_IPV6_ADDR_LEN) == 0);
+    assert(memcmp(frame + 78, write_frame + 14, sizeof(write_frame) - 14) == 0);
+
+    struct mrc_wire_packet decoded;
+    struct mrc_wire_srv6 routing;
+    assert(mrc_wire_decode_srv6(frame, len, &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 24 && decoded.ip_version == MRC_WIRE_IP4);
+    assert(decoded.body.write.data_len == 5 && decoded.body.write.imm_data == 0xf00dcafe);
+    assert(mrc_wire_dispatch_srv6_header(frame, 40 + 24 + MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN,
+                                         &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 24 && decoded.ip_version == MRC_WIRE_IP4);
+}
+
 static void test_bad_srv6_wrap(void)
 {
     uint8_t frame[sizeof(srv6_tx_srh_frame)];
@@ -793,8 +904,10 @@ static void test_bad_srv6_wrap(void)
     route.flow_label = 0x98765;
 
     memcpy(frame, write_frame, sizeof(write_frame));
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame) - 1, &route, &len) == -EBADMSG);
+    frame[13] = 6; /* ARP EtherType. */
     assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame), &route, &len) ==
-           -EPROTONOSUPPORT); /* IPv4 bare frame is outside TX scope. */
+           -EPROTONOSUPPORT);
 
     prepare_wrap_frame(frame);
     frame[sizeof(ipv6_write_frame) - 1] ^= 1;
@@ -862,8 +975,10 @@ int main(void)
     test_ipv6_trimmed_request();
     test_ipv6_integrity();
     test_srv6_receive();
+    test_srv6_dispatch();
     test_bad_srv6();
     test_srv6_transmit();
+    test_srv6_ipv4_transmit();
     test_bad_srv6_wrap();
     test_srv6_outer_trimmed_request();
     puts("MRC wire codec tests passed");

@@ -24,6 +24,8 @@
 #define MRC_ENDPOINT_QPN UINT32_C(2)
 #define MRC_WIRE_IPV4_HEADER_LEN 42
 #define MRC_WIRE_IPV6_HEADER_LEN 62
+/* Ethernet, outer IPv6, maximum SRH, inner IPv6, UDP, and BTH. */
+#define MRC_WIRE_SRV6_MAX_PREFIX_LEN (MRC_WIRE_IPV6_HEADER_LEN + 40 + 2048 + MRC_BTH_LEN)
 #define MRC_IPV6_ADDR_LEN 16
 #define MRC_IPV6_FLOW_LABEL_MASK UINT32_C(0x000fffff)
 #define MRC_ICRC_LEN 4
@@ -265,10 +267,17 @@ int mrc_wire_decode_ip(const uint8_t *frame, size_t length, struct mrc_wire_pack
  * This accepts a physically present prefix, including trimmed packets.
  * The receiving endpoint still validates lengths, iCRC and payload. */
 int mrc_wire_dispatch_header(const uint8_t *frame, size_t length, struct mrc_wire_packet *header);
+/* Also accepts preserved SRv6 with no SRH or a terminal SRH. The inner
+ * header and optional outer routing metadata are decoded from the available
+ * prefix. The metadata is zero for bare IP. The endpoint still validates
+ * lengths, iCRC and payload. */
+int mrc_wire_dispatch_srv6_header(const uint8_t *frame, size_t length, struct mrc_wire_packet *header,
+                                  struct mrc_wire_srv6 *routing);
 
 /*
- * Expand an already encoded bare IPv6/UDP MRC frame in place. The frame's
- * Ethernet header and complete inner datagram, including iCRC, are retained.
+ * Expand an already encoded bare IPv4/UDP or IPv6/UDP MRC frame in place.
+ * The Ethernet addresses and complete inner datagram, including iCRC, are
+ * retained, and the Ethernet type is set to IPv6.
  * This validates inner bounds and framing. Use the ordinary receive decoder
  * for end-to-end integrity validation.
  */

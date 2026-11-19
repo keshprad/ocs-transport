@@ -86,6 +86,19 @@ def main():
             f"Unexpected public unidirectional QP results: {tx}, {rx}")
     print(json.dumps({"case": "public_qp_over_dpdk", "tx": tx, "rx": rx}))
 
+    for mode in ("srv6", "srv6_transit"):
+        tx, rx = run_case(mode)
+        require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+                and tx["completions"] == rx["completions"] == 2
+                and tx["srv6_probe_rails"] == rx["srv6_probe_rails"] == 2
+                and tx["srv6_decapped_rails"] == 1
+                and rx["srv6_decapped_rails"] == (2 if mode == "srv6" else 0)
+                and tx["srv6_advanced_rails"] == 0
+                and rx["srv6_advanced_rails"] == (mode == "srv6_transit")
+                and tx["srv6_wrong_sid_probes"] == 0 and rx["srv6_wrong_sid_probes"] == 1,
+                f"Unexpected public SRv6 QP results: {tx}, {rx}")
+        print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
     tx, rx = run_case("duplex")
     check_duplex(tx, rx)
     print(json.dumps({"case": "public_bidirectional_qps_over_shared_dpdk_ports", "tx": tx, "rx": rx}))

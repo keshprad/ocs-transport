@@ -99,6 +99,21 @@ and refreshes it about every 250 ms. A peer report restricts path selection
 for one second. When it expires, the requester resumes path selection
 using its local link and EV state.
 
+To attach an SRv6 QP, pass a two-entry `mrc_dpdk_srv6_path` array to
+`mrc_dpdk_attach_srv6_qp()` alongside the existing DPDK route. Each rail
+uses its own local SID as the outer source and accepted destination, and
+the peer SID as the expected outer source on receive. The peer SID is
+also the default outer destination on send. To start at a different uSID
+container, set `initial_dst`. An optional `srh_segment` supplies one more
+128-bit container. Set `segments_left` to 1 when the fabric must promote
+that container, or leave it at 0 to carry the segment for telemetry.
+The application supplies packed wire-order containers.
+
+SRv6 attachments accept IPv4 or IPv6 inner GIDs. The receiver validates
+the SIDs on preserved encapsulation and accepts already decapsulated
+frames after checking the inner peer, P_Key, and QPN. The fabric advances
+transit routes before delivery to the MRC endpoint.
+
 The attachment supports a 1024-byte PMTU, registered send buffers with
 up to 16 SGEs, and payload-free WRITEIMM receive posts. Use
 `IBV_SEND_SOLICITED` on a WRITEIMM to trigger an armed solicited-only

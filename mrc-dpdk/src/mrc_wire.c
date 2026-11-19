@@ -716,14 +716,24 @@ static int decode_prefix(const uint8_t *frame, size_t length, enum mrc_wire_ip_v
     return decode_ip_prefix(frame + ETHERNET_LEN, length - ETHERNET_LEN, version, prefix);
 }
 
+static size_t declared_ip_length(const struct wire_prefix *prefix)
+{
+    return prefix->ip_version == MRC_WIRE_IP4 ? read_be16(prefix->ip + 2) :
+           IPV6_LEN + read_be16(prefix->ip + 4);
+}
+
+static size_t minimum_roce_ip_length(const struct wire_prefix *prefix)
+{
+    return (size_t)(prefix->udp - prefix->ip) + UDP_LEN + MRC_BTH_LEN + MRC_ICRC_LEN;
+}
+
 static int validate_ip_envelope(struct wire_prefix *prefix, size_t available, bool encapsulated)
 {
     const uint8_t *ip = prefix->ip;
     size_t ip_header_len = (size_t)(prefix->udp - ip);
-    size_t ip_len = prefix->ip_version == MRC_WIRE_IP4 ? read_be16(ip + 2) :
-                    IPV6_LEN + read_be16(ip + 4);
+    size_t ip_len = declared_ip_length(prefix);
     /* An inner IP datagram has no Ethernet padding to explain trailing octets. */
-    if (ip_len < ip_header_len + UDP_LEN + MRC_BTH_LEN + MRC_ICRC_LEN ||
+    if (ip_len < minimum_roce_ip_length(prefix) ||
         ip_len > available || (encapsulated && ip_len != available))
         return -EBADMSG;
 
@@ -930,15 +940,12 @@ int mrc_wire_wrap_srv6(uint8_t *frame, size_t capacity, size_t inner_frame_len,
         return -EINVAL;
     if (inner_frame_len > capacity)
         return -EMSGSIZE;
-    if (inner_frame_len < MRC_WIRE_IPV6_HEADER_LEN + MRC_BTH_LEN + MRC_ICRC_LEN)
-        return -EBADMSG;
-
     struct wire_prefix prefix;
-    int error = decode_prefix(frame, inner_frame_len, MRC_WIRE_IP6, &prefix);
+    int error = decode_prefix(frame, inner_frame_len, MRC_WIRE_IP_UNSPECIFIED, &prefix);
     if (error)
         return error;
     size_t inner_ip_len = inner_frame_len - ETHERNET_LEN;
-    if (inner_ip_len != IPV6_LEN + (size_t)read_be16(prefix.ip + 4))
+    if (inner_ip_len < minimum_roce_ip_length(&prefix) || inner_ip_len != declared_ip_length(&prefix))
         return -EBADMSG;
 
     size_t list_len = route->segment_count * MRC_IPV6_ADDR_LEN;
@@ -949,16 +956,18 @@ int mrc_wire_wrap_srv6(uint8_t *frame, size_t capacity, size_t inner_frame_len,
 
     uint8_t *outer = frame + ETHERNET_LEN;
     memmove(outer + added, outer, inner_ip_len);
+    write_be16(frame + 2 * MRC_MAC_LEN, ETHERTYPE_IPV6);
     uint8_t traffic_class = (uint8_t)((route->dscp << 2) | route->ecn);
+    uint8_t inner_next = prefix.ip_version == MRC_WIRE_IP4 ? IPPROTO_IPV4_ENCAP : IPPROTO_IPV6_ENCAP;
     encode_ipv6_base(outer, route->flow_label, traffic_class, route->hop_limit,
-                     srh_len ? IPPROTO_ROUTING : IPPROTO_IPV6_ENCAP,
+                     srh_len ? IPPROTO_ROUTING : inner_next,
                      (uint16_t)(inner_ip_len + srh_len));
     memcpy(outer + 8, route->outer_src_ip, MRC_IPV6_ADDR_LEN);
     memcpy(outer + 24, route->outer_dst_ip, MRC_IPV6_ADDR_LEN);
     if (srh_len) {
         uint8_t *srh = outer + IPV6_LEN;
         memset(srh, 0, SRH_FIXED_LEN);
-        srh[0] = IPPROTO_IPV6_ENCAP;
+        srh[0] = inner_next;
         srh[1] = (uint8_t)(list_len / 8);
         srh[2] = SRH_ROUTING_TYPE;
         srh[3] = route->segments_left;
@@ -975,7 +984,7 @@ static bool has_srv6_envelope(const uint8_t *frame, size_t length)
            frame[ETHERNET_LEN + 6] != IPPROTO_UDP;
 }
 
-static int decode_srv6_envelope(const uint8_t *ip, size_t available, bool trimmed,
+static int decode_srv6_envelope(const uint8_t *ip, size_t available, bool prefix_only,
                                  struct wire_prefix *prefix, struct mrc_wire_srv6 *routing)
 {
     if (available < IPV6_LEN)
@@ -983,8 +992,8 @@ static int decode_srv6_envelope(const uint8_t *ip, size_t available, bool trimme
     if (ip[0] >> 4 != 6)
         return -EPROTONOSUPPORT;
 
-    /* A trim switch may preserve or update the outer payload length. */
-    size_t remaining = trimmed ? available - IPV6_LEN : read_be16(ip + 4);
+    /* Dispatch may see a prefix, and trimming may preserve the untrimmed length. */
+    size_t remaining = prefix_only ? available - IPV6_LEN : read_be16(ip + 4);
     if (!remaining || remaining > available - IPV6_LEN)
         return -EBADMSG;
     const uint8_t *inner = ip + IPV6_LEN;
@@ -1010,7 +1019,7 @@ static int decode_srv6_envelope(const uint8_t *ip, size_t available, bool trimme
     int error = decode_ip_prefix(inner, remaining, inner_version, prefix);
     if (error)
         return error;
-    if (!trimmed) {
+    if (!prefix_only) {
         error = validate_ip_envelope(prefix, remaining, true);
         if (error)
             return error;
@@ -1024,6 +1033,24 @@ static int decode_srv6_envelope(const uint8_t *ip, size_t available, bool trimme
     routing->outer_ecn = traffic_class & 3;
     routing->outer_hop_limit = ip[7];
     routing->srh_len = (uint16_t)srh_len;
+    return 0;
+}
+
+int mrc_wire_dispatch_srv6_header(const uint8_t *frame, size_t length, struct mrc_wire_packet *header,
+                                  struct mrc_wire_srv6 *routing)
+{
+    if (!frame || !header)
+        return -EINVAL;
+    struct mrc_wire_srv6 decoded_routing = {0};
+    struct wire_prefix prefix;
+    int error = has_srv6_envelope(frame, length)
+        ? decode_srv6_envelope(frame + ETHERNET_LEN, length - ETHERNET_LEN, true, &prefix, &decoded_routing)
+        : decode_prefix(frame, length, MRC_WIRE_IP_UNSPECIFIED, &prefix);
+    if (error)
+        return error;
+    unpack_header(frame, &prefix, header);
+    if (routing)
+        *routing = decoded_routing;
     return 0;
 }
 

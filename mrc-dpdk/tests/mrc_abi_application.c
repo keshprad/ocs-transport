@@ -37,6 +37,9 @@ enum {
     WIRE_PETH_LEN = 16,
     WIRE_SETH_LEN = 28,
     WIRE_CC_STATE_LEN = 8,
+    WIRE_IPV6_LEN = 40,
+    WIRE_SINGLE_SRH_LEN = 24,
+    WIRE_UDP_LEN = 8,
     DUPLEX_BYTES = 2049,
     RX_FLOW_ROUNDS = 4,
     QA_PRIMER_BYTES = 192,
@@ -469,48 +472,199 @@ static void prepare_memif_links(void)
     }
 }
 
-struct generated_ev_witness {
+enum simplex_wire_mode {
+    SIMPLEX_WIRE_NONE,
+    SIMPLEX_GENERATED_EV,
+    SIMPLEX_SRV6,
+    SIMPLEX_SRV6_TRANSIT,
+};
+
+static void test_sid(uint8_t sid[16], uint16_t port, uint8_t endpoint)
+{
+    const uint8_t value[16] = {0x20, 0x01, 0x0d, 0xb8, 0, port + 1, [15] = endpoint};
+    memcpy(sid, value, sizeof(value));
+}
+
+static void attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
+                           struct mrc_dpdk_srv6_path paths[DUPLEX_RAILS], bool transit)
+{
+    const uint8_t local = route->requester ? 0x11 : 0x22;
+    const uint8_t peer = route->requester ? 0x22 : 0x11;
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        test_sid(paths[port].local_sid, port, local);
+        test_sid(paths[port].peer_sid, port, peer);
+    }
+    memcpy(paths[1].srh_segment, paths[1].peer_sid, sizeof(paths[1].srh_segment));
+    if (route->requester && transit) {
+        test_sid(paths[1].initial_dst, 1, 0x33);
+        paths[1].segments_left = 1;
+    }
+
+    struct mrc_dpdk_srv6_path invalid[DUPLEX_RAILS];
+    memcpy(invalid, paths, sizeof(invalid));
+    memset(invalid[0].local_sid, 0, sizeof(invalid[0].local_sid));
+    assert(mrc_dpdk_attach_srv6_qp(qp, route, invalid) == EINVAL);
+    memcpy(invalid, paths, sizeof(invalid));
+    invalid[0].segments_left = 1;
+    assert(mrc_dpdk_attach_srv6_qp(qp, route, invalid) == EINVAL);
+
+    int attached = mrc_dpdk_attach_srv6_qp(qp, route, paths);
+    if (attached) {
+        fprintf(stderr, "Failed to attach SRv6 QP: %s (%d)\n", strerror(attached), attached);
+        abort();
+    }
+}
+
+struct simplex_wire_witness {
     bool requester;
-    uint32_t qpn;
+    bool transit;
+    const struct connection *local;
+    const struct connection *peer;
+    const struct mrc_dpdk_srv6_path *srv6;
     uint32_t entropy[DUPLEX_RAILS];
     unsigned int probe_ports;
     unsigned int data_ports;
+    unsigned int decapped_ports;
+    unsigned int advanced_ports;
+    uint16_t first_probe_token;
+    bool wrong_sid_injected;
 };
 
-static uint16_t observe_generated_ev(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
-                                      uint16_t count, uint16_t capacity, void *argument)
+static struct observed_udp read_srv6_udp(struct rte_mbuf *packet, uint8_t *prefix, size_t capacity,
+                                          uint16_t port, const struct simplex_wire_witness *observed)
+{
+    const size_t packet_length = rte_pktmbuf_pkt_len(packet);
+    const size_t length = packet_length < capacity ? packet_length : capacity;
+    const size_t encapsulation = WIRE_IPV6_LEN + (port == 1 ? WIRE_SINGLE_SRH_LEN : 0);
+    const size_t udp_offset = RTE_ETHER_HDR_LEN + encapsulation + WIRE_IPV6_LEN;
+    assert(length >= udp_offset + WIRE_UDP_LEN + WIRE_BTH_LEN);
+    const uint8_t *frame = rte_pktmbuf_read(packet, 0, length, prefix);
+    assert(frame && wire_be16(frame + 12) == RTE_ETHER_TYPE_IPV6);
+    const struct mrc_dpdk_srv6_path *path = &observed->srv6[port];
+    const uint8_t *outer = frame + RTE_ETHER_HDR_LEN;
+    bool transit = observed->transit && !observed->requester && port == 1;
+    uint8_t transit_sid[16];
+    test_sid(transit_sid, port, 0x33);
+    assert((outer[0] >> 4) == 6 && outer[7] > 0);
+    assert(wire_be16(outer + 4) == packet_length - RTE_ETHER_HDR_LEN - WIRE_IPV6_LEN);
+    assert(memcmp(outer + 8, path->peer_sid, 16) == 0);
+    assert(memcmp(outer + 24, transit ? transit_sid : path->local_sid, 16) == 0);
+    if (port == 0) {
+        assert(outer[6] == IPPROTO_IPV6);
+    } else {
+        const uint8_t *srh = outer + WIRE_IPV6_LEN;
+        assert(outer[6] == IPPROTO_ROUTING);
+        assert(srh[0] == IPPROTO_IPV6 && srh[1] == 2 && srh[2] == 4 &&
+               srh[3] == transit && srh[4] == 0);
+        assert(memcmp(srh + 8, path->local_sid, 16) == 0);
+    }
+
+    const uint8_t *inner = outer + encapsulation;
+    const uint8_t *udp = inner + WIRE_IPV6_LEN;
+    assert((inner[0] >> 4) == 6 && inner[6] == IPPROTO_UDP);
+    assert(wire_be16(inner + 4) == packet_length - udp_offset);
+    assert(wire_be16(udp + 4) == packet_length - udp_offset);
+    assert(memcmp(inner + 8, observed->peer->gid.raw, 16) == 0);
+    assert(memcmp(inner + 24, observed->local->gid.raw, 16) == 0);
+    uint32_t entropy = (uint32_t)wire_be16(inner + 2) << 16 | wire_be16(udp);
+    return (struct observed_udp){.header = udp, .bytes = length - udp_offset, .entropy = entropy};
+}
+
+static void finish_srv6_receive(struct rte_mbuf *packet, uint16_t port,
+                                 struct simplex_wire_witness *observed)
+{
+    if (port == 0 && (observed->requester || observed->transit))
+        return;
+    if (!observed->requester && observed->transit) {
+        /* Emulate the final segment transition before the public RX path. */
+        uint8_t *outer = rte_pktmbuf_mtod_offset(packet, uint8_t *, RTE_ETHER_HDR_LEN);
+        memcpy(outer + 24, observed->srv6[port].local_sid, 16);
+        outer[WIRE_IPV6_LEN + 3] = 0;
+        observed->advanced_ports |= 1u << port;
+        return;
+    }
+
+    /* Independently remove the final SRH and outer IPv6 header while
+     * preserving Ethernet and the intact inner iCRC-protected packet. */
+    struct rte_ether_hdr ethernet;
+    memcpy(&ethernet, rte_pktmbuf_mtod(packet, const uint8_t *), sizeof(ethernet));
+    uint16_t envelope = WIRE_IPV6_LEN + (port == 1 ? WIRE_SINGLE_SRH_LEN : 0);
+    char *inner_frame = rte_pktmbuf_adj(packet, envelope);
+    assert(inner_frame);
+    memcpy(inner_frame, &ethernet, sizeof(ethernet));
+    observed->decapped_ports |= 1u << port;
+}
+
+static void observe_simplex_header(struct simplex_wire_witness *observed, uint16_t port,
+                                    const struct observed_udp *udp)
+{
+    const uint8_t *bth = udp->header + WIRE_UDP_LEN;
+    unsigned int bit = 1u << port;
+    uint32_t entropy = udp->entropy;
+    bool probe;
+    if (observed->requester) {
+        if (bth[0] != WIRE_SACK)
+            return;
+        assert(udp->bytes >= WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_SETH_LEN);
+        const uint8_t *seth = bth + WIRE_BTH_LEN;
+        probe = (seth[1] & 0x02) != 0;
+        entropy = wire_be32(seth + 4);
+        if (observed->srv6 && probe && port == 0) {
+            uint16_t token = wire_be16(seth + 2);
+            if (observed->probe_ports & bit)
+                assert(token != observed->first_probe_token);
+            else
+                observed->first_probe_token = token;
+        }
+    } else {
+        probe = bth[0] == WIRE_PROBE_REQUEST;
+        if (!probe && (bth[0] < WIRE_WRITE_FIRST || bth[0] > 0xcb))
+            return;
+    }
+    assert(wire_be24(bth + 5) == observed->local->qpn);
+    if ((observed->probe_ports | observed->data_ports) & bit)
+        assert(observed->entropy[port] == entropy);
+    else
+        observed->entropy[port] = entropy;
+    if (probe)
+        observed->probe_ports |= bit;
+    else
+        observed->data_ports |= bit;
+}
+
+static uint16_t observe_simplex_wire(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                     uint16_t count, uint16_t capacity, void *argument)
 {
     (void)queue;
-    (void)capacity;
-    struct generated_ev_witness *observed = argument;
+    struct simplex_wire_witness *observed = argument;
+    struct rte_mbuf *foreign = NULL;
     for (uint16_t i = 0; i < count; i++) {
-        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN + WIRE_SETH_LEN];
-        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
-        const uint8_t *bth = udp.header + 8;
-        uint32_t entropy = udp.entropy;
-        bool probe;
-        if (observed->requester) {
-            if (bth[0] != WIRE_SACK)
-                continue;
-            assert(udp.bytes >= 8 + WIRE_BTH_LEN + WIRE_SETH_LEN);
-            const uint8_t *seth = bth + WIRE_BTH_LEN;
-            probe = (seth[1] & 0x02) != 0;
-            entropy = wire_be32(seth + 4);
-        } else {
-            probe = bth[0] == WIRE_PROBE_REQUEST;
-            if (!probe && (bth[0] < WIRE_WRITE_FIRST || bth[0] > 0xcb))
-                continue;
+        uint8_t prefix[RTE_ETHER_HDR_LEN + 2 * WIRE_IPV6_LEN + WIRE_SINGLE_SRH_LEN +
+                       WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_SETH_LEN];
+        struct observed_udp udp = observed->srv6 ?
+            read_srv6_udp(packets[i], prefix, sizeof(prefix), port, observed) :
+            read_udp(packets[i], prefix, sizeof(prefix));
+        observe_simplex_header(observed, port, &udp);
+        if (!observed->srv6)
+            continue;
+
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (!observed->requester && port == 0 && bth[0] == WIRE_PROBE_REQUEST &&
+            !observed->wrong_sid_injected && count < capacity) {
+            /* Keep the inner packet and iCRC unchanged. A correct endpoint
+             * replies once even after seeing this other rail's SID. */
+            foreign = rte_pktmbuf_copy(packets[i], packets[i]->pool, 0, UINT32_MAX);
+            assert(foreign);
+            uint8_t *destination = rte_pktmbuf_mtod_offset(foreign, uint8_t *, RTE_ETHER_HDR_LEN + 24);
+            memcpy(destination, observed->srv6[1].local_sid, 16);
+            observed->wrong_sid_injected = true;
         }
-        assert(wire_be24(bth + 5) == observed->qpn);
-        unsigned int bit = 1u << port;
-        if ((observed->probe_ports | observed->data_ports) & bit)
-            assert(observed->entropy[port] == entropy);
-        else
-            observed->entropy[port] = entropy;
-        if (probe)
-            observed->probe_ports |= bit;
-        else
-            observed->data_ports |= bit;
+        finish_srv6_receive(packets[i], port, observed);
+    }
+    if (foreign) {
+        memmove(packets + 1, packets, count * sizeof(*packets));
+        packets[0] = foreign;
+        count++;
     }
     return count;
 }
@@ -518,8 +672,11 @@ static uint16_t observe_generated_ev(uint16_t port, uint16_t queue, struct rte_m
 static void run_simplex(bool requester, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
                        bool wire_error, const char *ev_store, uint64_t ev_profile_id,
-                       bool generated_ev)
+                       enum simplex_wire_mode wire_mode)
 {
+    const bool generated_ev = wire_mode == SIMPLEX_GENERATED_EV;
+    const bool srv6 = wire_mode == SIMPLEX_SRV6 || wire_mode == SIMPLEX_SRV6_TRANSIT;
+    const bool transit = wire_mode == SIMPLEX_SRV6_TRANSIT;
     if (requester && ev_profile_id)
         assert(mrc_dpdk_set_ev_store(context, ev_store) == 0);
     struct mrc_comp_channel *channel = NULL;
@@ -569,11 +726,18 @@ static void run_simplex(bool requester, const char *directory, const struct addr
 
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
-    attach_qp(qp, &route);
+    struct mrc_dpdk_srv6_path paths[DUPLEX_RAILS] = {0};
+    if (srv6)
+        attach_srv6_qp(qp, &route, paths, transit);
+    else
+        attach_qp(qp, &route);
 
-    struct generated_ev_witness observed = {.requester = requester, .qpn = local.qpn};
+    struct simplex_wire_witness observed = {
+        .requester = requester, .transit = transit, .local = &local, .peer = &peer,
+        .srv6 = srv6 ? paths : NULL,
+    };
     const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS] = {0};
-    if (generated_ev) {
+    if (wire_mode != SIMPLEX_WIRE_NONE) {
         prepare_memif_links();
         if (requester) {
             publish(directory, "tx.links-ready", NULL, 0);
@@ -583,7 +747,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             wait_for(ready);
         }
         for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
-            callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_generated_ev, &observed);
+            callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_simplex_wire, &observed);
             assert(callbacks[port]);
         }
     }
@@ -605,11 +769,19 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         complete_async_error(context, qp, cq, requester, local.qpn);
     else
         complete(qp, cq, channel, directory, requester, local.qpn);
-    if (generated_ev) {
+    if (wire_mode != SIMPLEX_WIRE_NONE) {
         const unsigned int both_rails = (1u << DUPLEX_RAILS) - 1;
         assert(observed.probe_ports == both_rails && observed.data_ports);
         if (!requester)
             assert(observed.data_ports == both_rails);
+        if (srv6) {
+            /* The final case can only complete its WRITEs after the
+             * responder accepts independently decapsulated traffic. */
+            unsigned int decapped_ports = requester ? 1u << 1 : (transit ? 0 : both_rails);
+            assert(observed.decapped_ports == decapped_ports);
+            assert(observed.advanced_ports == (!requester && transit ? 1u << 1 : 0));
+            assert(observed.wrong_sid_injected == !requester);
+        }
         for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
             assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
             rte_free((void *)callbacks[port]);
@@ -645,6 +817,13 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
         if (generated_ev)
             printf(",\"rail_entropy\":[%u,%u]", observed.entropy[0], observed.entropy[1]);
+        if (srv6)
+            printf(",\"srv6_probe_rails\":%u,\"srv6_decapped_rails\":%u,"
+                   "\"srv6_advanced_rails\":%u,\"srv6_wrong_sid_probes\":%u",
+                   (unsigned int)__builtin_popcount(observed.probe_ports),
+                   (unsigned int)__builtin_popcount(observed.decapped_ports),
+                   (unsigned int)__builtin_popcount(observed.advanced_ports),
+                   (unsigned int)observed.wrong_sid_injected);
         puts("}");
     }
 }
@@ -1376,6 +1555,13 @@ int main(int argc, char **argv)
     bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0;
     bool generated_ev = generated_stev || strcmp(argv[3], "generated_ev_udp") == 0;
     bool ev_profile = generated_ev || strcmp(argv[3], "ev_profile") == 0;
+    bool srv6_transit = strcmp(argv[3], "srv6_transit") == 0;
+    bool srv6 = srv6_transit || strcmp(argv[3], "srv6") == 0;
+    enum simplex_wire_mode wire_mode = SIMPLEX_WIRE_NONE;
+    if (generated_ev)
+        wire_mode = SIMPLEX_GENERATED_EV;
+    else if (srv6)
+        wire_mode = srv6_transit ? SIMPLEX_SRV6_TRANSIT : SIMPLEX_SRV6;
     const char *profile_store = NULL;
     uint64_t profile_id = 0;
     if (ev_profile || cc_profile || qa_profile) {
@@ -1386,11 +1572,12 @@ int main(int argc, char **argv)
         profile_id = strtoull(argv[5], &end, 10);
         assert(!errno && profile_id && !*end);
     } else {
-        assert(argc == 4 && (bidirectional || wire_error || strcmp(argv[3], "simplex") == 0));
+        assert(argc == 4 && (bidirectional || wire_error || srv6 ||
+                             strcmp(argv[3], "simplex") == 0));
     }
 
     struct address address = {0};
-    struct ibv_context *verbs = open_verbs(&address, generated_stev);
+    struct ibv_context *verbs = open_verbs(&address, generated_stev || srv6);
     if (!verbs) {
         fputs("A verbs device with a usable Ethernet GID and pkey is required.\n", stderr);
         return EXIT_FAILURE;
@@ -1410,7 +1597,7 @@ int main(int argc, char **argv)
         run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else
         run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store,
-                    profile_id, generated_ev);
+                    profile_id, wire_mode);
 
     assert(mrc_destroy_context(context) == 0);
     assert(ibv_dealloc_pd(pd) == 0);

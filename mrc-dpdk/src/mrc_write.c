@@ -355,6 +355,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
     uint32_t oob_port = 0, trim_nack = 1, service_time = 0, srv6_srh = 0, port_stats = 0;
     bool local_sid = false, peer_sid = false, with_immediate = false;
+    uint8_t local_sid_value[MRC_IPV6_ADDR_LEN], peer_sid_value[MRC_IPV6_ADDR_LEN];
     uint32_t repeat = 0, immediate = 0;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
     uint32_t mpr = WINDOW / MRC_MPR_UNIT, p_key = DEFAULT_PARTITION_KEY;
@@ -377,11 +378,11 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
             continue;
         if (!strcmp(key, "--service-time") && number(value, 0, 1, &service_time))
             continue;
-        if (!strcmp(key, "--srv6-local") && inet_pton(AF_INET6, value, transfer->local_sid) == 1) {
+        if (!strcmp(key, "--srv6-local") && inet_pton(AF_INET6, value, local_sid_value) == 1) {
             local_sid = true;
             continue;
         }
-        if (!strcmp(key, "--srv6-peer") && inet_pton(AF_INET6, value, transfer->peer_sid) == 1) {
+        if (!strcmp(key, "--srv6-peer") && inet_pton(AF_INET6, value, peer_sid_value) == 1) {
             peer_sid = true;
             continue;
         }
@@ -488,7 +489,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
         (!!benchmark->profile_directory != !!transfer->profile_id) ||
         (!!benchmark->oob_address != !!oob_port) || (oob_port && benchmark->remote_key_configured) ||
         local_sid != peer_sid ||
-        (local_sid && transfer->ip_version != MRC_WIRE_IP6) || (srv6_srh && !local_sid))
+        (srv6_srh && !local_sid))
         return false;
     if (benchmark->posted_receives == UINT32_MAX)
         benchmark->posted_receives = transfer->immediate_requests;
@@ -517,7 +518,18 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     transfer->report_service_time = transfer->peer_service_time = service_time != 0;
     benchmark->port_stats = port_stats != 0;
     transfer->srv6 = local_sid;
-    transfer->srv6_srh = srv6_srh != 0;
+    if (local_sid) {
+        for (unsigned int i = 0; i < PATH_COUNT; i++) {
+            struct mrc_endpoint_srv6_path *path = &transfer->paths[i].srv6;
+            memcpy(path->local_sid, local_sid_value, MRC_IPV6_ADDR_LEN);
+            memcpy(path->peer_sid, peer_sid_value, MRC_IPV6_ADDR_LEN);
+            memcpy(path->initial_dst, peer_sid_value, MRC_IPV6_ADDR_LEN);
+            if (srv6_srh) {
+                memcpy(path->segments[0], peer_sid_value, MRC_IPV6_ADDR_LEN);
+                path->segment_count = 1;
+            }
+        }
+    }
     transfer->trim_dscp = (uint8_t)trim_dscp;
     transfer->timeout_exponent = exponent;
     transfer->linear_retries = linear_retries;
