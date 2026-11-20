@@ -104,9 +104,10 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
 
 /* Pass the reliability cumulative ACK after accepting a packet. Poll again with
  * the same value while produced is true. Send a successful Transport ACK only
- * after all corresponding calls have succeeded. */
+ * after all corresponding calls have succeeded. On failure, nak_psn (if set)
+ * receives the PSN for a Transport NAK. */
 enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t delivery_cack,
-                                  struct mrc_wr_completion *completion, bool *produced);
+                                  struct mrc_wr_completion *completion, bool *produced, uint32_t *nak_psn);
 uint32_t mrc_wr_ack_msn(const struct mrc_wr_responder *responder);
 
 #endif

@@ -958,14 +958,21 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         int32_t msn = mrc_psn_delta(ack->msn, sender->msn_base);
         if (ack->syndrome != ACK_SYNDROME) {
             fprintf(stderr, "Transport rejected WRITE, syndrome %#x\n", ack->syndrome);
-            uint32_t failed = (uint32_t)last;
-            if (ack->syndrome == REMOTE_OPERATION_NAK &&
-                msn >= (int32_t)request_index(transfer, (uint32_t)first) &&
-                msn <= (int32_t)request_index(transfer, (uint32_t)last)) {
-                uint32_t start = transfer->work[msn].first_packet;
-                failed = start < (uint32_t)first ? (uint32_t)first : start;
+            uint32_t oldest = request_index(transfer, (uint32_t)first);
+            uint32_t failed = request_index(transfer, (uint32_t)last);
+            enum mrc_provider_wc_status status = aeth_error_status(ack->syndrome);
+            /* A NAK's MSN counts completed WRs. Its PSN identifies the failed
+             * WR, which cannot be part of the completed prefix. */
+            if (msn < (int32_t)oldest || msn > (int32_t)failed ||
+                (ack->syndrome == REMOTE_OPERATION_NAK && msn != (int32_t)failed))
+                status = MRC_PROVIDER_WC_BAD_RESPONSE;
+            if (status != MRC_PROVIDER_WC_BAD_RESPONSE && msn > (int32_t)oldest) {
+                int result = mrc_provider_qp_complete_send(sender->provider_qp,
+                                                           sender->first_sequence + (uint32_t)msn - 1);
+                if (result)
+                    return result;
             }
-            return fail_send(transfer, sender, failed, aeth_error_status(ack->syndrome), -EPROTO);
+            return fail_send(transfer, sender, (uint32_t)last, status, -EPROTO);
         }
         uint32_t completed = request_index(transfer, (uint32_t)last + 1);
         if (msn != (int32_t)completed)
@@ -1386,13 +1393,13 @@ static uint8_t fail_write(struct mrc_provider_qp *qp, enum mrc_wr_result result)
     }
 }
 
-static enum mrc_wr_result advance_writes(struct mrc_responder *receiver)
+static enum mrc_wr_result advance_writes(struct mrc_responder *receiver, uint32_t *nak_psn)
 {
     bool produced;
     enum mrc_wr_result result;
     do {
         struct mrc_wr_completion completion;
-        result = mrc_wr_advance(&receiver->wr, receiver->qp.cack_psn, &completion, &produced);
+        result = mrc_wr_advance(&receiver->wr, receiver->qp.cack_psn, &completion, &produced, nak_psn);
     } while (result == MRC_WR_OK && produced);
     return result;
 }
@@ -1498,9 +1505,10 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     sack_due |= receiver->mpr_pending && receiver->qp.cack_psn != receiver->last_sack_cack;
     counts->received[path]++;
     bool complete = transfer->packets && receiver->unique_packets == transfer->packets;
-    result = advance_writes(receiver);
+    uint32_t nak_psn;
+    result = advance_writes(receiver, &nak_psn);
     if (result != MRC_WR_OK)
-        return reject_write(transfer, receiver, counts, path, packet, result, receiver->qp.cack_psn, arrival_cycles);
+        return reject_write(transfer, receiver, counts, path, packet, result, nak_psn, arrival_cycles);
 
     uint32_t msn = mrc_wr_ack_msn(&receiver->wr);
     if (sack_due || complete)

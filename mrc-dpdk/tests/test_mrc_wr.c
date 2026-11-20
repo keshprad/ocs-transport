@@ -71,7 +71,7 @@ static enum mrc_wr_result offer(struct fixture *fixture, uint8_t opcode, uint32_
 static enum mrc_wr_result advance(struct fixture *fixture, struct mrc_wr_completion *completion,
                                   bool *produced)
 {
-    return mrc_wr_advance(&fixture->responder, fixture->qp.cack_psn, completion, produced);
+    return mrc_wr_advance(&fixture->responder, fixture->qp.cack_psn, completion, produced, NULL);
 }
 
 static void test_out_of_order_and_wrap(void)

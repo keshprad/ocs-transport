@@ -379,9 +379,11 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
 }
 
 enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t delivery_cack,
-                                  struct mrc_wr_completion *completion, bool *produced)
+                                  struct mrc_wr_completion *completion, bool *produced, uint32_t *nak_psn)
 {
     *produced = false;
+    if (nak_psn)
+        *nak_psn = delivery_cack;
     if (responder->failed)
         return MRC_WR_QP_ERROR;
     if (delivery_cack > MRC_PSN_MASK)
@@ -402,6 +404,8 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
             return fail(responder, MRC_WR_INVALID);
 
         if (slot->with_imm) {
+            if (nak_psn)
+                *nak_psn = last;
             if (slot->rqmsn != responder->next_rqmsn)
                 return fail(responder, MRC_WR_INVALID);
             uint64_t wr_id;

@@ -31,6 +31,16 @@ independent live peer. Both scripts cover IPv4, IPv6, and preserved SRv6
 with and without a final SRH. The relay moves Ethernet frames and the
 Python peer handles wire encoding, memory placement, and feedback.
 
+For §§6.2.4 and 6.3.3–6.3.5, three WRITEIMMs with one posted receive
+produce one successful requester completion, one remote-operation error,
+and one flush. The memif check receives only the Transport NAK and the
+focused case also passed across 24-bit PSN wrap. Independent IPv4, IPv6,
+and preserved SRv6 replays with and without a final SRH deliver the third
+WRITEIMM and both fragments of the second before the first. The first
+consumes the receive descriptor. The NAK carries PSN 1, the failed
+WRITEIMM's final packet, and completed MSN 1. The unit, ABI, memif,
+independent requester, and packet replay suites passed on Spark-04.
+
 For §6.3.1, the standalone memif cases exchange WRITEIMM and Port Status
 between full and limited members of the same partition, with either peer
 acting as requester. Two limited members and distinct partitions produce
@@ -466,3 +476,30 @@ requesters. DPDK reported zero port I/O errors and RX buffer exhaustion
 in both profiles.
 
 mlx5 setup requires `CAP_NET_RAW` and `CAP_NET_ADMIN` or an administrator-run endpoint. [DPDK mlx5 privilege documentation](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root)
+
+### Hardware prerequisites for the Transport NAK validation build
+
+Spark-02, Spark-03, and Spark-04 still have test worktrees at
+`0c537484a96b15e51c9cfd82491de83d65d554f4`. Their inactive smoke and
+failover services point to `/opt/ocs-mrc/0c53748.ZDc2j9`, with matching
+`mrc_write` SHA-256 `dfd4498a8f3e965409f4f182767a126f29a3e23e9f6a9ff96406bb976eac7305`.
+The negotiated transmit unit is absent on all three. An administrator
+must install the pinned snapshot and all six cycle units on each Spark,
+reload systemd, and enable the scoped start, stop, and journal access for
+the negotiated units. Sync the detached test worktrees to the published
+full revision after installation. The cycle harness checks the full
+revision and installed binary checksums before each profile. Run smoke,
+failover, and negotiated WRITEIMM/Dynamic MPR in that order.
+
+- Physical recovery needs scoped access to take a test rail down and
+  restore it during traffic, such as Spark-04's outgoing rail 1
+  (`enP2p1s0f0np0`, PCI `0002:01:00.0`). Check that traffic continues
+  on the surviving rail and returns to the restored rail.
+- All 12 Spark data ports report carrier up and MTU 1500. Jumbo
+  verification needs a scoped mlx5 test profile offering PMTU 4096
+  and access to raise and restore the MTU on both rails at both ends of
+  the test edge.
+- Independent MRC interoperability needs a separate MRC 1.0 endpoint.
+  Hardware SRv6, ECN, and switch-generated trimming need a fabric that
+  can forward the configured SIDs, mark congestion, and trim packets.
+  The Polatis double ring supplies optical connectivity.

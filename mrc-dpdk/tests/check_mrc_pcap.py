@@ -306,7 +306,7 @@ def check_responses(replay, output_paths, outside, trim_sizes):
 
 @contextmanager
 def run_capture(binary, replay, requests, *, role="rx", work="13,1025@0xfec01234", pmtu=None,
-                trim=False, last_hop=False, service_time=False):
+                trim=False, last_hop=False, service_time=False, posted_receives=None):
     with tempfile.TemporaryDirectory(prefix="mrc-pcap-") as temp:
         directory = Path(temp)
         incoming = [directory / f"rx{path}.pcap" for path in range(2)]
@@ -326,6 +326,8 @@ def run_capture(binary, replay, requests, *, role="rx", work="13,1025@0xfec01234
                     "--port-stats", "1", "--timeout-ms", "2000"]
         if pmtu is not None:
             command += ["--pmtu", str(pmtu)]
+        if posted_receives is not None:
+            command += ["--posted-receives", str(posted_receives)]
         if role == "tx":
             command += ["--linear-retries", "0", "--exp-retries", "0"]
         if trim:
@@ -410,6 +412,24 @@ def check_retransmitted_ack_request(binary, replay):
         require(sacks == [(INITIAL_PSN - 1, 2), (0, -1), (1, 0)],
                 f"Expected a cumulative SACK after filling the gap before the AR PSN: {sacks}")
         print(f"Independent {replay.name} replay preserved the retransmitted ACK request")
+
+
+def check_deferred_receive_error(binary, replay):
+    first = write_request(replay, 0, 0xCB, INITIAL_PSN, 1, 1, 0, 3, b"abc", 1, flags=0)
+    head = write_request(replay, 0, 0xC6, 0, 2, 2, 3, 1025, b"d" * 1024, flags=0)
+    tail = write_request(replay, 0, 0xC9, 1, 2, 2, 1027, 1025, b"e", 2)
+    third = write_request(replay, 0, 0xCB, 2, 3, 3, 1028, 5, b"fghij", 3)
+    # The first WRITEIMM closes the PSN gap and consumes the only receive.
+    # The second fails, even though receipt is cumulative through the third.
+    with run_capture(binary, replay, ([third, tail, head, first], []),
+                     work="3@1,1025@2,5@3", posted_receives=1) as (result, outgoing):
+        require(result.returncode == 1 and "MRC QP state=ERROR" in result.stderr,
+                f"The responder did not enter ERROR on RQ exhaustion:\n{result.stderr}")
+        aeth = [(packet.bth.psn, packet.body) for frame in read_capture(outgoing[0])
+                if (packet := decode_response(replay, 0, frame)).bth.opcode == 0xD1]
+        require(aeth == [(1, b"\x63\x00\x00\x01")],
+                f"The deferred error did not report the failed WRITEIMM PSN and successful MSN: {aeth}")
+        print(f"Independent {replay.name} replay identified the deferred WRITEIMM that lacked a receive")
 
 
 def check_jumbo_pmtu(binary, replay):
@@ -575,6 +595,7 @@ def main():
         run_replay(binary, replay)
         check_psn_feedback_bounds(binary, replay)
         check_retransmitted_ack_request(binary, replay)
+        check_deferred_receive_error(binary, replay)
         check_jumbo_pmtu(binary, replay)
         check_reserved_opcode(binary, replay)
         check_service_time(binary, replay)

@@ -405,6 +405,14 @@ def main():
             f"WRITEIMM without receive credit did not fail and flush the send queue: {tx}")
     print(json.dumps({"case": "write_imm_without_receive_credit"}))
 
+    tx, _ = transfer(binary, 11, "--immediate", "23", "--max-wimm-inflight", "4",
+                     posted_receives=1, work_requests=3,
+                     expected_errors={"tx": "syndrome 0x63", "rx": "MRC QP state=ERROR"})
+    require("transport-ACK=0" in tx and
+            "state=ERROR work-errors=1 first-status=remote-operation work-flushed=1" in tx,
+            f"Transport NAK did not preserve the completed WRITEIMM before RQ exhaustion: {tx}")
+    print(json.dumps({"case": "transport_nak_preserves_completed_write_imm"}))
+
     tx, _ = transfer(binary, 1024, work_requests=3,
                      tx_options=("--remote-key", "0x111111"),
                      expected_errors={"tx": "syndrome 0x62", "rx": "MRC QP state=ERROR"})
