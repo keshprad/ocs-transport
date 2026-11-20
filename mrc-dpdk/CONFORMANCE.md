@@ -15,7 +15,7 @@ The conformance target is the [OCP Multipath Reliable Connection 1.0 specificati
 
 - The endpoint uses the configurable UDP destination and default 4971 specified by §7.5.5.2. Table 7-9 shows the RoCEv2 value 4791, which remains selectable with `--udp-port 4791`.
 - Sections 7.5.1 and 7.5.5 describe the PDC IDs differently. The implementation uses the requestor's QPN low 16 bits as SPDCID and the responder's QPN low 16 bits as DPDCID, following Tables 7-6, 7-15, and 7-17.
-- Section 6.3.1 directs responders to silently drop outside-window PSNs. Table 7-3 names `PSN_OOR_WINDOW` as a mandatory responder NACK. The receiver currently sends that NACK for valid addressed requests outside its tracking window. Confirm the intended behavior with an independent implementation.
+- Section 6.3.1 directs responders to silently drop outside-window PSNs. Table 7-3 names `PSN_OOR_WINDOW` as a mandatory responder NACK. The endpoint applies the NACK to valid forward PSNs beyond the tracking window. It silently drops pre-start and ambiguous half-space PSNs. The interpretation still needs independent interoperability verification.
 - Table 6-5 specifies whole-WR DMA length in every RETH. The endpoint uses that value and validates each payload within the registered region.
 - Polatis connects Ethernet links optically. The Spark double ring can verify path use and recovery but does not itself supply ECN marks or packet trimming.
 
@@ -37,6 +37,12 @@ acting as requester. Two limited members and distinct partitions produce
 no data placement or feedback. Direct and negotiated connected routes use
 the same RC membership check. TCP-negotiated routes also pin the offered
 peer P_Key. [Linux RXE P_Key comparison](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/sw/rxe/rxe_verbs.h)
+
+For §§6.3.1 and 7.4.4, independent IPv4, IPv6, and preserved SRv6
+replays verify the receive-window boundary across PSN wrap. Untrimmed
+and trimmed WRITEs before connection start or exactly half a PSN
+space away produce no feedback. Forward window overruns produce a
+`PSN_OOR_WINDOW` NACK, and the valid next WRITE completes.
 
 For §§6.2.2.2 and 6.3.1, public memif tests check 256- and 512-byte
 segment lengths, address increments, and WRITEIMM completion across

@@ -17,7 +17,8 @@ uint32_t mrc_psn_add(uint32_t psn, int32_t delta);
 enum mrc_rx_disposition {
     MRC_RX_NEW,
     MRC_RX_DUPLICATE,
-    MRC_RX_OUTSIDE_WINDOW,
+    MRC_RX_AHEAD_OF_WINDOW,
+    MRC_RX_INVALID_PSN,
 };
 
 enum mrc_rx_packet_flags {

@@ -106,10 +106,10 @@ def write_request(replay, path, opcode, psn, msn, rqmsn, offset, length, payload
     return request(replay, path, opcode, psn, headers + payload, flags, **envelope)
 
 
-def trimmed_request(replay, data, *, timestamp=TRIM_TIMESTAMP, opaque=True,
+def trimmed_request(replay, data, *, psn=INITIAL_PSN, timestamp=TRIM_TIMESTAMP, opaque=True,
                     dscp=TRIM_DSCP, truncate=True, flags=0x80):
     traffic_class = dscp << 2
-    full = write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, len(data), data,
+    full = write_request(replay, 0, 0xCA, psn, 1, 0, 0, len(data), data,
                          timestamp=timestamp, opaque=opaque, flags=flags,
                          traffic_class=traffic_class if replay.srh is None else None,
                          outer_traffic_class=traffic_class if replay.srh is not None else None)
@@ -360,6 +360,31 @@ def run_replay(binary, replay):
         print(f"Independent {replay.name} packet replay passed placement, SACK, AETH, PETH, and both trim NACKs")
 
 
+def check_psn_feedback_bounds(binary, replay):
+    before_start = INITIAL_PSN - 1
+    ambiguous = (INITIAL_PSN + 0x800000) & 0xFFFFFF
+    window_end = (INITIAL_PSN + 1024) & 0xFFFFFF
+    valid = bytes(range(13))
+    unplaced = bytes(13)
+    requests = [write_request(replay, 0, 0xCA, psn, 1, 0, 0, 13, unplaced)
+                for psn in (before_start, ambiguous, window_end)]
+    requests += [trimmed_request(replay, unplaced, psn=psn)[0]
+                 for psn in (before_start, ambiguous, window_end + 1)]
+    requests.append(write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, 13, valid))
+    with run_capture(binary, replay, (requests, ()), work="13", trim=True) as (result, outgoing):
+        require(result.returncode == 0, f"pcap endpoint failed\n{result.stdout}\n{result.stderr}")
+        responses = [decode_response(replay, 0, frame) for frame in read_capture(outgoing[0])]
+        feedback = [packet for packet in responses if packet.bth.opcode in (0xD1, 0xDC, 0xDD)]
+        nacks = [(packet.bth.psn, packet.body[2], int.from_bytes(packet.body[13:16], "big"))
+                 for packet in feedback if packet.bth.opcode == 0xDD]
+        require(nacks == [(psn, 0x0B, psn) for psn in (window_end, window_end + 1)],
+                f"Expected window NACKs only for forward PSNs beyond the receive window: {nacks}")
+        acks = [(packet.bth.opcode, packet.bth.psn) for packet in feedback if packet.bth.opcode != 0xDD]
+        require(acks == [(0xDC, INITIAL_PSN), (0xD1, INITIAL_PSN)],
+                f"Expected SACK and AETH only for the accepted WRITE: {acks}")
+        print(f"Independent {replay.name} replay distinguished invalid and forward out-of-window PSNs")
+
+
 def check_retransmitted_ack_request(binary, replay):
     data = bytes((offset ^ (offset >> 8)) & 0xFF for offset in range(2049))
     first = write_request(replay, 0, 0xC6, INITIAL_PSN, 1, 1, 0, len(data),
@@ -548,6 +573,7 @@ def main():
     require(binary.is_file(), f"Build mrc_write first: {binary}")
     for replay in REPLAYS:
         run_replay(binary, replay)
+        check_psn_feedback_bounds(binary, replay)
         check_retransmitted_ack_request(binary, replay)
         check_jumbo_pmtu(binary, replay)
         check_reserved_opcode(binary, replay)

@@ -25,11 +25,11 @@ static void test_receive_window_and_ar(void)
     assert(mrc_rx_init(&rx, initial_psn, sizeof(slots), slots));
     assert(rx.cack_psn == MRC_PSN_MASK - 2);
     assert(rx.max_rcv_psn == rx.cack_psn);
-    assert(mrc_rx_classify(&rx, rx.cack_psn) == MRC_RX_OUTSIDE_WINDOW);
+    assert(mrc_rx_classify(&rx, rx.cack_psn) == MRC_RX_INVALID_PSN);
     assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, 383)) == MRC_RX_NEW);
-    assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, 384)) == MRC_RX_OUTSIDE_WINDOW);
+    assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, 384)) == MRC_RX_AHEAD_OF_WINDOW);
     assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, MRC_PSN_HALF))
-           == MRC_RX_OUTSIDE_WINDOW);
+           == MRC_RX_INVALID_PSN);
 
     /* The AR arrives across wrap, before the first two packets. */
     assert(mrc_rx_record(&rx, 0, 64, MRC_RX_AR, UINT32_MAX, &sack_due) == MRC_RX_NEW);
@@ -54,7 +54,7 @@ static void test_receive_window_and_ar(void)
     assert(mrc_rx_build_sack(&rx, initial_psn, &sack));
     assert(sack.ack_psn_offset == -2 && sack.bitmap == UINT64_C(0x5));
     assert(mrc_rx_classify(&rx, initial_psn) == MRC_RX_DUPLICATE);
-    assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, -1)) == MRC_RX_OUTSIDE_WINDOW);
+    assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, -1)) == MRC_RX_INVALID_PSN);
 }
 
 static void test_sack_rotation_and_probe(void)

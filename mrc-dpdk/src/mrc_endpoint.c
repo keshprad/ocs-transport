@@ -1327,7 +1327,9 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
                          (packet_ecn(packet) == 3 ? MRC_RX_ECN : 0);
     bool sack_due;
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, psn);
-    if (disposition == MRC_RX_OUTSIDE_WINDOW) {
+    if (disposition == MRC_RX_INVALID_PSN)
+        return 0;
+    if (disposition == MRC_RX_AHEAD_OF_WINDOW) {
         send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
                   MRC_NACK_PSN_OOR_WINDOW, 0, write_feedback_timestamp(transfer, packet, arrival_cycles));
         return 0;
@@ -1394,14 +1396,16 @@ static void receive_trimmed(const struct mrc_endpoint_config *transfer, const st
                             uint8_t reason, uint64_t arrival_cycles)
 {
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, trimmed->bth.psn);
-    if (disposition == MRC_RX_OUTSIDE_WINDOW) {
+    if (disposition == MRC_RX_INVALID_PSN || disposition == MRC_RX_DUPLICATE)
+        return;
+    if (disposition == MRC_RX_AHEAD_OF_WINDOW) {
         uint16_t timestamp = mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
                                                              trimmed->tsr, trimmed->tx_timestamp);
         send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_PSN_OOR_WINDOW,
                   0, timestamp);
         return;
     }
-    if (disposition == MRC_RX_DUPLICATE || !mrc_cc_nominal_size(trimmed->original_udp_len))
+    if (!mrc_cc_nominal_size(trimmed->original_udp_len))
         return;
 
     counts->trimmed++;

@@ -50,17 +50,17 @@ bool mrc_rx_init(struct mrc_rx_qp *qp, uint32_t initial_psn, uint32_t window,
 enum mrc_rx_disposition mrc_rx_classify(const struct mrc_rx_qp *qp, uint32_t psn)
 {
     if (psn > MRC_PSN_MASK)
-        return MRC_RX_OUTSIDE_WINDOW;
+        return MRC_RX_INVALID_PSN;
 
     uint32_t epsn = mrc_psn_add(qp->cack_psn, 1);
     int32_t offset = mrc_psn_delta(psn, epsn);
     if (offset < 0) {
         /* Pre-start PSNs were never received. The exact half-space is invalid. */
         return (uint32_t)(-offset) <= qp->contiguous_history
-               ? MRC_RX_DUPLICATE : MRC_RX_OUTSIDE_WINDOW;
+               ? MRC_RX_DUPLICATE : MRC_RX_INVALID_PSN;
     }
     if ((uint32_t)offset >= qp->window)
-        return MRC_RX_OUTSIDE_WINDOW;
+        return MRC_RX_AHEAD_OF_WINDOW;
 
     uint32_t index = (qp->first_index + (uint32_t)offset) % qp->window;
     return qp->slots[index] & RECEIVED ? MRC_RX_DUPLICATE : MRC_RX_NEW;
@@ -72,7 +72,7 @@ enum mrc_rx_disposition mrc_rx_record(struct mrc_rx_qp *qp, uint32_t psn,
 {
     enum mrc_rx_disposition disposition = mrc_rx_classify(qp, psn);
     *sack_due = false;
-    if (disposition == MRC_RX_OUTSIDE_WINDOW)
+    if (disposition == MRC_RX_INVALID_PSN || disposition == MRC_RX_AHEAD_OF_WINDOW)
         return disposition;
 
     uint32_t old_cack = qp->cack_psn;
