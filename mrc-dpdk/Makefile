@@ -8,7 +8,7 @@ MRC_INCLUDE_DIR ?=
 MRC_HEADERS = $(if $(MRC_INCLUDE_DIR),$(addprefix $(MRC_INCLUDE_DIR)/,mrc.h mrc_api_ver.h mrc_ctl.h mrc_ctl_api_ver.h))
 MRC_ABI_CFLAGS = -isystem "$(MRC_INCLUDE_DIR)" $(shell $(PKG_CONFIG) --cflags libibverbs)
 MRC_ABI_LIBS = $(shell $(PKG_CONFIG) --libs libibverbs)
-MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_async.c src/mrc_abi_ctl.c src/mrc_abi_ev_format.c src/mrc_abi_ev_event.c \
+MRC_ABI_SRC = src/mrc_abi.c src/mrc_abi_async.c src/mrc_abi_hint.c src/mrc_abi_ctl.c src/mrc_abi_ev_format.c src/mrc_abi_ev_event.c \
               src/mrc_abi_ctl_port.c src/mrc_port_netlink.c src/mrc_abi_qp.c src/mrc_abi_dpdk.c \
               src/mrc_abi_ep.c $(MRC_ENDPOINT_SRC)
 MRC_ABI_DEPS = src/mrc_abi.h src/mrc_dpdk.h src/mrc_port_netlink.h $(MRC_ENDPOINT_HEADERS) $(MRC_HEADERS)

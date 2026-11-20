@@ -14,6 +14,7 @@ struct mrc_provider_write_segments {
 struct work_entry {
     struct mrc_provider_mr_lease lease;
     struct mrc_provider_write_segments *segments;
+    uint8_t *inline_data;
     struct mrc_provider_write_view write;
     uint64_t id;
     bool signaled;
@@ -157,7 +158,10 @@ static bool valid_state(enum mrc_provider_qp_state state)
 
 static void release_write_sources(struct work_entry *work)
 {
-    if (work->segments) {
+    if (work->inline_data) {
+        free(work->inline_data);
+        work->inline_data = NULL;
+    } else if (work->segments) {
         for (size_t i = 0; i < work->segments->count; i++) {
             struct mrc_provider_mr_lease *lease = &work->segments->leases[i];
             if (lease->owner)
@@ -334,8 +338,28 @@ static int acquire_write_sources(struct mrc_provider_pd *pd, struct work_entry *
     return 0;
 }
 
+static int copy_inline_sources(struct work_entry *work, const struct mrc_provider_inline_sge *sges,
+                                size_t count, uint32_t length)
+{
+    if (!length)
+        return 0;
+    work->inline_data = malloc(length);
+    if (!work->inline_data)
+        return -ENOMEM;
+
+    uint8_t *destination = work->inline_data;
+    for (size_t i = 0; i < count; i++) {
+        if (!sges[i].length)
+            continue;
+        memcpy(destination, sges[i].data, sges[i].length);
+        destination += sges[i].length;
+    }
+    return 0;
+}
+
 static int post_write(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
-                       const struct mrc_provider_sge *sges, size_t count, uint64_t *sequence)
+                       const struct mrc_provider_sge *sges, const struct mrc_provider_inline_sge *inline_sges,
+                       size_t count, uint64_t *sequence)
 {
     if (write->length > UINT64_MAX - write->remote_address)
         return -EOVERFLOW;
@@ -347,10 +371,18 @@ static int post_write(struct mrc_provider_qp *qp, const struct mrc_provider_writ
     int result = reserve_send(qp, &work);
     if (!result) {
         *work = (struct work_entry){0};
-        result = acquire_write_sources(qp->pd, work, sges, count);
+        const void *data = write->local_buffer;
+        if (inline_sges) {
+            result = copy_inline_sources(work, inline_sges, count, write->length);
+            data = work->inline_data;
+        } else {
+            result = acquire_write_sources(qp->pd, work, sges, count);
+            if (work->lease.owner)
+                data = work->lease.address;
+        }
         if (!result) {
             work->write = (struct mrc_provider_write_view){
-                .data = work->lease.owner ? work->lease.address : write->local_buffer,
+                .data = data,
                 .remote_address = write->remote_address, .length = write->length,
                 .rkey = write->rkey, .immediate = write->immediate,
                 .with_immediate = write->with_immediate, .solicited = write->solicited,
@@ -384,7 +416,7 @@ int mrc_provider_qp_post_write(struct mrc_provider_qp *qp, const struct mrc_prov
     const struct mrc_provider_sge sge = {
         .iova = write->local_iova, .length = write->length, .lkey = write->lkey,
     };
-    return post_write(qp, write, &sge, write->lkey != 0, sequence);
+    return post_write(qp, write, &sge, NULL, write->lkey != 0, sequence);
 }
 
 int mrc_provider_qp_post_writev(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
@@ -407,7 +439,30 @@ int mrc_provider_qp_post_writev(struct mrc_provider_qp *qp, const struct mrc_pro
     }
     if (total != write->length)
         return -EINVAL;
-    return post_write(qp, write, sges, count, sequence);
+    return post_write(qp, write, sges, NULL, count, sequence);
+}
+
+int mrc_provider_qp_post_write_inline(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                                      const struct mrc_provider_inline_sge *sges, size_t count, uint64_t *sequence)
+{
+    if (!qp || !write || !sequence || (count && !sges) ||
+        write->local_iova || write->local_buffer || write->lkey)
+        return -EINVAL;
+    if (count > SIZE_MAX / sizeof(*sges))
+        return -EOVERFLOW;
+
+    uint32_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (sges[i].length && !sges[i].data)
+            return -EINVAL;
+        if (sges[i].length > UINTPTR_MAX - (uintptr_t)sges[i].data ||
+            sges[i].length > UINT32_MAX - total)
+            return -EOVERFLOW;
+        total += sges[i].length;
+    }
+    if (total != write->length)
+        return -EINVAL;
+    return post_write(qp, write, NULL, sges, count, sequence);
 }
 
 int mrc_provider_qp_get_write(struct mrc_provider_qp *qp, uint64_t sequence,

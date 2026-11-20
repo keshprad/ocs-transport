@@ -191,32 +191,24 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
 }
 
 static void post_writes(struct mrc_qp *qp, const struct connection *peer,
-                        const struct ibv_mr *first, const struct ibv_mr *last)
+                        struct ibv_sge sg[3], bool inline_mode)
 {
-    struct ibv_sge sg[] = {
-        { .addr = (uintptr_t)first->addr, .length = FIRST_BYTES, .lkey = first->lkey },
-        {
-            .addr = (uintptr_t)first->addr + FIRST_BYTES,
-            .length = IMMEDIATE_FIRST_SGE_BYTES, .lkey = first->lkey,
-        },
-        {
-            .addr = (uintptr_t)last->addr,
-            .length = IMMEDIATE_BYTES - IMMEDIATE_FIRST_SGE_BYTES, .lkey = last->lkey,
-        },
-    };
+    unsigned int inline_flag = inline_mode ? IBV_SEND_INLINE : 0;
     struct ibv_send_wr wr[] = {
         {
             .wr_id = 70, .opcode = IBV_WR_RDMA_WRITE, .num_sge = 1, .sg_list = &sg[0],
+            .send_flags = inline_flag,
             .wr.rdma = { .remote_addr = peer->remote_address, .rkey = peer->rkey },
         },
         {
             .wr_id = 71, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
-            .send_flags = IBV_SEND_SIGNALED | IBV_SEND_SOLICITED,
+            .send_flags = IBV_SEND_SIGNALED | IBV_SEND_SOLICITED | inline_flag,
             .num_sge = 2, .sg_list = &sg[1], .imm_data = htonl(FIRST_IMMEDIATE),
             .wr.rdma = { .remote_addr = peer->remote_address + FIRST_BYTES, .rkey = peer->rkey },
         },
         {
-            .wr_id = 72, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM, .send_flags = IBV_SEND_SIGNALED,
+            .wr_id = 72, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+            .send_flags = IBV_SEND_SIGNALED | inline_flag,
             .imm_data = htonl(SECOND_IMMEDIATE),
             .wr.rdma = { .remote_addr = peer->remote_address + TOTAL_BYTES, .rkey = peer->rkey },
         },
@@ -224,7 +216,16 @@ static void post_writes(struct mrc_qp *qp, const struct connection *peer,
     wr[0].next = &wr[1];
     wr[1].next = &wr[2];
     struct ibv_send_wr *bad = NULL;
-    assert(mrc_post_send(qp, wr, &bad) == 0 && !bad);
+    if (inline_mode) {
+        /* A failed later WR leaves the successful prefix on the SQ. */
+        struct ibv_sge too_long = { .addr = sg[0].addr, .length = IMMEDIATE_BYTES + 1 };
+        struct ibv_send_wr oversized = wr[0];
+        oversized.sg_list = &too_long;
+        oversized.next = NULL;
+        wr[0].next = &oversized;
+        assert(mrc_post_send(qp, wr, &bad) == EMSGSIZE && bad == &oversized);
+    }
+    assert(mrc_post_send(qp, inline_mode ? &wr[1] : wr, &bad) == 0 && !bad);
 }
 
 static void post_receives(struct mrc_qp *qp)
@@ -294,6 +295,45 @@ static void complete(struct mrc_qp *qp, struct mrc_cq *cq, struct mrc_comp_chann
 static uint8_t pattern(size_t offset)
 {
     return (uint8_t)(offset ^ (offset >> 8) ^ 0xa7);
+}
+
+static void post_inline_writes(struct mrc_qp *qp, const struct connection *peer)
+{
+    const size_t lengths[] = { FIRST_BYTES, IMMEDIATE_FIRST_SGE_BYTES,
+                               IMMEDIATE_BYTES - IMMEDIATE_FIRST_SGE_BYTES };
+    struct ibv_sge sg[3];
+    size_t offset = 0;
+    for (unsigned int i = 0; i < 3; i++) {
+        size_t allocation = i ? lengths[i] : IMMEDIATE_BYTES + 1;
+        uint8_t *source = malloc(allocation);
+        assert(source);
+        for (size_t j = 0; j < lengths[i]; j++)
+            source[j] = pattern(offset++);
+        sg[i] = (struct ibv_sge){ .addr = (uintptr_t)source, .length = lengths[i] };
+    }
+    post_writes(qp, peer, sg, true);
+    for (unsigned int i = 0; i < 3; i++) {
+        void *source = (void *)(uintptr_t)sg[i].addr;
+        explicit_bzero(source, lengths[i]);
+        free(source);
+    }
+}
+
+static void post_registered_writes(struct mrc_qp *qp, const struct connection *peer,
+                                   const struct ibv_mr *first, const struct ibv_mr *last)
+{
+    struct ibv_sge sg[] = {
+        { .addr = (uintptr_t)first->addr, .length = FIRST_BYTES, .lkey = first->lkey },
+        {
+            .addr = (uintptr_t)first->addr + FIRST_BYTES,
+            .length = IMMEDIATE_FIRST_SGE_BYTES, .lkey = first->lkey,
+        },
+        {
+            .addr = (uintptr_t)last->addr,
+            .length = IMMEDIATE_BYTES - IMMEDIATE_FIRST_SGE_BYTES, .lkey = last->lkey,
+        },
+    };
+    post_writes(qp, peer, sg, false);
 }
 
 
@@ -475,6 +515,7 @@ static void prepare_memif_links(void)
 
 enum simplex_wire_mode {
     SIMPLEX_WIRE_NONE,
+    SIMPLEX_INLINE,
     SIMPLEX_GENERATED_EV,
     SIMPLEX_SRV6,
     SIMPLEX_SRV6_TRANSIT,
@@ -1092,16 +1133,50 @@ static uint16_t observe_simplex_wire(uint16_t port, uint16_t queue, struct rte_m
     return count;
 }
 
+struct inline_wire_witness {
+    bool dropped;
+    bool retransmitted;
+};
+
+static uint16_t drop_inline_fragment(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                     uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)port;
+    (void)queue;
+    (void)capacity;
+    struct inline_wire_witness *observed = argument;
+    uint16_t kept = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + WIRE_UDP_LEN + WIRE_BTH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (bth[0] == WIRE_WRITE_FIRST && wire_be24(bth + 9) == SEND_PSN + 1) {
+            if (!observed->dropped) {
+                assert(!(bth[8] & 0x20));
+                rte_pktmbuf_free(packets[i]);
+                observed->dropped = true;
+                continue;
+            }
+            assert(bth[8] & 0x20);
+            observed->retransmitted = true;
+        }
+        packets[kept++] = packets[i];
+    }
+    return kept;
+}
+
 static void run_simplex(bool requester, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
                        bool wire_error, const char *ev_store, uint64_t ev_profile_id,
                        enum simplex_wire_mode wire_mode)
 {
+    const bool inline_mode = wire_mode == SIMPLEX_INLINE;
     const bool generated_ev = wire_mode == SIMPLEX_GENERATED_EV;
     const bool srv6_ev = wire_mode == SIMPLEX_SRV6_EXPLICIT_EV ||
                          wire_mode == SIMPLEX_SRV6_GENERATED_EV;
     const bool srv6 = srv6_ev || wire_mode == SIMPLEX_SRV6 || wire_mode == SIMPLEX_SRV6_TRANSIT;
     const bool transit = wire_mode == SIMPLEX_SRV6_TRANSIT;
+    const bool inspect_wire = wire_mode != SIMPLEX_WIRE_NONE && !inline_mode;
     if (requester && ev_profile_id)
         assert(mrc_dpdk_set_ev_store(context, ev_store) == 0);
     struct mrc_comp_channel *channel = NULL;
@@ -1113,11 +1188,14 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     uint8_t first_data[TOTAL_BYTES], last_data[TOTAL_BYTES];
     int access_flags = requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
     size_t first_length = requester ? FIRST_BYTES + IMMEDIATE_FIRST_SGE_BYTES : TOTAL_BYTES;
-    for (size_t i = 0; i < first_length; i++)
-        first_data[i] = requester ? pattern(i) : 0;
-    struct ibv_mr *first = register_memory(context, pd, first_data, first_length, access_flags);
+    struct ibv_mr *first = NULL;
     struct ibv_mr *last = NULL;
-    if (requester) {
+    if (!requester || !inline_mode) {
+        for (size_t i = 0; i < first_length; i++)
+            first_data[i] = requester ? pattern(i) : 0;
+        first = register_memory(context, pd, first_data, first_length, access_flags);
+    }
+    if (requester && !inline_mode) {
         size_t length = TOTAL_BYTES - first_length;
         for (size_t i = 0; i < length; i++)
             last_data[i] = pattern(first_length + i);
@@ -1131,6 +1209,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             .max_send_wr = requester ? 3 : 0,
             .max_send_sge = requester ? 2 : 0,
             .max_recv_wr = requester ? 0 : 2,
+            .max_inline_data = requester && inline_mode ? IMMEDIATE_BYTES : 0,
         },
     };
     if (!requester)
@@ -1142,6 +1221,11 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         .rkey = requester ? 0 : first->rkey,
     };
     assert(qp && mrc_get_qpn(qp, &local.qpn) == 0);
+    if (requester && inline_mode) {
+        struct ibv_qp_attr attrs;
+        assert(mrc_query_qp(qp, &attrs, IBV_QP_CAP, NULL, 0, NULL) == 0);
+        assert(attrs.cap.max_inline_data == IMMEDIATE_BYTES);
+    }
     publish(directory, requester ? "tx.connection" : "rx.connection", &local, sizeof(local));
     struct connection peer;
     read_peer_connections(directory, requester, &peer, 1);
@@ -1163,6 +1247,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         .requester = requester, .mode = wire_mode, .local = &local, .peer = &peer,
         .srv6 = srv6 ? paths : NULL,
     };
+    struct inline_wire_witness observed_inline = {0};
     const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS] = {0};
     if (wire_mode != SIMPLEX_WIRE_NONE) {
         prepare_memif_links();
@@ -1173,8 +1258,10 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             path_for(ready, directory, "tx.links-ready");
             wait_for(ready);
         }
-        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
-            callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_simplex_wire, &observed);
+        for (uint16_t port = 0; port < DUPLEX_RAILS && (!inline_mode || !requester); port++) {
+            callbacks[port] = inline_mode ?
+                rte_eth_add_rx_callback(port, 0, drop_inline_fragment, &observed_inline) :
+                rte_eth_add_rx_callback(port, 0, observe_simplex_wire, &observed);
             assert(callbacks[port]);
         }
     }
@@ -1183,7 +1270,10 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         char ready[PATH_MAX];
         path_for(ready, directory, "rx.ready");
         wait_for(ready);
-        post_writes(qp, &peer, first, last);
+        if (inline_mode)
+            post_inline_writes(qp, &peer);
+        else
+            post_registered_writes(qp, &peer, first, last);
     } else {
         post_receives(qp);
         if (!wire_error)
@@ -1196,7 +1286,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         complete_async_error(context, qp, cq, requester, local.qpn);
     else
         complete(qp, cq, channel, directory, requester, local.qpn);
-    if (wire_mode != SIMPLEX_WIRE_NONE) {
+    if (inspect_wire) {
         const unsigned int both_rails = (1u << DUPLEX_RAILS) - 1;
         assert(observed.probe_ports == both_rails && observed.data_ports);
         if (!requester)
@@ -1210,10 +1300,14 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             assert(observed.advanced_ports == advanced_ports);
             assert(observed.wrong_sid_injected == !requester);
         }
-        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
-            assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
-            rte_free((void *)callbacks[port]);
-        }
+    }
+    if (inline_mode && !requester)
+        assert(observed_inline.dropped && observed_inline.retransmitted);
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        if (!callbacks[port])
+            continue;
+        assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
+        rte_free((void *)callbacks[port]);
     }
     if (requester) {
         publish(directory, "tx.done", NULL, 0);
@@ -1236,7 +1330,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         assert(mrc_destroy_comp_channel(channel) == 0);
     if (last)
         deregister_memory(context, last);
-    deregister_memory(context, first);
+    if (first)
+        deregister_memory(context, first);
     if (wire_error) {
         printf("{\"role\":\"%s\",\"qp_fatal\":true,\"cq_error\":%s,\"qpn\":%u}\n",
                requester ? "tx" : "rx", requester ? "false" : "true", local.qpn);
@@ -1254,6 +1349,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                    (unsigned int)observed.wrong_sid_injected);
         if (srv6_ev)
             printf(",\"rail_entropy\":[%u,%u]", observed.entropy[0], observed.entropy[1]);
+        if (inline_mode && !requester)
+            printf(",\"inline_fragment_retransmitted\":%s", observed_inline.retransmitted ? "true" : "false");
         puts("}");
     }
 }
@@ -1983,6 +2080,7 @@ int main(int argc, char **argv)
     bool bidirectional = cc_profile || qa_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
     enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW : DUPLEX_NORMAL;
     bool wire_error = strcmp(argv[3], "wire_error") == 0;
+    bool inline_mode = strcmp(argv[3], "inline") == 0;
     bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0 ||
         strcmp(argv[3], "generated_ev_custom_stev") == 0;
     bool generated_ev = generated_stev || strcmp(argv[3], "generated_ev_udp") == 0;
@@ -1992,7 +2090,9 @@ int main(int argc, char **argv)
     bool srv6 = explicit_srv6 || generated_srv6 || srv6_transit || strcmp(argv[3], "srv6") == 0;
     bool ev_profile = generated_ev || explicit_srv6 || generated_srv6 || strcmp(argv[3], "ev_profile") == 0;
     enum simplex_wire_mode wire_mode = SIMPLEX_WIRE_NONE;
-    if (generated_ev)
+    if (inline_mode)
+        wire_mode = SIMPLEX_INLINE;
+    else if (generated_ev)
         wire_mode = SIMPLEX_GENERATED_EV;
     else if (explicit_srv6)
         wire_mode = SIMPLEX_SRV6_EXPLICIT_EV;
@@ -2012,7 +2112,7 @@ int main(int argc, char **argv)
         profile_id = strtoull(argv[5], &end, 10);
         assert(!errno && profile_id && !*end);
     } else {
-        assert(argc == 4 && (bidirectional || wire_error || srv6 ||
+        assert(argc == 4 && (bidirectional || wire_error || srv6 || inline_mode ||
                              strcmp(argv[3], "simplex") == 0));
     }
 

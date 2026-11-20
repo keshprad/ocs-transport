@@ -229,6 +229,11 @@ struct mrc_provider_sge {
     uint32_t lkey;
 };
 
+struct mrc_provider_inline_sge {
+    const void *data;
+    uint32_t length;
+};
+
 struct mrc_provider_write_segments;
 
 struct mrc_provider_write_view {
@@ -251,6 +256,11 @@ int mrc_provider_qp_post_write(struct mrc_provider_qp *qp, const struct mrc_prov
  * The QP pins the registrations and copies the SGE metadata during posting. */
 int mrc_provider_qp_post_writev(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
                                 const struct mrc_provider_sge *sges, size_t count, uint64_t *sequence);
+/* Copy the spans into the SQ before returning. No local registration is
+ * needed. Leave the local source fields of write zero and set its length
+ * to the sum of the span lengths. */
+int mrc_provider_qp_post_write_inline(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                                      const struct mrc_provider_inline_sge *sges, size_t count, uint64_t *sequence);
 /* A wire worker serializes use of this borrowed view with retiring the post,
  * putting the QP into ERROR, and destroying the QP. */
 int mrc_provider_qp_get_write(struct mrc_provider_qp *qp, uint64_t sequence,

@@ -57,11 +57,13 @@ static void test_resources_and_completions(struct ibv_context *verbs)
     if (supported) {
         assert(device.mrc_protocol_version == MRC_PROTOCOL_VERSION_1);
         assert(device.mpr_attr.mpr_resolution == 1 && device.mpr_attr.max_mpr == MRC_ABI_MAX_MPR);
+        assert(device.qp_attr.max_qp_hint == MRC_ABI_MAX_QP_HINTS);
     }
     struct mrc_device_attr same;
     int same_support;
     assert(mrc_query_device_ex(NULL, context, &same, &same_support) == 0);
     assert(same_support == supported && same.mrc_protocol_version == device.mrc_protocol_version);
+    assert(same.qp_attr.max_qp_hint == device.qp_attr.max_qp_hint);
     struct mrc_comp_channel *channel = NULL;
     assert(mrc_create_comp_channel(context, &channel) == 0 && channel);
     assert(mrc_destroy_context(context) == -1 && errno == EBUSY);
@@ -199,6 +201,93 @@ static void test_verbs_memory_binding(struct ibv_context *verbs)
     assert(ibv_dealloc_pd(other_pd) == 0);
     assert(ibv_dealloc_pd(verbs_pd) == 0);
     assert(mrc_destroy_context(context) == 0);
+}
+
+static void test_qp_hints(struct ibv_context *verbs)
+{
+    const int fields = (int)(MRC_QP_HINT_NUM_QPS_PER_PEER | MRC_QP_HINT_NUM_SEND_PEERS |
+                         MRC_QP_HINT_NUM_REMOTE_RECV_PEERS | MRC_QP_HINT_VENDOR_CFG);
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    struct mrc_context *other = mrc_create_context(verbs, NULL);
+    assert(context && other);
+
+    struct mrc_qp_hint_init_attr hint_init = {
+        .attr = { .num_qps_per_peer = 2, .num_send_peers = 4, .num_remote_recv_peers = -1 },
+    };
+    assert(mrc_create_qp_hint(context, &hint_init) == NULL && errno == EINVAL);
+    hint_init.attr.num_remote_recv_peers = 8;
+    hint_init.attr.vendor_cfg[0] = 0x12;
+    struct mrc_qp_hint *hint = mrc_create_qp_hint(context, &hint_init);
+    struct mrc_qp_hint *replacement = mrc_create_qp_hint(context, &hint_init);
+    struct mrc_qp_hint *foreign = mrc_create_qp_hint(other, &hint_init);
+    assert(hint && replacement && foreign);
+    assert(mrc_destroy_context(context) == -1 && errno == EBUSY);
+    assert(mrc_destroy_context(other) == -1 && errno == EBUSY);
+
+    struct mrc_qp_hint_attr attrs = { .num_send_peers = -1 };
+    assert(mrc_query_qp_hint(hint, &attrs, 1 << 10) == -1 && errno == EINVAL);
+    assert(mrc_query_qp_hint(hint, &attrs, MRC_QP_HINT_NUM_QPS_PER_PEER) == 0);
+    assert(attrs.num_qps_per_peer == 2 && attrs.num_send_peers == -1);
+    assert(mrc_modify_qp_hint(hint, &attrs, MRC_QP_HINT_NUM_SEND_PEERS) == -1 && errno == EINVAL);
+    attrs.num_remote_recv_peers = 0;
+    attrs.vendor_cfg[0] = 0x34;
+    assert(mrc_modify_qp_hint(hint, &attrs, (int)(MRC_QP_HINT_NUM_REMOTE_RECV_PEERS |
+                                               MRC_QP_HINT_VENDOR_CFG)) == 0);
+    assert(mrc_query_qp_hint(hint, &attrs, fields) == 0);
+    assert(attrs.num_qps_per_peer == 2 && attrs.num_send_peers == 4 &&
+           attrs.num_remote_recv_peers == 0 && attrs.vendor_cfg[0] == 0x34);
+
+    struct ibv_pd *pd = ibv_alloc_pd(verbs);
+    struct mrc_cq *cq = mrc_create_cq(context, 2, NULL, NULL, 0);
+    assert(pd && cq);
+    struct mrc_qp_init_attr qp_init = { .pd = pd, .send_cq = cq, .cap = { .max_send_wr = 1 } };
+    struct mrc_qp *first = mrc_create_qp(context, &qp_init);
+    struct mrc_qp *second = mrc_create_qp(context, &qp_init);
+    assert(first && second);
+    struct ibv_qp_attr verbs_attr = { .qp_state = IBV_QPS_INIT };
+    struct mrc_qp_attr qp_attrs = { .qp_hint = foreign };
+    assert(mrc_modify_qp(first, &verbs_attr, IBV_QP_STATE, &qp_attrs, MRC_QP_HINT) == EINVAL);
+    qp_attrs.qp_hint = hint;
+    assert(mrc_modify_qp(first, &verbs_attr, IBV_QP_STATE, &qp_attrs, MRC_QP_HINT) == 0);
+    assert(mrc_modify_qp(second, &verbs_attr, IBV_QP_STATE, &qp_attrs, MRC_QP_HINT) == 0);
+    assert(mrc_destroy_qp_hint(hint) == -1 && errno == EBUSY);
+
+    attrs.num_send_peers = 6;
+    assert(mrc_modify_qp_hint(hint, &attrs, MRC_QP_HINT_NUM_SEND_PEERS) == 0);
+    assert(mrc_query_qp_hint(hint, &attrs, fields) == 0 && attrs.num_send_peers == 6);
+    qp_attrs.qp_hint = foreign;
+    assert(mrc_modify_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT) == EINVAL);
+    assert(mrc_query_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT, NULL) == 0 && qp_attrs.qp_hint == hint);
+    assert(mrc_destroy_qp_hint(foreign) == 0);
+    assert(mrc_destroy_context(other) == 0);
+
+    qp_attrs.qp_hint = replacement;
+    assert(mrc_modify_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT) == 0);
+    assert(mrc_destroy_qp_hint(hint) == -1 && errno == EBUSY);
+    assert(mrc_destroy_qp(second) == 0);
+    assert(mrc_destroy_qp_hint(hint) == 0);
+    assert(mrc_destroy_qp_hint(replacement) == -1 && errno == EBUSY);
+    qp_attrs.qp_hint = NULL;
+    assert(mrc_modify_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT) == 0);
+    assert(mrc_query_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT, NULL) == 0 && !qp_attrs.qp_hint);
+    qp_attrs.qp_hint = replacement;
+    assert(mrc_modify_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT) == 0);
+    verbs_attr.qp_state = IBV_QPS_RESET;
+    assert(mrc_modify_qp(first, &verbs_attr, IBV_QP_STATE, NULL, 0) == 0);
+    assert(mrc_query_qp(first, NULL, 0, &qp_attrs, MRC_QP_HINT, NULL) == 0 && !qp_attrs.qp_hint);
+    assert(mrc_destroy_qp_hint(replacement) == 0);
+    assert(mrc_destroy_qp(first) == 0 && mrc_destroy_cq(cq) == 0 && ibv_dealloc_pd(pd) == 0);
+
+    struct mrc_qp_hint *hints[MRC_ABI_MAX_QP_HINTS];
+    for (size_t i = 0; i < MRC_ABI_MAX_QP_HINTS; i++) {
+        hints[i] = mrc_create_qp_hint(context, &hint_init);
+        assert(hints[i]);
+    }
+    assert(mrc_create_qp_hint(context, &hint_init) == NULL && errno == ENOSPC);
+    for (size_t i = MRC_ABI_MAX_QP_HINTS; i > 0; i--)
+        assert(mrc_destroy_qp_hint(hints[i - 1]) == 0);
+    assert(mrc_destroy_context(context) == 0);
+    puts("OCP MRC QP hint attributes, sharing, and lifetime tests passed");
 }
 
 static void test_public_qp(struct ibv_context *verbs)
@@ -713,6 +802,7 @@ int main(void)
     }
     test_resources_and_completions(verbs);
     test_verbs_memory_binding(verbs);
+    test_qp_hints(verbs);
     test_public_qp(verbs);
     test_async_events(verbs);
     test_shared_cq_error(verbs);

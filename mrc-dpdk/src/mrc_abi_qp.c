@@ -11,6 +11,7 @@ enum {
     MAX_QUEUE_DEPTH = 4096,
     MAX_REGISTERED_MRS = 4096,
     MAX_WRITE_BYTES = 1U << 30,
+    MAX_INLINE_BYTES = 4096,
 };
 
 static atomic_uint next_qpn = 3;
@@ -115,7 +116,7 @@ static int validate_init(struct mrc_context *context, const struct mrc_qp_init_a
         return EPROTONOSUPPORT;
     if (attr->cap.max_send_wr > MAX_QUEUE_DEPTH || attr->cap.max_recv_wr > MAX_QUEUE_DEPTH ||
         attr->cap.max_send_sge > MAX_SEND_SGE || attr->cap.max_recv_sge ||
-        attr->cap.max_inline_data || attr->send_ops_flags)
+        attr->cap.max_inline_data > MAX_INLINE_BYTES || attr->send_ops_flags)
         return EOPNOTSUPP;
     return 0;
 }
@@ -216,6 +217,8 @@ MRC_PUBLIC int mrc_destroy_qp(struct mrc_qp *qp)
     if (!error) {
         mrc_ctl_store_release(&qp->ev_lease);
         mrc_ctl_store_release(&qp->cc_lease);
+        mrc_abi_hint_release(qp->attrs.qp_hint);
+        qp->attrs.qp_hint = NULL;
     }
     pthread_mutex_unlock(&qp->mutex);
     if (error)
@@ -312,7 +315,7 @@ static int validate_attrs(const struct mrc_qp_attr *attrs)
         attrs->wimm.max_wimm > MRC_ABI_MAX_WIMM || attrs->wimm.max_wimm_dest > MRC_ABI_MAX_WIMM ||
         attrs->timeout > 24 || attrs->retry.linear_cnt > 7 || attrs->retry.exp_cnt > 25)
         return EINVAL;
-    if ((attrs->cap & ~supported_caps) || attrs->qp_hint)
+    if (attrs->cap & ~supported_caps)
         return EOPNOTSUPP;
     return 0;
 }
@@ -370,6 +373,7 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
     struct mrc_ctl_store_ref new_ev_lease = MRC_CTL_STORE_REF_INITIALIZER;
     struct mrc_ctl_store_ref new_cc_lease = MRC_CTL_STORE_REF_INITIALIZER;
     struct mrc_ctl_store_cc_profile new_cc_profile = {0};
+    struct mrc_qp_hint *new_hint = NULL;
     pthread_mutex_lock(&qp->mutex);
     struct mrc_provider_qp_attr provider;
     enum mrc_provider_qp_state state;
@@ -451,6 +455,15 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
             goto unlock;
     }
 
+    struct mrc_qp_hint *requested_hint = state == MRC_PROVIDER_QP_RESET ? NULL : updated_attrs.qp_hint;
+    bool change_hint = requested_hint != qp->attrs.qp_hint;
+    if (change_hint && requested_hint) {
+        error = mrc_abi_hint_retain(qp->context, requested_hint);
+        if (error)
+            goto unlock;
+        new_hint = requested_hint;
+    }
+
     if (state == MRC_PROVIDER_QP_RESET || state == MRC_PROVIDER_QP_ERROR)
         mrc_abi_release_route(qp);
     error = state == MRC_PROVIDER_QP_RESET ? -mrc_provider_qp_reset(qp->provider)
@@ -466,6 +479,10 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
         qp->cc_profile = new_cc_profile;
         new_cc_lease.fd = -1;
     }
+    if (!error && change_hint) {
+        mrc_abi_hint_release(qp->attrs.qp_hint);
+        new_hint = NULL;
+    }
     if (!error && state == MRC_PROVIDER_QP_RESET) {
         qp->verbs = (struct ibv_qp_attr){ .cap = qp->init.cap, .path_mtu = IBV_MTU_1024 };
         qp->attrs = default_qp_attrs();
@@ -477,6 +494,7 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
     }
 
 unlock:
+    mrc_abi_hint_release(new_hint);
     mrc_ctl_store_release(&new_ev_lease);
     mrc_ctl_store_release(&new_cc_lease);
     pthread_mutex_unlock(&qp->mutex);
@@ -518,7 +536,7 @@ static int post_write(struct mrc_qp *qp, const struct ibv_send_wr *wr)
     bool immediate = wr->opcode == IBV_WR_RDMA_WRITE_WITH_IMM;
     if (!immediate && wr->opcode != IBV_WR_RDMA_WRITE)
         return EOPNOTSUPP;
-    if (wr->send_flags & ~(IBV_SEND_SIGNALED | IBV_SEND_SOLICITED))
+    if (wr->send_flags & ~(IBV_SEND_SIGNALED | IBV_SEND_SOLICITED | IBV_SEND_INLINE))
         return EOPNOTSUPP;
     bool solicited = (wr->send_flags & IBV_SEND_SOLICITED) != 0;
     if (solicited && !immediate)
@@ -527,14 +545,29 @@ static int post_write(struct mrc_qp *qp, const struct ibv_send_wr *wr)
         (wr->num_sge && !wr->sg_list) || (immediate && !qp->attrs.wimm.max_wimm))
         return EINVAL;
 
+    bool inlined = (wr->send_flags & IBV_SEND_INLINE) != 0;
+    if (inlined && !qp->init.cap.max_inline_data)
+        return EOPNOTSUPP;
     struct mrc_provider_sge elements[MAX_SEND_SGE];
+    struct mrc_provider_inline_sge inline_elements[MAX_SEND_SGE];
     uint64_t length = 0;
     for (int i = 0; i < wr->num_sge; i++) {
         const struct ibv_sge *sg = &wr->sg_list[i];
-        elements[i] = (struct mrc_provider_sge){ .iova = sg->addr, .length = sg->length, .lkey = sg->lkey };
+        if (inlined) {
+            uintptr_t address = (uintptr_t)sg->addr;
+            if ((uint64_t)address != sg->addr)
+                return EOVERFLOW;
+            inline_elements[i] = (struct mrc_provider_inline_sge){
+                .data = (const void *)address, .length = sg->length,
+            };
+        } else {
+            elements[i] = (struct mrc_provider_sge){
+                .iova = sg->addr, .length = sg->length, .lkey = sg->lkey,
+            };
+        }
         length += sg->length;
     }
-    if (length > MAX_WRITE_BYTES)
+    if (length > MAX_WRITE_BYTES || (inlined && length > qp->init.cap.max_inline_data))
         return EMSGSIZE;
     const struct mrc_provider_write write = {
         .wr_id = wr->wr_id, .remote_address = wr->wr.rdma.remote_addr, .rkey = wr->wr.rdma.rkey,
@@ -543,6 +576,8 @@ static int post_write(struct mrc_qp *qp, const struct ibv_send_wr *wr)
         .signaled = (wr->send_flags & IBV_SEND_SIGNALED) != 0,
     };
     uint64_t sequence;
+    if (inlined)
+        return -mrc_provider_qp_post_write_inline(qp->provider, &write, inline_elements, wr->num_sge, &sequence);
     return -mrc_provider_qp_post_writev(qp->provider, &write, elements, wr->num_sge, &sequence);
 }
 

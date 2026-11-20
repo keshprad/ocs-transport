@@ -118,6 +118,13 @@ def main():
             f"Unexpected public unidirectional QP results: {tx}, {rx}")
     print(json.dumps({"case": "public_qp_over_dpdk", "tx": tx, "rx": rx}))
 
+    tx, rx = run_case("inline")
+    require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+            and tx["completions"] == rx["completions"] == 2
+            and rx["inline_fragment_retransmitted"],
+            f"Unexpected public inline WRITE results: {tx}, {rx}")
+    print(json.dumps({"case": "public_inline_write_retransmission", "tx": tx, "rx": rx}))
+
     for mode in ("srv6", "srv6_transit"):
         tx, rx = run_case(mode)
         check_srv6(tx, rx, rx_decapped=2 if mode == "srv6" else 0,

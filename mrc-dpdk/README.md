@@ -126,6 +126,18 @@ up to 16 SGEs, and payload-free WRITEIMM receive posts. Use
 receive CQ notification. The remaining APIs are tracked in
 [conformance](CONFORMANCE.md).
 
+Request up to 4,096 bytes of `max_inline_data` at QP creation and use
+`IBV_SEND_INLINE` on WRITE or WRITEIMM. The provider copies all source
+SGEs of an accepted inline WR during `mrc_post_send()` and ignores their
+lkeys. Those source buffers can be reused when the call returns.
+Retransmissions use the captured data.
+
+A QP hint describes the expected sending and receiving peer counts.
+Create it with `mrc_create_qp_hint()` and submit it through
+`MRC_QP_HINT` in INIT. Multiple QPs in one MRC context can share
+an advisory hint. Clear the association in INIT, reset the QP, or
+destroy it before destroying a hint it references.
+
 Provider-triggered QP failures and CQ overruns generate
 `IBV_EVENT_QP_FATAL` and `IBV_EVENT_CQ_ERR` on the MRC context. Use
 `mrc_get_async_event()` to retrieve events and `mrc_ack_async_event()` to

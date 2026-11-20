@@ -14,6 +14,7 @@
 enum {
     MRC_ABI_MAX_MPR = 8,
     MRC_ABI_MAX_WIMM = 1024,
+    MRC_ABI_MAX_QP_HINTS = 1024,
 };
 
 struct mrc_abi_route;
@@ -51,6 +52,8 @@ struct mrc_context {
     pthread_mutex_t mutex;
     size_t children;
     struct mrc_abi_pd *pds;
+    struct mrc_qp_hint *hints;
+    size_t hint_count;
     struct mrc_abi_async_channel async;
     struct mrc_ctl_store profile_store;
     atomic_uint ctl_event_layout;
@@ -99,6 +102,8 @@ enum mrc_ctl_store_format mrc_abi_builtin_ev_format(uint64_t id);
 unsigned int mrc_abi_builtin_ev_fields(enum mrc_ctl_store_format format);
 int mrc_abi_retain_context(struct mrc_context *context);
 void mrc_abi_release_context(struct mrc_context *context);
+int mrc_abi_hint_retain(struct mrc_context *context, struct mrc_qp_hint *hint);
+void mrc_abi_hint_release(struct mrc_qp_hint *hint);
 int mrc_abi_async_open(struct mrc_abi_async_channel *channel);
 void mrc_abi_async_close(struct mrc_abi_async_channel *channel);
 int mrc_abi_async_prepare(struct mrc_abi_async_source *source);
