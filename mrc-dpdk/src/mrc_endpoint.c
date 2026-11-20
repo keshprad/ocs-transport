@@ -30,7 +30,7 @@ enum {
     SINGLE_SEGMENT_SRH_LEN = 24,
     INITIAL_CWND_PACKETS = 128,
     TARGET_QUEUE_NS = 20000,
-    FAST_LOSS_GAP = 16,
+    FAST_LOSS_PACKETS = 16,
     ACK_SYNDROME = 0x1f,
     INVALID_REQUEST_NAK = 0x61,
     REMOTE_ACCESS_NAK = 0x62,
@@ -47,7 +47,6 @@ struct send_record {
     uint64_t retry_deadline;
     uint32_t retries_used;
     unsigned int ev;
-    bool fast_retransmitted;
     bool nacked;
     enum retry_wait retry_wait;
     bool counted_inflight;
@@ -89,7 +88,6 @@ struct mrc_requester {
     struct mrc_ev_profile ev;
     struct mrc_mpr mpr;
     uint32_t next;
-    int32_t highest_sacked;
     uint16_t probe_id;
     struct outstanding_probe probes[MRC_EV_MAX_PATHS];
 };
@@ -1012,19 +1010,6 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
                             packet->bth.retransmit, now, rtt_sample, &flow, NULL))
             return -EPROTO;
 
-        int32_t highest = mrc_psn_delta(sack.cack_psn, transfer->initial_psn);
-        int32_t cack = highest;
-        if (sack.bitmap) {
-            int32_t bitmap_end = cack + sack.sack_offset + 63 -
-                                 (int32_t)__builtin_clzll(sack.bitmap);
-            if (bitmap_end > highest && bitmap_end < (int32_t)sender->next)
-                highest = bitmap_end;
-        }
-        int32_t trigger = cack + sack.ack_psn_offset;
-        if (!wire->probe_response && trigger > highest && trigger < (int32_t)sender->next)
-            highest = trigger;
-        if (highest > sender->highest_sacked && highest < (int32_t)sender->next)
-            sender->highest_sacked = highest;
         return 0;
     }
     case MRC_RELIABILITY_NACK: {
@@ -1139,10 +1124,26 @@ static int arm_retry_timer(const struct mrc_endpoint_config *transfer, struct se
     return 0;
 }
 
+static uint32_t fast_loss_boundary(const struct mrc_requester *sender, uint32_t first)
+{
+    if (sender->next - first <= FAST_LOSS_PACKETS)
+        return first;
+    unsigned int remaining = FAST_LOSS_PACKETS;
+    for (uint32_t index = sender->next - 1; index > first; index--) {
+        uint32_t psn = mrc_psn_add(sender->transfer.initial_psn, (int32_t)index);
+        if (mrc_tx_packet(&sender->qp, psn)->received && --remaining == 0)
+            return index;
+    }
+    return first;
+}
+
 static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                              struct mrc_endpoint_counters *counts, uint32_t first, uint64_t now,
                              uint32_t *busy_rails)
 {
+    /* A lone far-ahead PSN can reflect ordinary reordering. Count confirmed
+     * deliveries beyond each gap in the original flight. */
+    const uint32_t fast_boundary = fast_loss_boundary(sender, first);
     for (uint32_t index = first; index < sender->next; index++) {
         uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
         struct mrc_tx_packet *packet = mrc_tx_packet(&sender->qp, psn);
@@ -1157,8 +1158,9 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         bool waiting = record->retry_wait != RETRY_NO_WAIT;
         bool expired = now >= record->retry_deadline;
         bool nacked = record->nacked && !packet->received;
-        bool fast = !packet->received && !nacked && !record->fast_retransmitted &&
-                    sender->highest_sacked - (int32_t)index >= FAST_LOSS_GAP &&
+        /* Feedback for the original flight cannot establish loss of a retry. */
+        bool fast = !expired && !packet->received && !nacked && !packet->retransmissions &&
+                    index < fast_boundary &&
                     age >= transfer->initial_rto / 4;
         if (!expired && !waiting && !nacked && !fast)
             continue;
@@ -1210,7 +1212,6 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         record->counted_inflight = true;
         record->redundant_attempt = packet->received;
         record->nacked = false;
-        record->fast_retransmitted |= fast;
         counts->fast_retries += fast;
     }
     return 0;
@@ -1668,7 +1669,6 @@ static void reset_requester_batch(struct mrc_requester *sender)
     transfer->immediate_requests = 0;
     transfer->uniform_wr_packets = 0;
     sender->next = 0;
-    sender->highest_sacked = -1;
 }
 
 int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct mrc_provider_qp *qp,

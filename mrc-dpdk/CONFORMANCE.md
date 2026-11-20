@@ -82,6 +82,16 @@ attempts. It accepts both cross-rail probe replies and completes the
 WRITEIMM with exactly two retries. Use `--late-nack-only` to run the
 replay across both IP families and both preserved SRv6 forms.
 
+For §7.4.5, the requester waits one quarter of the initial ACK timeout
+and requires delivery feedback for 16 later packets before an original
+transmission is eligible for fast retransmission. The independent peer
+holds a 24-packet WRITEIMM behind a single far-ahead SACK, then releases
+the delayed packets without a retry. A second case delays a NACK-driven
+retransmission beyond the same threshold and observes exactly one retry.
+A third drops the original packet and confirms one fast retry before
+the local ACK timeout. Use `--fast-loss-only` with `--mode` to check
+IPv4, IPv6, and preserved SRv6 with or without an SRH.
+
 The standalone memif suite uses 1, 2, 3, 4, and 8 configured rails for
 WRITEIMM across PSN wrap. It verifies per-rail data and probe counters,
 including traffic on rail 7 and isolation of that rail by deny mask

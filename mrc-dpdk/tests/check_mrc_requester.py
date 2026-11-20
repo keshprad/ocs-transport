@@ -76,6 +76,7 @@ class ReferenceResponder:
             for role, macs in MACS.items()
         }
         self.memory = bytearray(sum(self.write_lengths))
+        self.first_write_end = max(0, (self.write_lengths[0] - 1) // 1024)
         self.received = set()
         self.cumulative = -1
         self.received_bytes = 0
@@ -141,11 +142,11 @@ class ReferenceResponder:
                 f"Unexpected WRITE opcode {packet.bth.opcode:#x} for packet {index}")
         is_retry = bool(packet.bth.flags & RTX)
         require(not (packet.bth.flags & 0x10), "Unexpected TSETH on benchmark WRITE")
-        wr = 0 if index <= FIRST_WRITE_END else 1
+        wr = 0 if index <= self.first_write_end else 1
         require(wr == 0 or self.first_write_acked,
                 "WRITEIMM used its receive credit after only a reliability SACK")
         rqmsn, msn, address, rkey, length = struct.unpack_from("!HHQII", packet.body)
-        segment = index if wr == 0 else index - FIRST_WRITE_END - 1
+        segment = index if wr == 0 else index - self.first_write_end - 1
         offset = segment * 1024 + (self.write_lengths[0] if wr else 0)
         data_length = min(self.write_lengths[wr] - segment * 1024, 1024)
         require((rqmsn, msn, address, rkey, length) ==
@@ -172,7 +173,7 @@ class ReferenceResponder:
         if index in self.received:
             require(is_retry, f"Duplicate WRITE packet {index} lacked RTX")
             self.sack(rail, packet, index=index)
-            if (self.nack_reason is not None and index == 0 and self.cumulative == FIRST_WRITE_END
+            if (self.nack_reason is not None and index == 0 and self.cumulative == self.first_write_end
                     and not self.first_write_acked):
                 self.transport_ack(rail, 1)
                 self.first_write_acked = True
@@ -356,6 +357,71 @@ class LateNackResponder(ReferenceResponder):
         if self.pending_ack is not None:
             super().write(*self.pending_ack)
             self.pending_ack = None
+
+
+class FastLossResponder(ReferenceResponder):
+    packets = 24
+    write_lengths = (packets * 1024,)
+    opcodes = (0xC6, *(0xC7,) * (packets - 2), 0xC9)
+    timeout_exponent = 18
+    base_timeout = (1024 << timeout_exponent) / 1e9
+
+    def __init__(self, wire, mode, case):
+        super().__init__(wire, mode, None)
+        self.case = case
+        self.original = None
+        self.original_at = None
+        self.delayed = []
+        self.release_at = None
+        self.retries = 0
+
+    def write(self, rail, packet):
+        now = time.monotonic()
+        index = (packet.bth.psn - INITIAL_PSN) & PSN_MASK
+        if packet.bth.flags & RTX:
+            require(self.case != "sparse" and index == 0 and self.retries == 0,
+                    f"Spurious retransmission in {self.case} case at packet {index}")
+            require(self.original_at is not None and now - self.original_at < 0.85 * self.base_timeout,
+                    "Requester waited for the local ACK timer instead of recovering early")
+            self.retries += 1
+            if self.case == "nack":
+                # The SACKs for the original flight remain visible while
+                # this NACK-triggered retry takes longer than the fast timer.
+                self.delayed.append((rail, packet))
+                self.release_at = now + self.base_timeout / 2
+                return
+        elif self.case == "sparse":
+            if index != self.packets - 1:
+                self.delayed.append((rail, packet))
+                return
+            # Only this far-ahead PSN has arrived so far.
+            self.release_at = now + self.base_timeout / 2
+        elif index == 0:
+            self.original = (rail, packet)
+            self.original_at = now
+            self.reject_original_if_ready()
+            return
+
+        super().write(rail, packet)
+        self.reject_original_if_ready()
+
+    def reject_original_if_ready(self):
+        if self.case == "nack" and self.original is not None and len(self.received) == self.packets - 1:
+            self.nack(*self.original, NO_PKT_BUFFER)
+            self.original = None
+
+    def tick(self, now):
+        if self.release_at is not None and now >= self.release_at:
+            for rail, packet in self.delayed:
+                super().write(rail, packet)
+            self.delayed.clear()
+            self.release_at = None
+
+    def check_counters(self, counters):
+        require(self.retries == sum(counters["retries"]) == (self.case != "sparse")
+                and counters["fast_retries"] == (self.case == "loss")
+                and counters["nack_received_mask"] == (1 << NO_PKT_BUFFER if self.case == "nack" else 0),
+                f"Incorrect fast-loss accounting in {self.case}: {counters}")
 
 
 class PortStatusResponder(ReferenceResponder):
@@ -554,7 +620,7 @@ def stop_relay(wire, relay):
 
 def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                   port_status=None, flow_control=False, probe_correlation=False, retry_timer=None,
-                  late_nack=False):
+                  late_nack=False, fast_loss=None):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -584,6 +650,10 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                 wire.settimeout(0.01)
             elif late_nack:
                 responder = LateNackResponder(wire, mode)
+            elif fast_loss is not None:
+                responder = FastLossResponder(wire, mode, fast_loss)
+                ack_timeout = responder.timeout_exponent
+                wire.settimeout(0.005)
             elif probe_correlation:
                 responder = ProbeCorrelationResponder(wire, mode)
             elif flow_control:
@@ -666,6 +736,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         and counters["probe_replies"] == 2
                         and counters["nack_received_mask"] == 1 << NO_PKT_BUFFER,
                         f"Late NACK interfered with the current attempt: {counters}")
+            elif fast_loss is not None:
+                responder.check_counters(counters)
             elif port_status is not None:
                 require(counters["port_status_updates"] == 2 and counters["port_status_replies"] == 1,
                         f"Unexpected Port Status counters: {counters}")
@@ -705,11 +777,12 @@ def main():
     focused.add_argument("--probe-correlation-only", action="store_true", help="Run only the probe correlation case")
     focused.add_argument("--retry-timer-only", action="store_true", help="Run only the NACK and timeout retry cases")
     focused.add_argument("--late-nack-only", action="store_true", help="Run only cross-rail late NACK cases")
+    focused.add_argument("--fast-loss-only", action="store_true", help="Run only SACK fast-loss cases")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
     binary, relay = args.binary.resolve(), args.relay.resolve()
     normal_suite = not (args.port_status_only or args.flow_control_only or args.probe_correlation_only
-                        or args.retry_timer_only or args.late_nack_only)
+                        or args.retry_timer_only or args.late_nack_only or args.fast_loss_only)
     if normal_suite:
         for mode in args.mode or MODES:
             for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim"),
@@ -735,6 +808,10 @@ def main():
         for case in ("backoff", "exhausted"):
             counters = run_requester(binary, relay, mode, retry_timer=case)
             print(json.dumps({"mode": mode, "retry_timer": case, **counters}))
+    if normal_suite or args.fast_loss_only:
+        for case in ("sparse", "nack", "loss"):
+            counters = run_requester(binary, relay, mode, fast_loss=case)
+            print(json.dumps({"mode": mode, "fast_loss": case, **counters}))
 
 
 if __name__ == "__main__":
