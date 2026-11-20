@@ -615,6 +615,7 @@ enum simplex_wire_mode {
     SIMPLEX_SRV6_TRANSIT,
     SIMPLEX_SRV6_EXPLICIT_EV,
     SIMPLEX_SRV6_GENERATED_EV,
+    SIMPLEX_SRV6_MAPPED_EV,
 };
 
 static void test_sid(uint8_t sid[16], uint16_t port, uint8_t endpoint)
@@ -1130,6 +1131,8 @@ struct simplex_wire_witness {
     unsigned int data_ports;
     unsigned int decapped_ports;
     unsigned int advanced_ports;
+    unsigned int probe_evs;
+    unsigned int data_evs;
     uint16_t first_probe_token;
     bool wrong_sid_injected;
 };
@@ -1159,7 +1162,8 @@ static struct srv6_wire_path expected_srv6_path(const struct simplex_wire_witnes
         /* Replies use the responder's own route, independent of the request profile. */
         path.action = port == 1 ? SRV6_DECAPSULATE : SRV6_PRESERVE;
     } else if (observed->mode == SIMPLEX_SRV6_EXPLICIT_EV ||
-               observed->mode == SIMPLEX_SRV6_GENERATED_EV) {
+               observed->mode == SIMPLEX_SRV6_GENERATED_EV ||
+               observed->mode == SIMPLEX_SRV6_MAPPED_EV) {
         /* The controller fixture seeds these containers. Attach inputs specify
          * different destinations and an SRH only on rail 1. */
         test_sid(path.destination, 0, port + 1);
@@ -1268,10 +1272,19 @@ static void observe_simplex_header(struct simplex_wire_witness *observed, uint16
             return;
     }
     assert(wire_be24(bth + 5) == observed->local->qpn);
-    if ((observed->probe_ports | observed->data_ports) & bit)
+    if (observed->mode == SIMPLEX_SRV6_MAPPED_EV) {
+        const unsigned int entry = (uint16_t)entropy - 0xc000u;
+        assert(entry < 4 && entry != 2 && port == 1 - entry % 2);
+        assert((entropy >> 16) == 0x100 + entry);
+        if (probe)
+            observed->probe_evs |= 1u << entry;
+        else
+            observed->data_evs |= 1u << entry;
+    } else if ((observed->probe_ports | observed->data_ports) & bit) {
         assert(observed->entropy[port] == entropy);
-    else
+    } else {
         observed->entropy[port] = entropy;
+    }
     if (probe)
         observed->probe_ports |= bit;
     else
@@ -1288,6 +1301,12 @@ static uint16_t observe_simplex_wire(uint16_t port, uint16_t queue, struct rte_m
         path = expected_srv6_path(observed, port);
     struct rte_mbuf *foreign = NULL;
     for (uint16_t i = 0; i < count; i++) {
+        if (!observed->requester && observed->mode == SIMPLEX_SRV6_MAPPED_EV) {
+            uint8_t suffix;
+            const uint8_t *last = rte_pktmbuf_read(packets[i], RTE_ETHER_HDR_LEN + 39, 1, &suffix);
+            assert(last && *last >= 1 && *last <= 4 && *last != 3 && port == 1 - (*last - 1) % 2);
+            test_sid(path.destination, 0, *last);
+        }
         uint8_t prefix[RTE_ETHER_HDR_LEN + 2 * WIRE_IPV6_LEN + WIRE_SINGLE_SRH_LEN +
                        WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_SETH_LEN];
         struct observed_udp udp = observed->srv6 ?
@@ -1424,8 +1443,9 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                                 error_mode == SIMPLEX_ACCESS_ERROR;
     const bool inline_mode = wire_mode == SIMPLEX_INLINE;
     const bool generated_ev = wire_mode == SIMPLEX_GENERATED_EV;
+    const bool mapped_srv6 = wire_mode == SIMPLEX_SRV6_MAPPED_EV;
     const bool srv6_ev = wire_mode == SIMPLEX_SRV6_EXPLICIT_EV ||
-                         wire_mode == SIMPLEX_SRV6_GENERATED_EV;
+                         wire_mode == SIMPLEX_SRV6_GENERATED_EV || mapped_srv6;
     const bool srv6 = srv6_ev || wire_mode == SIMPLEX_SRV6 || wire_mode == SIMPLEX_SRV6_TRANSIT;
     const bool transit = wire_mode == SIMPLEX_SRV6_TRANSIT;
     const unsigned int pmtu = wire_mode == SIMPLEX_PMTU_256 ? 256 : wire_mode == SIMPLEX_PMTU_512 ? 512 : 0;
@@ -1573,7 +1593,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
     }
-    if (ev_profile_id && !generated_ev && wire_mode != SIMPLEX_SRV6_GENERATED_EV)
+    if (ev_profile_id && !generated_ev && wire_mode != SIMPLEX_SRV6_GENERATED_EV && !mapped_srv6)
         check_blocked_profile(qp, cq, ev_store, requester, first_data);
     if (wire_error)
         complete_async_error(context, qp, cq, requester, local.qpn, error_mode);
@@ -1593,6 +1613,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             assert(observed.advanced_ports == advanced_ports);
             assert(observed.wrong_sid_injected == !requester);
         }
+        if (mapped_srv6)
+            assert(observed.probe_evs == 0xb && (requester || observed.data_evs == 0xb));
     }
     if (inline_mode && !requester)
         assert(observed_inline.dropped && observed_inline.retransmitted);
@@ -1652,7 +1674,9 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                    (unsigned int)__builtin_popcount(observed.decapped_ports),
                    (unsigned int)__builtin_popcount(observed.advanced_ports),
                    (unsigned int)observed.wrong_sid_injected);
-        if (srv6_ev)
+        if (mapped_srv6)
+            printf(",\"write_evs\":%u,\"probe_evs\":%u", observed.data_evs, observed.probe_evs);
+        else if (srv6_ev)
             printf(",\"rail_entropy\":[%u,%u]", observed.entropy[0], observed.entropy[1]);
         if (inline_mode && !requester)
             printf(",\"inline_fragment_retransmitted\":%s", observed_inline.retransmitted ? "true" : "false");
@@ -2260,6 +2284,9 @@ struct counted_rail_witness {
     uint32_t retries;
     uint32_t write_rejections;
     uint32_t retry_rejections;
+    uint16_t ev_base;
+    unsigned int write_evs;
+    unsigned int probe_evs;
     bool backpressure;
     bool dropped;
 };
@@ -2301,7 +2328,18 @@ static uint16_t observe_counted_rails(uint16_t port, uint16_t queue, struct rte_
         uint8_t prefix[14 + 40 + WIRE_UDP_LEN + WIRE_BTH_LEN];
         struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
         const uint8_t *bth = udp.header + WIRE_UDP_LEN;
-        if (bth[0] >= WIRE_WRITE_FIRST && bth[0] <= WIRE_WRITE_ONLY_IMM) {
+        bool write = bth[0] >= WIRE_WRITE_FIRST && bth[0] <= WIRE_WRITE_ONLY_IMM;
+        bool probe = bth[0] == WIRE_PROBE_REQUEST;
+        if (observed->ev_base && (write || probe)) {
+            assert(udp.entropy >= observed->ev_base);
+            unsigned int entry = udp.entropy - observed->ev_base;
+            assert(entry < 4 && entry != 2 && port == 1 - entry % 2);
+            if (write)
+                observed->write_evs |= 1u << entry;
+            else
+                observed->probe_evs |= 1u << entry;
+        }
+        if (write) {
             if (bth[8] & 0x20) {
                 observed->retries |= UINT32_C(1) << port;
             } else {
@@ -2320,8 +2358,9 @@ static uint16_t observe_counted_rails(uint16_t port, uint16_t queue, struct rte_
 
 static void run_counted_route(bool requester, const char *directory, const struct address *address,
                               struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                              bool backpressure)
+                              bool backpressure, uint16_t ev_base, uint64_t profile_id)
 {
+    const unsigned int rail_count = ev_base ? DUPLEX_RAILS : COUNTED_RAILS;
     struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
     assert(cq);
     struct mrc_qp_init_attr init = {
@@ -2346,23 +2385,24 @@ static void run_counted_route(bool requester, const char *directory, const struc
     publish(directory, requester ? "tx.connection" : "rx.connection", &local, sizeof(local));
     struct connection peer;
     read_peer_connections(directory, requester, &peer, 1);
-    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, 0, 0, IBV_MTU_1024);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester,
+                 requester ? profile_id : 0, 0, 0, 0, IBV_MTU_1024);
 
     struct mrc_dpdk_rail rails[COUNTED_RAILS];
-    for (uint16_t i = 0; i < COUNTED_RAILS; i++)
+    for (uint16_t i = 0; i < rail_count; i++)
         rails[i] = (struct mrc_dpdk_rail){ .port = i, .peer_mac = { 2, 0, 0, 0, 0, (requester ? 0x10 : 0x20) + i } };
     struct mrc_dpdk_route_config route = { .rails = rails, .pool = pool, .requester = requester };
     assert(mrc_dpdk_attach_qp_rails(qp, &route) == EINVAL);
     route.rail_count = 33;
     assert(mrc_dpdk_attach_qp_rails(qp, &route) == EINVAL);
-    route.rail_count = COUNTED_RAILS;
-    rails[COUNTED_RAILS - 1].port = 0;
+    route.rail_count = rail_count;
+    rails[rail_count - 1].port = 0;
     assert(mrc_dpdk_attach_qp_rails(qp, &route) == EINVAL);
-    rails[COUNTED_RAILS - 1].port = COUNTED_RAILS - 1;
+    rails[rail_count - 1].port = (uint16_t)(rail_count - 1);
     assert(mrc_dpdk_attach_qp_rails(qp, &route) == 0);
-    prepare_memif_rails(COUNTED_RAILS);
+    prepare_memif_rails(rail_count);
 
-    struct counted_rail_witness observed = { .backpressure = backpressure };
+    struct counted_rail_witness observed = { .backpressure = backpressure, .ev_base = ev_base };
     const struct rte_eth_rxtx_callback *callbacks[COUNTED_RAILS];
     char ready[PATH_MAX];
     if (requester) {
@@ -2370,7 +2410,7 @@ static void run_counted_route(bool requester, const char *directory, const struc
         path_for(ready, directory, "rx.ready");
         wait_for(ready);
         if (backpressure) {
-            for (uint16_t port = 0; port < COUNTED_RAILS; port++) {
+            for (uint16_t port = 0; port < rail_count; port++) {
                 callbacks[port] = rte_eth_add_tx_callback(port, 0, backpressure_writes, &observed);
                 assert(callbacks[port]);
             }
@@ -2390,7 +2430,7 @@ static void run_counted_route(bool requester, const char *directory, const struc
     } else {
         path_for(ready, directory, "tx.links-ready");
         wait_for(ready);
-        for (uint16_t port = 0; port < COUNTED_RAILS; port++) {
+        for (uint16_t port = 0; port < rail_count; port++) {
             callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_counted_rails, &observed);
             assert(callbacks[port]);
         }
@@ -2413,7 +2453,7 @@ static void run_counted_route(bool requester, const char *directory, const struc
         assert(wc.wr_id == 70 && wc.opcode == IBV_WC_RDMA_WRITE);
         if (backpressure) {
             assert(__builtin_popcount(observed.retry_rejections) >= 2);
-            for (uint16_t port = 0; port < COUNTED_RAILS; port++) {
+            for (uint16_t port = 0; port < rail_count; port++) {
                 assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
                 rte_free((void *)callbacks[port]);
             }
@@ -2426,13 +2466,15 @@ static void run_counted_route(bool requester, const char *directory, const struc
             assert(observed.dropped && observed.writes == (UINT32_C(1) << BACKPRESSURE_FIRST_RAIL) &&
                    observed.retries == (UINT32_C(1) << BACKPRESSURE_RETRY_RAIL));
         } else {
-            assert((observed.writes | observed.retries) == (UINT32_C(1) << COUNTED_RAILS) - 1);
+            assert((observed.writes | observed.retries) == (UINT32_C(1) << rail_count) - 1);
         }
+        if (ev_base)
+            assert(observed.write_evs == 0xb && observed.probe_evs == 0xb);
         for (size_t i = 0; i < sizeof(data); i++)
             assert(data[i] == pattern(i));
         path_for(ready, directory, "tx.done");
         wait_for(ready);
-        for (uint16_t port = 0; port < COUNTED_RAILS; port++) {
+        for (uint16_t port = 0; port < rail_count; port++) {
             assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
             rte_free((void *)callbacks[port]);
         }
@@ -2441,9 +2483,10 @@ static void run_counted_route(bool requester, const char *directory, const struc
     assert(mrc_destroy_qp(qp) == 0 && mrc_destroy_cq(cq) == 0);
     deregister_memory(context, mr);
     printf("{\"role\":\"%s\",\"qpn\":%u,\"bytes\":%zu,\"observed_rails\":%u,\"retry_rails\":%u,"
-           "\"write_rejections\":%u,\"retry_rejections\":%u}\n",
+           "\"write_rejections\":%u,\"retry_rejections\":%u,\"write_evs\":%u,\"probe_evs\":%u}\n",
            requester ? "tx" : "rx", local.qpn, sizeof(data), observed.writes | observed.retries,
-           observed.retries, observed.write_rejections, observed.retry_rejections);
+           observed.retries, observed.write_rejections, observed.retry_rejections,
+           observed.write_evs, observed.probe_evs);
 }
 
 struct duplex_qp {
@@ -3332,10 +3375,17 @@ int main(int argc, char **argv)
     bool srv6_transit = strcmp(argv[3], "srv6_transit") == 0;
     bool explicit_srv6 = strcmp(argv[3], "explicit_ev_srv6") == 0;
     bool generated_srv6 = strcmp(argv[3], "generated_ev_srv6_srh") == 0;
-    bool srv6 = explicit_srv6 || generated_srv6 || srv6_transit || strcmp(argv[3], "srv6") == 0;
+    bool mapped_srv6 = strcmp(argv[3], "mapped_ev_srv6") == 0;
+    bool srv6 = explicit_srv6 || generated_srv6 || mapped_srv6 || srv6_transit || strcmp(argv[3], "srv6") == 0;
     bool backpressure = strcmp(argv[3], "rail_backpressure") == 0;
     bool counted_route = backpressure || strcmp(argv[3], "counted_route") == 0;
-    bool ev_profile = generated_ev || explicit_srv6 || generated_srv6 || strcmp(argv[3], "ev_profile") == 0;
+    uint16_t mapped_ev_base = 0;
+    if (!strcmp(argv[3], "mapped_ev_udp"))
+        mapped_ev_base = 0xc610;
+    else if (!strcmp(argv[3], "mapped_ev_auto"))
+        mapped_ev_base = 0xc000;
+    bool ev_profile = generated_ev || explicit_srv6 || generated_srv6 || mapped_srv6 || mapped_ev_base ||
+                      strcmp(argv[3], "ev_profile") == 0;
     enum simplex_wire_mode wire_mode = SIMPLEX_WIRE_NONE;
     if (inline_mode)
         wire_mode = SIMPLEX_INLINE;
@@ -3349,6 +3399,8 @@ int main(int argc, char **argv)
         wire_mode = SIMPLEX_SRV6_EXPLICIT_EV;
     else if (generated_srv6)
         wire_mode = SIMPLEX_SRV6_GENERATED_EV;
+    else if (mapped_srv6)
+        wire_mode = SIMPLEX_SRV6_MAPPED_EV;
     else if (srv6)
         wire_mode = srv6_transit ? SIMPLEX_SRV6_TRANSIT : SIMPLEX_SRV6;
     const char *profile_store = NULL;
@@ -3380,6 +3432,8 @@ int main(int argc, char **argv)
     struct ibv_pd *pd = need_pd ? ibv_alloc_pd(verbs) : NULL;
     struct mrc_context *context = mrc_create_context(verbs, NULL);
     assert((!need_pd || pd) && context);
+    if (mapped_ev_base && client)
+        assert(mrc_dpdk_set_ev_store(context, profile_store) == 0);
 
     unsigned int rail_count = counted_route || counted_endpoint ? COUNTED_RAILS : DUPLEX_RAILS;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_for_ports(0, rail_count);
@@ -3393,8 +3447,8 @@ int main(int argc, char **argv)
         run_counted_endpoint(client, directory, context, pool);
     else if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
-    else if (counted_route)
-        run_counted_route(client, directory, &address, context, pd, pool, backpressure);
+    else if (counted_route || mapped_ev_base)
+        run_counted_route(client, directory, &address, context, pd, pool, backpressure, mapped_ev_base, profile_id);
     else if (mpr_updates) {
         enum single_write_case scenario = dynamic_mpr_rts ? DYNAMIC_MPR_RTS : dynamic_mpr ? DYNAMIC_MPR : STATIC_MPR;
         run_single_write(client, directory, &address, context, pd, pool, scenario);

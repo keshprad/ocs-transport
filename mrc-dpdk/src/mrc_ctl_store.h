@@ -74,6 +74,7 @@ struct mrc_ctl_store_config {
     uint8_t event_mask; /* Requested states from mrc_ctl_store_ev_event. */
     uint32_t populated; /* Bit i identifies a configured entropy slot. */
     uint32_t denied; /* Administrative DENY updates are allowed while ONLINE. */
+    uint8_t ports[MRC_EV_MAX_PATHS]; /* Zero maps the entry to its one-based slot number. */
     uint32_t entropy[MRC_EV_MAX_PATHS];
     uint8_t srv6[MRC_EV_MAX_PATHS][MRC_CTL_STORE_SRV6_EV_BYTES]; /* Network byte order. */
     uint8_t field_count; /* Zero for profiles with no generated field metadata. */
@@ -81,6 +82,11 @@ struct mrc_ctl_store_config {
     uint8_t format_field_count;
     uint8_t format_widths[MRC_CTL_STORE_MAX_EV_FIELDS];
 };
+
+static inline unsigned int mrc_ctl_store_ev_port(const struct mrc_ctl_store_config *config, unsigned int entry)
+{
+    return config->ports[entry] ? config->ports[entry] : entry + 1;
+}
 
 struct mrc_ctl_store_profile {
     uint64_t id;

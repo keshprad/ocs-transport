@@ -14,8 +14,9 @@ enum {
     MODIFY_ATTRS = MRC_CTL_EV_PROFILE_STATE | MRC_CTL_EV_PROFILE_CUR_STATE |
         MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_FMT_ID | MRC_CTL_EV_PROFILE_COUNT |
         MRC_CTL_EV_PROFILE_MIN_ACTIVE | MRC_CTL_EV_PROFILE_EVENT_MASK |
-        MRC_CTL_EV_PROFILE_EV_OP | MRC_CTL_EV_PROFILE_EV_FIELDS_OP,
-    EV_GEOMETRY = MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_FMT_ID | MRC_CTL_EV_PROFILE_COUNT,
+        MRC_CTL_EV_PROFILE_EV_OP | MRC_CTL_EV_PROFILE_EV_FIELDS_OP | MRC_CTL_EV_PROFILE_VENDOR_CFG,
+    EV_GEOMETRY = MRC_CTL_EV_PROFILE_MODE | MRC_CTL_EV_PROFILE_FMT_ID | MRC_CTL_EV_PROFILE_COUNT |
+        MRC_CTL_EV_PROFILE_VENDOR_CFG,
     EV_EVENT_MASK = MRC_CTL_EV_GOOD | MRC_CTL_EV_ASSUMED_BAD,
     EVENT_LAYOUT_DEFAULT = 0,
     EVENT_LAYOUT_LEGACY,
@@ -28,6 +29,8 @@ _Static_assert((int)MRC_CTL_PROFILE_INIT == (int)MRC_CTL_STORE_INIT &&
                "Controller and persistent profile states must agree");
 _Static_assert(MRC_CTL_EV_MAX_BYTES == MRC_CTL_STORE_SRV6_EV_BYTES,
                "Controller and persistent SRv6 EV widths must agree");
+_Static_assert(MRC_CTL_MAX_VENDOR_CFG_SIZE >= MRC_EV_MAX_PATHS,
+               "Vendor configuration must hold a port for every EV");
 _Static_assert((int)MRC_CTL_EV_GOOD == (int)MRC_CTL_STORE_EV_EVENT_GOOD &&
                (int)MRC_CTL_EV_ASSUMED_BAD == (int)MRC_CTL_STORE_EV_EVENT_ASSUMED_BAD,
                "Controller and persistent event mask bits must agree");
@@ -274,7 +277,7 @@ static int unpack_ev(const struct mrc_ctl_ev *ev, uint32_t *value)
 
 static struct mrc_ctl_ev pack_ev(const struct mrc_ctl_store_config *config, unsigned int path)
 {
-    struct mrc_ctl_ev ev = { .port = (uint8_t)(path + 1) };
+    struct mrc_ctl_ev ev = { .port = (uint8_t)mrc_ctl_store_ev_port(config, path) };
     if (mrc_ctl_store_format_is_srv6(config->format))
         memcpy(ev.val, config->srv6[path], sizeof(ev.val));
     else {
@@ -287,23 +290,31 @@ static struct mrc_ctl_ev pack_ev(const struct mrc_ctl_store_config *config, unsi
     return ev;
 }
 
-static int ev_path(const struct mrc_ctl_store_config *config, const struct mrc_ctl_ev *ev)
+static int find_ev_slot(const struct mrc_ctl_store_config *config, const struct mrc_ctl_ev *ev)
 {
-    if (!ev->port || ev->port > config->count)
+    if (!ev->port || ev->port > MRC_EV_MAX_PATHS)
         return -EINVAL;
-    unsigned int path = ev->port - 1;
     if (mrc_ctl_store_format_is_srv6(config->format)) {
         /* All-zero identifies an empty explicit slot. */
         const mrc_ctl_ev_t empty = {0};
         if (memcmp(ev->val, empty, sizeof(empty)) && !mrc_ctl_store_srv6_ev_valid(config->format, ev->val))
             return -EINVAL;
-        return memcmp(config->srv6[path], ev->val, sizeof(ev->val)) ? -ENOENT : (int)path;
+        for (unsigned int i = 0; i < config->count; i++) {
+            if (mrc_ctl_store_ev_port(config, i) == ev->port &&
+                !memcmp(config->srv6[i], ev->val, sizeof(ev->val)))
+                return (int)i;
+        }
+        return -ENOENT;
     }
     uint32_t value;
     int error = unpack_ev(ev, &value);
     if (error)
         return error;
-    return ev_value(config, path) == value ? (int)path : -ENOENT;
+    for (unsigned int i = 0; i < config->count; i++) {
+        if (mrc_ctl_store_ev_port(config, i) == ev->port && ev_value(config, i) == value)
+            return (int)i;
+    }
+    return -ENOENT;
 }
 
 static enum mrc_ctl_ev_state ev_state(const struct mrc_ctl_store_config *config, unsigned int path)
@@ -316,24 +327,29 @@ static enum mrc_ctl_ev_state ev_state(const struct mrc_ctl_store_config *config,
 
 static int replace_ev(struct mrc_ctl_store_config *config, unsigned int path, const struct mrc_ctl_ev *ev)
 {
-    if (ev->port != path + 1)
+    if (!ev->port || ev->port > MRC_EV_MAX_PATHS)
         return -EINVAL;
     if (mrc_ctl_store_format_is_srv6(config->format)) {
         if (!mrc_ctl_store_srv6_ev_valid(config->format, ev->val))
             return -EINVAL;
+        for (unsigned int i = 0; i < config->count; i++) {
+            if (i != path && mrc_ctl_store_ev_port(config, i) == ev->port &&
+                !memcmp(config->srv6[i], ev->val, sizeof(ev->val)))
+                return -EEXIST;
+        }
         memcpy(config->srv6[path], ev->val, sizeof(ev->val));
-        return 0;
+    } else {
+        uint32_t value;
+        if (unpack_ev(ev, &value) || !(uint16_t)value ||
+            (configured_format(config) == MRC_CTL_STORE_FORMAT_UDP && value > UINT16_MAX))
+            return -EINVAL;
+        for (unsigned int i = 0; i < config->count; i++) {
+            if (i != path && config->entropy[i] == value)
+                return -EEXIST;
+        }
+        config->entropy[path] = value;
     }
-
-    uint32_t value;
-    if (unpack_ev(ev, &value) || !(uint16_t)value ||
-        (configured_format(config) == MRC_CTL_STORE_FORMAT_UDP && value > UINT16_MAX))
-        return -EINVAL;
-    for (unsigned int i = 0; i < config->count; i++) {
-        if (i != path && config->entropy[i] == value)
-            return -EEXIST;
-    }
-    config->entropy[path] = value;
+    config->ports[path] = ev->port == path + 1 ? 0 : ev->port;
     return 0;
 }
 
@@ -343,7 +359,7 @@ static int modify_ev(struct mrc_ctl_store_config *config, enum mrc_ctl_ev_op op,
     if ((entry->state != MRC_CTL_EV_GOOD && entry->state != MRC_CTL_EV_DENIED) ||
         (entry->flags & ~MRC_CTL_EV_OP_F_ALL_COPIES))
         return -EINVAL;
-    int path = ev_path(config, &entry->ev);
+    int path = find_ev_slot(config, &entry->ev);
     if (path < 0)
         return path;
     uint32_t bit = UINT32_C(1) << path;
@@ -624,6 +640,7 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
         memcpy(config->format_widths, layout.widths, sizeof(config->format_widths));
         config->populated = 0;
         config->denied = 0;
+        memset(config->ports, 0, sizeof(config->ports));
         memset(config->entropy, 0, sizeof(config->entropy));
         memset(config->srv6, 0, sizeof(config->srv6));
         config->field_count = 0;
@@ -634,8 +651,21 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
         config->populated &= keep;
         config->denied &= keep;
         for (unsigned int i = config->count; i < old_count; i++) {
+            config->ports[i] = 0;
             config->entropy[i] = 0;
             memset(config->srv6[i], 0, sizeof(config->srv6[i]));
+        }
+    }
+    if (mask & MRC_CTL_EV_PROFILE_VENDOR_CFG) {
+        /* Explicit profiles assign a port as each value is installed. */
+        if (mode == MRC_CTL_STORE_EXPLICIT)
+            return -EINVAL;
+        for (unsigned int i = 0; i < sizeof(attr->vendor_cfg); i++) {
+            uint8_t port = attr->vendor_cfg[i];
+            if (port > MRC_EV_MAX_PATHS || (i >= config->count && port))
+                return -EINVAL;
+            if (i < config->count)
+                config->ports[i] = port == i + 1 ? 0 : port;
         }
     }
     if (mask & MRC_CTL_EV_PROFILE_MIN_ACTIVE) {
@@ -801,7 +831,7 @@ static int query_entries(const struct mrc_ctl_store_config *config, struct mrc_c
         if (count > EV_BATCH_LIMIT)
             return -E2BIG;
         for (int i = 0; i < count; i++) {
-            int path = ev_path(config, &attr->ev_op.entries[i].ev);
+            int path = find_ev_slot(config, &attr->ev_op.entries[i].ev);
             if (path < 0)
                 return path;
             attr->ev_op.entries[i].state = ev_state(config, (unsigned int)path);
@@ -858,6 +888,11 @@ MRC_PUBLIC int mrc_ctl_query_ev_profile(struct mrc_context *context, uint64_t id
         attr->ev_min_active = config->min_active;
     if (mask & MRC_CTL_EV_PROFILE_EVENT_MASK)
         attr->ev_event_mask = config->event_mask;
+    if (mask & MRC_CTL_EV_PROFILE_VENDOR_CFG) {
+        memset(attr->vendor_cfg, 0, sizeof(attr->vendor_cfg));
+        for (unsigned int i = 0; i < config->count; i++)
+            attr->vendor_cfg[i] = (uint8_t)mrc_ctl_store_ev_port(config, i);
+    }
     if (mask & MRC_CTL_EV_PROFILE_EV_OP)
         error = query_entries(config, attr);
     else

@@ -100,6 +100,7 @@ struct mrc_endpoint_config {
     uint64_t profile_id;
     struct mrc_ctl_store profile_store;
     struct mrc_ctl_store_profile profile;
+    uint32_t rail_evs[MRC_EV_MAX_PATHS];
     struct mrc_ctl_store_cc_profile cc_profile;
     uint32_t restore_after;
     uint32_t mpr_change_at;

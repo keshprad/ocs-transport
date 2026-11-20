@@ -94,6 +94,14 @@ case rejects WRITE submissions on multiple queues. The requester finds
 an eligible queue in the same poll, then uses a different queue after
 the receiver discards one packet. The receiver checks both rail indices,
 the retransmit bit, the WRITEIMM completion, and the full buffer.
+The mapped EV cases use four EV entries on two rails and deny one entry
+without disabling its rail. The receiver observes the three eligible EVs
+in WRITE packets and reliability probes on their assigned ports, then
+verifies payload and completion. Coverage includes explicit, generated,
+and AUTO UDP profiles and explicit SRv6 destinations. The SRv6 fixture
+also checks that SACK replies reflect each probe's entropy. The store
+suite verifies legacy snapshots, persistence of the port mapping, and
+rejection of a mapping change while the profile is ONLINE.
 The controller test generates eight EVs, grows the offline profile to
 32 entries, then shrinks it to four. Each size is brought online and
 queried to check the EV value and port order. The counted connectionless

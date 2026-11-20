@@ -715,6 +715,25 @@ static void test_ev_event_masks(const struct mrc_ctl_store *store)
     assert(mrc_ctl_store_configure(store, id, &config) == 0);
     expect_ev_snapshot_version(store, 6);
     assert(mrc_ctl_store_set_state(store, id, MRC_CTL_STORE_ONLINE) == 0);
+
+    const uint64_t mapped_id = id + 1;
+    struct mrc_ctl_store_config mapped = explicit_config();
+    assert(mrc_ctl_store_create(store, mapped_id) == 0);
+    mapped.ports[1] = MRC_EV_MAX_PATHS + 1;
+    assert(mrc_ctl_store_configure(store, mapped_id, &mapped) == -EINVAL);
+    mapped.ports[1] = 1;
+    assert(mrc_ctl_store_configure(store, mapped_id, &mapped) == 0);
+    expect_ev_snapshot_version(store, 7);
+    assert(mrc_ctl_store_set_state(store, mapped_id, MRC_CTL_STORE_ONLINE) == 0);
+    struct mrc_ctl_store_profile mapping;
+    assert(mrc_ctl_store_get(store, mapped_id, &mapping) == 0);
+    assert(mrc_ctl_store_ev_port(&mapping.config, 0) == 1 && mrc_ctl_store_ev_port(&mapping.config, 1) == 1);
+    mapping.config.ports[1] = 0;
+    assert(mrc_ctl_store_edit(store, mapped_id, replace_profile, &mapping) == -EBUSY);
+    assert(mrc_ctl_store_update_denied(store, mapped_id, 2, 0) == 0);
+    assert(mrc_ctl_store_get(store, mapped_id, &mapping) == 0 && mapping.config.denied == 2 &&
+           mrc_ctl_store_ev_port(&mapping.config, 1) == 1);
+
     struct mrc_ctl_store_ref lease = MRC_CTL_STORE_REF_INITIALIZER;
     struct mrc_ctl_store_profile saved;
     assert(mrc_ctl_store_acquire(store, id, &lease, &saved) == 0);
@@ -726,6 +745,9 @@ static void test_ev_event_masks(const struct mrc_ctl_store *store)
     assert(saved.config.denied == 1 && saved.config.event_mask == both);
     mrc_ctl_store_release(&lease);
 
+    assert(mrc_ctl_store_set_state(store, mapped_id, MRC_CTL_STORE_OFFLINE) == 0);
+    assert(mrc_ctl_store_remove(store, mapped_id) == 0);
+    expect_ev_snapshot_version(store, 6);
     assert(mrc_ctl_store_set_state(store, id, MRC_CTL_STORE_OFFLINE) == 0);
     config.event_mask = 0;
     assert(mrc_ctl_store_configure(store, id, &config) == 0);

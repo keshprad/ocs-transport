@@ -46,7 +46,7 @@ enum retry_wait {
 struct send_record {
     uint64_t retry_deadline;
     uint32_t retries_used;
-    unsigned int path;
+    unsigned int ev;
     bool fast_retransmitted;
     bool nacked;
     enum retry_wait retry_wait;
@@ -79,7 +79,7 @@ struct mrc_requester {
     int event_fd;
     bool event_dropped;
     int result;
-    uint32_t initial_probe_paths;
+    uint32_t initial_probes;
     struct mrc_cc cc;
     struct mrc_endpoint_node local_node;
     struct mrc_endpoint_node *node;
@@ -231,63 +231,77 @@ bool mrc_endpoint_apply_ev_profile(struct mrc_endpoint_config *config)
 {
     const struct mrc_ctl_store_config *profile = &config->profile.config;
     const unsigned int paths = mrc_endpoint_path_count(config);
-    if (paths > MRC_EV_MAX_PATHS || profile->count != paths ||
+    bool srv6 = mrc_ctl_store_format_is_srv6(profile->format);
+    if (paths > MRC_EV_MAX_PATHS || !profile->count || profile->count > MRC_EV_MAX_PATHS ||
+        (srv6 && (!config->sender || !config->srv6 || profile->mode == MRC_CTL_STORE_AUTO)) ||
         (profile->format == MRC_CTL_STORE_FORMAT_STEV && config->ip_version != MRC_WIRE_IP6))
         return false;
-    if (profile->mode == MRC_CTL_STORE_AUTO)
-        return !mrc_ctl_store_format_is_srv6(profile->format);
-    if (mrc_ctl_store_format_is_srv6(profile->format)) {
-        if (!config->sender || !config->srv6)
+    for (unsigned int ev = 0; ev < profile->count; ev++) {
+        if (mrc_ctl_store_ev_port(profile, ev) > paths)
             return false;
-        for (unsigned int path = 0; path < paths; path++) {
-            if (!mrc_ctl_store_srv6_ev_valid(profile->format, profile->srv6[path]))
+        if (srv6) {
+            if (!mrc_ctl_store_srv6_ev_valid(profile->format, profile->srv6[ev]))
                 return false;
-        }
-        for (unsigned int path = 0; path < paths; path++) {
-            struct mrc_endpoint_srv6_path *route = &config->paths[path].srv6;
-            const uint8_t *value = profile->srv6[path];
-            const uint8_t *segment = value + MRC_CTL_STORE_SRV6_SID_BYTES;
-            memcpy(route->initial_dst, value, sizeof(route->initial_dst));
-            memcpy(route->segments[0], segment, sizeof(route->segments[0]));
-            route->segment_count = profile->format == MRC_CTL_STORE_FORMAT_SRV6_SRH;
-            route->segments_left = route->segment_count &&
-                memcmp(value, segment, MRC_CTL_STORE_SRV6_SID_BYTES) != 0;
-        }
-        return true;
-    }
-    for (unsigned int path = 0; path < paths; path++) {
-        uint32_t entropy = profile->entropy[path];
-        if (!(uint16_t)entropy ||
-            ((config->ip_version != MRC_WIRE_IP6 || profile->format == MRC_CTL_STORE_FORMAT_UDP) &&
-             entropy > UINT16_MAX))
-            return false;
-        for (unsigned int previous = 0; previous < path; previous++) {
-            if (profile->entropy[previous] == entropy)
+        } else if (profile->mode != MRC_CTL_STORE_AUTO) {
+            uint32_t entropy = profile->entropy[ev];
+            if (!(uint16_t)entropy ||
+                ((config->ip_version != MRC_WIRE_IP6 || profile->format == MRC_CTL_STORE_FORMAT_UDP) &&
+                 entropy > UINT16_MAX))
                 return false;
+            for (unsigned int previous = 0; previous < ev; previous++) {
+                if (profile->entropy[previous] == entropy)
+                    return false;
+            }
         }
     }
+    memset(config->rail_evs, 0, sizeof(config->rail_evs));
+    for (unsigned int ev = 0; ev < profile->count; ev++)
+        config->rail_evs[mrc_ctl_store_ev_port(profile, ev) - 1] |= UINT32_C(1) << ev;
     return true;
 }
 
-static uint32_t path_entropy(const struct mrc_endpoint_config *transfer, unsigned int index,
-                             bool requestor)
+static unsigned int ev_rail(const struct mrc_endpoint_config *transfer, unsigned int ev)
 {
-    bool structured = transfer->ip_version == MRC_WIRE_IP6;
-    if (requestor) {
-        const struct mrc_ctl_store_config *profile = &transfer->profile.config;
-        /* An SRv6 profile selects the route; the inner entropy still
-         * carries a unique per-rail identifier for SACK/NACK reflection. */
-        if (transfer->profile_id && profile->mode != MRC_CTL_STORE_AUTO &&
-            !mrc_ctl_store_format_is_srv6(profile->format))
-            return profile->entropy[index];
-        return mrc_endpoint_default_entropy(
-            structured && profile->format != MRC_CTL_STORE_FORMAT_UDP, index);
-    }
-    uint32_t port = RESPONDER_EV_PORT + index;
-    return structured ? port | ((EV_FLOW_LABEL + index) & UINT16_MAX) << 16 : port;
+    return transfer->profile_id ? mrc_ctl_store_ev_port(&transfer->profile.config, ev) - 1 : ev;
 }
 
-static void publish_ev_transition(void *context, unsigned int path, enum mrc_ev_state state)
+static uint32_t rail_evs(const struct mrc_endpoint_config *transfer, unsigned int rail)
+{
+    return transfer->profile_id ? transfer->rail_evs[rail] : UINT32_C(1) << rail;
+}
+
+static uint32_t evs_on_rails(const struct mrc_endpoint_config *transfer, uint32_t rails)
+{
+    if (!transfer->profile_id)
+        return rails;
+    uint32_t evs = 0;
+    for (; rails; rails &= rails - 1)
+        evs |= transfer->rail_evs[__builtin_ctz(rails)];
+    return evs;
+}
+
+static uint32_t rails_of_evs(const struct mrc_endpoint_config *transfer, uint32_t evs)
+{
+    if (!transfer->profile_id)
+        return evs;
+    uint32_t rails = 0;
+    for (; evs; evs &= evs - 1)
+        rails |= UINT32_C(1) << ev_rail(transfer, (unsigned int)__builtin_ctz(evs));
+    return rails;
+}
+
+static uint32_t request_entropy(const struct mrc_endpoint_config *transfer, unsigned int ev)
+{
+    const struct mrc_ctl_store_config *profile = &transfer->profile.config;
+    /* For SRv6 the inner entropy identifies the EV in SACK/NACK feedback. */
+    if (transfer->profile_id && profile->mode != MRC_CTL_STORE_AUTO &&
+        !mrc_ctl_store_format_is_srv6(profile->format))
+        return profile->entropy[ev];
+    return mrc_endpoint_default_entropy(
+        transfer->ip_version == MRC_WIRE_IP6 && profile->format != MRC_CTL_STORE_FORMAT_UDP, ev);
+}
+
+static void publish_ev_transition(void *context, unsigned int ev, enum mrc_ev_state state)
 {
     struct mrc_requester *sender = context;
     const struct mrc_endpoint_config *transfer = &sender->transfer;
@@ -307,13 +321,13 @@ static void publish_ev_transition(void *context, unsigned int path, enum mrc_ev_
         return;
 
     struct mrc_ev_event_record event = {
-        .profile_id = transfer->profile_id, .port = (uint8_t)(path + 1),
+        .profile_id = transfer->profile_id, .port = (uint8_t)(ev_rail(transfer, ev) + 1),
         .state = event_state, .dropped = sender->event_dropped,
     };
     if (mrc_ctl_store_format_is_srv6(profile->format)) {
-        memcpy(event.value, profile->srv6[path], sizeof(event.value));
+        memcpy(event.value, profile->srv6[ev], sizeof(event.value));
     } else {
-        uint32_t value = path_entropy(transfer, path, true);
+        uint32_t value = request_entropy(transfer, ev);
         for (unsigned int i = 0; i < sizeof(value); i++)
             event.value[i] = (uint8_t)(value >> (8 * (sizeof(value) - 1 - i)));
     }
@@ -337,8 +351,9 @@ static uint8_t packet_ecn(const struct mrc_wire_packet *packet)
     return packet->ip_version == MRC_WIRE_IP6 ? packet->ipv6.ecn : packet->ipv4.ecn;
 }
 
-struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config *transfer,
-                                               unsigned int index, uint8_t opcode, uint32_t psn)
+static struct mrc_wire_packet packet_with_entropy(const struct mrc_endpoint_config *transfer,
+                                                  unsigned int index, uint8_t opcode, uint32_t psn,
+                                                  uint32_t entropy)
 {
     const struct mrc_endpoint_path *path = &transfer->paths[index];
     uint32_t dqp = transfer->sender ? transfer->responder_qpn : transfer->requestor_qpn;
@@ -353,7 +368,6 @@ struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config 
     };
 
     bool data = mrc_wire_is_write(opcode);
-    uint32_t entropy = path_entropy(transfer, index, transfer->sender);
     uint8_t dscp = data || opcode == MRC_RELIABILITY_PROBE ? transfer->data_dscp : MRC_ENDPOINT_CONTROL_DSCP;
     uint8_t ecn = data ? 2 : 0;
     if (transfer->ip_version == MRC_WIRE_IP6) {
@@ -377,7 +391,23 @@ struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config 
     return packet;
 }
 
-static size_t simulate_trim(const struct mrc_endpoint_config *transfer, unsigned int path, uint8_t *frame)
+struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config *transfer,
+                                               unsigned int path, uint8_t opcode, uint32_t psn)
+{
+    bool structured = transfer->ip_version == MRC_WIRE_IP6;
+    uint32_t entropy = RESPONDER_EV_PORT + path;
+    if (structured)
+        entropy |= ((EV_FLOW_LABEL + path) & UINT16_MAX) << 16;
+    if (transfer->sender) {
+        uint32_t evs = rail_evs(transfer, path);
+        entropy = evs ? request_entropy(transfer, (unsigned int)__builtin_ctz(evs)) :
+                        mrc_endpoint_default_entropy(structured, path);
+    }
+    return packet_with_entropy(transfer, path, opcode, psn, entropy);
+}
+
+static size_t simulate_trim(const struct mrc_endpoint_config *transfer,
+                            const struct mrc_endpoint_srv6_path *route, uint8_t *frame)
 {
     /* Preserve the nominal UDP length but truncate the body before the RETH. */
     uint8_t *ip = frame + RTE_ETHER_HDR_LEN;
@@ -392,7 +422,7 @@ static size_t simulate_trim(const struct mrc_endpoint_config *transfer, unsigned
         if (transfer->srv6) {
             outer_payload += transfer->ip_version == MRC_WIRE_IP6 ?
                 sizeof(struct rte_ipv6_hdr) : sizeof(struct rte_ipv4_hdr);
-            if (transfer->paths[path].srv6.segment_count)
+            if (route->segment_count)
                 outer_payload += SINGLE_SEGMENT_SRH_LEN;
         }
         header.payload_len = rte_cpu_to_be_16((uint16_t)outer_payload);
@@ -412,7 +442,8 @@ static size_t simulate_trim(const struct mrc_endpoint_config *transfer, unsigned
 }
 
 static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned int path,
-                           const struct mrc_wire_packet *packet, bool inject_trim)
+                           const struct mrc_wire_packet *packet, bool inject_trim,
+                           const struct mrc_endpoint_srv6_path *selected)
 {
     struct rte_mbuf *mbuf = rte_pktmbuf_alloc(transfer->pool);
     if (!mbuf)
@@ -422,7 +453,6 @@ static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned 
     size_t capacity = rte_pktmbuf_tailroom(mbuf);
     int result = mrc_wire_encode(frame, capacity, packet, &length);
     if (!result && transfer->srv6) {
-        const struct mrc_endpoint_srv6_path *selected = &transfer->paths[path].srv6;
         bool ipv6 = packet->ip_version == MRC_WIRE_IP6;
         struct mrc_wire_srv6_tx route = {
             .flow_label = ipv6 ? packet->ipv6.flow_label : 0,
@@ -440,7 +470,7 @@ static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned 
         return false;
     }
     if (inject_trim)
-        length = simulate_trim(transfer, path, frame);
+        length = simulate_trim(transfer, selected, frame);
     if (!rte_pktmbuf_append(mbuf, (uint16_t)length)) {
         rte_pktmbuf_free(mbuf);
         return false;
@@ -448,10 +478,33 @@ static bool transmit_frame(const struct mrc_endpoint_config *transfer, unsigned 
     return mrc_dpdk_transmit(transfer->paths[path].port, mbuf);
 }
 
+static bool transmit_ev(const struct mrc_endpoint_config *transfer, unsigned int path, unsigned int ev,
+                        const struct mrc_wire_packet *packet, bool inject_trim)
+{
+    const struct mrc_endpoint_srv6_path *base = &transfer->paths[path].srv6;
+    const struct mrc_ctl_store_config *profile = &transfer->profile.config;
+    if (!transfer->srv6 || !mrc_ctl_store_format_is_srv6(profile->format))
+        return transmit_frame(transfer, path, packet, inject_trim, base);
+
+    struct mrc_endpoint_srv6_path route = *base;
+    const uint8_t *value = profile->srv6[ev];
+    memcpy(route.initial_dst, value, sizeof(route.initial_dst));
+    memcpy(route.segments[0], value + MRC_CTL_STORE_SRV6_SID_BYTES, sizeof(route.segments[0]));
+    route.segment_count = profile->format == MRC_CTL_STORE_FORMAT_SRV6_SRH;
+    route.segments_left = route.segment_count &&
+        memcmp(route.initial_dst, route.segments[0], sizeof(route.initial_dst)) != 0;
+    return transmit_frame(transfer, path, packet, inject_trim, &route);
+}
+
 bool mrc_endpoint_transmit(const struct mrc_endpoint_config *transfer, unsigned int path,
                            const struct mrc_wire_packet *packet)
 {
-    return transmit_frame(transfer, path, packet, false);
+    if (transfer->sender && transfer->profile_id) {
+        uint32_t evs = rail_evs(transfer, path);
+        if (evs)
+            return transmit_ev(transfer, path, (unsigned int)__builtin_ctz(evs), packet, false);
+    }
+    return transmit_frame(transfer, path, packet, false, &transfer->paths[path].srv6);
 }
 
 static const uint8_t *read_frame(const struct rte_mbuf *mbuf,
@@ -655,10 +708,10 @@ bool mrc_endpoint_receive_op(const struct mrc_endpoint_config *transfer, struct 
     return true;
 }
 
-static uint32_t available_paths(const struct mrc_requester *sender, uint64_t now)
+static uint32_t available_rails(const struct mrc_requester *sender, uint64_t now)
 {
     const struct mrc_endpoint_node *node = sender->node;
-    uint32_t local = mrc_endpoint_path_mask(sender->ev.count) & ~node->local_down;
+    uint32_t local = mrc_endpoint_path_mask(mrc_endpoint_path_count(&sender->transfer)) & ~node->local_down;
     if (now < node->peer_valid_until)
         return local & node->peer_ports;
     return local;
@@ -673,11 +726,11 @@ static bool blackholed(const struct mrc_endpoint_config *transfer, const struct 
             sender->scheduled_packets < transfer->restore_after);
 }
 
-static int reflected_path(const struct mrc_endpoint_config *transfer, uint32_t entropy)
+static int reflected_ev(const struct mrc_requester *sender, uint32_t entropy)
 {
-    for (unsigned int path = 0; path < mrc_endpoint_path_count(transfer); path++) {
-        if (entropy == path_entropy(transfer, path, true))
-            return (int)path;
+    for (unsigned int ev = 0; ev < sender->ev.count; ev++) {
+        if (entropy == request_entropy(&sender->transfer, ev))
+            return (int)ev;
     }
     return -1;
 }
@@ -695,7 +748,7 @@ static enum mrc_ev_feedback ev_mark(uint8_t mark)
 }
 
 static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
-                       struct mrc_endpoint_counters *counts, unsigned int path, uint32_t index,
+                       struct mrc_endpoint_counters *counts, unsigned int ev, uint32_t index,
                        bool retry)
 {
     uint32_t wr = request_index(transfer, index);
@@ -708,7 +761,9 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
         return -EPROTO;
 
     uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
-    struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, expected_opcode(work, index), psn);
+    unsigned int path = ev_rail(transfer, ev);
+    struct mrc_wire_packet packet = packet_with_entropy(transfer, path, expected_opcode(work, index),
+                                                       psn, request_entropy(transfer, ev));
     uint16_t pmtu = endpoint_pmtu(transfer);
     uint32_t length = length_at(work, index, pmtu);
     uint32_t nominal_bytes = nominal_size(packet.bth.opcode, length, false);
@@ -747,7 +802,7 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
             return -EPROTO;
         bool inject_trim = path == 1 && transfer->trim_after != UINT32_MAX &&
                            sender->scheduled_packets >= transfer->trim_after;
-        if (!transmit_frame(transfer, path, &packet, inject_trim))
+        if (!transmit_ev(transfer, path, ev, &packet, inject_trim))
             return -EAGAIN;
         counts->trimmed += inject_trim;
     }
@@ -762,23 +817,26 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     return 0;
 }
 
-static int send_on_available_rail(struct mrc_requester *sender, uint32_t index, bool retry,
-                                   uint32_t avoid, uint64_t now, uint32_t *busy_rails)
+static int send_on_available_ev(struct mrc_requester *sender, uint32_t index, bool retry,
+                                 uint32_t avoid, uint64_t now, uint32_t *busy_rails)
 {
-    uint32_t available = available_paths(sender, now);
+    const struct mrc_endpoint_config *transfer = &sender->transfer;
+    uint32_t available = evs_on_rails(transfer, available_rails(sender, now) & ~*busy_rails);
     int picked;
-    while ((picked = mrc_ev_pick(&sender->ev, available & ~*busy_rails, avoid, now)) >= 0) {
-        unsigned int path = (unsigned int)picked;
-        int result = send_write(&sender->transfer, sender, sender->counts, path, index, retry);
+    while ((picked = mrc_ev_pick(&sender->ev, available, avoid, now)) >= 0) {
+        unsigned int ev = (unsigned int)picked;
+        int result = send_write(transfer, sender, sender->counts, ev, index, retry);
         if (result == -EAGAIN) {
             /* Retry this queue on the next poll. Local TX backpressure
              * provides no evidence that the EV cannot reach the peer. */
+            unsigned int path = ev_rail(transfer, ev);
             *busy_rails |= UINT32_C(1) << path;
+            available &= ~rail_evs(transfer, path);
             continue;
         }
         if (result)
             return result;
-        mrc_ev_sent(&sender->ev, path);
+        mrc_ev_sent(&sender->ev, ev);
         return picked;
     }
     return -EAGAIN;
@@ -818,7 +876,7 @@ static int fail_retry(const struct mrc_endpoint_config *transfer, struct mrc_req
     uint32_t first = (uint32_t)mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
     fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
                     " (first segment %u, next %u, last transmit path %u)\n",
-            psn, first, sender->next, sender->metadata[index % WINDOW].path);
+            psn, first, sender->next, ev_rail(transfer, sender->metadata[index % WINDOW].ev));
     return fail_send(transfer, sender, index, MRC_PROVIDER_WC_RETRY_EXCEEDED, -ETIMEDOUT);
 }
 
@@ -838,11 +896,11 @@ static enum mrc_provider_wc_status aeth_error_status(uint8_t syndrome)
 
 static int match_probe(const struct mrc_requester *sender, const struct mrc_wire_sack *sack)
 {
-    for (unsigned int path = 0; path < sender->ev.count; path++) {
-        const struct outstanding_probe *probe = &sender->probes[path];
+    for (unsigned int ev = 0; ev < sender->ev.count; ev++) {
+        const struct outstanding_probe *probe = &sender->probes[ev];
         if (probe->pending && probe->id == (uint16_t)sack->ack_psn_offset &&
             probe->entropy == sack->entropy)
-            return (int)path;
+            return (int)ev;
     }
     return -1;
 }
@@ -890,10 +948,10 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         if (wire->spdcid != (uint16_t)transfer->requestor_qpn || wire->dpdcid != (uint16_t)transfer->responder_qpn ||
             (!wire->probe_response && packet->bth.psn != wire->cack_psn))
             return 0;
-        int probe_path = -1;
+        int probe_ev = -1;
         if (wire->probe_response) {
-            probe_path = match_probe(sender, wire);
-            if (probe_path < 0)
+            probe_ev = match_probe(sender, wire);
+            if (probe_ev < 0)
                 return 0;
         }
         struct mrc_sack sack = {
@@ -913,21 +971,21 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         counts->sacks++;
         struct mrc_cc_tx_sample sample;
         struct mrc_cc_tx_sample *rtt_sample = NULL;
-        if (probe_path >= 0) {
-            struct outstanding_probe *probe = &sender->probes[probe_path];
+        if (probe_ev >= 0) {
+            struct outstanding_probe *probe = &sender->probes[probe_ev];
             sample = (struct mrc_cc_tx_sample){
                 .sent_at_ns = cycles_to_ns(transfer, probe->sent_at),
                 .arrived_at_ns = cycles_to_ns(transfer, arrival_cycles),
                 .service_time_ns = peer_service_ns(transfer, wire->tx_timestamp),
             };
             rtt_sample = &sample;
-            mrc_ev_feedback(&sender->ev, (unsigned int)probe_path, ev_mark(wire->mark),
+            mrc_ev_feedback(&sender->ev, (unsigned int)probe_ev, ev_mark(wire->mark),
                             true, probe->sent_at, now_cycles);
             probe->pending = false;
-            sender->initial_probe_paths &= ~(UINT32_C(1) << probe_path);
+            sender->initial_probes &= ~(UINT32_C(1) << probe_ev);
             counts->probe_replies++;
         } else {
-            int ev = reflected_path(transfer, wire->entropy);
+            int ev = reflected_ev(sender, wire->entropy);
             if (ev >= 0)
                 mrc_ev_feedback(&sender->ev, (unsigned int)ev, ev_mark(wire->mark),
                                 false, 0, now_cycles);
@@ -995,12 +1053,12 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
             /* Use the reflected transmit entropy. Successive retries share
              * the RTX bit and their feedback may arrive on either rail. */
             if (record->nacked || packet->bth.retransmit != (state->retransmissions != 0) ||
-                nack->entropy != path_entropy(transfer, record->path, true))
+                nack->entropy != request_entropy(transfer, record->ev))
                 return 0;
             bool trimmed = nack->reason == MRC_NACK_TRIMMED ||
                            nack->reason == MRC_NACK_TRIMMED_LASTHOP;
             if (nack->reason == MRC_NACK_TRIMMED)
-                mrc_ev_feedback(&sender->ev, record->path, MRC_EV_SKIP_ONCE,
+                mrc_ev_feedback(&sender->ev, record->ev, MRC_EV_SKIP_ONCE,
                                 false, 0, now_cycles);
             if (record->counted_inflight) {
                 struct mrc_cc_tx_sample sample = {
@@ -1048,7 +1106,7 @@ static int receive_control(const struct mrc_endpoint_config *transfer, struct mr
                            struct mrc_endpoint_counters *counts)
 {
     int result = 0;
-    for (unsigned int path = 0; path < sender->ev.count; path++) {
+    for (unsigned int path = 0; path < mrc_endpoint_path_count(transfer); path++) {
         struct mrc_endpoint_rx_packet packets[BURST];
         uint16_t n = receive_burst(transfer, path, packets);
         for (uint16_t i = 0; i < n; i++) {
@@ -1120,13 +1178,13 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         uint32_t next_retry = record->retries_used + (record->retries_used < UINT32_MAX);
 
         if (!packet->received && !nacked && !waiting &&
-            packet->sent_at >= sender->ev.paths[record->path].changed_at)
-            mrc_ev_timeout(&sender->ev, record->path, now);
+            packet->sent_at >= sender->ev.paths[record->ev].changed_at)
+            mrc_ev_timeout(&sender->ev, record->ev, now);
 
-        uint32_t avoid = UINT32_C(1) << record->path;
+        uint32_t avoid = UINT32_C(1) << record->ev;
         int picked = -EAGAIN;
         if (mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
-            picked = send_on_available_rail(sender, index, true, avoid, now, busy_rails);
+            picked = send_on_available_ev(sender, index, true, avoid, now, busy_rails);
         if (picked == -EAGAIN) {
             /* Keep the retry eligible while waiting for a path or TX room.
              * An expired wait uses a retry slot without sending a packet. */
@@ -1140,7 +1198,6 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         }
         if (picked < 0)
             return picked;
-        unsigned int path = (unsigned int)picked;
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
         /* Section 7.4.4 uses the base timer for a NACK-driven transmission. */
@@ -1149,7 +1206,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
             return result;
         record->retries_used = next_retry;
         record->retry_wait = RETRY_NO_WAIT;
-        record->path = path;
+        record->ev = (unsigned int)picked;
         record->counted_inflight = true;
         record->redundant_attempt = packet->received;
         record->nacked = false;
@@ -1160,7 +1217,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
 }
 
 static bool request_probe(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
-                           struct mrc_endpoint_counters *counts, unsigned int path, uint64_t now)
+                           struct mrc_endpoint_counters *counts, unsigned int ev, uint64_t now)
 {
     uint16_t probe_id = sender->probe_id;
     bool outstanding;
@@ -1170,15 +1227,17 @@ static bool request_probe(const struct mrc_endpoint_config *transfer, struct mrc
         for (unsigned int i = 0; i < sender->ev.count; i++)
             outstanding |= sender->probes[i].pending && sender->probes[i].id == probe_id;
     } while (outstanding);
-    struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, MRC_RELIABILITY_PROBE, 0);
+    unsigned int path = ev_rail(transfer, ev);
+    struct mrc_wire_packet packet = packet_with_entropy(transfer, path, MRC_RELIABILITY_PROBE,
+                                                       0, request_entropy(transfer, ev));
     packet.body.probe = (struct mrc_wire_probe){
         .probe_id = probe_id, .spdcid = (uint16_t)transfer->requestor_qpn,
         .dpdcid = (uint16_t)transfer->responder_qpn,
     };
-    if (!blackholed(transfer, sender, path) && !mrc_endpoint_transmit(transfer, path, &packet))
+    if (!blackholed(transfer, sender, path) && !transmit_ev(transfer, path, ev, &packet, false))
         return false;
     sender->probe_id = probe_id;
-    sender->probes[path] = (struct outstanding_probe){
+    sender->probes[ev] = (struct outstanding_probe){
         .sent_at = now, .entropy = reflect_entropy(&packet), .id = probe_id, .pending = true,
     };
     counts->probe_requests++;
@@ -1189,11 +1248,11 @@ static bool request_probe(const struct mrc_endpoint_config *transfer, struct mrc
 static void update_ev_denials(struct mrc_requester *sender, uint32_t current, uint32_t updated,
                               uint64_t now)
 {
-    for (unsigned int path = 0; path < sender->ev.count; path++) {
-        uint32_t bit = UINT32_C(1) << path;
+    for (unsigned int ev = 0; ev < sender->ev.count; ev++) {
+        uint32_t bit = UINT32_C(1) << ev;
         if ((current ^ updated) & bit) {
-            mrc_ev_deny(&sender->ev, path, (updated & bit) != 0, now);
-            sender->probes[path].pending = false;
+            mrc_ev_deny(&sender->ev, ev, (updated & bit) != 0, now);
+            sender->probes[ev].pending = false;
         }
     }
 }
@@ -1640,15 +1699,16 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     struct mrc_endpoint_config *transfer = &sender->transfer;
     transfer->sender = true;
     transfer->work = NULL;
-    const unsigned int paths = mrc_endpoint_path_count(transfer);
-    sender->initial_probe_paths = mrc_endpoint_path_mask(paths);
+    const unsigned int ev_count = transfer->profile_id ? transfer->profile.config.count :
+                                  mrc_endpoint_path_count(transfer);
+    sender->initial_probes = mrc_endpoint_path_mask(ev_count);
     uint32_t nominal_mtu = mrc_endpoint_nominal_mtu(endpoint_pmtu(transfer));
     if (!mrc_tx_init(&sender->qp, transfer->initial_psn, transfer->window, sender->slots) ||
         !mrc_cc_init(&sender->cc, nominal_mtu, INITIAL_CWND_PACKETS * nominal_mtu, 0, TARGET_QUEUE_NS) ||
         (transfer->cc_profile.id &&
          !mrc_cc_apply_config(&sender->cc, transfer->cc_profile.configured ?
                               &transfer->cc_profile.config : NULL)) ||
-        !mrc_ev_init(&sender->ev, paths, transfer->profile.config.min_active,
+        !mrc_ev_init(&sender->ev, ev_count, transfer->profile.config.min_active,
                      transfer->initial_rto / 8 + 1, transfer->initial_rto / 2 + 1) ||
         !mrc_mpr_init(&sender->mpr, transfer->dynamic_mpr, transfer->mpr_max)) {
         result = -EINVAL;
@@ -1671,7 +1731,7 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     }
 
     sender->last_progress = rte_get_timer_cycles();
-    sender->denied = transfer->ev_deny_mask | transfer->profile.config.denied;
+    sender->denied = evs_on_rails(transfer, transfer->ev_deny_mask) | transfer->profile.config.denied;
     update_ev_denials(sender, 0, sender->denied, sender->last_progress);
     sender->profile_period = mrc_endpoint_cycles(transfer, UINT64_C(10000000));
     sender->next_profile_check = sender->last_progress + sender->profile_period;
@@ -1721,7 +1781,7 @@ static int requester_step(struct mrc_requester *sender)
             return result;
         }
         now = rte_get_timer_cycles();
-        uint32_t updated = transfer->ev_deny_mask | profile.config.denied;
+        uint32_t updated = evs_on_rails(transfer, transfer->ev_deny_mask) | profile.config.denied;
         if (updated != sender->denied) {
             update_ev_denials(sender, sender->denied, updated, now);
             sender->denied = updated;
@@ -1738,8 +1798,8 @@ static int requester_step(struct mrc_requester *sender)
         counts->ev_skipped = sender->ev.skipped;
         counts->ev_failed = sender->ev.failed;
         counts->ev_recovered = sender->ev.recovered;
-        counts->ev_failed_mask = sender->ev.failed_mask;
-        counts->ev_recovered_mask = sender->ev.recovered_mask;
+        counts->ev_failed_mask = rails_of_evs(transfer, sender->ev.failed_mask);
+        counts->ev_recovered_mask = rails_of_evs(transfer, sender->ev.recovered_mask);
         if (!transfer->continuous_send)
             return 1;
         if (transfer->packets) {
@@ -1766,19 +1826,19 @@ static int requester_step(struct mrc_requester *sender)
     bool probe_timer_due = now >= sender->next_probe;
     bool window_blocked = probe_timer_due && sender->next < transfer->packets &&
         !mrc_cc_can_send(&sender->cc, nominal_at(transfer, sender->next));
-    bool general_probe = probe_timer_due && (sender->initial_probe_paths || window_blocked);
+    bool general_probe = probe_timer_due && (sender->initial_probes || window_blocked);
     bool sent_probe = false;
-    for (unsigned int path = 0; path < sender->ev.count; path++) {
-        uint32_t bit = UINT32_C(1) << path;
-        if (sender->node->local_down & bit)
+    for (unsigned int ev = 0; ev < sender->ev.count; ev++) {
+        uint32_t bit = UINT32_C(1) << ev;
+        if (sender->node->local_down & (UINT32_C(1) << ev_rail(transfer, ev)))
             continue;
-        bool due = mrc_ev_probe_due(&sender->ev, path, now);
-        bool initial = (sender->initial_probe_paths & bit) != 0;
+        bool due = mrc_ev_probe_due(&sender->ev, ev, now);
+        bool initial = (sender->initial_probes & bit) != 0;
         if (due || (general_probe && (initial || window_blocked) &&
-                    mrc_ev_probe_allowed(&sender->ev, path) &&
-                    sender->ev.paths[path].state != MRC_EV_ASSUMED_BAD)) {
-            sent_probe |= request_probe(transfer, sender, counts, path, now);
-            mrc_ev_probe_attempt(&sender->ev, path, now);
+                    mrc_ev_probe_allowed(&sender->ev, ev) &&
+                    sender->ev.paths[ev].state != MRC_EV_ASSUMED_BAD)) {
+            sent_probe |= request_probe(transfer, sender, counts, ev, now);
+            mrc_ev_probe_attempt(&sender->ev, ev, now);
         }
     }
     if (general_probe)
@@ -1795,7 +1855,7 @@ static int requester_step(struct mrc_requester *sender)
         if ((work->with_immediate && wimm_inflight >= transfer->max_wimm_inflight) ||
             !mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
             break;
-        int picked = send_on_available_rail(sender, index, false, 0, now, &busy_rails);
+        int picked = send_on_available_ev(sender, index, false, 0, now, &busy_rails);
         if (picked == -EAGAIN)
             break;
         if (picked < 0)
@@ -1804,7 +1864,7 @@ static int requester_step(struct mrc_requester *sender)
             return -EPROTO;
         sender->metadata[index % WINDOW] = (struct send_record){
             .retry_deadline = now + transfer->initial_rto,
-            .path = (unsigned int)picked, .counted_inflight = true,
+            .ev = (unsigned int)picked, .counted_inflight = true,
         };
         sender->next++;
         sender->scheduled_packets++;

@@ -33,6 +33,9 @@ enum {
     GEN_CUSTOM_SRV6_PROFILE_ID = 18,
     EXP_CUSTOM_UDP_PROFILE_ID = 19,
     EVENT_PROFILE_ID = 20,
+    MAPPED_PROFILE_ID = 21,
+    MAPPED_EV_COUNT = 4,
+    MAPPED_EV_BASE = 0xc610,
     CUSTOM_STEV_FORMAT_ID = 100,
     CUSTOM_SRV6_FORMAT_ID = 101,
     CUSTOM_UDP_FORMAT_ID = 102,
@@ -377,6 +380,66 @@ static enum mrc_ctl_ev_state get_ev_state(struct mrc_context *context, uint64_t 
     };
     assert(mrc_ctl_query_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_EV_OP) == 0);
     return entry.state;
+}
+
+static struct mrc_ctl_ev mapped_value(uint8_t port, unsigned int entry, uint32_t first, bool srv6)
+{
+    if (!srv6)
+        return ev(port, first + entry);
+    return (struct mrc_ctl_ev){
+        .port = port, .val = {0x20, 0x01, 0x0d, 0xb8, 0, 1, [15] = 1 + entry},
+    };
+}
+
+static void seed_mapped_profile(struct mrc_context *controller, enum mrc_ctl_ev_mode mode, bool srv6)
+{
+    const uint8_t ports[MAPPED_EV_COUNT] = {2, 1, 2, 1};
+    struct mrc_ctl_ev_field field = {
+        .width = 16, .init_val = MAPPED_EV_BASE, .max_val = MAPPED_EV_COUNT - 1, .mask = 3,
+    };
+    struct mrc_ctl_ev_profile_attr attr = {
+        .profile_state = MRC_CTL_PROFILE_OFFLINE, .ev_mode = mode, .ev_count = MAPPED_EV_COUNT,
+        .ev_fmt_profile_id = srv6 ? MRC_DPDK_EV_FORMAT_SRV6 : MRC_DPDK_EV_FORMAT_UDP,
+        .ev_fields_op = { .op = MRC_CTL_EV_FIELDS_OP_MODIFY_FIELDS, .field_count = 1, .fields = &field },
+    };
+    unsigned int mask = MRC_CTL_EV_PROFILE_STATE | MRC_CTL_EV_PROFILE_MODE |
+                        MRC_CTL_EV_PROFILE_COUNT | MRC_CTL_EV_PROFILE_FMT_ID;
+    if (mode != MRC_CTL_EV_MODE_EXP) {
+        memcpy(attr.vendor_cfg, ports, sizeof(ports));
+        mask |= MRC_CTL_EV_PROFILE_VENDOR_CFG;
+    }
+    if (mode == MRC_CTL_EV_MODE_GEN)
+        mask |= MRC_CTL_EV_PROFILE_EV_FIELDS_OP;
+    assert(mrc_ctl_modify_ev_profile(controller, MAPPED_PROFILE_ID, &attr, mask) == 0);
+    if (mode == MRC_CTL_EV_MODE_EXP) {
+        struct mrc_ctl_ev_op_entry entries[MAPPED_EV_COUNT];
+        for (unsigned int i = 0; i < MAPPED_EV_COUNT; i++)
+            entries[i] = (struct mrc_ctl_ev_op_entry){
+                .ev = ev((uint8_t)(i + 1), 0), .ev_new = mapped_value(ports[i], i, MAPPED_EV_BASE, srv6),
+                .state = MRC_CTL_EV_GOOD,
+            };
+        assert(replace_evs(controller, MAPPED_PROFILE_ID, entries, MAPPED_EV_COUNT) == 0);
+    }
+    assert(set_profile_state(controller, MAPPED_PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
+    assert(mrc_ctl_modify_ev_profile(controller, MAPPED_PROFILE_ID, &attr,
+                                    MRC_CTL_EV_PROFILE_VENDOR_CFG) == -1 && errno == EBUSY);
+
+    const uint32_t first = mode == MRC_CTL_EV_MODE_AUTO ? 0xc000 : MAPPED_EV_BASE;
+    set_ev_state(controller, MAPPED_PROFILE_ID, mapped_value(ports[2], 2, first, srv6), MRC_CTL_EV_DENIED);
+    assert(get_ev_state(controller, MAPPED_PROFILE_ID, mapped_value(ports[0], 0, first, srv6)) == MRC_CTL_EV_GOOD);
+    struct mrc_ctl_ev_op_entry entries[MAPPED_EV_COUNT];
+    attr = (struct mrc_ctl_ev_profile_attr){
+        .ev_op = { .op = MRC_CTL_EV_OP_QUERY_EV_ARRAY, .entries = entries, .entry_count = MAPPED_EV_COUNT },
+    };
+    assert(mrc_ctl_query_ev_profile(controller, MAPPED_PROFILE_ID, &attr, MRC_CTL_EV_PROFILE_EV_OP |
+                                    MRC_CTL_EV_PROFILE_VENDOR_CFG) == 0);
+    assert(attr.ev_op.entry_count == MAPPED_EV_COUNT && memcmp(attr.vendor_cfg, ports, sizeof(ports)) == 0);
+    for (unsigned int i = 0; i < MAPPED_EV_COUNT; i++) {
+        const struct mrc_ctl_ev expected = mapped_value(ports[i], i, first, srv6);
+        assert(entries[i].ev.port == ports[i] && !memcmp(entries[i].ev.val, expected.val, sizeof(expected.val)));
+        assert(entries[i].state == (i == 2 ? MRC_CTL_EV_DENIED : MRC_CTL_EV_GOOD));
+    }
+    printf("%u\n", (unsigned int)MAPPED_PROFILE_ID);
 }
 
 static void select_profile(struct mrc_qp *qp, uint64_t id)
@@ -1340,6 +1403,14 @@ int main(int argc, char **argv)
     bool seed_srv6_srh = argc == 3 && strcmp(argv[1], "--seed-generated-srv6-srh") == 0;
     bool watch_events = argc == 3 && strcmp(argv[1], "--watch-ev-events") == 0;
     bool watch_bad = argc == 3 && strcmp(argv[1], "--watch-ev-bad") == 0;
+    bool mapped_srv6 = argc == 3 && strcmp(argv[1], "--seed-mapped-srv6") == 0;
+    enum mrc_ctl_ev_mode mapped = 0;
+    if (mapped_srv6 || (argc == 3 && strcmp(argv[1], "--seed-mapped-exp") == 0))
+        mapped = MRC_CTL_EV_MODE_EXP;
+    else if (argc == 3 && strcmp(argv[1], "--seed-mapped-gen") == 0)
+        mapped = MRC_CTL_EV_MODE_GEN;
+    else if (argc == 3 && strcmp(argv[1], "--seed-mapped-auto") == 0)
+        mapped = MRC_CTL_EV_MODE_AUTO;
     const struct generated_profile *generated = NULL;
     if (argc == 3 && strcmp(argv[1], "--seed-gen") == 0)
         generated = &generated_udp;
@@ -1348,12 +1419,12 @@ int main(int argc, char **argv)
     else if (argc == 3 && strcmp(argv[1], "--seed-gen-custom-stev") == 0)
         generated = &generated_custom_stev;
     bool fixture = seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 ||
-                   seed_srv6_srh || watch_events || watch_bad;
+                   seed_srv6_srh || watch_events || watch_bad || mapped;
     if (argc != 1 && !expect_no_cap && !fixture) {
         fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | "
                         "--seed-cc DIR | --seed-qa DIR | --seed-gen DIR | --seed-gen-stev DIR | --seed-gen-custom-stev DIR | "
                         "--seed-explicit-srv6 DIR | --unblock-explicit-srv6 DIR | --seed-generated-srv6-srh DIR | "
-                        "--watch-ev-events DIR | --watch-ev-bad DIR]\n",
+                        "--watch-ev-events DIR | --watch-ev-bad DIR | --seed-mapped-{exp,gen,auto,srv6} DIR]\n",
                         argv[0]);
         return EXIT_FAILURE;
     }
@@ -1368,6 +1439,8 @@ int main(int argc, char **argv)
             watch_ev_events(controller, argv[2], watch_bad);
         } else if (seed) {
             seed_denied_profile(controller);
+        } else if (mapped) {
+            seed_mapped_profile(controller, mapped, mapped_srv6);
         } else if (unblock) {
             assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
             set_ev_state(controller, PROFILE_ID, ev(2, SECOND_EV), MRC_CTL_EV_GOOD);

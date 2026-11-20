@@ -54,6 +54,10 @@ static void show(const struct mrc_ctl_store_profile *profile)
             printf(" ev[%u]=0x%08" PRIx32, path, config->entropy[path]);
         }
     }
+    for (unsigned int ev = 0; ev < config->count; ev++) {
+        if (config->ports[ev])
+            printf(" port[%u]=%u", ev, mrc_ctl_store_ev_port(config, ev));
+    }
     putchar('\n');
 }
 
@@ -146,7 +150,7 @@ static void usage(const char *program)
                     "  create|show|online|offline|remove ID\n"
                     "  configure ID auto COUNT MIN_ACTIVE\n"
                     "  configure ID explicit|generated MIN_ACTIVE EV [EV ...]\n"
-                    "  deny|allow ID PATH_MASK\n", program);
+                    "  deny|allow ID EV_MASK\n", program);
 }
 
 int main(int argc, char **argv)

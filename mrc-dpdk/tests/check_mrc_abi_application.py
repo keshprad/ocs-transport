@@ -127,6 +127,7 @@ def main():
                          help="Run only the shared connected P_Key Port Status case")
     focused.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
     focused.add_argument("--counted-rails-only", action="store_true", help="Run only the eight-rail QP cases")
+    focused.add_argument("--mapped-evs-only", action="store_true", help="Run only the EV-to-rail mapping cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -199,6 +200,29 @@ def main():
             require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 8193 and rx["observed_rails"] == rails,
                     f"Unexpected eight-rail QP result: {tx}, {rx}")
             print(json.dumps({"case": f"public_qp_{case}", "tx": tx, "rx": rx}))
+
+    def check_mapped_evs(controller):
+        for mode, endpoint in (("exp", "mapped_ev_udp"), ("gen", "mapped_ev_udp"),
+                               ("auto", "mapped_ev_auto"), ("srv6", "mapped_ev_srv6")):
+            with tempfile.TemporaryDirectory(prefix="mrc-abi-mapped-") as store:
+                profile_id = control(controller, f"--seed-mapped-{mode}", store)
+                require(profile_id.isdecimal() and int(profile_id) > 0,
+                        f"Invalid mapped EV profile ID: {profile_id!r}")
+                tx, rx = run_case(endpoint, store, profile_id)
+            if mode == "srv6":
+                check_srv6(tx, rx, rx_decapped=0, rx_advanced=2)
+                require(tx["probe_evs"] == rx["write_evs"] == rx["probe_evs"] == 0xB,
+                        f"Unexpected mapped SRv6 EVs: {tx}, {rx}")
+            else:
+                require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 8193
+                        and rx["observed_rails"] == 3 and rx["write_evs"] == rx["probe_evs"] == 0xB,
+                        f"Unexpected mapped {mode} EVs: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_mapped_{mode}_evs", "tx": tx, "rx": rx}))
+
+    if args.mapped_evs_only:
+        require(args.controller and args.controller.is_file(), "Supply the built --controller fixture")
+        check_mapped_evs(args.controller.resolve())
+        return
 
     if args.last_hop_trim_only or args.service_level_dscp_only:
         check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)
@@ -287,6 +311,7 @@ def main():
             check_endpoint_operations(binary, format_name)
         check_shared_port_status(binary)
         check_live_profile(binary, controller)
+        check_mapped_evs(controller)
         for mode, seed, expected in (
             ("generated_ev_udp", "--seed-gen", [0xC405, 0xC410]),
             ("generated_ev_stev", "--seed-gen-stev", [0x0A00E499, 0x0A20E499]),

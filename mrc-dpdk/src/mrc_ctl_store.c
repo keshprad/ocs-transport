@@ -18,6 +18,7 @@ enum {
     SRV6_VERSION = 4,
     CUSTOM_FORMAT_VERSION = 5,
     EV_EVENT_VERSION = 6,
+    EV_PORT_VERSION = 7,
     LEGACY_ENTRY_HEADER_SIZE = 20,
     ENTRY_HEADER_SIZE = 24,
     EV_EVENT_MASK_OFFSET = 22,
@@ -29,7 +30,8 @@ enum {
     SRV6_VALUES_OFFSET = ENTRY_SIZE + MRC_CTL_STORE_MAX_EV_FIELDS * EV_FIELD_SIZE,
     SRV6_ENTRY_SIZE = SRV6_VALUES_OFFSET + MRC_EV_MAX_PATHS * MRC_CTL_STORE_SRV6_EV_BYTES,
     CUSTOM_FORMAT_ENTRY_SIZE = SRV6_ENTRY_SIZE + 32,
-    SNAPSHOT_MAX_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * CUSTOM_FORMAT_ENTRY_SIZE,
+    EV_PORT_ENTRY_SIZE = CUSTOM_FORMAT_ENTRY_SIZE + MRC_EV_MAX_PATHS,
+    SNAPSHOT_MAX_SIZE = HEADER_SIZE + MRC_CTL_STORE_MAX_PROFILES * EV_PORT_ENTRY_SIZE,
 };
 
 /* Use the existing filename and lock inode when migrating the wire version. */
@@ -205,6 +207,9 @@ static bool config_valid(const struct mrc_ctl_store_config *config)
 
     for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
         bool populated = config->populated & (UINT32_C(1) << i);
+        if (config->ports[i] > MRC_EV_MAX_PATHS || (i >= config->count && config->ports[i]) ||
+            (config->mode == MRC_CTL_STORE_EXPLICIT && !populated && config->ports[i]))
+            return false;
         if ((srv6 || !populated) && config->entropy[i])
             return false;
         if (config->format_id && populated && !srv6 &&
@@ -236,7 +241,7 @@ static bool profile_valid(const struct mrc_ctl_store_profile *profile)
             config->populated || config->denied || config->field_count || !format_binding_valid(config))
             return false;
         for (unsigned int i = 0; i < MRC_EV_MAX_PATHS; i++) {
-            if (config->entropy[i] || !bytes_are_zero(config->srv6[i], sizeof(config->srv6[i])))
+            if (config->ports[i] || config->entropy[i] || !bytes_are_zero(config->srv6[i], sizeof(config->srv6[i])))
                 return false;
         }
         return true;
@@ -278,6 +283,7 @@ static bool same_layout(const struct mrc_ctl_store_config *previous,
            previous->count == updated->count && previous->min_active == updated->min_active &&
            previous->event_mask == updated->event_mask &&
            previous->populated == updated->populated && same_fields(previous, updated) &&
+           memcmp(previous->ports, updated->ports, sizeof(previous->ports)) == 0 &&
            memcmp(previous->entropy, updated->entropy, sizeof(previous->entropy)) == 0 &&
            memcmp(previous->srv6, updated->srv6, sizeof(previous->srv6)) == 0;
 }
@@ -329,6 +335,8 @@ static unsigned int ev_entry_size(uint8_t version)
     case CUSTOM_FORMAT_VERSION:
     case EV_EVENT_VERSION:
         return CUSTOM_FORMAT_ENTRY_SIZE;
+    case EV_PORT_VERSION:
+        return EV_PORT_ENTRY_SIZE;
     default:
         return 0;
     }
@@ -408,6 +416,8 @@ static bool decode_profile(const uint8_t *bytes, uint8_t version,
         profile->config.format_field_count = binding[8];
         memcpy(profile->config.format_widths, binding + 9, widths);
     }
+    if (version >= EV_PORT_VERSION)
+        memcpy(profile->config.ports, bytes + CUSTOM_FORMAT_ENTRY_SIZE, sizeof(profile->config.ports));
     unsigned int slots = srv6 ? MRC_CTL_STORE_MAX_EV_FIELDS : GENERATED_FIELDS_SLOTS;
     return (!fields || decode_ev_fields(bytes + ENTRY_SIZE, slots, &profile->config)) && profile_valid(profile);
 }
@@ -439,6 +449,8 @@ static void encode_profile(uint8_t *bytes, uint8_t version, const struct mrc_ctl
         binding[8] = config->format_field_count;
         memcpy(binding + 9, config->format_widths, sizeof(config->format_widths));
     }
+    if (version >= EV_PORT_VERSION)
+        memcpy(bytes + CUSTOM_FORMAT_ENTRY_SIZE, config->ports, sizeof(config->ports));
 }
 
 static int read_all(int fd, uint8_t *bytes, size_t length)
@@ -700,11 +712,13 @@ static int save_snapshot(const struct mrc_ctl_store *store, const struct transac
     uint8_t version = TYPED_VERSION;
     for (unsigned int i = 0; i < MRC_CTL_STORE_MAX_PROFILES; i++) {
         const struct mrc_ctl_store_config *config = &txn->profiles[i].config;
-        if (config->event_mask) {
-            version = EV_EVENT_VERSION;
+        if (!bytes_are_zero(config->ports, sizeof(config->ports))) {
+            version = EV_PORT_VERSION;
             break;
         }
-        if (config->format_id)
+        if (config->event_mask)
+            version = EV_EVENT_VERSION;
+        else if (config->format_id && version < CUSTOM_FORMAT_VERSION)
             version = CUSTOM_FORMAT_VERSION;
         else if (mrc_ctl_store_format_is_srv6(config->format) && version < SRV6_VERSION)
             version = SRV6_VERSION;

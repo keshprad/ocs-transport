@@ -288,12 +288,22 @@ position corresponds to its Table 7-3 reason code.
 
 The OCP controller ABI exposes device capabilities, built-in format queries,
 and profile configuration through `mrc_ctl.h`. It accepts 1 to 32 EVs
-per profile in AUTO, explicit, and generated modes. The attached QP uses
-one EV per configured rail. Select `MRC_DPDK_EV_FORMAT_UDP` for
+per profile in AUTO, explicit, and generated modes. Multiple EVs can
+share one rail. Select `MRC_DPDK_EV_FORMAT_UDP` for
 a UDP source-port EV or `MRC_DPDK_EV_FORMAT_STEV` for an IPv6 flow label and
 UDP source-port EV. The first four bytes of a controller EV hold a big-endian
 value. The remaining bytes are zero. The one-based port numbers follow
 the attached DPDK route's rail order.
+
+Each slot defaults to the rail with the same one-based index. To place
+an explicit EV on a different rail, set `ev_new.port` in
+`MRC_CTL_EV_OP_REPLACE_EV`. An empty slot is selected by its default
+port number and an all-zero value. For AUTO or generated profiles, set
+`MRC_CTL_EV_PROFILE_VENDOR_CFG` while configuring the profile OFFLINE.
+Use one byte per EV in `vendor_cfg`, with zero selecting the default
+rail for that entry, and zero-fill the remainder. Querying the EV array
+or vendor configuration returns the effective one-based ports. Include
+every mapped port when attaching the QP.
 
 Select `MRC_DPDK_EV_FORMAT_SRV6` for a uSID destination in the first 16
 bytes, or `MRC_DPDK_EV_FORMAT_SRV6_SRH` for a uSID destination followed
@@ -308,7 +318,8 @@ mutate profiles. For separate service accounts, use a controller-owned
 directory with mode `02750` and the application group. Profile snapshots
 and a lock with that group get mode `0640`. Application processes take
 read-only leases. Keep the directory and lock inode stable. The store
-reads legacy snapshots and updates them to the typed format on a write.
+reads legacy snapshots and persists any nondefault port assignments
+with the EV profile.
 
 Configure the profile OFFLINE, populate the explicit EVs, and set it
 ONLINE. In the application, set `MRC_QP_EV_PROFILE_ID` when bringing the
@@ -327,15 +338,14 @@ Use a zero mask and zero bounds for a fixed field.
 
 The provider fills the profile with valid combinations in increasing
 compact-value order, varying the UDP field fastest and skipping UDP
-source port zero. It assigns one EV to each rail and persists both the
-field definitions and the generated values. Query fields or the EV array
+source port zero. It persists the field definitions and generated values.
+Query fields or the EV array
 before setting the profile ONLINE.
 
 Generated SRv6 uses eight or sixteen 16-bit slots in wire order, with
 the last field varying fastest. Fields narrower than their slot are
 zero-padded on the left. The provider skips unspecified and multicast
-destinations and SRH segments. It assigns distinct usable values in
-rail order.
+destinations and SRH segments.
 
 To define a different field layout, use `mrc_ctl_modify_ev_fmt_profile()`
 with a format ID above 4. Move the format to OFFLINE with its UDP, STEV,
@@ -385,7 +395,7 @@ mkdir -m 700 ./ev-profiles
 ```
 
 Pass `--profile-dir ./ev-profiles --profile-id 42` to `mrc_write tx`.
-The CLI's numeric profiles use two distinct EVs in path order. For IPv4,
+The CLI's numeric profile creation assigns distinct EVs in rail order. For IPv4,
 an EV is a nonzero UDP source port. For IPv6, its upper 16 bits give the
 lower 16 bits of the flow label and its lower 16 bits give the UDP source port.
 `configure ID auto 2 MIN_ACTIVE` uses the benchmark's default EVs.
@@ -395,9 +405,9 @@ demotion. Administrative denials still apply.
 
 To use an SRv6 profile created with the OCP controller API, also pass the
 benchmark's `--srv6-local` and `--srv6-peer` SIDs. `show` displays
-the stored destination and any SRH container for each rail.
+the stored EVs, any SRH containers, and any nondefault rail assignments.
 
-Use `deny 42 2` and `allow 42 2` with the same directory to change path 1
+Use `deny 42 2` and `allow 42 2` with the same directory to change EV slot 1
 while the endpoint runs. The sender refreshes administrative state every
 10 ms and reports applied changes as `ev_admin_updates`. A profile in use
 stays online until the QP releases it. Use `offline 42` and `remove 42` to
