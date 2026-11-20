@@ -78,8 +78,7 @@ static bool valid_offer(const struct mrc_connect_offer *offer)
     return offer && offer->receive.qpn > 2 && offer->receive.qpn < MRC_PSN_MASK &&
            offer->receive.initial_psn <= MRC_PSN_MASK &&
            offer->receive.initial_msn <= MRC_PSN_MASK && offer->receive.max_mpr &&
-           offer->pmtu >= 256 && offer->pmtu <= 4096 &&
-           !(offer->pmtu & (offer->pmtu - 1)) && (offer->p_key & MRC_PKEY_PARTITION_MASK) &&
+           mrc_wire_pmtu_valid(offer->pmtu) && (offer->p_key & MRC_PKEY_PARTITION_MASK) &&
            !(offer->supported & ~(uint32_t)ALL_CAPS) && !(offer->offered & ~offer->supported) &&
            valid_memory(&offer->receive.memory);
 }

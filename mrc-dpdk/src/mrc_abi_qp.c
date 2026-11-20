@@ -415,7 +415,7 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
         error = EOPNOTSUPP;
         goto unlock;
     }
-    if (updated_verbs.path_mtu != IBV_MTU_1024) {
+    if (updated_verbs.path_mtu < IBV_MTU_256 || updated_verbs.path_mtu > IBV_MTU_4096) {
         error = EOPNOTSUPP;
         goto unlock;
     }

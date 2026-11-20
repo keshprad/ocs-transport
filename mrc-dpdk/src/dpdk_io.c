@@ -8,16 +8,30 @@
 
 struct rte_mempool *mrc_dpdk_packet_pool(void)
 {
-    return rte_pktmbuf_pool_create("mrc_packets", 8191, 0, 0,
-                                  RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID_ANY);
+    return mrc_dpdk_packet_pool_for_frame(0);
 }
 
-int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool,
-                      struct rte_ether_addr *mac)
+struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length)
+{
+    unsigned int room = frame_length + RTE_PKTMBUF_HEADROOM;
+    if (room > UINT16_MAX)
+        return NULL;
+    if (room < RTE_MBUF_DEFAULT_BUF_SIZE)
+        room = RTE_MBUF_DEFAULT_BUF_SIZE;
+    return rte_pktmbuf_pool_create("mrc_packets", 8191, 0, 0, (uint16_t)room, SOCKET_ID_ANY);
+}
+
+int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool, struct rte_ether_addr *mac)
+{
+    return mrc_dpdk_open_port_with_mtu(port, pool, mac, 0);
+}
+
+int mrc_dpdk_open_port_with_mtu(uint16_t port, struct rte_mempool *pool,
+                               struct rte_ether_addr *mac, uint16_t mtu)
 {
     if (!rte_eth_dev_is_valid_port(port))
         return -ENODEV;
-    struct rte_eth_conf config = {0};
+    struct rte_eth_conf config = { .rxmode.mtu = mtu };
     int result = rte_eth_dev_configure(port, 1, 1, &config);
     if (result)
         return result;

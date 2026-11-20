@@ -25,11 +25,20 @@ entry a WRITEIMM. Use the list by itself in place of the single size,
 `--work-requests`, and `--immediate`. Each WRITEIMM consumes one receive
 credit and advances the receive queue message sequence.
 
+Use `--pmtu N` to select a RoCE payload size of 256, 512, 1024, 2048,
+or 4096 bytes. The default is 1024. Use the same value on both peers
+for manual setup. The standalone command configures each DPDK port and
+its packet pool for the offered size. A 2048- or 4096-byte PMTU requires
+ports and a network path that can carry jumbo frames.
+
 Add `--oob-host IP --oob-port N` on both endpoints to exchange the QP
 parameters over TCP. On the receiver, the IP is the local management address
 to bind. On the sender, it is the receiver's management address. The peers
 exchange QPN, initial PSN, receive limits, P_Key, trim capability, and
-registered-memory information before the data transfer. TCP setup uses the provider-generated rkey. Use `--remote-key` with manual setup. The exchange record
+registered-memory information before the data transfer. Both peers use
+the smaller PMTU offer to segment their work and validate options that
+refer to packet counts. TCP setup uses the provider-generated rkey. Use
+`--remote-key` with manual setup. The exchange record
 is specific to this benchmark. OCP leaves the out-of-band encoding to the
 application. To exercise Dynamic MPR, pass `--dynamic-mpr 1` on both peers
 with TCP setup enabled. On the receiver, `--mpr-change-at PACKETS` and
@@ -157,11 +166,17 @@ the SIDs on preserved encapsulation and accepts already decapsulated
 frames after checking the inner peer, P_Key, and QPN. The fabric advances
 transit routes before delivery to the MRC endpoint.
 
-The attachment supports a 1024-byte PMTU and up to 16 SGEs per send or
-receive WR. A WRITEIMM places its payload at the remote address in the
-request. Its receive post supplies only a completion credit and can
-include a scatter/gather list. Use `IBV_SEND_SOLICITED` on a WRITEIMM to
-trigger an armed solicited-only receive CQ notification.
+Set the agreed path MTU with `IBV_QP_PATH_MTU` when moving the QP to RTR.
+The provider accepts `IBV_MTU_256` through `IBV_MTU_4096`. Configure both
+DPDK port MTUs and packet pool data room to fit the payload and its wire
+headers before attaching the QP. Attachment returns `EMSGSIZE` if the
+pool or a port is too small.
+
+The attachment supports up to 16 SGEs per send or receive WR. A WRITEIMM
+places its payload at the remote address in the request. Its receive post
+supplies only a completion credit and can include a scatter/gather list.
+Use `IBV_SEND_SOLICITED` on a WRITEIMM to trigger an armed solicited-only
+receive CQ notification.
 
 At QP creation, `send_ops_flags` accepts `IBV_QP_EX_WITH_RDMA_WRITE` and
 `IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM`. Post the corresponding operations

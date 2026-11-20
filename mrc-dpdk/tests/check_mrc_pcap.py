@@ -305,8 +305,8 @@ def check_responses(replay, output_paths, outside, trim_sizes):
 
 
 @contextmanager
-def run_capture(binary, replay, requests, *, work="13,1025@0xfec01234", trim=False,
-                last_hop=False, service_time=False):
+def run_capture(binary, replay, requests, *, role="rx", work="13,1025@0xfec01234", pmtu=None,
+                trim=False, last_hop=False, service_time=False):
     with tempfile.TemporaryDirectory(prefix="mrc-pcap-") as temp:
         directory = Path(temp)
         incoming = [directory / f"rx{path}.pcap" for path in range(2)]
@@ -318,12 +318,16 @@ def run_capture(binary, replay, requests, *, work="13,1025@0xfec01234", trim=Fal
                    f"--file-prefix={directory.name}", "-m", "64"]
         for path in range(2):
             command.append(f"--vdev=net_pcap{path},rx_pcap={incoming[path]},tx_pcap={outgoing[path]}")
-        command += ["--", "rx", work, replay.local_ip, replay.peer_ip,
+        command += ["--", role, work, replay.local_ip, replay.peer_ip,
                     "0", PEER_MACS[0].hex(":"), "1", PEER_MACS[1].hex(":"),
                     "--initial-psn", str(INITIAL_PSN), "--requestor-qpn", hex(REQUESTOR),
                     "--responder-qpn", hex(RESPONDER), "--p-key", hex(PKEY),
                     "--remote-address", hex(ADDRESS), "--remote-key", hex(RKEY),
                     "--port-stats", "1", "--timeout-ms", "2000"]
+        if pmtu is not None:
+            command += ["--pmtu", str(pmtu)]
+        if role == "tx":
+            command += ["--linear-retries", "0", "--exp-retries", "0"]
         if trim:
             command += ["--trim-dscp", str(TRIM_DSCP), "--trim-nack", "1"]
         if last_hop:
@@ -381,6 +385,69 @@ def check_retransmitted_ack_request(binary, replay):
         require(sacks == [(INITIAL_PSN - 1, 2), (0, -1), (1, 0)],
                 f"Expected a cumulative SACK after filling the gap before the AR PSN: {sacks}")
         print(f"Independent {replay.name} replay preserved the retransmitted ACK request")
+
+
+def check_jumbo_pmtu(binary, replay):
+    pmtu = 4096
+    data = bytes((offset ^ (offset >> 8)) & 0xFF for offset in range(2 * pmtu + 33))
+    first = write_request(replay, 0, 0xC6, INITIAL_PSN, 1, 1, 0, len(data),
+                          data[:pmtu], flags=0)
+    middle = write_request(replay, 0, 0xC7, 0, 1, 1, pmtu, len(data), data[pmtu:2 * pmtu])
+    tail = write_request(replay, 0, 0xC9, 1, 1, 1, 2 * pmtu, len(data),
+                         data[2 * pmtu:], 0xFEC01234)
+    # Keep capture order fixed so the responder stages the middle before
+    # the tail anchors the write. The first segment closes the PSN gap.
+    requests = ([middle, tail, first], [])
+    with run_capture(binary, replay, requests, work=f"{len(data)}@0xfec01234", pmtu=pmtu) as (result, outgoing):
+        # A successful standalone receive checks every byte of the reassembled write.
+        require(result.returncode == 0, f"Jumbo pcap endpoint failed\n{result.stdout}\n{result.stderr}")
+        counters = json.loads(result.stdout.strip().splitlines()[-1])
+        require(counters["bytes"] == len(data) and counters["received"] == [3, 0]
+                and counters["immediate_completions"] == 1,
+                f"Unexpected {replay.name} jumbo placement or completion: {counters}")
+        responses = [decode_response(replay, 0, frame) for frame in read_capture(outgoing[0])]
+        sacks = [(packet.bth.psn, struct.unpack_from("!h", packet.body, 2)[0],
+                  struct.unpack_from("!H", packet.body, 30)[0])
+                 for packet in responses if packet.bth.opcode == 0xDC]
+        require(sacks == [(INITIAL_PSN - 1, 2, 1), (INITIAL_PSN - 1, 3, 2), (1, -2, 0)],
+                f"Unexpected {replay.name} jumbo SACK sequence: {sacks}")
+        aeth = [(packet.bth.psn, packet.body) for packet in responses if packet.bth.opcode == 0xD1]
+        require(aeth == [(1, b"\x1f\x00\x00\x01")],
+                f"Unexpected {replay.name} jumbo transport ACK: {aeth}")
+        print(f"Independent {replay.name} 4096-byte PMTU replay passed reordered WRITEIMM placement")
+
+
+def check_jumbo_requester(binary, pmtu):
+    replay = REPLAYS[0]
+    length = 2 * pmtu + 33
+    immediate = 0xFEC01234
+    with run_capture(binary, replay, ([], []), role="tx",
+                     work=f"{length}@{immediate:#x}", pmtu=pmtu) as (result, outgoing):
+        require(result.returncode == 1 and "Retry limit exhausted for PSN" in result.stderr,
+                f"Jumbo requester did not reach its retry limit\n{result.stdout}\n{result.stderr}")
+        fragments = {}
+        for path, output in enumerate(outgoing):
+            source = IPPeer(PCAP_MACS[path], ipaddress.ip_address(replay.local_ip).packed)
+            destination = IPPeer(PEER_MACS[path], ipaddress.ip_address(replay.peer_ip).packed)
+            for frame in read_capture(output):
+                packet = decode_ipv4(frame, source, destination, UDP_PORT)
+                if 0xC6 <= packet.bth.opcode <= 0xCB:
+                    require(packet.bth.psn not in fragments and not packet.bth.flags & 0x20,
+                            f"Unexpected retransmission of PSN {packet.bth.psn:#x}")
+                    fragments[packet.bth.psn] = packet
+        psns = (INITIAL_PSN, 0, 1)
+        require(fragments.keys() == set(psns), f"Unexpected jumbo WRITE PSNs: {list(fragments)}")
+        for index, (psn, opcode) in enumerate(zip(psns, (0xC6, 0xC7, 0xC9))):
+            packet = fragments[psn]
+            require((packet.bth.opcode, packet.bth.pkey, packet.bth.qp) == (opcode, PKEY, RESPONDER),
+                    f"Wrong jumbo WRITE opcode, P_Key, or QP at PSN {psn:#x}")
+            offset = index * pmtu
+            headers = struct.pack("!HHQII", 1, 1, ADDRESS + offset, RKEY, length)
+            if opcode == 0xC9:
+                headers += struct.pack("!I", immediate)
+            data = bytes((i ^ (i >> 8)) & 0xFF for i in range(offset, min(offset + pmtu, length)))
+            require(packet.body == headers + data, f"Wrong jumbo WRITE geometry or payload at PSN {psn:#x}")
+        print(f"Independent IPv4 requester capture passed WRITEIMM wire geometry at {pmtu}-byte PMTU")
 
 
 def check_service_time(binary, replay):
@@ -482,8 +549,11 @@ def main():
     for replay in REPLAYS:
         run_replay(binary, replay)
         check_retransmitted_ack_request(binary, replay)
+        check_jumbo_pmtu(binary, replay)
         check_reserved_opcode(binary, replay)
         check_service_time(binary, replay)
+    for pmtu in (2048, 4096):
+        check_jumbo_requester(binary, pmtu)
 
 
 if __name__ == "__main__":

@@ -122,6 +122,7 @@ def main():
     focused.add_argument("--dynamic-mpr-only", action="store_true", help="Run only the live MPR negotiation cases")
     focused.add_argument("--pkey-port-status-only", action="store_true",
                          help="Run only the shared connected P_Key Port Status case")
+    focused.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -173,6 +174,15 @@ def main():
                     f"Unexpected wire or application MPR during {mode}: {tx}, {rx}")
             print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
 
+    def check_pmtu():
+        for pmtu, fragments in ((256, 5), (512, 3)):
+            tx, rx = run_case(f"pmtu_{pmtu}")
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+                    and tx["completions"] == rx["completions"] == 2
+                    and tx["pmtu"] == rx["pmtu"] == pmtu and rx["writeimm_fragments"] == fragments,
+                    f"Unexpected WRITEIMM wire geometry or completion at PMTU {pmtu}: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_pmtu_{pmtu}", "tx": tx, "rx": rx}))
+
     if args.last_hop_trim_only or args.service_level_dscp_only:
         check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)
         return
@@ -189,11 +199,16 @@ def main():
         check_shared_port_status(binary)
         return
 
+    if args.pmtu_only:
+        check_pmtu()
+        return
+
     tx, rx = run_case("simplex")
     require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
             and tx["completions"] == rx["completions"] == 2,
             f"Unexpected public unidirectional QP results: {tx}, {rx}")
     print(json.dumps({"case": "public_qp_over_dpdk", "tx": tx, "rx": rx}))
+    check_pmtu()
 
     tx, rx = run_case("inline")
     require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038

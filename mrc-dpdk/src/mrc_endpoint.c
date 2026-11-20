@@ -28,7 +28,7 @@ enum {
     RESPONDER_EV_PORT = 0xd000,
     EV_FLOW_LABEL = 0xa0100,
     SINGLE_SEGMENT_SRH_LEN = 24,
-    INITIAL_CWND = 128 * MRC_NOMINAL_MTU,
+    INITIAL_CWND_PACKETS = 128,
     TARGET_QUEUE_NS = 20000,
     FAST_LOSS_GAP = 16,
     ALL_PATHS = (1 << PATH_COUNT) - 1,
@@ -137,10 +137,25 @@ static uint32_t request_index(const struct mrc_endpoint_config *transfer, uint32
     return first;
 }
 
-static uint32_t length_at(const struct mrc_endpoint_write *work, uint32_t index)
+static uint16_t endpoint_pmtu(const struct mrc_endpoint_config *transfer)
 {
-    uint32_t remaining = work->length - (index - work->first_packet) * PMTU;
-    return remaining < PMTU ? remaining : PMTU;
+    return transfer->pmtu ? transfer->pmtu : MRC_DEFAULT_PMTU;
+}
+
+uint16_t mrc_endpoint_frame_capacity(const struct mrc_endpoint_config *transfer)
+{
+    unsigned int headers = transfer->ip_version == MRC_WIRE_IP4 ?
+                           MRC_WIRE_IPV4_HEADER_LEN : MRC_WIRE_IPV6_HEADER_LEN;
+    if (transfer->srv6)
+        headers += sizeof(struct rte_ipv6_hdr) + SINGLE_SEGMENT_SRH_LEN;
+    return (uint16_t)(endpoint_pmtu(transfer) + headers + MRC_BTH_LEN + MRC_METH_LEN +
+                      MRC_TSETH_LEN + MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN);
+}
+
+static uint32_t length_at(const struct mrc_endpoint_write *work, uint32_t index, uint16_t pmtu)
+{
+    uint32_t remaining = work->length - (index - work->first_packet) * pmtu;
+    return remaining < pmtu ? remaining : pmtu;
 }
 
 static uint8_t expected_opcode(const struct mrc_endpoint_write *work, uint32_t index)
@@ -166,10 +181,16 @@ static uint32_t nominal_size(uint8_t opcode, size_t data_length, bool timestamp)
                                           MRC_ICRC_LEN));
 }
 
+uint32_t mrc_endpoint_nominal_mtu(uint16_t pmtu)
+{
+    return nominal_size(MRC_WRITE_LAST_IMM, pmtu, false);
+}
+
 static uint32_t nominal_at(const struct mrc_endpoint_config *transfer, uint32_t index)
 {
     const struct mrc_endpoint_write *work = &transfer->work[request_index(transfer, index)];
-    return nominal_size(expected_opcode(work, index), length_at(work, index), false);
+    return nominal_size(expected_opcode(work, index),
+                        length_at(work, index, endpoint_pmtu(transfer)), false);
 }
 
 static uint64_t cycles_to_ns(const struct mrc_endpoint_config *transfer, uint64_t cycles)
@@ -684,7 +705,8 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
 
     uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
     struct mrc_wire_packet packet = mrc_endpoint_packet_for(transfer, path, expected_opcode(work, index), psn);
-    uint32_t length = length_at(work, index);
+    uint16_t pmtu = endpoint_pmtu(transfer);
+    uint32_t length = length_at(work, index, pmtu);
     uint32_t nominal_bytes = nominal_size(packet.bth.opcode, length, false);
     if (!mrc_cc_can_send(&sender->cc, nominal_bytes))
         return -EPROTO;
@@ -700,7 +722,7 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
                              index + 1 == transfer->packets ||
                              mrc_cc_ack_request(&sender->cc, nominal_bytes, SACK_THRESHOLD);
-    uint32_t offset = (index - work->first_packet) * PMTU;
+    uint32_t offset = (index - work->first_packet) * pmtu;
     packet.body.write = (struct mrc_wire_write){
         .rqmsn = write.with_immediate ?
             (uint16_t)(sender->rqmsn_base + work->preceding_immediates + 1) : 0,
@@ -715,7 +737,7 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     if (blackholed(transfer, sender, path)) {
         counts->dropped++;
     } else {
-        uint8_t payload[PMTU];
+        uint8_t payload[MRC_MAX_PMTU];
         packet.body.write.data = mrc_provider_write_slice(&write, offset, length, payload);
         if (length && !packet.body.write.data)
             return -EPROTO;
@@ -1462,6 +1484,11 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
     return 0;
 }
 
+static uint32_t write_packets(uint32_t length, uint16_t pmtu)
+{
+    return length ? 1 + (length - 1) / pmtu : 1;
+}
+
 bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capacity,
                                uint32_t length, bool with_immediate,
                                uint32_t immediate)
@@ -1469,7 +1496,10 @@ bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capa
     if (!transfer || !transfer->work || transfer->work_requests >= capacity ||
         (uint64_t)transfer->bytes + length > (1U << 30))
         return false;
-    uint32_t packets = length ? 1 + (length - 1) / PMTU : 1;
+    uint16_t pmtu = endpoint_pmtu(transfer);
+    if (!mrc_wire_pmtu_valid(pmtu))
+        return false;
+    uint32_t packets = write_packets(length, pmtu);
     if ((uint64_t)transfer->packets + packets >= MRC_PSN_HALF)
         return false;
 
@@ -1481,6 +1511,30 @@ bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capa
     transfer->bytes += length;
     transfer->packets += packets;
     transfer->immediate_requests += with_immediate;
+    return true;
+}
+
+bool mrc_endpoint_resegment_writes(struct mrc_endpoint_config *transfer, uint16_t pmtu)
+{
+    if (!transfer || !mrc_wire_pmtu_valid(pmtu) || (transfer->work_requests && !transfer->work))
+        return false;
+    uint64_t packets = 0;
+    for (uint32_t wr = 0; wr < transfer->work_requests; wr++)
+        packets += write_packets(transfer->work[wr].length, pmtu);
+    if (packets >= MRC_PSN_HALF)
+        return false;
+
+    uint32_t first = 0;
+    for (uint32_t wr = 0; wr < transfer->work_requests; wr++) {
+        struct mrc_endpoint_write *work = &transfer->work[wr];
+        work->first_packet = first;
+        work->packets = write_packets(work->length, pmtu);
+        first += work->packets;
+    }
+    transfer->packets = first;
+    transfer->pmtu = pmtu;
+    if (transfer->uniform_wr_packets && transfer->work_requests)
+        transfer->uniform_wr_packets = transfer->work[0].packets;
     return true;
 }
 
@@ -1540,6 +1594,7 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
 {
     if (!configuration || !qp || !counts || !requester || !configuration->pool ||
         !configuration->hz || !configuration->initial_rto ||
+        !mrc_wire_pmtu_valid(endpoint_pmtu(configuration)) ||
         configuration->window > WINDOW)
         return -EINVAL;
     struct mrc_provider_qp_attr attr;
@@ -1563,8 +1618,9 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     struct mrc_endpoint_config *transfer = &sender->transfer;
     transfer->sender = true;
     transfer->work = NULL;
+    uint32_t nominal_mtu = mrc_endpoint_nominal_mtu(endpoint_pmtu(transfer));
     if (!mrc_tx_init(&sender->qp, transfer->initial_psn, transfer->window, sender->slots) ||
-        !mrc_cc_init(&sender->cc, MRC_NOMINAL_MTU, INITIAL_CWND, 0, TARGET_QUEUE_NS) ||
+        !mrc_cc_init(&sender->cc, nominal_mtu, INITIAL_CWND_PACKETS * nominal_mtu, 0, TARGET_QUEUE_NS) ||
         (transfer->cc_profile.id &&
          !mrc_cc_apply_config(&sender->cc, transfer->cc_profile.configured ?
                               &transfer->cc_profile.config : NULL)) ||
@@ -1774,6 +1830,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
 {
     if (!transfer || !qp || !counts || !responder || transfer->sender ||
         !transfer->pool || !transfer->hz || !transfer->initial_rto ||
+        !mrc_wire_pmtu_valid(endpoint_pmtu(transfer)) ||
         transfer->window > WINDOW || transfer->rx_staging_capacity > WINDOW ||
         transfer->rx_work_capacity > WINDOW)
         return -EINVAL;
@@ -1788,8 +1845,9 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
     struct mrc_responder *receiver = calloc(1, sizeof(*receiver));
     if (!receiver)
         return -ENOMEM;
+    uint16_t pmtu = endpoint_pmtu(transfer);
     if (transfer->rx_staging_capacity) {
-        receiver->staged_payload = malloc(transfer->rx_staging_capacity * PMTU);
+        receiver->staged_payload = malloc(transfer->rx_staging_capacity * pmtu);
         if (!receiver->staged_payload) {
             mrc_responder_destroy(receiver);
             return -ENOMEM;
@@ -1805,7 +1863,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
             .memory = transfer->data, .address = transfer->remote_address,
             .length = transfer->bytes, .r_key = transfer->remote_key,
         },
-        .pmtu = PMTU, .initial_psn = transfer->initial_psn,
+        .pmtu = pmtu, .initial_psn = transfer->initial_psn,
         .initial_msn = 1, .initial_rqmsn = 1,
         .max_wimm_inflight = transfer->max_wimm_inflight,
         .work = receiver->work, .work_capacity = transfer->rx_work_capacity,

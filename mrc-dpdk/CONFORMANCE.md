@@ -38,6 +38,15 @@ no data placement or feedback. Direct and negotiated connected routes use
 the same RC membership check. TCP-negotiated routes also pin the offered
 peer P_Key. [Linux RXE P_Key comparison](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/sw/rxe/rxe_verbs.h)
 
+For §§6.2.2.2 and 6.3.1, public memif tests check 256- and 512-byte
+segment lengths, address increments, and WRITEIMM completion across
+PSN wrap. The standalone tests verify mixed work and smaller-PMTU
+selection in both directions of an asymmetric TCP offer. Independent
+captures verify requester payload, RETH geometry, and immediate data at
+2048 and 4096 bytes. Separate replays verify out-of-order 4096-byte
+placement over IPv4, IPv6, and preserved SRv6 with and without a final
+SRH. Jumbo transfers on the physical NICs remain unverified.
+
 For §7.4.8, one Port Status report with a zero mask pauses writes on
 two QPs with overlapping membership and pinned-key filters. A second
 report reopens both rails and both QPs complete the queued writes.

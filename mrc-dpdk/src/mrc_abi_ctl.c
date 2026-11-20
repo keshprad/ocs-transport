@@ -902,7 +902,7 @@ static int configure_cc(struct mrc_ctl_store_cc_profile *profile,
     if (!config)
         return -EINVAL;
     struct mrc_cc_config checked = { COPY_NSCC_FIELDS(config) };
-    if (!mrc_cc_config_valid(&checked, MRC_NOMINAL_MTU))
+    if (!mrc_cc_config_valid(&checked, mrc_endpoint_nominal_mtu(MRC_MIN_PMTU)))
         return -EINVAL;
     profile->config = checked;
     profile->configured = true;

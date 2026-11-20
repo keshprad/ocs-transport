@@ -313,6 +313,14 @@ static bool parse_writes(struct mrc_endpoint_config *transfer, const char *input
     return valid;
 }
 
+static bool valid_packet_options(const struct mrc_endpoint_config *transfer)
+{
+    return (transfer->drop_after == UINT32_MAX || transfer->drop_after < transfer->packets) &&
+           (transfer->restore_after == UINT32_MAX || transfer->restore_after < transfer->packets) &&
+           (transfer->trim_after == UINT32_MAX || transfer->trim_after < transfer->packets) &&
+           (transfer->mpr_change_at == UINT32_MAX || transfer->mpr_change_at < transfer->packets);
+}
+
 static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
 {
     struct mrc_endpoint_config *transfer = &benchmark->transfer;
@@ -350,7 +358,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     transfer->responder_qpn = DEFAULT_RESPONDER_QPN;
     transfer->remote_address = default_remote_address;
     transfer->remote_key = DEFAULT_REMOTE_KEY;
-    uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT;
+    uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, pmtu = MRC_DEFAULT_PMTU;
     uint32_t trim_dscp = MRC_ENDPOINT_TRIM_DSCP, trim_last_hop_dscp = 0;
     uint32_t data_dscp = 0, retry_dscp = UINT32_MAX;
     uint32_t oob_port = 0, trim_nack = 1, service_time = 0, srv6_srh = 0, port_stats = 0;
@@ -365,6 +373,9 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     for (int i = 9; i < argc; i += 2) {
         const char *key = argv[i], *value = argv[i + 1];
         if (!strcmp(key, "--udp-port") && number(value, 1, UINT16_MAX, &udp_port))
+            continue;
+        if (!strcmp(key, "--pmtu") && number(value, MRC_MIN_PMTU, MRC_MAX_PMTU, &pmtu) &&
+            mrc_wire_pmtu_valid((uint16_t)pmtu))
             continue;
         if (!strcmp(key, "--initial-psn") && number(value, 0, MRC_PSN_MASK, &transfer->initial_psn))
             continue;
@@ -484,18 +495,16 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
         return false;
     }
 
+    transfer->pmtu = (uint16_t)pmtu;
     if (!parse_writes(transfer, argv[2], repeat, with_immediate, immediate))
         return false;
     if (transfer->remote_address > UINT64_MAX - transfer->bytes ||
         trim_last_hop_dscp == trim_dscp ||
-        (transfer->drop_after != UINT32_MAX && transfer->drop_after >= transfer->packets) ||
-        (transfer->restore_after != UINT32_MAX &&
-         (transfer->restore_after <= transfer->drop_after || transfer->restore_after >= transfer->packets)) ||
+        (transfer->restore_after != UINT32_MAX && transfer->restore_after <= transfer->drop_after) ||
+        (!oob_port && !valid_packet_options(transfer)) ||
         (dynamic_mpr && !oob_port) ||
         ((transfer->mpr_change_at != UINT32_MAX) != (mpr_change_to != 0)) ||
-        (mpr_change_to && (!dynamic_mpr || mpr_change_to > mpr ||
-                           transfer->mpr_change_at >= transfer->packets)) ||
-        (transfer->trim_after != UINT32_MAX && transfer->trim_after >= transfer->packets) ||
+        (mpr_change_to && (!dynamic_mpr || mpr_change_to > mpr)) ||
         (transfer->drop_after != UINT32_MAX && transfer->trim_after != UINT32_MAX) ||
         (!!benchmark->profile_directory != !!transfer->profile_id) ||
         (!!benchmark->oob_address != !!oob_port) || (oob_port && benchmark->remote_key_configured) ||
@@ -620,7 +629,7 @@ static int setup_qp(struct benchmark *benchmark)
             .max_mpr = (uint8_t)(transfer->window / MRC_MPR_UNIT),
             .max_wimm = (uint16_t)transfer->max_wimm_inflight,
         },
-        .pmtu = PMTU, .p_key = transfer->partition_key,
+        .pmtu = transfer->pmtu, .p_key = transfer->partition_key,
         .supported = MRC_CONNECT_TRIM_NACK | MRC_CONNECT_DYNAMIC_MPR | MRC_CONNECT_SERVICE_TIME,
         .offered = (transfer->trim_nack_enabled ? MRC_CONNECT_TRIM_NACK : 0) |
                    (transfer->dynamic_mpr ? MRC_CONNECT_DYNAMIC_MPR : 0) |
@@ -638,8 +647,15 @@ static int setup_qp(struct benchmark *benchmark)
                                   benchmark->timeout_ms, &local, &qp);
     if (result)
         return result;
-    if (qp.pmtu != PMTU || qp.send.initial_msn != 1 || qp.send.initial_rqmsn != 1)
+    if (qp.send.initial_msn != 1 || qp.send.initial_rqmsn != 1)
         return -EPROTONOSUPPORT;
+    if (!mrc_endpoint_resegment_writes(transfer, qp.pmtu))
+        return -EOVERFLOW;
+    if (!valid_packet_options(transfer)) {
+        fprintf(stderr, "Packet-indexed options do not fit %u packets at PMTU %u\n",
+                transfer->packets, transfer->pmtu);
+        return -EINVAL;
+    }
 
     transfer->peer_partition_key = qp.peer_p_key;
     transfer->dynamic_mpr = qp.dynamic_mpr;
@@ -665,9 +681,9 @@ static int setup_qp(struct benchmark *benchmark)
         transfer->requestor_qpn = qp.send.qpn;
     }
 
-    fprintf(stderr, "Negotiated QP %u -> %u, PSN %u, window %u, WRITEIMM credits %u\n",
+    fprintf(stderr, "Negotiated QP %u -> %u, PSN %u, window %u, WRITEIMM credits %u, PMTU %u\n",
             transfer->requestor_qpn, transfer->responder_qpn, transfer->initial_psn,
-            transfer->window, transfer->max_wimm_inflight);
+            transfer->window, transfer->max_wimm_inflight, transfer->pmtu);
     return 0;
 }
 
@@ -737,7 +753,7 @@ int main(int argc, char **argv)
     if (!parse_args(argc - consumed, argv + consumed, &benchmark)) {
         fprintf(stderr, "Usage: %s [EAL options] -- tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP\n"
                         "       PORT0 PEER_MAC0 PORT1 PEER_MAC1 [--initial-psn N] [--udp-port N]\n"
-                        "       [--requestor-qpn N] [--responder-qpn N] [--p-key N] [--mpr N]\n"
+                        "       [--requestor-qpn N] [--responder-qpn N] [--p-key N] [--mpr N] [--pmtu N]\n"
                         "       [--remote-key N] [--remote-address N] [--immediate N]\n"
                         "       [--work-requests N] [--max-wimm-inflight N] [--posted-receives N (rx)]\n"
                         "       [--ack-timeout N] [--linear-retries N]\n"
@@ -762,8 +778,12 @@ int main(int argc, char **argv)
         goto done;
     }
 
+    /* Start the ports before OOB so the peer can establish the links. The
+     * local PMTU offer bounds the negotiated frame size. */
+    uint16_t frame_length = mrc_endpoint_frame_capacity(transfer);
+    uint16_t port_mtu = frame_length - RTE_ETHER_HDR_LEN;
     transfer->data = malloc(transfer->bytes ? transfer->bytes : 1);
-    transfer->pool = mrc_dpdk_packet_pool();
+    transfer->pool = mrc_dpdk_packet_pool_for_frame(frame_length);
     if (!transfer->data || !transfer->pool) {
         result = -ENOMEM;
         goto done;
@@ -777,7 +797,8 @@ int main(int argc, char **argv)
         goto done;
     for (; opened < PATH_COUNT; opened++) {
         struct mrc_endpoint_path *path = &transfer->paths[opened];
-        result = mrc_dpdk_open_port(path->port, transfer->pool, &path->local);
+        result = mrc_dpdk_open_port_with_mtu(path->port, transfer->pool, &path->local,
+                                            port_mtu > RTE_ETHER_MTU ? port_mtu : 0);
         if (result)
             goto done;
         initial_stats[opened].valid = rte_eth_stats_get(path->port, &initial_stats[opened].stats) == 0;
@@ -789,7 +810,7 @@ int main(int argc, char **argv)
     }
     result = transfer->sender ? run_sender(&benchmark, &counts) : run_receiver(&benchmark, &counts);
     if (!result)
-        printf("{\"role\":\"%s\",\"bytes\":%u,\"packets\":%u,\"sent\":[%u,%u],"
+        printf("{\"role\":\"%s\",\"bytes\":%u,\"pmtu\":%u,\"packets\":%u,\"sent\":[%u,%u],"
                "\"received\":[%u,%u],\"retries\":[%u,%u],\"dropped\":%u,\"sacks\":%u,"
                "\"trimmed\":%u,\"trim_nacks\":%u,\"transport_acks\":%u,"
                "\"nack_sent_mask\":%u,\"nack_received_mask\":%u,"
@@ -801,7 +822,7 @@ int main(int argc, char **argv)
                "\"duplicates\":%u,\"fast_retries\":%u,"
                "\"reorder_max\":%u,\"write_completions\":%u,\"immediate_completions\":%u,"
                "\"immediate_completed\":%s,\"registered_memory\":%s}\n",
-               transfer->sender ? "tx" : "rx", transfer->bytes, transfer->packets,
+               transfer->sender ? "tx" : "rx", transfer->bytes, transfer->pmtu, transfer->packets,
                counts.sent[0], counts.sent[1], counts.received[0], counts.received[1],
                counts.retries[0], counts.retries[1], counts.dropped, counts.sacks,
                counts.trimmed, counts.trim_nacks, counts.transport_acks,

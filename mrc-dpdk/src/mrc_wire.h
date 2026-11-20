@@ -29,8 +29,16 @@
 #define MRC_IPV6_ADDR_LEN 16
 #define MRC_IPV6_FLOW_LABEL_MASK UINT32_C(0x000fffff)
 #define MRC_ICRC_LEN 4
+#define MRC_MIN_PMTU 256
+#define MRC_DEFAULT_PMTU 1024
+#define MRC_MAX_PMTU 4096
 #define MRC_PKEY_PARTITION_MASK UINT16_C(0x7fff)
 #define MRC_PKEY_FULL_MEMBER UINT16_C(0x8000)
+
+static inline bool mrc_wire_pmtu_valid(uint16_t pmtu)
+{
+    return pmtu >= MRC_MIN_PMTU && pmtu <= MRC_MAX_PMTU && (pmtu & (pmtu - 1)) == 0;
+}
 
 /* A connected RC partition needs the same nonzero partition and a full member. */
 static inline bool mrc_wire_pkey_compatible(uint16_t local, uint16_t peer)

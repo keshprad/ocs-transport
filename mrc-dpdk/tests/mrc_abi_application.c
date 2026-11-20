@@ -36,8 +36,15 @@ enum {
     WIRE_PROBE_REQUEST = 0xde,
     WIRE_SACK = 0xdc,
     WIRE_WRITE_FIRST = 0xc6,
+    WIRE_WRITE_MIDDLE = 0xc7,
+    WIRE_WRITE_LAST_IMM = 0xc9,
     WIRE_WRITE_ONLY_IMM = 0xcb,
     WIRE_BTH_LEN = 12,
+    WIRE_METH_LEN = 4,
+    WIRE_TSETH_LEN = 4,
+    WIRE_RETH_LEN = 16,
+    WIRE_IMM_LEN = 4,
+    WIRE_ICRC_LEN = 4,
     WIRE_PETH_LEN = 16,
     WIRE_NETH_LEN = 20,
     WIRE_SETH_LEN = 28,
@@ -183,7 +190,7 @@ static void read_peer_connections(const char *directory, bool client,
 static void configure_qp(struct mrc_qp *qp, const struct address *address,
                           const struct connection *peer, uint32_t send_psn,
                           bool send, bool receive, uint64_t ev_profile_id, uint64_t cc_profile_id,
-                          unsigned int qp_caps, uint8_t service_level)
+                          unsigned int qp_caps, uint8_t service_level, enum ibv_mtu path_mtu)
 {
     struct ibv_qp_attr verbs = {
         .qp_state = IBV_QPS_INIT,
@@ -196,7 +203,7 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
                          profiles ? &attrs : NULL, profiles) == 0);
 
     verbs = (struct ibv_qp_attr){
-        .qp_state = IBV_QPS_RTR, .path_mtu = IBV_MTU_1024,
+        .qp_state = IBV_QPS_RTR, .path_mtu = path_mtu,
         .dest_qp_num = peer->qpn, .rq_psn = peer->psn,
         .ah_attr = {
             .is_global = 1, .port_num = address->port, .sl = service_level,
@@ -594,6 +601,8 @@ static void prepare_memif_links(void)
 enum simplex_wire_mode {
     SIMPLEX_WIRE_NONE,
     SIMPLEX_INLINE,
+    SIMPLEX_PMTU_256,
+    SIMPLEX_PMTU_512,
     SIMPLEX_GENERATED_EV,
     SIMPLEX_SRV6,
     SIMPLEX_SRV6_TRANSIT,
@@ -942,7 +951,7 @@ static void run_endpoint_ops(bool client, const char *directory, const char *for
         idle_qp = mrc_create_qp(context, &init);
         assert(idle_qp);
         const struct connection peer = { .gid = test.route.peer_gid, .qpn = 13 };
-        configure_qp(idle_qp, address, &peer, 0, false, true, 0, 0, 0, 0);
+        configure_qp(idle_qp, address, &peer, 0, false, true, 0, 0, 0, 0, IBV_MTU_1024);
         struct mrc_dpdk_route route = path_route(pool, false);
         route.peer_pkey = test.route.peer_pkey;
         route.udp_port = test.route.udp_port;
@@ -1243,6 +1252,67 @@ static uint16_t drop_inline_fragment(uint16_t port, uint16_t queue, struct rte_m
     return kept;
 }
 
+struct pmtu_wire_witness {
+    uint64_t address;
+    unsigned int pmtu;
+    unsigned int fragments;
+    uint32_t seen;
+};
+
+static uint16_t observe_pmtu_write(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                  uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)port;
+    (void)queue;
+    (void)capacity;
+    struct pmtu_wire_witness *observed = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + WIRE_UDP_LEN + WIRE_BTH_LEN +
+                       WIRE_METH_LEN + WIRE_TSETH_LEN + WIRE_RETH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (bth[0] < WIRE_WRITE_FIRST || bth[0] > WIRE_WRITE_ONLY_IMM)
+            continue;
+        /* The large WRITEIMM starts after the short WRITE, then wraps through PSN 0. */
+        uint32_t fragment = (wire_be24(bth + 9) - (SEND_PSN + 1)) & 0xffffff;
+        if (fragment >= observed->fragments)
+            continue;
+        bool last = fragment + 1 == observed->fragments;
+        unsigned int offset = fragment * observed->pmtu;
+        unsigned int payload = last ? IMMEDIATE_BYTES - offset : observed->pmtu;
+        assert(bth[0] == (last ? WIRE_WRITE_LAST_IMM : fragment ? WIRE_WRITE_MIDDLE : WIRE_WRITE_FIRST));
+        unsigned int timestamp = bth[8] & 0x10 ? WIRE_TSETH_LEN : 0;
+        const uint8_t *reth = bth + WIRE_BTH_LEN + WIRE_METH_LEN + timestamp;
+        assert(udp.bytes >= (size_t)(reth + WIRE_RETH_LEN - udp.header));
+        uint64_t address = (uint64_t)wire_be32(reth) << 32 | wire_be32(reth + 4);
+        assert(address == observed->address + offset && wire_be32(reth + 12) == IMMEDIATE_BYTES);
+        unsigned int header = WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_METH_LEN + timestamp + WIRE_RETH_LEN +
+                              (last ? WIRE_IMM_LEN : 0);
+        unsigned int pad = (bth[1] >> 4) & 3;
+        assert(wire_be16(udp.header + 4) == header + payload + pad + WIRE_ICRC_LEN);
+        observed->seen |= UINT32_C(1) << fragment;
+    }
+    return count;
+}
+
+static void check_jumbo_attachment(struct mrc_qp *qp, const struct mrc_dpdk_route *route, enum ibv_mtu restore)
+{
+    struct ibv_qp_attr verbs = { .path_mtu = IBV_MTU_4096 };
+    assert(mrc_modify_qp(qp, &verbs, IBV_QP_PATH_MTU, NULL, 0) == 0);
+    assert(mrc_dpdk_attach_qp(qp, route) == EMSGSIZE);
+
+    struct mrc_dpdk_route jumbo = *route;
+    jumbo.pool = rte_pktmbuf_pool_create("jumbo_attach_test", 31, 0, 0,
+                                         RTE_PKTMBUF_HEADROOM + 4608, SOCKET_ID_ANY);
+    assert(jumbo.pool);
+    assert(mrc_dpdk_attach_qp(qp, &jumbo) == EMSGSIZE);
+    rte_mempool_free(jumbo.pool);
+    assert(mrc_dpdk_progress_qp(qp) == ENOTCONN);
+
+    verbs.path_mtu = restore;
+    assert(mrc_modify_qp(qp, &verbs, IBV_QP_PATH_MTU, NULL, 0) == 0);
+}
+
 static void run_simplex(bool requester, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
                        enum simplex_error error_mode, const char *ev_store, uint64_t ev_profile_id,
@@ -1258,7 +1328,9 @@ static void run_simplex(bool requester, const char *directory, const struct addr
                          wire_mode == SIMPLEX_SRV6_GENERATED_EV;
     const bool srv6 = srv6_ev || wire_mode == SIMPLEX_SRV6 || wire_mode == SIMPLEX_SRV6_TRANSIT;
     const bool transit = wire_mode == SIMPLEX_SRV6_TRANSIT;
-    const bool inspect_wire = wire_mode != SIMPLEX_WIRE_NONE && !inline_mode;
+    const unsigned int pmtu = wire_mode == SIMPLEX_PMTU_256 ? 256 : wire_mode == SIMPLEX_PMTU_512 ? 512 : 0;
+    const enum ibv_mtu path_mtu = pmtu == 256 ? IBV_MTU_256 : pmtu == 512 ? IBV_MTU_512 : IBV_MTU_1024;
+    const bool inspect_wire = wire_mode != SIMPLEX_WIRE_NONE && !inline_mode && !pmtu;
     if (requester && ev_profile_id)
         assert(mrc_dpdk_set_ev_store(context, ev_store) == 0);
     struct mrc_comp_channel *channel = NULL;
@@ -1324,7 +1396,12 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     read_peer_connections(directory, requester, &peer, 1);
     assert(local.qpn != peer.qpn);
     configure_qp(qp, address, &peer, local.psn, requester, !requester,
-                 requester ? ev_profile_id : 0, 0, 0, 0);
+                 requester ? ev_profile_id : 0, 0, 0, 0, path_mtu);
+    if (pmtu) {
+        struct ibv_qp_attr verbs;
+        assert(mrc_query_qp(qp, &verbs, IBV_QP_PATH_MTU, NULL, 0, NULL) == 0);
+        assert(verbs.path_mtu == path_mtu);
+    }
     if (!requester && error_mode == SIMPLEX_REQUEST_ERROR) {
         /* The peer offers one WRITEIMM at a time. This responder has
          * no slots for immediate data, exercising an OOB mismatch. */
@@ -1334,6 +1411,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
 
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
+    if (pmtu == 256 && !requester)
+        check_jumbo_attachment(qp, &route, path_mtu);
     struct mrc_dpdk_srv6_path paths[DUPLEX_RAILS] = {0};
     if (requester && srv6_ev)
         assert(mrc_dpdk_attach_qp(qp, &route) == EINVAL);
@@ -1347,6 +1426,11 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         .srv6 = srv6 ? paths : NULL,
     };
     struct inline_wire_witness observed_inline = {0};
+    struct pmtu_wire_witness observed_pmtu = {
+        .address = local.remote_address + FIRST_BYTES,
+        .pmtu = pmtu,
+        .fragments = pmtu ? (IMMEDIATE_BYTES + pmtu - 1) / pmtu : 0,
+    };
     const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS] = {0};
     if (wire_mode != SIMPLEX_WIRE_NONE) {
         prepare_memif_links();
@@ -1357,10 +1441,15 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             path_for(ready, directory, "tx.links-ready");
             wait_for(ready);
         }
-        for (uint16_t port = 0; port < DUPLEX_RAILS && (!inline_mode || !requester); port++) {
-            callbacks[port] = inline_mode ?
-                rte_eth_add_rx_callback(port, 0, drop_inline_fragment, &observed_inline) :
-                rte_eth_add_rx_callback(port, 0, observe_simplex_wire, &observed);
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            if (inline_mode && !requester)
+                callbacks[port] = rte_eth_add_rx_callback(port, 0, drop_inline_fragment, &observed_inline);
+            else if (pmtu && !requester)
+                callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_pmtu_write, &observed_pmtu);
+            else if (inspect_wire)
+                callbacks[port] = rte_eth_add_rx_callback(port, 0, observe_simplex_wire, &observed);
+            else
+                continue;
             assert(callbacks[port]);
         }
     }
@@ -1407,6 +1496,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     }
     if (inline_mode && !requester)
         assert(observed_inline.dropped && observed_inline.retransmitted);
+    if (pmtu && !requester)
+        assert(observed_pmtu.seen == (UINT32_C(1) << observed_pmtu.fragments) - 1);
     for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
         if (!callbacks[port])
             continue;
@@ -1465,6 +1556,10 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             printf(",\"rail_entropy\":[%u,%u]", observed.entropy[0], observed.entropy[1]);
         if (inline_mode && !requester)
             printf(",\"inline_fragment_retransmitted\":%s", observed_inline.retransmitted ? "true" : "false");
+        if (pmtu)
+            printf(",\"pmtu\":%u", pmtu);
+        if (pmtu && !requester)
+            printf(",\"writeimm_fragments\":%u", (unsigned int)__builtin_popcount(observed_pmtu.seen));
         puts("}");
     }
 }
@@ -1951,7 +2046,7 @@ static void run_single_write(bool requester, const char *directory, const struct
         assert(mrc_dpdk_set_sl_dscp(context, sl, SERVICE_DATA_DSCP, SERVICE_RETRY_DSCP) == 0);
         assert(mrc_dpdk_set_sl_dscp(context, 0, 8, 16) == 0);
     }
-    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, caps, sl);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, caps, sl, IBV_MTU_1024);
     if (mpr_updates) {
         struct mrc_qp_attr attrs = { .mpr = { .mpr = MPR_TEST_MAX, .mpr_dest = MPR_TEST_MAX } };
         assert(mrc_modify_qp(qp, NULL, 0, &attrs, requester ? MRC_QP_MPR : MRC_QP_MPR_DEST) == 0);
@@ -2832,7 +2927,7 @@ static void run_duplex(bool client, const char *directory, const struct address 
         const unsigned int caps = rx_flow && index == unsupported_index
                                   ? MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED : 0;
         configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true, 0,
-                     client ? cc_profile_id : 0, caps, 0);
+                     client ? cc_profile_id : 0, caps, 0, IBV_MTU_1024);
         if (rx_flow) {
             struct mrc_qp_attr attr;
             assert(mrc_query_qp(qps[index].qp, NULL, 0, &attr, MRC_QP_CAP, NULL) == 0);
@@ -2946,6 +3041,10 @@ int main(int argc, char **argv)
     enum simplex_wire_mode wire_mode = SIMPLEX_WIRE_NONE;
     if (inline_mode)
         wire_mode = SIMPLEX_INLINE;
+    else if (strcmp(argv[3], "pmtu_256") == 0)
+        wire_mode = SIMPLEX_PMTU_256;
+    else if (strcmp(argv[3], "pmtu_512") == 0)
+        wire_mode = SIMPLEX_PMTU_512;
     else if (generated_ev)
         wire_mode = SIMPLEX_GENERATED_EV;
     else if (explicit_srv6)
@@ -2967,7 +3066,7 @@ int main(int argc, char **argv)
         assert(!errno && profile_id && !*end);
     } else {
         assert(argc == 4 && (bidirectional || blackout || last_hop_trim || mpr_updates || error_mode != SIMPLEX_NO_ERROR ||
-                             srv6 || inline_mode || strcmp(argv[3], "simplex") == 0));
+                             wire_mode != SIMPLEX_WIRE_NONE || strcmp(argv[3], "simplex") == 0));
     }
 
     bool endpoint_shared = endpoint_ops && !strcmp(argv[4], "shared");

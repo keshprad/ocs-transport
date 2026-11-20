@@ -375,7 +375,7 @@ static void test_public_qp(struct ibv_context *verbs)
     assert(ibv_query_gid(verbs, port, 0, &gid) == 0);
     vattr = (struct ibv_qp_attr){
         .qp_state = IBV_QPS_RTR, .cur_qp_state = IBV_QPS_RESET,
-        .path_mtu = IBV_MTU_1024, .dest_qp_num = other_qpn, .rq_psn = 777,
+        .path_mtu = IBV_MTU_4096, .dest_qp_num = other_qpn, .rq_psn = 777,
         .ah_attr = { .is_global = 1, .port_num = port, .grh = { .dgid = gid } },
     };
     const int rtr_mask = IBV_QP_STATE | IBV_QP_CUR_STATE | IBV_QP_PATH_MTU |
@@ -386,6 +386,9 @@ static void test_public_qp(struct ibv_context *verbs)
     const int rtr_attrs = MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST | MRC_QP_CAP;
     assert(mrc_modify_qp(qp, &vattr, rtr_mask, &attr, rtr_attrs) == EINVAL);
     vattr.cur_qp_state = IBV_QPS_INIT;
+    vattr.path_mtu = 0;
+    assert(mrc_modify_qp(qp, &vattr, rtr_mask, &attr, rtr_attrs) == EOPNOTSUPP);
+    vattr.path_mtu = IBV_MTU_4096;
     assert(mrc_modify_qp(qp, &vattr, rtr_mask, &attr, rtr_attrs) == 0);
 
     vattr = (struct ibv_qp_attr){ .qp_state = IBV_QPS_RTS, .sq_psn = 0xffffff };
@@ -399,6 +402,7 @@ static void test_public_qp(struct ibv_context *verbs)
     assert(mrc_modify_qp(qp, &vattr, IBV_QP_STATE | IBV_QP_SQ_PSN, &attr, rts_attrs) == 0);
     assert(mrc_query_qp(qp, &vattr, rtr_mask | IBV_QP_SQ_PSN, &attr, rts_attrs | rtr_attrs, NULL) == 0);
     assert(vattr.qp_state == IBV_QPS_RTS && vattr.cur_qp_state == IBV_QPS_RTS);
+    assert(vattr.path_mtu == IBV_MTU_4096);
     assert(vattr.sq_psn == 0xffffff && vattr.rq_psn == 777 && vattr.dest_qp_num == other_qpn);
     assert(attr.wimm.max_wimm == 2 && attr.wimm.max_wimm_dest == 1 &&
            attr.mpr.mpr == 1 && attr.mpr.mpr_dest == 3 && attr.timeout == 13 &&
@@ -437,6 +441,8 @@ static void test_public_qp(struct ibv_context *verbs)
     assert(mrc_post_send(qp, &send[2], &bad_send) == 0 && !bad_send);
     vattr.qp_state = IBV_QPS_RESET;
     assert(mrc_modify_qp(qp, &vattr, IBV_QP_STATE, NULL, 0) == 0);
+    assert(mrc_query_qp(qp, &vattr, IBV_QP_PATH_MTU, NULL, 0, NULL) == 0);
+    assert(vattr.path_mtu == IBV_MTU_1024);
     assert(mrc_poll_cq(cq, 2, wc) == 0);
     assert(mrc_provider_qp_query(qp->provider, &provider) == 0 && provider.send_pending == 0);
     assert(mrc_destroy_qp(qp) == 0);

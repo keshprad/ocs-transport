@@ -186,6 +186,44 @@ def check_reliability_nacks(binary):
     print(json.dumps({"case": "unexpected_completion_queue_overrun"}))
 
 
+def check_path_mtu(binary):
+    for pmtu, ipv6 in ((256, False), (512, True)):
+        writes = [(0, None), (pmtu + 1, 0xffffffff), (2 * pmtu, None),
+                  (pmtu - 1, 7), (0, 0)]
+        tx, rx = transfer(binary, 0, "--pmtu", str(pmtu), writes=writes, ipv6=ipv6,
+                          tx_options=("--initial-psn", "16777214"),
+                          rx_options=("--initial-psn", "16777214"))
+        require(tx["pmtu"] == rx["pmtu"] == pmtu and tx["packets"] == rx["packets"] == 7
+                and rx["immediate_completions"] == 3,
+                f"Wrong PMTU, segmentation, or WRITEIMM completions: {tx}, {rx}")
+        print(json.dumps({"case": f"manual_pmtu_{pmtu}", "tx": tx, "rx": rx}))
+
+    writes = [(0, None), (8197, 42), (49165, None), (513, 23), (0, 0)]
+    for tx_pmtu, rx_pmtu in ((512, 256), (256, 512)):
+        rx_options = ["--pmtu", str(rx_pmtu)]
+        if rx_pmtu == 512:
+            # This resize is beyond the packet count at the responder's
+            # offered PMTU and occurs after it agrees to 256-byte segments.
+            rx_options += ["--mpr", "8", "--mpr-change-at", "160", "--mpr-change-to", "1"]
+        tx, rx = transfer(binary, 0, "--dynamic-mpr", "1", writes=writes, negotiate=True,
+                          tx_options=("--pmtu", str(tx_pmtu)), rx_options=rx_options)
+        expected_packets = sum(max(1, (length + 255) // 256) for length, _ in writes)
+        require(tx["pmtu"] == rx["pmtu"] == 256 and tx["packets"] == rx["packets"] == expected_packets
+                and tx["registered_memory"] and rx["registered_memory"] and rx["immediate_completions"] == 3,
+                f"Negotiated PMTU did not rebuild mixed WRITE geometry: {tx}, {rx}")
+        if rx_pmtu == 512:
+            require(tx["mpr_updates"] == rx["mpr_updates"] == 1,
+                    f"Packet-indexed resize did not use negotiated geometry: {tx}, {rx}")
+        print(json.dumps({"case": f"negotiated_pmtu_{tx_pmtu}_to_{rx_pmtu}", "tx": tx, "rx": rx}))
+
+    invalid = "Packet-indexed options do not fit 3 packets at PMTU 256"
+    transfer(binary, 513, "--dynamic-mpr", "1", negotiate=True, drop_after=3,
+             tx_options=("--pmtu", "512"),
+             rx_options=("--pmtu", "256", "--mpr", "8", "--mpr-change-at", "3", "--mpr-change-to", "1"),
+             expected_errors={"tx": invalid, "rx": invalid})
+    print(json.dumps({"case": "reject_packet_index_after_pmtu_negotiation"}))
+
+
 def check_partition_membership(binary):
     full, limited = "0xa345", "0x2345"
     for name, tx_key, rx_key, ipv6 in (
@@ -226,12 +264,16 @@ def main():
     parser.add_argument("--event-controller", type=Path,
                         help="Path to test_mrc_ctl_abi for cross-process EV event verification")
     parser.add_argument("--pkey-only", action="store_true", help="Run only the P_Key membership cases")
+    parser.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     controller = (args.controller or binary.with_name("mrc_ctl_profile")).resolve()
     require(binary.is_file(), f"Build mrc_write first: {binary}")
     if args.pkey_only:
         check_partition_membership(binary)
+        return
+    if args.pmtu_only:
+        check_path_mtu(binary)
         return
     require(controller.is_file(), f"Build mrc_ctl_profile first: {controller}")
 
@@ -325,6 +367,7 @@ def main():
             "Negotiated transfer did not use provider-registered memory")
     print(json.dumps({"case": "negotiated_qp", "tx": tx, "rx": rx}))
 
+    check_path_mtu(binary)
     check_partition_membership(binary)
 
     for ipv6, case in ((True, "srv6_write_imm_trim_nack"), (False, "srv6_ipv4_write_imm_trim_nack")):

@@ -43,7 +43,10 @@ int mrc_dpdk_set_sl_dscp(struct mrc_context *context, unsigned int sl,
 
 /* Application-owned, started DPDK ports with queue zero for RX and TX.
  * QPs in this process can share these ports. Keep application I/O on the
- * attached queues inside the MRC progress calls until the QPs detach. */
+ * attached queues inside the MRC progress calls until the QPs detach.
+ * Both port MTUs and the pool's mbuf data room must fit the selected QP
+ * path MTU and its wire headers. Attach returns EMSGSIZE for insufficient
+ * port or pool capacity. */
 struct mrc_dpdk_route {
     uint16_t ports[2];
     uint8_t peer_macs[2][6];

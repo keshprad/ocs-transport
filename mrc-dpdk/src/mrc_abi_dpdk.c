@@ -459,6 +459,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     *config = (struct mrc_endpoint_config){
         .sender = tx, .continuous_send = tx, .pool = route->pool, .pd = qp->pd->provider,
         .srv6 = srv6 != NULL,
+        .pmtu = (uint16_t)(MRC_MIN_PMTU << (verbs->path_mtu - IBV_MTU_256)),
         .requestor_qpn = tx ? qp->qpn : verbs->dest_qp_num,
         .responder_qpn = tx ? verbs->dest_qp_num : qp->qpn,
         .initial_psn = tx ? verbs->sq_psn : verbs->rq_psn,
@@ -518,6 +519,18 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     }
     if (config->profile_id && !mrc_endpoint_apply_ev_profile(config))
         return EINVAL;
+
+    const uint16_t frame_length = mrc_endpoint_frame_capacity(config);
+    if (rte_pktmbuf_data_room_size(config->pool) < frame_length + RTE_PKTMBUF_HEADROOM)
+        return EMSGSIZE;
+    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+        uint16_t mtu;
+        error = -rte_eth_dev_get_mtu(config->paths[i].port, &mtu);
+        if (error)
+            return error;
+        if (mtu < frame_length - RTE_ETHER_HDR_LEN)
+            return EMSGSIZE;
+    }
     return 0;
 }
 

@@ -10,12 +10,10 @@
 
 enum {
     PATH_COUNT = 2,
-    MRC_ENDPOINT_FRAME_CAPACITY = 1514,
+    MRC_ENDPOINT_FRAME_CAPACITY = MRC_WIRE_SRV6_MAX_PREFIX_LEN + MRC_METH_LEN +
+        MRC_TSETH_LEN + MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_MAX_PMTU,
     MRC_ENDPOINT_CONTROL_DSCP = 48,
     MRC_ENDPOINT_TRIM_DSCP = 49,
-    PMTU = 1024,
-    MRC_NOMINAL_MTU = PMTU + 8 + MRC_BTH_LEN + MRC_METH_LEN +
-                      MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
     WINDOW = 1024,
     MAX_WORK_REQUESTS = 4096,
 };
@@ -88,6 +86,7 @@ struct mrc_endpoint_config {
     uint32_t rx_staging_capacity;
     uint32_t rx_work_capacity;
     uint64_t remote_address;
+    uint16_t pmtu; /* Zero selects MRC_DEFAULT_PMTU. */
     uint16_t partition_key;
     uint16_t peer_partition_key; /* Zero uses RC partition membership. */
     uint32_t local_ip;
@@ -181,6 +180,8 @@ struct mrc_responder;
 
 uint32_t mrc_endpoint_default_entropy(bool structured, unsigned int path);
 bool mrc_endpoint_apply_ev_profile(struct mrc_endpoint_config *config);
+uint16_t mrc_endpoint_frame_capacity(const struct mrc_endpoint_config *config);
+uint32_t mrc_endpoint_nominal_mtu(uint16_t pmtu);
 struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config *transfer,
                                                unsigned int path, uint8_t opcode, uint32_t psn);
 bool mrc_endpoint_transmit(const struct mrc_endpoint_config *transfer, unsigned int path,
@@ -201,6 +202,7 @@ bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *config, unsigne
 bool mrc_endpoint_append_write(struct mrc_endpoint_config *transfer, size_t capacity,
                                uint32_t length, bool with_immediate,
                                uint32_t immediate);
+bool mrc_endpoint_resegment_writes(struct mrc_endpoint_config *transfer, uint16_t pmtu);
 uint64_t mrc_endpoint_cycles(const struct mrc_endpoint_config *transfer, uint64_t ns);
 
 /* The caller owns the ports, configuration, QP and counters for the lifetime
