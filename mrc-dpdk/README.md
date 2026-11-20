@@ -643,16 +643,22 @@ unshare -Urn python3 tests/check_mrc_srv6_fabric.py
 unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault ecn
 unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault trim
 unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault link
+unshare -Urn python3 tests/check_mrc_srv6_fabric.py --jumbo
 ```
 
 Use `--af-packet-driver /path/to/librte_net_af_packet.so.24` for a
-separately built driver that DPDK does not load automatically. The ECN
-case requires nftables. Each transfer uses separate endpoints, a
+separately built driver that DPDK does not load automatically.
+Each transfer uses separate endpoints, a
 management link for OOB negotiation, and two independent Linux routers.
 The test checks SRH advancement on both rails, terminal decapsulation
 on one rail, WRITEIMM completion and payload, and a live Dynamic MPR
 update. The ECN case marks the outer IPv6 header in the kernel. The trim
 case forwards sender-injected trims and checks alternate-rail recovery.
+The jumbo case uses the TAP PMD, `/dev/net/tun`, and Linux bridges with
+MTU 4500. It negotiates 4096-byte segments and checks that both routers
+see full-sized packets, including on the rail that decapsulates the SRH.
+Use `--tap-driver /path/to/librte_net_tap.so.24` for a separately built
+TAP driver. The ECN, link, and jumbo cases require nftables.
 The link case uses nftables and tc netem to observe and pace a 4 MiB
 transfer. It brings one sender interface down and back up, checks the
 Port Status masks on the surviving rail, and verifies that both rails

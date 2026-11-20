@@ -51,7 +51,12 @@ selection in both directions of an asymmetric TCP offer. Independent
 captures verify requester payload, RETH geometry, and immediate data at
 2048 and 4096 bytes. Separate replays verify out-of-order 4096-byte
 placement over IPv4, IPv6, and preserved SRv6 with and without a final
-SRH. Jumbo transfers on the physical NICs remain unverified.
+SRH. The Linux SRv6 fabric's `--jumbo` case negotiated PMTU 4096 and
+delivered a 1,048,749-byte WRITEIMM. Kernel ingress counters saw 128
+full-sized packets on each rail. The receiver validated the complete
+buffer, including the 173-byte tail. One rail preserved the header and
+the other decapsulated it with `End.DX6`. Jumbo transfers on the physical
+NICs remain unverified.
 
 For §7.4.8, one Port Status report with a zero mask pauses writes on
 two QPs with overlapping membership and pinned-key filters. A second
