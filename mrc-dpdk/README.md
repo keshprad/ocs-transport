@@ -613,12 +613,35 @@ The [original RoCEv2 baseline](../summary.md) used two logical paths over
 one QSFP cable. The current Polatis tests use the separate circuits listed
 in [Spark double ring](#spark-double-ring).
 
+## Linux SRv6 fabric verification
+
+Use the AF_PACKET PMD and Linux with user and network namespaces,
+veth, iproute2, and SRv6 local actions. Build the controller fixture
+against the OCP headers. It seeds the EV profile using an accessible
+Ethernet verbs device.
+
+```sh
+make mrc_write MRC_INCLUDE_DIR=/path/to/ocp/headers tests/test_mrc_ctl_abi
+unshare -Urn python3 tests/check_mrc_srv6_fabric.py
+unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault ecn
+unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault trim
+```
+
+Use `--af-packet-driver /path/to/librte_net_af_packet.so.24` for a
+separately built driver that DPDK does not load automatically. The ECN
+case requires nftables. Each transfer uses separate endpoints, a
+management link for OOB negotiation, and two independent Linux routers.
+The test checks SRH advancement on both rails, terminal decapsulation
+on one rail, WRITEIMM completion and payload, and a live Dynamic MPR
+update. The ECN case marks the outer IPv6 header in the kernel. The trim
+case forwards sender-injected trims and checks alternate-rail recovery.
+
 ## Behavioral parity with the emulator
 
 Use an upstream [`srv6-mrc-emulator`](https://github.com/segmentrouting/srv6-mrc-emulator)
 checkout. The comparison was developed against
-`ccd0f5eb711743ae27a83c236445d33e633ee18d`. The test runs two endpoints on
-two real DPDK `net_memif` virtual links. It requires Linux, two usable CPU
+`ccd0f5eb711743ae27a83c236445d33e633ee18d`. The test runs the original
+`mrc_bench` over two DPDK `net_memif` virtual links. It requires Linux, two usable CPU
 cores, Python 3, and the memif PMD. It needs no physical NICs or hugepages.
 
 ```sh
