@@ -33,7 +33,6 @@ enum {
     FAST_LOSS_GAP = 16,
     ALL_PATHS = (1 << PATH_COUNT) - 1,
     DATA_DSCP = 0,
-    CONTROL_DSCP = 48,
     ACK_SYNDROME = 0x1f,
     INVALID_REQUEST_NAK = 0x61,
     REMOTE_ACCESS_NAK = 0x62,
@@ -330,7 +329,7 @@ struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config 
 
     bool data = mrc_wire_is_write(opcode);
     uint32_t entropy = path_entropy(transfer, index, transfer->sender);
-    uint8_t dscp = data || opcode == MRC_RELIABILITY_PROBE ? DATA_DSCP : CONTROL_DSCP;
+    uint8_t dscp = data || opcode == MRC_RELIABILITY_PROBE ? DATA_DSCP : MRC_ENDPOINT_CONTROL_DSCP;
     uint8_t ecn = data ? 2 : 0;
     if (transfer->ip_version == MRC_WIRE_IP6) {
         packet.ipv6 = (struct mrc_wire_ipv6){
@@ -1344,7 +1343,8 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
 
 static void receive_trimmed(const struct mrc_endpoint_config *transfer, const struct mrc_responder *receiver,
                             struct mrc_endpoint_counters *counts, unsigned int path,
-                            const struct mrc_wire_trimmed *trimmed, uint32_t entropy, uint64_t arrival_cycles)
+                            const struct mrc_wire_trimmed *trimmed, uint32_t entropy,
+                            uint8_t reason, uint64_t arrival_cycles)
 {
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, trimmed->bth.psn);
     if (disposition == MRC_RX_OUTSIDE_WINDOW) {
@@ -1361,7 +1361,7 @@ static void receive_trimmed(const struct mrc_endpoint_config *transfer, const st
     if (transfer->trim_nack_enabled) {
         uint16_t timestamp = mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
                                                              trimmed->tsr, trimmed->tx_timestamp);
-        if (send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_TRIMMED,
+        if (send_nack(transfer, counts, path, &trimmed->bth, entropy, reason,
                       trimmed->original_udp_len, timestamp))
             counts->trim_nacks++;
     }
@@ -1385,6 +1385,11 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
     struct mrc_wire_trimmed trimmed;
     struct mrc_wire_srv6 route;
     int result = mrc_wire_decode_trimmed_srv6(frame, length, transfer->trim_dscp, &trimmed, &route);
+    uint8_t trim_reason = MRC_NACK_TRIMMED;
+    if (result == -EPROTONOSUPPORT && transfer->trim_last_hop_dscp) {
+        result = mrc_wire_decode_trimmed_srv6(frame, length, transfer->trim_last_hop_dscp, &trimmed, &route);
+        trim_reason = MRC_NACK_TRIMMED_LASTHOP;
+    }
     struct mrc_wire_packet packet;
     if (result != -EPROTONOSUPPORT) {
         if (result || !mrc_endpoint_route_matches(transfer, path, &route)) {
@@ -1400,7 +1405,7 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
                 rx->matched++;
                 receiver->last_frame = rte_get_timer_cycles();
                 receive_trimmed(transfer, receiver, counts, path, &trimmed, reflect_entropy(&packet),
-                                arrival_cycles);
+                                trim_reason, arrival_cycles);
             } else {
                 rx->other_peer++;
             }

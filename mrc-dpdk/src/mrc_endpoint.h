@@ -11,6 +11,8 @@
 enum {
     PATH_COUNT = 2,
     MRC_ENDPOINT_FRAME_CAPACITY = 1514,
+    MRC_ENDPOINT_CONTROL_DSCP = 48,
+    MRC_ENDPOINT_TRIM_DSCP = 49,
     PMTU = 1024,
     MRC_NOMINAL_MTU = PMTU + 8 + MRC_BTH_LEN + MRC_METH_LEN +
                       MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_CC_NOMINAL_HDRSIZE,
@@ -109,6 +111,7 @@ struct mrc_endpoint_config {
     uint32_t final_ack_drops;
     uint16_t udp_port;
     uint8_t trim_dscp;
+    uint8_t trim_last_hop_dscp;
     unsigned int timeout_exponent;
     unsigned int linear_retries;
     unsigned int exponential_retries;

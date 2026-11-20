@@ -38,6 +38,8 @@ OPCODES = (0xC6, 0xC7, 0xC7, 0xC7, 0xC9, 0xCB)
 FIRST_WRITE_END = 4
 REJECTED_PACKET = 1
 TRIM = 0x01
+TRIM_LAST_HOP = 0x02
+TRIM_NACKS = (TRIM, TRIM_LAST_HOP)
 NO_PKT_BUFFER = 0x07
 RTX = 0x20
 ENDPOINT_QPN = 2
@@ -127,7 +129,7 @@ class ReferenceResponder:
     def nack(self, rail, packet, reason):
         body = struct.pack("!HBBIHHI", 0, reason, 0, packet.entropy, *PDC_IDS, packet.bth.psn)
         body += struct.pack("!I", 0x20000000)
-        original = packet.udp_size if reason == TRIM else None
+        original = packet.udp_size if reason in TRIM_NACKS else None
         self.reply(rail, 0xDD, packet.bth.psn, body, packet.bth.flags & RTX,
                    original_udp_size=original)
 
@@ -162,7 +164,7 @@ class ReferenceResponder:
             return
         if self.nack_reason is not None and index == REJECTED_PACKET and index not in self.received:
             require(is_retry and self.rejected_rail is not None and rail != self.rejected_rail,
-                    "Mandatory NACK did not cause an alternate-rail retransmission")
+                    "NACK did not cause an alternate-rail retransmission")
             self.retry_rail = rail
 
         if index in self.received:
@@ -599,7 +601,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                 require(responder.retry_rail is not None and responder.first_write_acked,
                         "Fixture did not exercise both retransmission and delayed semantic completion")
                 require(counters["nack_received_mask"] == 1 << nack_reason and
-                        counters["trim_nacks"] == (nack_reason == TRIM),
+                        counters["trim_nacks"] == (nack_reason in TRIM_NACKS) and
+                        counters["ev_skipped"] == (nack_reason == TRIM),
                         f"Unexpected NACK counters: {counters}")
             elif retry_timer is not None:
                 require(sum(counters["retries"]) == 4 and counters["nack_received_mask"] == 1 << NO_PKT_BUFFER,
@@ -650,7 +653,8 @@ def main():
                         or args.retry_timer_only)
     if normal_suite:
         for mode in args.mode or MODES:
-            for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim")):
+            for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim"),
+                                  (TRIM_LAST_HOP, "trim_last_hop")):
                 counters = run_requester(binary, relay, mode, reason)
                 print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
     mode = (args.mode or ("ipv6",))[0]

@@ -420,13 +420,14 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         .max_wimm_inflight = tx ? attrs->wimm.max_wimm : attrs->wimm.max_wimm_dest,
         .rx_ooo_capacity = window, .rx_staging_capacity = window, .rx_work_capacity = window,
         .dynamic_mpr = (attrs->cap & MRC_QP_CAP_DYNAMIC_MPR) != 0,
-        .trim_nack_enabled = !(attrs->cap & MRC_QP_CAP_TRIM_NACK_DEST_UNSUPPORTED),
+        /* The local device advertises generation independently of the peer. */
+        .trim_nack_enabled = !tx,
         .report_service_time = true,
         .peer_service_time = tx && !(attrs->cap & MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED),
         .timeout_exponent = attrs->timeout, .linear_retries = attrs->retry.linear_cnt,
         .exponential_retries = attrs->retry.exp_cnt,
         .udp_port = route->udp_port ? route->udp_port : MRC_UDP_DEFAULT_PORT,
-        .trim_dscp = route->trim_dscp ? route->trim_dscp : 49,
+        .trim_dscp = route->trim_dscp ? route->trim_dscp : MRC_ENDPOINT_TRIM_DSCP,
         .drop_after = UINT32_MAX, .restore_after = UINT32_MAX, .trim_after = UINT32_MAX,
         .mpr_change_at = UINT32_MAX, .hz = rte_get_timer_hz(),
         .receive = take_packets, .receive_context = direction,
@@ -575,6 +576,22 @@ MRC_PUBLIC int mrc_dpdk_set_rx_flow_control(struct mrc_qp *qp, uint8_t penalty, 
     int error = ENOTCONN;
     if (qp->route && qp->route->response)
         error = -mrc_responder_set_flow_control(qp->route->response, penalty, restore);
+    pthread_mutex_unlock(&qp->mutex);
+    return error;
+}
+
+MRC_PUBLIC int mrc_dpdk_set_trim_last_hop_dscp(struct mrc_qp *qp, unsigned int dscp)
+{
+    if (!qp || dscp > 63 || dscp == MRC_ENDPOINT_CONTROL_DSCP)
+        return EINVAL;
+    pthread_mutex_lock(&qp->mutex);
+    int error = ENOTCONN;
+    if (qp->route && qp->route->response) {
+        struct mrc_endpoint_config *config = &qp->route->rx.config;
+        error = dscp == config->trim_dscp ? EINVAL : 0;
+        if (!error)
+            config->trim_last_hop_dscp = (uint8_t)dscp;
+    }
     pthread_mutex_unlock(&qp->mutex);
     return error;
 }

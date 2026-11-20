@@ -14,7 +14,7 @@ from typing import NamedTuple, Optional
 
 from memif_pair import require
 from mrc_wire_reference import (Bth, IPPeer, decode_ipv4, decode_ipv6, encode_ipv4,
-                                encode_ipv6, unwrap_srv6, wrap_srv6)
+                                encode_ipv6, ipv4_checksum, unwrap_srv6, wrap_srv6)
 
 REQUESTOR = 0x120345
 RESPONDER = 0x230456
@@ -25,6 +25,8 @@ RKEY = 0xDECAFE
 UDP_PORT = 4971
 TRIM_DSCP = 49
 TRIM_TIMESTAMP = 0x4C12
+TRIM_LAST_HOP_DSCP = 51
+TRIM_LAST_HOP_TIMESTAMP = 0x7A5C
 RESERVED_OPCODE = 0xDF
 PEER_MACS = [bytes.fromhex("0200000000a0"), bytes.fromhex("0200000000a1")]
 PCAP_MACS = [bytes.fromhex("027063617000"), bytes.fromhex("027063617001")]
@@ -60,14 +62,24 @@ REPLAYS = (
 
 
 def request(replay, path, opcode, psn, body, flags=0, *, ce=False, source_sid=PEER_SID,
-            outer_traffic_class=None, dqp=RESPONDER):
+            traffic_class=None, outer_traffic_class=None, dqp=RESPONDER):
     source = IPPeer(PEER_MACS[path], ipaddress.ip_address(replay.peer_ip).packed)
     destination = IPPeer(PCAP_MACS[path], ipaddress.ip_address(replay.local_ip).packed)
     bth = Bth(opcode, PKEY, dqp, psn, flags)
     if not replay.ipv6:
-        return encode_ipv4(source, destination, SOURCE_PORTS[path], UDP_PORT, bth, body)
+        frame = encode_ipv4(source, destination, SOURCE_PORTS[path], UDP_PORT, bth, body)
+        if traffic_class is None:
+            return frame
+        # The RoCE invariant CRC masks IPv4 traffic class and header checksum.
+        marked = bytearray(frame)
+        marked[15] = traffic_class
+        marked[24:26] = bytes(2)
+        struct.pack_into("!H", marked, 24, ipv4_checksum(marked[14:34]))
+        return bytes(marked)
+    if traffic_class is None:
+        traffic_class = 3 if ce and replay.srh is None else 2
     frame = encode_ipv6(source, destination, SOURCE_PORTS[path], UDP_PORT, bth, body,
-                        flow_label=FLOW_LABELS[path], traffic_class=3 if ce and replay.srh is None else 2)
+                        flow_label=FLOW_LABELS[path], traffic_class=traffic_class)
     if replay.srh is None:
         return frame
     if outer_traffic_class is None:
@@ -94,20 +106,26 @@ def write_request(replay, path, opcode, psn, msn, rqmsn, offset, length, payload
     return request(replay, path, opcode, psn, headers + payload, flags, **envelope)
 
 
-def trimmed_request(replay, data, *, timestamp=TRIM_TIMESTAMP, opaque=True):
+def trimmed_request(replay, data, *, timestamp=TRIM_TIMESTAMP, opaque=True,
+                    dscp=TRIM_DSCP, truncate=True, flags=0x80):
+    traffic_class = dscp << 2
     full = write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, len(data), data,
-                         timestamp=timestamp, opaque=opaque, outer_traffic_class=TRIM_DSCP << 2)
+                         timestamp=timestamp, opaque=opaque, flags=flags,
+                         traffic_class=traffic_class if replay.srh is None else None,
+                         outer_traffic_class=traffic_class if replay.srh is not None else None)
     # The switch preserves the original declared lengths and removes data and iCRC.
-    udp_offset = 14 + 40 + 24 + 40  # Ethernet, outer IPv6, single-segment SRH, inner IPv6
+    udp_offset = 14 + (40 if replay.ipv6 else 20)
+    if replay.srh is not None:
+        udp_offset += 40 + (24 if replay.srh else 0)
     original_udp_size = struct.unpack_from("!H", full, udp_offset + 4)[0]
     keep = udp_offset + 8 + 12 + 4 + 4  # UDP, BTH, METH, TSETH
-    return full[:keep], original_udp_size
+    return (full[:keep] if truncate else full), original_udp_size
 
 
 def captured_requests(replay):
     # Match the benchmark's application payload check without its wire codec.
     data = bytes((i ^ (i >> 8)) & 0xFF for i in range(13 + 1025))
-    first = write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, 13, data[:13])
+    first = write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, 13, data[:13], flags=0xA0)
     corrupt = first[:-1] + bytes([first[-1] ^ 1])
     outside = (INITIAL_PSN + 1024) & 0xFFFFFF
     outside_write = write_request(replay, 0, 0xCA, outside, 1, 0, 0, 13, data[:13])
@@ -131,13 +149,14 @@ def captured_requests(replay):
         transit = bytearray(first)
         transit[14 + 40 + 3] = 1  # SRH Segments Left
         rejected.append(bytes(transit))
-    rail = [outside_write, wrong_context, probe, *rejected]
-    trim_size = None
-    if replay.srh:
-        trim, trim_size = trimmed_request(replay, data[:13])
-        rail.append(trim)
-    rail.extend((first, tail, duplicate))
-    return (rail, [head]), outside, len(rejected), trim_size
+    trim, trim_size = trimmed_request(replay, data[:13])
+    # The intact marked WRITE has valid headers and iCRC. A probe checks that
+    # neither trim advanced delivery before the real WRITE places its data.
+    wrong_data = bytes(value ^ 0xFF for value in data[:13])
+    last_hop, last_hop_size = trimmed_request(replay, wrong_data, timestamp=TRIM_LAST_HOP_TIMESTAMP,
+                                              dscp=TRIM_LAST_HOP_DSCP, truncate=False, flags=0xA0)
+    rail = [outside_write, wrong_context, *rejected, trim, last_hop, probe, first, tail, duplicate]
+    return (rail, [head]), outside, len(rejected), (trim_size, last_hop_size)
 
 
 def service_time_requests(replay):
@@ -228,14 +247,13 @@ def decode_response(replay, path, frame):
     return packet
 
 
-def check_responses(replay, output_paths, outside, trim_size):
+def check_responses(replay, output_paths, outside, trim_sizes):
     responses = [[decode_response(replay, path, frame) for frame in read_capture(output)]
                  for path, output in enumerate(output_paths)]
     aeth = [[(packet.bth.psn, packet.body) for packet in rail if packet.bth.opcode == 0xD1]
             for rail in responses]
-    require(aeth[0] and all(body == b"\x1f\x00\x00\x01" and psn == INITIAL_PSN
-                            for psn, body in aeth[0]), "Transport ACK completed WR 2 before its first packet")
-    require((1, b"\x1f\x00\x00\x02") in aeth[1], "Final transport ACK did not complete MSN 2")
+    require(aeth == [[(INITIAL_PSN, b"\x1f\x00\x00\x01")] * 2, [(1, b"\x1f\x00\x00\x02")]],
+            f"Unexpected semantic ACKs after two trims and a duplicate: {aeth}")
 
     sacks = [(packet.bth.psn, packet.bth.flags, packet.body)
              for packet in responses[0] if packet.bth.opcode == 0xDC]
@@ -260,18 +278,22 @@ def check_responses(replay, output_paths, outside, trim_size):
             "Selective ACK did not reflect the retransmission flag")
     nacks = [packet for packet in responses[0] if packet.bth.opcode == 0xDD]
     by_reason = {packet.body[2]: packet for packet in nacks}
-    expected_reasons = {0x01, 0x0B} if trim_size is not None else {0x0B}
+    expected_reasons = {0x01, 0x02, 0x0B}
     require(len(nacks) == len(expected_reasons) and by_reason.keys() == expected_reasons,
             "Unexpected reliability NACKs")
     window = by_reason[0x0B]
     require(window.bth.psn == outside and int.from_bytes(window.body[13:16], "big") == outside,
             "Out-of-window NACK did not reflect the request PSN")
-    if trim_size is not None:
-        trimmed = by_reason[0x01]
-        require(trimmed.bth.psn == INITIAL_PSN and trimmed.udp_size == trim_size and
+    for reason, size, timestamp, rtx in (
+        (0x01, trim_sizes[0], TRIM_TIMESTAMP, False),
+        (0x02, trim_sizes[1], TRIM_LAST_HOP_TIMESTAMP, True),
+    ):
+        trimmed = by_reason[reason]
+        require(trimmed.bth.psn == INITIAL_PSN and trimmed.udp_size == size and
+                bool(trimmed.bth.flags & 0x20) == rtx and
                 int.from_bytes(trimmed.body[13:16], "big") == INITIAL_PSN and
-                struct.unpack_from("!H", trimmed.body, 18)[0] == TRIM_TIMESTAMP,
-                "Trim NACK did not reflect the request PSN, original UDP size, and timestamp")
+                struct.unpack_from("!H", trimmed.body, 18)[0] == timestamp,
+                f"Trim NACK {reason:#x} did not reflect the PSN, RTX flag, original UDP size, and timestamp")
     require(any(packet.bth.opcode == 0xDC and packet.bth.psn == 1 and packet.body[17] == 0 and
                 struct.unpack_from("!H", packet.body, 30)[0] == 0 for packet in responses[1]),
             "Final SACK did not close the receive gap")
@@ -283,7 +305,7 @@ def check_responses(replay, output_paths, outside, trim_size):
 
 
 @contextmanager
-def run_capture(binary, replay, requests, *, trim=False, service_time=False):
+def run_capture(binary, replay, requests, *, trim=False, last_hop=False, service_time=False):
     with tempfile.TemporaryDirectory(prefix="mrc-pcap-") as temp:
         directory = Path(temp)
         incoming = [directory / f"rx{path}.pcap" for path in range(2)]
@@ -303,6 +325,8 @@ def run_capture(binary, replay, requests, *, trim=False, service_time=False):
                     "--port-stats", "1", "--timeout-ms", "2000"]
         if trim:
             command += ["--trim-dscp", str(TRIM_DSCP), "--trim-nack", "1"]
+        if last_hop:
+            command += ["--trim-last-hop-dscp", str(TRIM_LAST_HOP_DSCP)]
         if service_time:
             command += ["--service-time", "1"]
         if replay.srh is not None:
@@ -316,20 +340,19 @@ def run_capture(binary, replay, requests, *, trim=False, service_time=False):
 
 
 def run_replay(binary, replay):
-    requests, outside, rejected, trim_size = captured_requests(replay)
-    with run_capture(binary, replay, requests, trim=trim_size is not None) as (result, outgoing):
+    requests, outside, rejected, trim_sizes = captured_requests(replay)
+    with run_capture(binary, replay, requests, trim=True, last_hop=True) as (result, outgoing):
         require(result.returncode == 0, f"pcap endpoint failed\n{result.stdout}\n{result.stderr}")
         counters = json.loads(result.stdout.strip().splitlines()[-1])
-        trimmed = int(trim_size is not None)
         require(counters["bytes"] == 1038 and counters["received"] == [2, 1] and
                 counters["duplicates"] == 1 and counters["immediate_completions"] == 1 and
                 counters["probe_requests"] == 1 and
-                counters["trimmed"] == counters["trim_nacks"] == trimmed and
-                counters["nack_sent_mask"] == ((1 << 0x0B) | (trimmed << 1)) and
+                counters["trimmed"] == counters["trim_nacks"] == 2 and
+                counters["nack_sent_mask"] == (1 << 0x0B | 1 << 0x02 | 1 << 0x01) and
                 f"decode-rejected={rejected} other-peer=0" in result.stderr,
                 f"Unexpected {replay.name} placement or error counters: {counters}\n{result.stderr}")
-        check_responses(replay, outgoing, outside, trim_size)
-        print(f"Independent {replay.name} packet replay passed WRITE, WRITEIMM, SACK, AETH, PETH, and NETH checks")
+        check_responses(replay, outgoing, outside, trim_sizes)
+        print(f"Independent {replay.name} packet replay passed placement, SACK, AETH, PETH, and both trim NACKs")
 
 
 def check_service_time(binary, replay):

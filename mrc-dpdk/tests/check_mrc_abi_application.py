@@ -99,7 +99,9 @@ def main():
     )
     parser.add_argument("--controller", type=Path,
                         help="Path to test_mrc_ctl_abi for privileged controller and endpoint cases")
-    parser.add_argument("--blackout-only", action="store_true", help="Run only the two-rail blackout cases")
+    focused = parser.add_mutually_exclusive_group()
+    focused.add_argument("--blackout-only", action="store_true", help="Run only the two-rail blackout cases")
+    focused.add_argument("--last-hop-trim-only", action="store_true", help="Run only the last-hop trim case")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -124,6 +126,18 @@ def main():
                     and rx["recovered"] == recovered,
                     f"Unexpected requester or rail behavior during {mode}: {tx}, {rx}")
             print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+    def check_last_hop_trim():
+        tx, rx = run_case("last_hop_trim")
+        require(tx["qpn"] != rx["qpn"] and tx["completions"] == rx["completions"] == 1
+                and tx["nack_reason"] == 2 and tx["original_udp_len"] == 64
+                and tx["nack_rail"] == rx["marked_rail"] and rx["marked_rail"] != rx["retry_rail"],
+                f"Unexpected last-hop trim recovery: {tx}, {rx}")
+        print(json.dumps({"case": "public_qp_last_hop_trim", "tx": tx, "rx": rx}))
+
+    if args.last_hop_trim_only:
+        check_last_hop_trim()
+        return
 
     if args.blackout_only:
         check_blackouts()
@@ -179,6 +193,7 @@ def main():
         print(json.dumps({"case": f"public_async_events_on_{mode}", "tx": tx, "rx": rx}))
 
     check_blackouts()
+    check_last_hop_trim()
 
     if args.controller:
         controller = args.controller.resolve()

@@ -36,6 +36,14 @@ with TCP setup enabled. On the receiver, `--mpr-change-at PACKETS` and
 `--mpr-change-to UNITS` advertise a new limit after accepting that many
 segments. The new limit uses units of 128 packets, like `--mpr`.
 
+The receiver recognizes regular trim on DSCP 49 by default. Use
+`--trim-dscp N` to change it and `--trim-last-hop-dscp N` to enable a
+distinct last-hop class. The latter defaults to zero, which disables it.
+In the public API, call `mrc_dpdk_set_trim_last_hop_dscp(qp, N)` on an
+attached responder to enable the same classification. Both classes
+leave destination memory and receive completions untouched until an
+ordinary WRITE arrives.
+
 The sender uses `--deny-path-mask MASK` to exclude configured paths from its
 EV profile. Bit 0 selects path 0 and bit 1 selects path 1. For a transient
 in-process path-1 blackhole, pair `--drop-path-after N` with
@@ -49,8 +57,8 @@ A Python codec generates IPv4, IPv6, and preserved SRv6 requests with and
 without a final SRH. The replay validates data placement, SACKs and transport
 ACKs across PSN wrap, iCRC and routing rejection, and the invalid-request
 error for an unsupported opcode. The IPv6 cases also check structured
-entropy and CE feedback. The final SRH case checks the original UDP length
-and timestamp in a TRIM NACK.
+entropy and CE feedback. The trim replays check distinct regular and
+last-hop NACKs, the original UDP length, and timestamp reflection.
 
 With the `net_memif` PMD available, build `tests/mrc_memif_relay` and run
 `python3 tests/check_mrc_requester.py`. The Python responder verifies the same

@@ -31,12 +31,14 @@ enum {
     SECOND_IMMEDIATE = 0x12345678,
     DUPLEX_QPS = 2,
     DUPLEX_RAILS = 2,
+    WIRE_NACK = 0xdd,
     WIRE_PROBE_REQUEST = 0xde,
     WIRE_SACK = 0xdc,
     WIRE_WRITE_FIRST = 0xc6,
     WIRE_WRITE_ONLY_IMM = 0xcb,
     WIRE_BTH_LEN = 12,
     WIRE_PETH_LEN = 16,
+    WIRE_NETH_LEN = 20,
     WIRE_SETH_LEN = 28,
     WIRE_CC_STATE_LEN = 8,
     WIRE_IPV6_LEN = 40,
@@ -51,6 +53,9 @@ enum {
     RX_FLOW_PENALTY_MASK = 0x7f,
     BLACKOUT_TIMEOUT_EXPONENT = 16,
     BLACKOUT_FINITE_RETRIES = 3,
+    LAST_HOP_TRIM_DSCP = 51,
+    LAST_HOP_TRIM_REASON = 0x02,
+    SINGLE_WRITE_UDP_LEN = 64,
 };
 
 struct address {
@@ -72,6 +77,12 @@ enum simplex_error {
     SIMPLEX_CQ_OVERRUN,
     SIMPLEX_REQUEST_ERROR,
     SIMPLEX_ACCESS_ERROR,
+};
+
+enum single_write_case {
+    BLACKOUT_FINITE,
+    BLACKOUT_INFINITE,
+    LAST_HOP_TRIM,
 };
 
 static struct ibv_context *open_verbs(struct address *address, bool require_ipv6)
@@ -1516,10 +1527,141 @@ static uint64_t check_blackout_requester(struct mrc_context *context, struct mrc
     return (finished - (infinite ? restore_at : start)) * 1000 / hz;
 }
 
-static void run_blackout(bool requester, const char *directory, const struct address *address,
-                          struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                          bool infinite)
+struct trim_witness {
+    bool requester;
+    bool checked_before_retry;
+    unsigned int marked;
+    unsigned int retries;
+    unsigned int nacks;
+    uint16_t marked_rail;
+    uint16_t retry_rail;
+    uint16_t nack_rail;
+    uint16_t original_udp_len;
+};
+
+static uint16_t witness_last_hop_trim(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                      uint16_t count, uint16_t capacity, void *argument)
 {
+    (void)queue;
+    (void)capacity;
+    struct trim_witness *observed = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_NETH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (observed->requester) {
+            if (bth[0] != WIRE_NACK)
+                continue;
+            const uint8_t *neth = bth + WIRE_BTH_LEN;
+            assert(udp.bytes >= WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_NETH_LEN);
+            assert(neth[2] == LAST_HOP_TRIM_REASON && wire_be24(neth + 13) == SEND_PSN);
+            assert(wire_be24(bth + 9) == SEND_PSN && !(bth[8] & 0x20));
+            observed->nack_rail = port;
+            observed->original_udp_len = wire_be16(udp.header + 4);
+            observed->nacks++;
+            continue;
+        }
+        if (bth[0] != WIRE_WRITE_ONLY_IMM)
+            continue;
+        assert(wire_be24(bth + 9) == SEND_PSN);
+        assert(wire_be16(udp.header + 4) == SINGLE_WRITE_UDP_LEN);
+        assert(rte_pktmbuf_pkt_len(packets[i]) == RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + SINGLE_WRITE_UDP_LEN);
+        if (bth[8] & 0x20) {
+            assert(observed->marked == 1 && observed->checked_before_retry);
+            observed->retry_rail = port;
+            observed->retries++;
+            continue;
+        }
+        assert(observed->marked++ == 0 && rte_pktmbuf_is_contiguous(packets[i]));
+        observed->marked_rail = port;
+        /* Keep the full frame and iCRC. The iCRC masks the IPv6 traffic class. */
+        uint8_t *ip = rte_pktmbuf_mtod_offset(packets[i], uint8_t *, RTE_ETHER_HDR_LEN);
+        assert((ip[0] >> 4) == 6);
+        uint8_t traffic_class = (LAST_HOP_TRIM_DSCP << 2) | ((ip[1] >> 4) & 3);
+        ip[0] = (ip[0] & 0xf0) | (traffic_class >> 4);
+        ip[1] = (ip[1] & 0x0f) | (uint8_t)(traffic_class << 4);
+    }
+    return count;
+}
+
+static void run_last_hop_trim(bool requester, const char *directory, struct mrc_qp *qp, struct mrc_cq *cq,
+                             struct ibv_mr *mr, const struct connection *peer, uint32_t qpn,
+                             const uint8_t data[FIRST_BYTES])
+{
+    struct trim_witness observed = { .requester = requester };
+    const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS];
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        callbacks[port] = rte_eth_add_rx_callback(port, 0, witness_last_hop_trim, &observed);
+        assert(callbacks[port]);
+    }
+
+    char ready[PATH_MAX], done[PATH_MAX];
+    path_for(ready, directory, "rx.ready");
+    path_for(done, directory, "tx.done");
+    if (requester) {
+        wait_for(ready);
+        post_single_write_imm(qp, peer, mr);
+    } else {
+        struct ibv_recv_wr receive = { .wr_id = 81 };
+        struct ibv_recv_wr *bad = NULL;
+        assert(mrc_post_recv(qp, &receive, &bad) == 0 && !bad);
+        publish(directory, "rx.ready", NULL, 0);
+    }
+
+    unsigned int completed = 0;
+    uint64_t deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+        struct ibv_wc wc;
+        int entries = mrc_poll_cq(cq, 1, &wc);
+        assert(entries >= 0 && completed + (unsigned int)entries <= 1);
+        if (!requester && observed.marked && !observed.checked_before_retry) {
+            assert(!entries && !observed.retries);
+            for (size_t i = 0; i < FIRST_BYTES; i++)
+                assert(data[i] == 0);
+            observed.checked_before_retry = true;
+        }
+        if (entries) {
+            assert(wc.status == IBV_WC_SUCCESS && wc.qp_num == qpn);
+            if (requester) {
+                assert(wc.wr_id == 70 && wc.opcode == IBV_WC_RDMA_WRITE);
+            } else {
+                assert(wc.wr_id == 81 && wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM);
+                assert(wc.byte_len == FIRST_BYTES && (wc.wc_flags & IBV_WC_WITH_IMM));
+                assert(ntohl(wc.imm_data) == FIRST_IMMEDIATE);
+            }
+            completed++;
+        }
+        rte_pause();
+    } while (!completed || (!requester && access(done, F_OK) != 0));
+
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
+        rte_free((void *)callbacks[port]);
+    }
+    if (requester) {
+        assert(observed.nacks == 1 && observed.original_udp_len == SINGLE_WRITE_UDP_LEN);
+        publish(directory, "tx.done", NULL, 0);
+        printf("{\"role\":\"tx\",\"qpn\":%u,\"completions\":%u,\"nack_reason\":%u,"
+               "\"nack_rail\":%u,\"original_udp_len\":%u}\n",
+               qpn, completed, LAST_HOP_TRIM_REASON, observed.nack_rail, observed.original_udp_len);
+    } else {
+        assert(observed.marked == 1 && observed.retries == 1 && observed.checked_before_retry);
+        assert(observed.marked_rail != observed.retry_rail);
+        for (size_t i = 0; i < FIRST_BYTES; i++)
+            assert(data[i] == pattern(i));
+        printf("{\"role\":\"rx\",\"qpn\":%u,\"completions\":%u,\"marked_rail\":%u,\"retry_rail\":%u}\n",
+               qpn, completed, observed.marked_rail, observed.retry_rail);
+    }
+}
+
+static void run_single_write(bool requester, const char *directory, const struct address *address,
+                             struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                             enum single_write_case scenario)
+{
+    bool infinite = scenario == BLACKOUT_INFINITE;
+    bool last_hop_trim = scenario == LAST_HOP_TRIM;
     struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
     assert(cq);
     uint8_t data[FIRST_BYTES] = {0};
@@ -1548,18 +1690,35 @@ static void run_blackout(bool requester, const char *directory, const struct add
     struct connection peer;
     read_peer_connections(directory, requester, &peer, 1);
     assert(local.qpn != peer.qpn);
-    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, 0);
+    /* The remote requester does not generate trim NACKs. The local responder does. */
+    unsigned int caps = last_hop_trim && !requester ? MRC_QP_CAP_TRIM_NACK_DEST_UNSUPPORTED : 0;
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, caps);
     if (requester) {
         struct mrc_qp_attr attrs = {
-            .timeout = BLACKOUT_TIMEOUT_EXPONENT, .retry.exp_cnt = infinite ? 25 : BLACKOUT_FINITE_RETRIES,
+            .timeout = last_hop_trim ? 20 : BLACKOUT_TIMEOUT_EXPONENT,
+            .retry.exp_cnt = infinite ? 25 : BLACKOUT_FINITE_RETRIES,
         };
         assert(mrc_modify_qp(qp, NULL, 0, &attrs, MRC_QP_TIMEOUT | MRC_QP_RETRY_CNT) == 0);
     }
+    if (last_hop_trim)
+        assert(mrc_dpdk_set_trim_last_hop_dscp(qp, LAST_HOP_TRIM_DSCP) == ENOTCONN);
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
     attach_qp(qp, &route);
     prepare_memif_links();
-    if (requester) {
+    if (last_hop_trim) {
+        if (requester) {
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, LAST_HOP_TRIM_DSCP) == ENOTCONN);
+        } else {
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, 64) == EINVAL);
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, 48) == EINVAL);
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, 49) == EINVAL);
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, LAST_HOP_TRIM_DSCP) == 0);
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, 0) == 0);
+            assert(mrc_dpdk_set_trim_last_hop_dscp(qp, LAST_HOP_TRIM_DSCP) == 0);
+        }
+        run_last_hop_trim(requester, directory, qp, cq, mr, &peer, local.qpn, data);
+    } else if (requester) {
         char ready[PATH_MAX];
         path_for(ready, directory, "rx.ready");
         wait_for(ready);
@@ -2341,6 +2500,7 @@ int main(int argc, char **argv)
     bool endpoint_ops = strcmp(argv[3], "endpoint_ops") == 0;
     bool infinite_retry = strcmp(argv[3], "blackout_infinite") == 0;
     bool blackout = infinite_retry || strcmp(argv[3], "blackout_finite") == 0;
+    bool last_hop_trim = strcmp(argv[3], "last_hop_trim") == 0;
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
     bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
@@ -2385,13 +2545,13 @@ int main(int argc, char **argv)
         profile_id = strtoull(argv[5], &end, 10);
         assert(!errno && profile_id && !*end);
     } else {
-        assert(argc == 4 && (bidirectional || blackout || error_mode != SIMPLEX_NO_ERROR || srv6 || inline_mode ||
-                             strcmp(argv[3], "simplex") == 0));
+        assert(argc == 4 && (bidirectional || blackout || last_hop_trim || error_mode != SIMPLEX_NO_ERROR ||
+                             srv6 || inline_mode || strcmp(argv[3], "simplex") == 0));
     }
 
     bool endpoint_shared = endpoint_ops && !strcmp(argv[4], "shared");
     struct address address = {0};
-    struct ibv_context *verbs = open_verbs(&address, generated_stev || srv6 || endpoint_shared);
+    struct ibv_context *verbs = open_verbs(&address, generated_stev || srv6 || endpoint_shared || last_hop_trim);
     if (!verbs) {
         fputs("A verbs device with a usable Ethernet GID and pkey is required.\n", stderr);
         return EXIT_FAILURE;
@@ -2410,9 +2570,11 @@ int main(int argc, char **argv)
 
     if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
-    else if (blackout)
-        run_blackout(client, directory, &address, context, pd, pool, infinite_retry);
-    else if (bidirectional)
+    else if (blackout || last_hop_trim) {
+        enum single_write_case scenario = last_hop_trim ? LAST_HOP_TRIM :
+            infinite_retry ? BLACKOUT_INFINITE : BLACKOUT_FINITE;
+        run_single_write(client, directory, &address, context, pd, pool, scenario);
+    } else if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else
         run_simplex(client, directory, &address, context, pd, pool, error_mode, profile_store,

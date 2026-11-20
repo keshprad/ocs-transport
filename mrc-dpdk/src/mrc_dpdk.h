@@ -100,4 +100,9 @@ int mrc_dpdk_progress_qp(struct mrc_qp *qp);
  * returns zero or a positive errno. */
 int mrc_dpdk_set_rx_flow_control(struct mrc_qp *qp, uint8_t penalty, bool restore);
 
+/* Configure last-hop trim recognition on an attached responder QP.
+ * Zero disables the last-hop class. A nonzero DSCP must differ from
+ * the regular trim and Control classes. Returns zero or positive errno. */
+int mrc_dpdk_set_trim_last_hop_dscp(struct mrc_qp *qp, unsigned int dscp);
+
 #endif

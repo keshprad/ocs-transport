@@ -24,8 +24,6 @@ enum {
     DEFAULT_RESPONDER_QPN = 0x102,
     DEFAULT_PARTITION_KEY = 0xffff,
     DEFAULT_REMOTE_KEY = 0x6d726301,
-    CONTROL_DSCP = 48,
-    TRIM_DSCP = 49,
 };
 
 struct benchmark {
@@ -352,7 +350,8 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     transfer->responder_qpn = DEFAULT_RESPONDER_QPN;
     transfer->remote_address = default_remote_address;
     transfer->remote_key = DEFAULT_REMOTE_KEY;
-    uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT, trim_dscp = TRIM_DSCP;
+    uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT;
+    uint32_t trim_dscp = MRC_ENDPOINT_TRIM_DSCP, trim_last_hop_dscp = 0;
     uint32_t oob_port = 0, trim_nack = 1, service_time = 0, srv6_srh = 0, port_stats = 0;
     bool local_sid = false, peer_sid = false, with_immediate = false;
     uint8_t local_sid_value[MRC_IPV6_ADDR_LEN], peer_sid_value[MRC_IPV6_ADDR_LEN];
@@ -389,7 +388,10 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
         if (!strcmp(key, "--srv6-srh") && number(value, 0, 1, &srv6_srh))
             continue;
         if (!strcmp(key, "--trim-dscp") && number(value, 1, 63, &trim_dscp) &&
-            trim_dscp != CONTROL_DSCP)
+            trim_dscp != MRC_ENDPOINT_CONTROL_DSCP)
+            continue;
+        if (!strcmp(key, "--trim-last-hop-dscp") && number(value, 0, 63, &trim_last_hop_dscp) &&
+            trim_last_hop_dscp != MRC_ENDPOINT_CONTROL_DSCP)
             continue;
         if (!strcmp(key, "--requestor-qpn") && number(value, 3, MRC_PSN_MASK, &transfer->requestor_qpn))
             continue;
@@ -477,6 +479,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     if (!parse_writes(transfer, argv[2], repeat, with_immediate, immediate))
         return false;
     if (transfer->remote_address > UINT64_MAX - transfer->bytes ||
+        trim_last_hop_dscp == trim_dscp ||
         (transfer->drop_after != UINT32_MAX && transfer->drop_after >= transfer->packets) ||
         (transfer->restore_after != UINT32_MAX &&
          (transfer->restore_after <= transfer->drop_after || transfer->restore_after >= transfer->packets)) ||
@@ -531,6 +534,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
         }
     }
     transfer->trim_dscp = (uint8_t)trim_dscp;
+    transfer->trim_last_hop_dscp = (uint8_t)trim_last_hop_dscp;
     transfer->timeout_exponent = exponent;
     transfer->linear_retries = linear_retries;
     transfer->exponential_retries = exponential_retries;
@@ -729,7 +733,7 @@ int main(int argc, char **argv)
                         "       [--work-requests N] [--max-wimm-inflight N] [--posted-receives N (rx)]\n"
                         "       [--ack-timeout N] [--linear-retries N]\n"
                         "       [--exp-retries N] [--timeout-ms N] [--drop-path-after N (tx)] [--deny-path-mask N (tx)]\n"
-                        "       [--trim-dscp N] [--trim-nack 0|1] [--trim-path-after N (tx)]\n"
+                        "       [--trim-dscp N] [--trim-last-hop-dscp N] [--trim-nack 0|1] [--trim-path-after N (tx)]\n"
                         "       [--drop-final-acks N (rx)] [--oob-host IP --oob-port N]\n"
                         "       [--restore-path-after N (tx)] [--profile-dir DIR --profile-id ID (tx)]\n"
                         "       [--dynamic-mpr 0|1] [--service-time 0|1]\n"
