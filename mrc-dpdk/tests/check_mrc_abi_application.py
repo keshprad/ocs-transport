@@ -103,6 +103,7 @@ def main():
     focused.add_argument("--blackout-only", action="store_true", help="Run only the two-rail blackout cases")
     focused.add_argument("--last-hop-trim-only", action="store_true", help="Run only the last-hop trim case")
     focused.add_argument("--service-level-dscp-only", action="store_true", help="Run only the service-level DSCP case")
+    focused.add_argument("--dynamic-mpr-only", action="store_true", help="Run only the live MPR negotiation cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -141,12 +142,29 @@ def main():
                     f"Unexpected service-level traffic classes: {tx}, {rx}")
         print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
 
+    def check_mpr_updates():
+        for mode, queried, advertised in (
+            ("dynamic_mpr", [3, 1, 3], [3, 1, 3]),
+            ("dynamic_mpr_rts", [3, 1, 3], [3, 1, 3]),
+            ("static_mpr", [3, 3, 3], [0, 0, 0]),
+        ):
+            tx, rx = run_case(mode)
+            require(tx["qpn"] != rx["qpn"] and tx["completions"] == rx["completions"] == 3
+                    and tx["queried_mpr"] == rx["queried_mpr"] == queried
+                    and tx["advertised_mpr"] == advertised,
+                    f"Unexpected wire or application MPR during {mode}: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
     if args.last_hop_trim_only or args.service_level_dscp_only:
         check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)
         return
 
     if args.blackout_only:
         check_blackouts()
+        return
+
+    if args.dynamic_mpr_only:
+        check_mpr_updates()
         return
 
     tx, rx = run_case("simplex")
@@ -201,6 +219,7 @@ def main():
     check_blackouts()
     check_last_hop_trim()
     check_last_hop_trim(service_level_dscp=True)
+    check_mpr_updates()
 
     if args.controller:
         controller = args.controller.resolve()

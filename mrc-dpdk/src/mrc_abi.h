@@ -125,6 +125,8 @@ void mrc_abi_async_finish(struct mrc_abi_async_source *source);
 
 /* Caller holds the QP mutex. */
 void mrc_abi_release_route(struct mrc_qp *qp);
+int mrc_abi_set_rx_mpr(struct mrc_qp *qp, uint8_t units);
+uint8_t mrc_abi_requester_mpr(const struct mrc_qp *qp);
 
 /* Import a caller-owned verbs registration with the permissions enabled for
  * MRC. Keep the verbs MR live until the provider lkey is deregistered. */

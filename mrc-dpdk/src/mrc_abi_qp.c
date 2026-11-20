@@ -327,7 +327,7 @@ static int validate_attrs(const struct mrc_qp_attr *attrs)
 
 static int select_transition(const struct mrc_provider_qp_attr *provider,
                               const struct ibv_qp_attr *verbs, unsigned int vmask,
-                              unsigned int mmask, enum mrc_provider_qp_state *state)
+                              unsigned int mmask, bool attached, enum mrc_provider_qp_state *state)
 {
     *state = provider->state;
     if ((vmask & IBV_QP_CUR_STATE) && verbs->cur_qp_state != verbs_states[*state])
@@ -357,6 +357,8 @@ static int select_transition(const struct mrc_provider_qp_attr *provider,
     case MRC_PROVIDER_QP_RTS:
         allowed_verbs |= RTS_VERBS;
         allowed_mrc = RTS_MRC;
+        if (attached && *state == provider->state)
+            allowed_mrc |= MRC_QP_MPR_DEST;
         if (*state != provider->state && !(vmask & IBV_QP_SQ_PSN))
             return EINVAL;
         break;
@@ -384,10 +386,18 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
     enum mrc_provider_qp_state state;
     int error = -mrc_provider_qp_query(qp->provider, &provider);
     if (!error)
-        error = select_transition(&provider, verbs, vmask, mmask, &state);
+        error = select_transition(&provider, verbs, vmask, mmask, qp->route != NULL, &state);
     if (!error && qp->route && state != MRC_PROVIDER_QP_RESET && state != MRC_PROVIDER_QP_ERROR &&
-        (state != provider.state || (vmask & ~STATE_VERBS) || mmask))
+        (state != provider.state || (vmask & ~STATE_VERBS) || mmask)) {
         error = EBUSY;
+        if (state == provider.state && !(vmask & ~STATE_VERBS) && mmask == MRC_QP_MPR_DEST) {
+            uint8_t units = attrs->mpr.mpr_dest;
+            error = mrc_abi_set_rx_mpr(qp, units);
+            if (!error)
+                qp->attrs.mpr.mpr_dest = units;
+        }
+        goto unlock;
+    }
     if (error)
         goto unlock;
 
@@ -529,6 +539,8 @@ MRC_PUBLIC int mrc_query_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int vm
     if (!error && attrs) {
         *attrs = (struct mrc_qp_attr){0};
         apply_mrc(attrs, &qp->attrs, mmask);
+        if (mmask & MRC_QP_MPR)
+            attrs->mpr.mpr = mrc_abi_requester_mpr(qp);
     }
     if (!error && init)
         *init = qp->init;

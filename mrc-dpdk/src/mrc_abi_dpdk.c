@@ -598,6 +598,20 @@ MRC_PUBLIC int mrc_dpdk_set_rx_flow_control(struct mrc_qp *qp, uint8_t penalty, 
     return error;
 }
 
+int mrc_abi_set_rx_mpr(struct mrc_qp *qp, uint8_t units)
+{
+    if (!qp->route->response)
+        return EOPNOTSUPP;
+    return -mrc_responder_set_mpr(qp->route->response, units);
+}
+
+uint8_t mrc_abi_requester_mpr(const struct mrc_qp *qp)
+{
+    if (!qp->route || !qp->route->request)
+        return qp->attrs.mpr.mpr;
+    return mrc_requester_mpr(qp->route->request);
+}
+
 MRC_PUBLIC int mrc_dpdk_set_trim_last_hop_dscp(struct mrc_qp *qp, unsigned int dscp)
 {
     if (!qp || dscp > 63 || dscp == MRC_ENDPOINT_CONTROL_DSCP)

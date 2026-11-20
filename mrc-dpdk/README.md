@@ -120,6 +120,15 @@ selected mapping on attachment. Unconfigured levels use DSCP zero
 for both kinds of WRITE. Probes use the data DSCP, and SRv6 egress
 copies the selected traffic class into the outer IPv6 header.
 
+To use Dynamic MPR, negotiate `MRC_QP_CAP_DYNAMIC_MPR` on both peers.
+An attached responder in RTR or RTS can change `attrs.mpr.mpr_dest`
+with `mrc_modify_qp(qp, NULL, 0, &attrs, MRC_QP_MPR_DEST)`. The value
+must be between 1 and the negotiated maximum, in units of 128 packets.
+The responder advertises the change in its next SACKs. The requester
+applies it when the SACK advances the cumulative PSN. Query each side
+with `mrc_query_qp()` and its directional MPR mask to read the current
+limit.
+
 To attach an SRv6 QP, pass a two-entry `mrc_dpdk_srv6_path` array to
 `mrc_dpdk_attach_srv6_qp()` alongside the existing DPDK route. Each rail
 uses its own local SID as the outer source and accepted destination, and

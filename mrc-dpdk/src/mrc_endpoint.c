@@ -107,6 +107,8 @@ struct mrc_responder {
     struct mrc_rx_qp qp;
     struct mrc_wr_responder wr;
     struct mrc_mpr mpr;
+    uint32_t last_sack_cack;
+    bool mpr_pending;
     struct mrc_endpoint_node local_node;
     struct mrc_endpoint_node *node;
     struct mrc_wr_slot work[WINDOW];
@@ -1189,6 +1191,9 @@ static void send_sack(const struct mrc_endpoint_config *transfer, struct mrc_res
     if (mrc_endpoint_transmit(transfer, path, &packet)) {
         counts->sacks++;
         mrc_rx_sack_sent(&receiver->qp, &state);
+        if (state.cack_psn != receiver->last_sack_cack)
+            receiver->mpr_pending = false;
+        receiver->last_sack_cack = state.cack_psn;
     }
 }
 
@@ -1328,10 +1333,10 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     mrc_cc_rx_record(&receiver->cc, nominal, true, false);
     receiver->unique_packets++;
     if (receiver->unique_packets == transfer->mpr_change_at &&
-        mrc_mpr_set_advertised(&receiver->mpr, transfer->mpr_change_to)) {
-        counts->mpr_updates++;
+        !mrc_responder_set_mpr(receiver, transfer->mpr_change_to))
         sack_due = true;
-    }
+    /* Only an advancing cumulative PSN can apply a new MPR at the peer. */
+    sack_due |= receiver->mpr_pending && receiver->qp.cack_psn != receiver->last_sack_cack;
     counts->received[path]++;
     bool complete = transfer->packets && receiver->unique_packets == transfer->packets;
     result = advance_writes(receiver);
@@ -1734,6 +1739,11 @@ int mrc_requester_progress(struct mrc_requester *requester)
     return requester->result;
 }
 
+uint8_t mrc_requester_mpr(const struct mrc_requester *requester)
+{
+    return requester->mpr.units;
+}
+
 void mrc_requester_destroy(struct mrc_requester *requester)
 {
     if (requester) {
@@ -1794,6 +1804,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
         return -EINVAL;
     }
     receiver->last_frame = receiver->last_progress = rte_get_timer_cycles();
+    receiver->last_sack_cack = receiver->qp.cack_psn;
     *responder = receiver;
     return 0;
 }
@@ -1839,6 +1850,22 @@ int mrc_responder_set_flow_control(struct mrc_responder *responder, uint8_t pena
     if (!responder || penalty > 127)
         return -EINVAL;
     responder->flow = (struct mrc_cc_receiver_flow){ .penalty = penalty, .restore = restore };
+    return 0;
+}
+
+int mrc_responder_set_mpr(struct mrc_responder *responder, uint8_t units)
+{
+    if (!responder)
+        return -EINVAL;
+    if (!responder->mpr.dynamic)
+        return -EOPNOTSUPP;
+    uint8_t previous = responder->mpr.units;
+    if (!mrc_mpr_set_advertised(&responder->mpr, units))
+        return -EINVAL;
+    if (units != previous) {
+        responder->mpr_pending = true;
+        responder->counts->mpr_updates++;
+    }
     return 0;
 }
 
