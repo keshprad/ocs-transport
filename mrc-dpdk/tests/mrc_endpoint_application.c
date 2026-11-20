@@ -8,6 +8,7 @@
 
 #include <rte_cycles.h>
 #include <rte_eal.h>
+#include <rte_ether.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_pause.h>
@@ -255,10 +256,21 @@ static void run_link_transition(void)
            rail_packets[1][0], rail_packets[1][1], rail_packets[2][0], rail_packets[2][1]);
 }
 
+static void check_jumbo_mbuf_room(void)
+{
+    const struct mrc_endpoint_config config = { .ip_version = MRC_WIRE_IP4, .pmtu = MRC_MAX_PMTU };
+    const uint16_t frame_length = mrc_endpoint_frame_capacity(&config);
+    struct rte_mempool *pool = mrc_dpdk_packet_pool_for_frame(frame_length);
+    assert(pool);
+    assert(rte_pktmbuf_data_room_size(pool) >= frame_length + RTE_ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM);
+    rte_mempool_free(pool);
+}
+
 int main(int argc, char **argv)
 {
     int consumed = rte_eal_init(argc, argv);
     assert(consumed >= 0);
+    check_jumbo_mbuf_room();
     if (argc - consumed == 2 && strcmp(argv[consumed + 1], "link_transition") == 0)
         run_link_transition();
     else

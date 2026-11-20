@@ -9,6 +9,7 @@ struct rte_mbuf;
 struct rte_mempool;
 
 struct rte_mempool *mrc_dpdk_packet_pool(void);
+/* frame_length includes the Ethernet header. The pool reserves space for the FCS. */
 struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length);
 struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsigned int port_count);
 int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool,

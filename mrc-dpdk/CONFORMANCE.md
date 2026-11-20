@@ -508,19 +508,36 @@ In the negotiated run, each edge completed eight 32 MiB WRITEIMMs with
 registered memory, eight immediate completions at the receiver, and one
 MPR update at each peer.
 
-### Remaining hardware prerequisites
+### Spark-04 to Spark-02 link recovery and jumbo MTU
 
-- Physical recovery requires administrator-operated or separately scoped
-  down/up control of Spark-04's outgoing rail 1 (`enP2p1s0f0np0`, PCI
-  `0002:01:00.0`) during traffic. Verify that traffic continues on the
-  surviving rail and resumes on the restored rail.
-- For a two-rail jumbo run from Spark-04 to Spark-02, the transmit ports
-  `enp1s0f0np0` and `enP2p1s0f0np0` on Spark-04 and the receive ports
-  `enp1s0f1np1` and `enP2p1s0f1np1` on Spark-02 all report MTU 1500.
-  The run requires separately scoped MTU 9000 setup and MTU 1500
-  restoration on those four ports, plus an mlx5 test profile that offers
-  PMTU 4096.
-- Independent MRC interoperability requires a separate MRC 1.0 endpoint.
-  Hardware SRv6, ECN, and switch-generated trimming require a fabric
-  that can forward the configured SIDs, mark congestion, and trim
-  packets. The Polatis double ring supplies optical connectivity.
+The two-rail link-recovery profile completed a 768 MiB WRITE using the
+installed `fb32475` build at PMTU 1024. Spark-04's outgoing rail 1
+(`enP2p1s0f0np0`, PCI `0002:01:00.0`) was taken administratively down
+and restored during the transfer. Independent mlx5 vport counters
+recorded 40,985,020 transmit bytes on rail 0 during the 258.7 ms sampled
+down interval, while rail 1 recorded 94 bytes. Rail 1 carried another
+7,517,246 bytes before the WRITE completed. Spark-02 verified all
+786,432 segments, receiving 422,871 on rail 0 and 363,561 on rail 1.
+Spark-04 carrier returned on rail 1 and Spark-02 recorded no peer
+carrier transitions. This verifies recovery from a local NIC
+administrative transition on the optical test edge.
+
+The negotiated PMTU 4096 hardware run on `fb32475` stopped while
+setting up Spark-02's mlx5 receive queue. The driver required 4,186
+bytes plus 128 bytes of headroom while the pool supplied 4,310 bytes.
+The pool now reserves the Ethernet FCS in addition to the configured
+frame and headroom. The application regression checks that reservation.
+The corrected build passed independent jumbo packet replay and the Linux
+TAP test, which negotiated PMTU 4096 and counted 128 full-sized packets
+per rail. The hardware run restored all four ports to MTU 1500.
+Hardware verification needs the corrected pinned snapshot installed
+and a fresh run of the scoped jumbo profile.
+
+### Independent hardware interoperability
+
+A separate OCP MRC 1.0 endpoint and a fabric supporting hardware SRv6,
+ECN, and switch-generated trimming are unconfirmed and assumed
+unavailable for planning. The Polatis double ring supplies optical
+connectivity. Independent software packet replay and the Linux SRv6
+fabric results above provide protocol evidence. External endpoint and
+hardware forwarding behavior remain open.

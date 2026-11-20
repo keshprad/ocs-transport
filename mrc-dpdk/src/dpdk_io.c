@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdio.h>
 
+#include <rte_ether.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 
@@ -25,7 +26,8 @@ struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length)
 
 struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsigned int port_count)
 {
-    unsigned int room = frame_length + RTE_PKTMBUF_HEADROOM;
+    /* mlx5 includes the Ethernet FCS in its single-segment RX size check. */
+    unsigned int room = frame_length + RTE_ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM;
     if (room > UINT16_MAX || !port_count)
         return NULL;
     if (room < RTE_MBUF_DEFAULT_BUF_SIZE)
