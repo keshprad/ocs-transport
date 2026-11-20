@@ -149,6 +149,18 @@ def main():
             f"Unexpected public async events after receiver CQ overflow: {tx}, {rx}")
     print(json.dumps({"case": "public_async_events_on_unexpected_wire_error", "tx": tx, "rx": rx}))
 
+    for mode, event, completion in (
+        ("wire_request_error", "QP_REQ_ERR", "REM_INV_REQ_ERR"),
+        ("wire_access_error", "QP_ACCESS_ERR", "REM_ACCESS_ERR"),
+    ):
+        tx, rx = run_case(mode)
+        require(tx["qpn"] != rx["qpn"] and tx["qp_event"] == "QP_FATAL"
+                and tx["completion"] == completion and tx["completions"] == 1
+                and rx["qp_event"] == event and rx["completion"] == "WR_FLUSH_ERR"
+                and rx["completions"] == 2,
+                f"Unexpected public async events or completions after {mode}: {tx}, {rx}")
+        print(json.dumps({"case": f"public_async_events_on_{mode}", "tx": tx, "rx": rx}))
+
     if args.controller:
         controller = args.controller.resolve()
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")

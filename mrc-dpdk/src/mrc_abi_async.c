@@ -283,6 +283,8 @@ MRC_PUBLIC void mrc_ack_async_event(struct mrc_async_event *event)
         source = event->element.cq ? &event->element.cq->async : NULL;
         break;
     case IBV_EVENT_QP_FATAL:
+    case IBV_EVENT_QP_REQ_ERR:
+    case IBV_EVENT_QP_ACCESS_ERR:
         source = event->element.qp ? &event->element.qp->async : NULL;
         break;
     default:

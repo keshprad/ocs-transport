@@ -39,7 +39,7 @@ struct mrc_provider_qp {
     uint64_t next_sequence;
     uint32_t qpn;
     bool sq_sig_all;
-    void (*on_error)(void *context);
+    void (*on_error)(void *context, enum mrc_provider_qp_error error);
     void *error_context;
     struct work_entry entries[];
 };
@@ -220,12 +220,12 @@ static int flush_qp(struct mrc_provider_qp *qp, uint64_t sequence,
 }
 
 static int fail_qp(struct mrc_provider_qp *qp, uint64_t sequence,
-                    enum mrc_provider_wc_status status)
+                    enum mrc_provider_wc_status status, enum mrc_provider_qp_error error)
 {
     bool notify = qp->state != MRC_PROVIDER_QP_ERROR;
     int result = flush_qp(qp, sequence, status);
     if (notify && qp->on_error)
-        qp->on_error(qp->error_context);
+        qp->on_error(qp->error_context, error);
     return result;
 }
 
@@ -234,7 +234,7 @@ static int check_cqs_locked(struct mrc_provider_qp *qp)
     if (!mrc_provider_cq_failed(qp->send.cq) && !mrc_provider_cq_failed(qp->recv.cq))
         return 0;
     if (qp->state >= MRC_PROVIDER_QP_INIT && qp->state <= MRC_PROVIDER_QP_RTS)
-        fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+        fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED, MRC_PROVIDER_QP_FATAL_ERROR);
     return -EOVERFLOW;
 }
 
@@ -567,7 +567,7 @@ int mrc_provider_qp_complete_send(struct mrc_provider_qp *qp, uint64_t sequence)
             }
         }
         if (result)
-            fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+            fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED, MRC_PROVIDER_QP_FATAL_ERROR);
     }
     pthread_mutex_unlock(&qp->mutex);
     return result;
@@ -593,9 +593,25 @@ int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
         };
         result = mrc_provider_cq_push(qp->recv.cq, &wc, solicited);
         if (result)
-            fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED);
+            fail_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED, MRC_PROVIDER_QP_FATAL_ERROR);
         else
             *wr_id = work->id;
+    }
+    pthread_mutex_unlock(&qp->mutex);
+    return result;
+}
+
+static int fail_active_qp(struct mrc_provider_qp *qp, uint64_t sequence,
+                          enum mrc_provider_wc_status status, enum mrc_provider_qp_error error)
+{
+    pthread_mutex_lock(&qp->mutex);
+    int result;
+    if (qp->state == MRC_PROVIDER_QP_RESET) {
+        result = -EINVAL;
+    } else if (sequence && (sequence < qp->first_sequence || sequence >= qp->next_sequence)) {
+        result = -ENOENT;
+    } else {
+        result = fail_qp(qp, sequence, status, error);
     }
     pthread_mutex_unlock(&qp->mutex);
     return result;
@@ -607,15 +623,12 @@ int mrc_provider_qp_fail(struct mrc_provider_qp *qp, uint64_t sequence,
     if (!qp || (sequence ? (status <= MRC_PROVIDER_WC_SUCCESS || status >= MRC_PROVIDER_WC_FLUSHED)
                          : status != MRC_PROVIDER_WC_FLUSHED))
         return -EINVAL;
-    pthread_mutex_lock(&qp->mutex);
-    int result;
-    if (qp->state == MRC_PROVIDER_QP_RESET) {
-        result = -EINVAL;
-    } else if (sequence && (sequence < qp->first_sequence || sequence >= qp->next_sequence)) {
-        result = -ENOENT;
-    } else {
-        result = fail_qp(qp, sequence, status);
-    }
-    pthread_mutex_unlock(&qp->mutex);
-    return result;
+    return fail_active_qp(qp, sequence, status, MRC_PROVIDER_QP_FATAL_ERROR);
+}
+
+int mrc_provider_qp_fail_recv(struct mrc_provider_qp *qp, enum mrc_provider_qp_error error)
+{
+    if (!qp || (error != MRC_PROVIDER_QP_REQUEST_ERROR && error != MRC_PROVIDER_QP_ACCESS_ERROR))
+        return -EINVAL;
+    return fail_active_qp(qp, 0, MRC_PROVIDER_WC_FLUSHED, error);
 }

@@ -129,10 +129,15 @@ static struct mrc_qp_attr default_qp_attrs(void)
     };
 }
 
-static void qp_error_event(void *argument)
+static void qp_error_event(void *argument, enum mrc_provider_qp_error error)
 {
     struct mrc_qp *qp = argument;
-    const struct mrc_async_event event = { .event_type = IBV_EVENT_QP_FATAL, .element.qp = qp };
+    static const enum ibv_event_type types[] = {
+        [MRC_PROVIDER_QP_FATAL_ERROR] = IBV_EVENT_QP_FATAL,
+        [MRC_PROVIDER_QP_REQUEST_ERROR] = IBV_EVENT_QP_REQ_ERR,
+        [MRC_PROVIDER_QP_ACCESS_ERROR] = IBV_EVENT_QP_ACCESS_ERR,
+    };
+    const struct mrc_async_event event = { .event_type = types[error], .element.qp = qp };
     mrc_abi_async_publish(&qp->async, &event);
 }
 

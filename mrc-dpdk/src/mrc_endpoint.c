@@ -1154,14 +1154,17 @@ static bool send_nack(const struct mrc_endpoint_config *transfer, struct mrc_end
     return true;
 }
 
-static uint8_t write_error_syndrome(enum mrc_wr_result result)
+static uint8_t fail_write(struct mrc_provider_qp *qp, enum mrc_wr_result result)
 {
     switch (result) {
     case MRC_WR_REMOTE_ACCESS:
+        mrc_provider_qp_fail_recv(qp, MRC_PROVIDER_QP_ACCESS_ERROR);
         return REMOTE_ACCESS_NAK;
     case MRC_WR_RQ_EMPTY:
+        mrc_provider_qp_fail(qp, 0, MRC_PROVIDER_WC_FLUSHED);
         return REMOTE_OPERATION_NAK;
     default:
+        mrc_provider_qp_fail_recv(qp, MRC_PROVIDER_QP_REQUEST_ERROR);
         return INVALID_REQUEST_NAK;
     }
 }
@@ -1194,11 +1197,11 @@ static int reject_write(const struct mrc_endpoint_config *transfer, const struct
         mrc_provider_qp_fail(receiver->provider_qp, 0, MRC_PROVIDER_WC_FLUSHED);
         reason = MRC_NACK_UNEXP_EVENT;
         break;
-    default:
-        mrc_provider_qp_fail(receiver->provider_qp, 0, MRC_PROVIDER_WC_FLUSHED);
-        send_ack(transfer, counts, path, ack_psn, write_error_syndrome(result),
-                 mrc_wr_ack_msn(&receiver->wr));
+    default: {
+        uint8_t syndrome = fail_write(receiver->provider_qp, result);
+        send_ack(transfer, counts, path, ack_psn, syndrome, mrc_wr_ack_msn(&receiver->wr));
         return -EPROTO;
+    }
     }
     send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet), reason,
               0, write_feedback_timestamp(transfer, packet, arrival_cycles));

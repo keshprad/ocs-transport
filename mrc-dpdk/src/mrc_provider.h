@@ -168,6 +168,12 @@ enum mrc_provider_qp_state {
     MRC_PROVIDER_QP_ERROR,
 };
 
+enum mrc_provider_qp_error {
+    MRC_PROVIDER_QP_FATAL_ERROR,
+    MRC_PROVIDER_QP_REQUEST_ERROR,
+    MRC_PROVIDER_QP_ACCESS_ERROR,
+};
+
 struct mrc_provider_qp_config {
     struct mrc_provider_pd *pd;
     struct mrc_provider_cq *send_cq;
@@ -178,7 +184,7 @@ struct mrc_provider_qp_config {
     bool sq_sig_all;
     /* Called with the QP locked on provider-initiated ERROR.
      * The callback must not call provider queue functions. */
-    void (*on_error)(void *context);
+    void (*on_error)(void *context, enum mrc_provider_qp_error error);
     void *error_context;
 };
 
@@ -282,5 +288,7 @@ int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
  * queue order. Sequence zero with status FLUSHED flushes both queues. */
 int mrc_provider_qp_fail(struct mrc_provider_qp *qp, uint64_t sequence,
                          enum mrc_provider_wc_status status);
+/* A terminal receive error flushes work and reports why the QP entered ERROR. */
+int mrc_provider_qp_fail_recv(struct mrc_provider_qp *qp, enum mrc_provider_qp_error error);
 
 #endif

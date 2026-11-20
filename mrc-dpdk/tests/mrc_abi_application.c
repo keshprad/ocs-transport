@@ -64,6 +64,13 @@ struct connection {
     uint32_t rkey;
 };
 
+enum simplex_error {
+    SIMPLEX_NO_ERROR,
+    SIMPLEX_CQ_OVERRUN,
+    SIMPLEX_REQUEST_ERROR,
+    SIMPLEX_ACCESS_ERROR,
+};
+
 static struct ibv_context *open_verbs(struct address *address, bool require_ipv6)
 {
     struct ibv_device **devices = ibv_get_device_list(NULL);
@@ -336,6 +343,22 @@ static void post_registered_writes(struct mrc_qp *qp, const struct connection *p
     post_writes(qp, peer, sg, false);
 }
 
+static void post_rejected_write(struct mrc_qp *qp, const struct connection *peer,
+                                 const struct ibv_mr *source)
+{
+    struct ibv_sge sg = {
+        .addr = (uintptr_t)source->addr, .length = FIRST_BYTES, .lkey = source->lkey,
+    };
+    struct ibv_send_wr wr = {
+        .wr_id = 70, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM,
+        .send_flags = IBV_SEND_SIGNALED, .num_sge = 1, .sg_list = &sg,
+        .wr.rdma = { .remote_addr = peer->remote_address, .rkey = peer->rkey },
+        .imm_data = htonl(FIRST_IMMEDIATE),
+    };
+    struct ibv_send_wr *bad = NULL;
+    assert(mrc_post_send(qp, &wr, &bad) == 0 && !bad);
+}
+
 
 static struct ibv_mr *register_memory(struct mrc_context *context, struct ibv_pd *pd,
                                       uint8_t *memory, size_t length, int access)
@@ -382,34 +405,40 @@ static void skip_local_qp_numbers(struct mrc_context *context, struct mrc_qp_ini
 }
 
 static void complete_async_error(struct mrc_context *context, struct mrc_qp *qp,
-                                 struct mrc_cq *cq, bool requester, uint32_t qpn)
+                                 struct mrc_cq *cq, bool requester, uint32_t qpn,
+                                 enum simplex_error error_mode)
 {
+    const bool cq_overrun = error_mode == SIMPLEX_CQ_OVERRUN;
+    const bool request_error = error_mode == SIMPLEX_REQUEST_ERROR;
     int fd;
     assert(mrc_dpdk_get_async_fd(context, &fd) == 0);
     int flags = fcntl(fd, F_GETFL);
     assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
     uint64_t deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
 
-    /* Leave completions in the responder's single-slot CQ. The second
-     * WRITEIMM overflows it and sends UNEXP_EVENT to the requester. */
+    /* In the overrun case, leaving both completions in the single-slot
+     * receive CQ causes UNEXP_EVENT on the second WRITEIMM. */
     int result;
     do {
         assert(rte_get_timer_cycles() < deadline);
         result = mrc_dpdk_progress_qp(qp);
         rte_pause();
     } while (result == 0);
-    assert(result == (requester ? EREMOTEIO : EPROTO));
+    assert(result == (requester && cq_overrun ? EREMOTEIO : EPROTO));
 
     struct pollfd ready = { .fd = fd, .events = POLLIN };
     assert(poll(&ready, 1, 0) == 1 && (ready.revents & POLLIN));
     struct mrc_async_event event;
-    if (!requester) {
+    if (!requester && cq_overrun) {
         assert(mrc_get_async_event(context, &event) == 0);
         assert(event.event_type == IBV_EVENT_CQ_ERR && event.element.cq == cq);
         mrc_ack_async_event(&event);
     }
     assert(mrc_get_async_event(context, &event) == 0);
-    assert(event.event_type == IBV_EVENT_QP_FATAL && event.element.qp == qp);
+    enum ibv_event_type expected = IBV_EVENT_QP_FATAL;
+    if (!requester && !cq_overrun)
+        expected = request_error ? IBV_EVENT_QP_REQ_ERR : IBV_EVENT_QP_ACCESS_ERR;
+    assert(event.event_type == expected && event.element.qp == qp);
     mrc_ack_async_event(&event);
     assert(poll(&ready, 1, 0) == 0);
     assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
@@ -418,15 +447,26 @@ static void complete_async_error(struct mrc_context *context, struct mrc_qp *qp,
     assert(mrc_query_qp(qp, &observed, IBV_QP_STATE, NULL, 0, NULL) == 0);
     assert(observed.qp_state == IBV_QPS_ERR);
     struct ibv_wc entries[2];
-    if (requester) {
+    if (requester && cq_overrun) {
         assert(mrc_poll_cq(cq, 2, entries) == 2);
         assert(entries[0].status == IBV_WC_SUCCESS && entries[0].wr_id == 71 &&
                entries[0].qp_num == qpn);
         assert(entries[1].status == IBV_WC_REM_OP_ERR && entries[1].wr_id == 72 &&
                entries[1].qp_num == qpn);
-    } else {
+    } else if (cq_overrun) {
         assert(mrc_poll_cq(cq, 2, entries) == -1 && errno == EOVERFLOW);
+    } else if (requester) {
+        enum ibv_wc_status status = request_error ? IBV_WC_REM_INV_REQ_ERR : IBV_WC_REM_ACCESS_ERR;
+        assert(mrc_poll_cq(cq, 2, entries) == 1);
+        assert(entries[0].status == status && entries[0].wr_id == 70 && entries[0].qp_num == qpn);
+    } else {
+        assert(mrc_poll_cq(cq, 2, entries) == 2);
+        for (unsigned int i = 0; i < 2; i++)
+            assert(entries[i].status == IBV_WC_WR_FLUSH_ERR && entries[i].wr_id == 81 + i &&
+                   entries[i].qp_num == qpn);
     }
+    if (!cq_overrun)
+        assert(mrc_poll_cq(cq, 1, entries) == 0);
     assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
 }
 
@@ -1167,9 +1207,13 @@ static uint16_t drop_inline_fragment(uint16_t port, uint16_t queue, struct rte_m
 
 static void run_simplex(bool requester, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                       bool wire_error, const char *ev_store, uint64_t ev_profile_id,
+                       enum simplex_error error_mode, const char *ev_store, uint64_t ev_profile_id,
                        enum simplex_wire_mode wire_mode)
 {
+    const bool wire_error = error_mode != SIMPLEX_NO_ERROR;
+    const bool cq_overrun = error_mode == SIMPLEX_CQ_OVERRUN;
+    const bool rejected_write = error_mode == SIMPLEX_REQUEST_ERROR ||
+                                error_mode == SIMPLEX_ACCESS_ERROR;
     const bool inline_mode = wire_mode == SIMPLEX_INLINE;
     const bool generated_ev = wire_mode == SIMPLEX_GENERATED_EV;
     const bool srv6_ev = wire_mode == SIMPLEX_SRV6_EXPLICIT_EV ||
@@ -1182,11 +1226,16 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     struct mrc_comp_channel *channel = NULL;
     if (!requester && !wire_error)
         assert(mrc_create_comp_channel(context, &channel) == 0);
-    struct mrc_cq *cq = mrc_create_cq(context, !requester && wire_error ? 1 : 4, NULL, channel, 0);
+    struct mrc_cq *cq = mrc_create_cq(context, !requester && cq_overrun ? 1 : 4, NULL, channel, 0);
     assert(cq);
 
     uint8_t first_data[TOTAL_BYTES], last_data[TOTAL_BYTES];
-    int access_flags = requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    int access_flags = 0;
+    if (!requester) {
+        access_flags = IBV_ACCESS_LOCAL_WRITE;
+        if (error_mode != SIMPLEX_ACCESS_ERROR)
+            access_flags |= IBV_ACCESS_REMOTE_WRITE;
+    }
     size_t first_length = requester ? FIRST_BYTES + IMMEDIATE_FIRST_SGE_BYTES : TOTAL_BYTES;
     struct ibv_mr *first = NULL;
     struct ibv_mr *last = NULL;
@@ -1195,7 +1244,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             first_data[i] = requester ? pattern(i) : 0;
         first = register_memory(context, pd, first_data, first_length, access_flags);
     }
-    if (requester && !inline_mode) {
+    if (requester && !inline_mode && !rejected_write) {
         size_t length = TOTAL_BYTES - first_length;
         for (size_t i = 0; i < length; i++)
             last_data[i] = pattern(first_length + i);
@@ -1232,6 +1281,12 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     assert(local.qpn != peer.qpn);
     configure_qp(qp, address, &peer, local.psn, requester, !requester,
                  requester ? ev_profile_id : 0, 0, 0);
+    if (!requester && error_mode == SIMPLEX_REQUEST_ERROR) {
+        /* The peer offers one WRITEIMM at a time. This responder has
+         * no slots for immediate data, exercising an OOB mismatch. */
+        struct mrc_qp_attr attrs = { .wimm.max_wimm_dest = 0 };
+        assert(mrc_modify_qp(qp, NULL, 0, &attrs, MRC_QP_MAX_WIMM_DEST) == 0);
+    }
 
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
@@ -1270,7 +1325,9 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         char ready[PATH_MAX];
         path_for(ready, directory, "rx.ready");
         wait_for(ready);
-        if (inline_mode)
+        if (rejected_write)
+            post_rejected_write(qp, &peer, first);
+        else if (inline_mode)
             post_inline_writes(qp, &peer);
         else
             post_registered_writes(qp, &peer, first, last);
@@ -1283,7 +1340,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     if (ev_profile_id && !generated_ev && wire_mode != SIMPLEX_SRV6_GENERATED_EV)
         check_blocked_profile(qp, cq, ev_store, requester, first_data);
     if (wire_error)
-        complete_async_error(context, qp, cq, requester, local.qpn);
+        complete_async_error(context, qp, cq, requester, local.qpn, error_mode);
     else
         complete(qp, cq, channel, directory, requester, local.qpn);
     if (inspect_wire) {
@@ -1313,7 +1370,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         publish(directory, "tx.done", NULL, 0);
     } else {
         for (size_t i = 0; i < TOTAL_BYTES; i++)
-            assert(first_data[i] == pattern(i));
+            assert(first_data[i] == (rejected_write ? 0 : pattern(i)));
         if (wire_error) {
             char done[PATH_MAX];
             path_for(done, directory, "tx.done");
@@ -1332,9 +1389,16 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         deregister_memory(context, last);
     if (first)
         deregister_memory(context, first);
-    if (wire_error) {
+    if (cq_overrun) {
         printf("{\"role\":\"%s\",\"qp_fatal\":true,\"cq_error\":%s,\"qpn\":%u}\n",
                requester ? "tx" : "rx", requester ? "false" : "true", local.qpn);
+    } else if (rejected_write) {
+        const bool invalid = error_mode == SIMPLEX_REQUEST_ERROR;
+        const char *event = requester ? "QP_FATAL" : invalid ? "QP_REQ_ERR" : "QP_ACCESS_ERR";
+        const char *completion = requester ? (invalid ? "REM_INV_REQ_ERR" : "REM_ACCESS_ERR") : "WR_FLUSH_ERR";
+        printf("{\"role\":\"%s\",\"qp_event\":\"%s\",\"completion\":\"%s\","
+               "\"completions\":%u,\"qpn\":%u}\n",
+               requester ? "tx" : "rx", event, completion, requester ? 1u : 2u, local.qpn);
     } else {
         printf("{\"role\":\"%s\",\"bytes\":%u,\"completions\":2,\"qpn\":%u",
                requester ? "tx" : "rx", (unsigned int)TOTAL_BYTES, local.qpn);
@@ -2079,7 +2143,13 @@ int main(int argc, char **argv)
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
     bool bidirectional = cc_profile || qa_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
     enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW : DUPLEX_NORMAL;
-    bool wire_error = strcmp(argv[3], "wire_error") == 0;
+    enum simplex_error error_mode = SIMPLEX_NO_ERROR;
+    if (!strcmp(argv[3], "wire_error"))
+        error_mode = SIMPLEX_CQ_OVERRUN;
+    else if (!strcmp(argv[3], "wire_request_error"))
+        error_mode = SIMPLEX_REQUEST_ERROR;
+    else if (!strcmp(argv[3], "wire_access_error"))
+        error_mode = SIMPLEX_ACCESS_ERROR;
     bool inline_mode = strcmp(argv[3], "inline") == 0;
     bool generated_stev = strcmp(argv[3], "generated_ev_stev") == 0 ||
         strcmp(argv[3], "generated_ev_custom_stev") == 0;
@@ -2112,7 +2182,7 @@ int main(int argc, char **argv)
         profile_id = strtoull(argv[5], &end, 10);
         assert(!errno && profile_id && !*end);
     } else {
-        assert(argc == 4 && (bidirectional || wire_error || srv6 || inline_mode ||
+        assert(argc == 4 && (bidirectional || error_mode != SIMPLEX_NO_ERROR || srv6 || inline_mode ||
                              strcmp(argv[3], "simplex") == 0));
     }
 
@@ -2140,7 +2210,7 @@ int main(int argc, char **argv)
     else if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else
-        run_simplex(client, directory, &address, context, pd, pool, wire_error, profile_store,
+        run_simplex(client, directory, &address, context, pd, pool, error_mode, profile_store,
                     profile_id, wire_mode);
 
     assert(mrc_destroy_context(context) == 0);
