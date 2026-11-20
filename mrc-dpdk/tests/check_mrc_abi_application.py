@@ -102,6 +102,7 @@ def main():
     focused = parser.add_mutually_exclusive_group()
     focused.add_argument("--blackout-only", action="store_true", help="Run only the two-rail blackout cases")
     focused.add_argument("--last-hop-trim-only", action="store_true", help="Run only the last-hop trim case")
+    focused.add_argument("--service-level-dscp-only", action="store_true", help="Run only the service-level DSCP case")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -127,16 +128,21 @@ def main():
                     f"Unexpected requester or rail behavior during {mode}: {tx}, {rx}")
             print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
 
-    def check_last_hop_trim():
-        tx, rx = run_case("last_hop_trim")
+    def check_last_hop_trim(service_level_dscp=False):
+        mode = "service_level_dscp" if service_level_dscp else "last_hop_trim"
+        tx, rx = run_case(mode)
         require(tx["qpn"] != rx["qpn"] and tx["completions"] == rx["completions"] == 1
                 and tx["nack_reason"] == 2 and tx["original_udp_len"] == 64
                 and tx["nack_rail"] == rx["marked_rail"] and rx["marked_rail"] != rx["retry_rail"],
                 f"Unexpected last-hop trim recovery: {tx}, {rx}")
-        print(json.dumps({"case": "public_qp_last_hop_trim", "tx": tx, "rx": rx}))
+        if service_level_dscp:
+            require(tx["control_dscp"] == 48 and rx["data_dscp"] == 26
+                    and rx["retry_dscp"] == 34 and rx["probe_rails"] == 3,
+                    f"Unexpected service-level traffic classes: {tx}, {rx}")
+        print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
 
-    if args.last_hop_trim_only:
-        check_last_hop_trim()
+    if args.last_hop_trim_only or args.service_level_dscp_only:
+        check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)
         return
 
     if args.blackout_only:
@@ -194,6 +200,7 @@ def main():
 
     check_blackouts()
     check_last_hop_trim()
+    check_last_hop_trim(service_level_dscp=True)
 
     if args.controller:
         controller = args.controller.resolve()

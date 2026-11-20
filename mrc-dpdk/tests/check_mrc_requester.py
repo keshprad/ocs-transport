@@ -64,6 +64,8 @@ class ReferenceResponder:
     def __init__(self, wire, mode, nack_reason):
         self.wire = wire
         self.nack_reason = nack_reason
+        self.data_dscp = 0
+        self.retry_dscp = 0
         self.ipv6 = mode != "ipv4"
         self.srv6 = mode in ("srv6", "srv6-srh")
         self.srh = mode == "srv6-srh"
@@ -239,12 +241,17 @@ class ReferenceResponder:
                 require(len(packet.body) == 36 and not (packet.body[1] >> 2) & 3, "Invalid Port Status EETH")
                 self.port_status_response(rail, token)
         elif bth.opcode == 0xDE:
+            require(packet.traffic_class == self.data_dscp << 2,
+                    "Reliability probe did not use the configured data DSCP")
             require(len(packet.body) == 16 and struct.unpack_from("!HH", packet.body, 8) == PDC_IDS,
                     "Invalid PETH identifiers")
             token, = struct.unpack_from("!H", packet.body, 4)
             timestamp, = struct.unpack_from("!H", packet.body, 12)
             self.acknowledge_probe(rail, packet, token, timestamp)
         else:
+            dscp = self.retry_dscp if bth.flags & RTX else self.data_dscp
+            require(packet.traffic_class == (dscp << 2 | 2),
+                    "WRITE did not use its configured DSCP with ECT(0)")
             self.write(rail, packet)
 
 
@@ -558,6 +565,12 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
             if retry_timer is not None:
                 command += ["--linear-retries", "0", "--exp-retries", "0" if responder.exhausted else "4"]
+            if nack_reason == NO_PKT_BUFFER:
+                responder.data_dscp, responder.retry_dscp = 26, 34
+                command += ["--data-dscp", "26", "--retry-dscp", "34"]
+            elif nack_reason == TRIM_LAST_HOP:
+                responder.data_dscp = responder.retry_dscp = 18
+                command += ["--data-dscp", "18"]
             if responder.srv6:
                 command += ["--srv6-local", str(SIDS["tx"]), "--srv6-peer", str(SIDS["rx"])]
                 if responder.srh:

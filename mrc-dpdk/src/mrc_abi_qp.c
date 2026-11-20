@@ -416,7 +416,7 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
     }
     if (vmask & IBV_QP_AV) {
         const struct ibv_ah_attr *ah = &updated_verbs.ah_attr;
-        if (!ah->is_global || !ah->port_num) {
+        if (!ah->is_global || !ah->port_num || ah->sl >= MRC_ABI_SL_COUNT) {
             error = EINVAL;
             goto unlock;
         }

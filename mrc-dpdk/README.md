@@ -36,6 +36,12 @@ with TCP setup enabled. On the receiver, `--mpr-change-at PACKETS` and
 `--mpr-change-to UNITS` advertise a new limit after accepting that many
 segments. The new limit uses units of 128 packets, like `--mpr`.
 
+On the sender, `--data-dscp N` sets the DSCP for new WRITEs and
+reliability probes. `--retry-dscp N` can select a separate DSCP for
+retransmissions. The data DSCP defaults to zero and the retry DSCP
+defaults to the data DSCP. Responder SACKs, NACKs, and Transport ACKs
+use Control DSCP 48.
+
 The receiver recognizes regular trim on DSCP 49 by default. Use
 `--trim-dscp N` to change it and `--trim-last-hop-dscp N` to enable a
 distinct last-hop class. The latter defaults to zero, which disables it.
@@ -106,6 +112,13 @@ An endpoint announces the current mask on reachable rails when it changes
 and refreshes it about every 250 ms. A peer report restricts path selection
 for one second. When it expires, the requester resumes path selection
 using its local link and EV state.
+
+Set the QP's service level in `ibv_qp_attr.ah_attr.sl` with `IBV_QP_AV`.
+Use `mrc_dpdk_set_sl_dscp(context, sl, data_dscp, retry_dscp)` to
+configure that level for the MRC context. A requester snapshots its
+selected mapping on attachment. Unconfigured levels use DSCP zero
+for both kinds of WRITE. Probes use the data DSCP, and SRv6 egress
+copies the selected traffic class into the outer IPv6 header.
 
 To attach an SRv6 QP, pass a two-entry `mrc_dpdk_srv6_path` array to
 `mrc_dpdk_attach_srv6_qp()` alongside the existing DPDK route. Each rail

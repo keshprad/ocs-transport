@@ -32,7 +32,6 @@ enum {
     TARGET_QUEUE_NS = 20000,
     FAST_LOSS_GAP = 16,
     ALL_PATHS = (1 << PATH_COUNT) - 1,
-    DATA_DSCP = 0,
     ACK_SYNDROME = 0x1f,
     INVALID_REQUEST_NAK = 0x61,
     REMOTE_ACCESS_NAK = 0x62,
@@ -329,7 +328,7 @@ struct mrc_wire_packet mrc_endpoint_packet_for(const struct mrc_endpoint_config 
 
     bool data = mrc_wire_is_write(opcode);
     uint32_t entropy = path_entropy(transfer, index, transfer->sender);
-    uint8_t dscp = data || opcode == MRC_RELIABILITY_PROBE ? DATA_DSCP : MRC_ENDPOINT_CONTROL_DSCP;
+    uint8_t dscp = data || opcode == MRC_RELIABILITY_PROBE ? transfer->data_dscp : MRC_ENDPOINT_CONTROL_DSCP;
     uint8_t ecn = data ? 2 : 0;
     if (transfer->ip_version == MRC_WIRE_IP6) {
         packet.ipv6 = (struct mrc_wire_ipv6){
@@ -674,6 +673,12 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     if (!mrc_cc_can_send(&sender->cc, nominal_bytes))
         return -EPROTO;
     packet.bth.retransmit = retry;
+    if (retry) {
+        if (packet.ip_version == MRC_WIRE_IP6)
+            packet.ipv6.dscp = transfer->retry_dscp;
+        else
+            packet.ipv4.dscp = transfer->retry_dscp;
+    }
     packet.bth.solicited = write.solicited &&
         (packet.bth.opcode == MRC_WRITE_LAST_IMM || packet.bth.opcode == MRC_WRITE_ONLY_IMM);
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||

@@ -15,6 +15,7 @@ enum {
     MRC_ABI_MAX_MPR = 8,
     MRC_ABI_MAX_WIMM = 1024,
     MRC_ABI_MAX_QP_HINTS = 1024,
+    MRC_ABI_SL_COUNT = 16,
 };
 
 struct mrc_abi_route;
@@ -52,6 +53,11 @@ struct mrc_abi_pd {
     size_t users;
 };
 
+struct mrc_abi_sl_dscp {
+    uint8_t data;
+    uint8_t retry;
+};
+
 struct mrc_context {
     struct ibv_context *verbs; /* Borrowed until all MRC resources are destroyed. */
     pthread_mutex_t mutex;
@@ -59,6 +65,7 @@ struct mrc_context {
     struct mrc_abi_pd *pds;
     struct mrc_qp_hint *hints;
     size_t hint_count;
+    struct mrc_abi_sl_dscp sl_dscp[MRC_ABI_SL_COUNT];
     struct mrc_abi_async_channel async;
     struct mrc_ctl_store profile_store;
     atomic_uint ctl_event_layout;

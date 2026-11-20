@@ -352,6 +352,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     transfer->remote_key = DEFAULT_REMOTE_KEY;
     uint32_t timeout_ms = 5000, udp_port = MRC_UDP_DEFAULT_PORT;
     uint32_t trim_dscp = MRC_ENDPOINT_TRIM_DSCP, trim_last_hop_dscp = 0;
+    uint32_t data_dscp = 0, retry_dscp = UINT32_MAX;
     uint32_t oob_port = 0, trim_nack = 1, service_time = 0, srv6_srh = 0, port_stats = 0;
     bool local_sid = false, peer_sid = false, with_immediate = false;
     uint8_t local_sid_value[MRC_IPV6_ADDR_LEN], peer_sid_value[MRC_IPV6_ADDR_LEN];
@@ -392,6 +393,12 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
             continue;
         if (!strcmp(key, "--trim-last-hop-dscp") && number(value, 0, 63, &trim_last_hop_dscp) &&
             trim_last_hop_dscp != MRC_ENDPOINT_CONTROL_DSCP)
+            continue;
+        if (transfer->sender && !strcmp(key, "--data-dscp") && number(value, 0, 63, &data_dscp) &&
+            data_dscp != MRC_ENDPOINT_CONTROL_DSCP)
+            continue;
+        if (transfer->sender && !strcmp(key, "--retry-dscp") && number(value, 0, 63, &retry_dscp) &&
+            retry_dscp != MRC_ENDPOINT_CONTROL_DSCP)
             continue;
         if (!strcmp(key, "--requestor-qpn") && number(value, 3, MRC_PSN_MASK, &transfer->requestor_qpn))
             continue;
@@ -535,6 +542,8 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     }
     transfer->trim_dscp = (uint8_t)trim_dscp;
     transfer->trim_last_hop_dscp = (uint8_t)trim_last_hop_dscp;
+    transfer->data_dscp = (uint8_t)data_dscp;
+    transfer->retry_dscp = (uint8_t)(retry_dscp == UINT32_MAX ? data_dscp : retry_dscp);
     transfer->timeout_exponent = exponent;
     transfer->linear_retries = linear_retries;
     transfer->exponential_retries = exponential_retries;
@@ -734,6 +743,7 @@ int main(int argc, char **argv)
                         "       [--ack-timeout N] [--linear-retries N]\n"
                         "       [--exp-retries N] [--timeout-ms N] [--drop-path-after N (tx)] [--deny-path-mask N (tx)]\n"
                         "       [--trim-dscp N] [--trim-last-hop-dscp N] [--trim-nack 0|1] [--trim-path-after N (tx)]\n"
+                        "       [--data-dscp N] [--retry-dscp N] (tx)\n"
                         "       [--drop-final-acks N (rx)] [--oob-host IP --oob-port N]\n"
                         "       [--restore-path-after N (tx)] [--profile-dir DIR --profile-id ID (tx)]\n"
                         "       [--dynamic-mpr 0|1] [--service-time 0|1]\n"

@@ -112,6 +112,8 @@ struct mrc_endpoint_config {
     uint16_t udp_port;
     uint8_t trim_dscp;
     uint8_t trim_last_hop_dscp;
+    uint8_t data_dscp;
+    uint8_t retry_dscp;
     unsigned int timeout_exponent;
     unsigned int linear_retries;
     unsigned int exponential_retries;

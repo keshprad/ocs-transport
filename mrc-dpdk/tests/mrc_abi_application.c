@@ -31,6 +31,7 @@ enum {
     SECOND_IMMEDIATE = 0x12345678,
     DUPLEX_QPS = 2,
     DUPLEX_RAILS = 2,
+    WIRE_TRANSPORT_ACK = 0xd1,
     WIRE_NACK = 0xdd,
     WIRE_PROBE_REQUEST = 0xde,
     WIRE_SACK = 0xdc,
@@ -56,6 +57,10 @@ enum {
     LAST_HOP_TRIM_DSCP = 51,
     LAST_HOP_TRIM_REASON = 0x02,
     SINGLE_WRITE_UDP_LEN = 64,
+    MAPPED_SERVICE_LEVEL = 7,
+    SERVICE_DATA_DSCP = 26,
+    SERVICE_RETRY_DSCP = 34,
+    CONTROL_DSCP = 48,
 };
 
 struct address {
@@ -83,6 +88,7 @@ enum single_write_case {
     BLACKOUT_FINITE,
     BLACKOUT_INFINITE,
     LAST_HOP_TRIM,
+    SERVICE_LEVEL_DSCP,
 };
 
 static struct ibv_context *open_verbs(struct address *address, bool require_ipv6)
@@ -172,7 +178,7 @@ static void read_peer_connections(const char *directory, bool client,
 static void configure_qp(struct mrc_qp *qp, const struct address *address,
                           const struct connection *peer, uint32_t send_psn,
                           bool send, bool receive, uint64_t ev_profile_id, uint64_t cc_profile_id,
-                          unsigned int qp_caps)
+                          unsigned int qp_caps, uint8_t service_level)
 {
     struct ibv_qp_attr verbs = {
         .qp_state = IBV_QPS_INIT,
@@ -188,7 +194,7 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
         .qp_state = IBV_QPS_RTR, .path_mtu = IBV_MTU_1024,
         .dest_qp_num = peer->qpn, .rq_psn = peer->psn,
         .ah_attr = {
-            .is_global = 1, .port_num = address->port,
+            .is_global = 1, .port_num = address->port, .sl = service_level,
             .grh = { .dgid = peer->gid, .sgid_index = address->gid_index, .hop_limit = 64 },
         },
     };
@@ -197,6 +203,11 @@ static void configure_qp(struct mrc_qp *qp, const struct address *address,
     };
     const int rtr_verbs = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
     const int rtr_attrs = MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST | (qp_caps ? MRC_QP_CAP : 0);
+    if (service_level) {
+        verbs.ah_attr.sl = 16;
+        assert(mrc_modify_qp(qp, &verbs, rtr_verbs, &attrs, rtr_attrs) == EINVAL);
+        verbs.ah_attr.sl = service_level;
+    }
     assert(mrc_modify_qp(qp, &verbs, rtr_verbs, &attrs, rtr_attrs) == 0);
     if (!send)
         return;
@@ -528,6 +539,7 @@ struct observed_udp {
     const uint8_t *header;
     size_t bytes;
     uint32_t entropy;
+    uint8_t traffic_class;
 };
 
 static struct observed_udp read_udp(struct rte_mbuf *packet, uint8_t *prefix, size_t capacity)
@@ -545,7 +557,10 @@ static struct observed_udp read_udp(struct rte_mbuf *packet, uint8_t *prefix, si
     uint32_t entropy = wire_be16(frame + udp);
     if (ipv6)
         entropy |= (uint32_t)wire_be16(frame + 16) << 16;
-    return (struct observed_udp){.header = frame + udp, .bytes = length - udp, .entropy = entropy};
+    uint8_t traffic_class = ipv6 ? (uint8_t)(wire_be16(frame + 14) >> 4) : frame[15];
+    return (struct observed_udp){
+        .header = frame + udp, .bytes = length - udp, .entropy = entropy, .traffic_class = traffic_class,
+    };
 }
 
 static void prepare_memif_links(void)
@@ -918,7 +933,7 @@ static void run_endpoint_ops(bool client, const char *directory, const char *for
         idle_qp = mrc_create_qp(context, &init);
         assert(idle_qp);
         const struct connection peer = { .gid = test.route.peer_gid, .qpn = 13 };
-        configure_qp(idle_qp, address, &peer, 0, false, true, 0, 0, 0);
+        configure_qp(idle_qp, address, &peer, 0, false, true, 0, 0, 0, 0);
         struct mrc_dpdk_route route = path_route(pool, false);
         route.peer_pkey = test.route.peer_pkey;
         route.udp_port = test.route.udp_port;
@@ -1294,7 +1309,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     read_peer_connections(directory, requester, &peer, 1);
     assert(local.qpn != peer.qpn);
     configure_qp(qp, address, &peer, local.psn, requester, !requester,
-                 requester ? ev_profile_id : 0, 0, 0);
+                 requester ? ev_profile_id : 0, 0, 0, 0);
     if (!requester && error_mode == SIMPLEX_REQUEST_ERROR) {
         /* The peer offers one WRITEIMM at a time. This responder has
          * no slots for immediate data, exercising an OOB mismatch. */
@@ -1530,9 +1545,14 @@ static uint64_t check_blackout_requester(struct mrc_context *context, struct mrc
 struct trim_witness {
     bool requester;
     bool checked_before_retry;
+    bool saw_sack;
+    bool saw_transport_ack;
+    uint8_t data_dscp;
+    uint8_t retry_dscp;
     unsigned int marked;
     unsigned int retries;
     unsigned int nacks;
+    unsigned int probe_rails;
     uint16_t marked_rail;
     uint16_t retry_rail;
     uint16_t nack_rail;
@@ -1549,8 +1569,13 @@ static uint16_t witness_last_hop_trim(uint16_t port, uint16_t queue, struct rte_
         uint8_t prefix[RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_NETH_LEN];
         struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
         const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        uint8_t opcode = bth[0];
         if (observed->requester) {
-            if (bth[0] != WIRE_NACK)
+            if (opcode == WIRE_SACK || opcode == WIRE_NACK || opcode == WIRE_TRANSPORT_ACK)
+                assert(udp.traffic_class == CONTROL_DSCP << 2);
+            observed->saw_sack |= opcode == WIRE_SACK;
+            observed->saw_transport_ack |= opcode == WIRE_TRANSPORT_ACK;
+            if (opcode != WIRE_NACK)
                 continue;
             const uint8_t *neth = bth + WIRE_BTH_LEN;
             assert(udp.bytes >= WIRE_UDP_LEN + WIRE_BTH_LEN + WIRE_NETH_LEN);
@@ -1561,17 +1586,23 @@ static uint16_t witness_last_hop_trim(uint16_t port, uint16_t queue, struct rte_
             observed->nacks++;
             continue;
         }
-        if (bth[0] != WIRE_WRITE_ONLY_IMM)
+        if (opcode == WIRE_PROBE_REQUEST) {
+            assert(udp.traffic_class == observed->data_dscp << 2);
+            observed->probe_rails |= 1u << port;
+        }
+        if (opcode != WIRE_WRITE_ONLY_IMM)
             continue;
         assert(wire_be24(bth + 9) == SEND_PSN);
         assert(wire_be16(udp.header + 4) == SINGLE_WRITE_UDP_LEN);
         assert(rte_pktmbuf_pkt_len(packets[i]) == RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + SINGLE_WRITE_UDP_LEN);
         if (bth[8] & 0x20) {
+            assert(udp.traffic_class == ((observed->retry_dscp << 2) | 2));
             assert(observed->marked == 1 && observed->checked_before_retry);
             observed->retry_rail = port;
             observed->retries++;
             continue;
         }
+        assert(udp.traffic_class == ((observed->data_dscp << 2) | 2));
         assert(observed->marked++ == 0 && rte_pktmbuf_is_contiguous(packets[i]));
         observed->marked_rail = port;
         /* Keep the full frame and iCRC. The iCRC masks the IPv6 traffic class. */
@@ -1586,9 +1617,13 @@ static uint16_t witness_last_hop_trim(uint16_t port, uint16_t queue, struct rte_
 
 static void run_last_hop_trim(bool requester, const char *directory, struct mrc_qp *qp, struct mrc_cq *cq,
                              struct ibv_mr *mr, const struct connection *peer, uint32_t qpn,
-                             const uint8_t data[FIRST_BYTES])
+                             const uint8_t data[FIRST_BYTES], bool service_level_dscp)
 {
-    struct trim_witness observed = { .requester = requester };
+    struct trim_witness observed = {
+        .requester = requester,
+        .data_dscp = service_level_dscp ? SERVICE_DATA_DSCP : 0,
+        .retry_dscp = service_level_dscp ? SERVICE_RETRY_DSCP : 0,
+    };
     const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS];
     for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
         callbacks[port] = rte_eth_add_rx_callback(port, 0, witness_last_hop_trim, &observed);
@@ -1644,16 +1679,26 @@ static void run_last_hop_trim(bool requester, const char *directory, struct mrc_
         assert(observed.nacks == 1 && observed.original_udp_len == SINGLE_WRITE_UDP_LEN);
         publish(directory, "tx.done", NULL, 0);
         printf("{\"role\":\"tx\",\"qpn\":%u,\"completions\":%u,\"nack_reason\":%u,"
-               "\"nack_rail\":%u,\"original_udp_len\":%u}\n",
+               "\"nack_rail\":%u,\"original_udp_len\":%u",
                qpn, completed, LAST_HOP_TRIM_REASON, observed.nack_rail, observed.original_udp_len);
+        if (service_level_dscp) {
+            assert(observed.saw_sack && observed.saw_transport_ack);
+            printf(",\"control_dscp\":%u", CONTROL_DSCP);
+        }
     } else {
         assert(observed.marked == 1 && observed.retries == 1 && observed.checked_before_retry);
         assert(observed.marked_rail != observed.retry_rail);
         for (size_t i = 0; i < FIRST_BYTES; i++)
             assert(data[i] == pattern(i));
-        printf("{\"role\":\"rx\",\"qpn\":%u,\"completions\":%u,\"marked_rail\":%u,\"retry_rail\":%u}\n",
+        printf("{\"role\":\"rx\",\"qpn\":%u,\"completions\":%u,\"marked_rail\":%u,\"retry_rail\":%u",
                qpn, completed, observed.marked_rail, observed.retry_rail);
+        if (service_level_dscp) {
+            assert(observed.probe_rails == (1u << DUPLEX_RAILS) - 1);
+            printf(",\"data_dscp\":%u,\"retry_dscp\":%u,\"probe_rails\":%u",
+                   observed.data_dscp, observed.retry_dscp, observed.probe_rails);
+        }
     }
+    puts("}");
 }
 
 static void run_single_write(bool requester, const char *directory, const struct address *address,
@@ -1661,7 +1706,8 @@ static void run_single_write(bool requester, const char *directory, const struct
                              enum single_write_case scenario)
 {
     bool infinite = scenario == BLACKOUT_INFINITE;
-    bool last_hop_trim = scenario == LAST_HOP_TRIM;
+    bool service_level_dscp = scenario == SERVICE_LEVEL_DSCP;
+    bool last_hop_trim = scenario == LAST_HOP_TRIM || service_level_dscp;
     struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
     assert(cq);
     uint8_t data[FIRST_BYTES] = {0};
@@ -1692,7 +1738,22 @@ static void run_single_write(bool requester, const char *directory, const struct
     assert(local.qpn != peer.qpn);
     /* The remote requester does not generate trim NACKs. The local responder does. */
     unsigned int caps = last_hop_trim && !requester ? MRC_QP_CAP_TRIM_NACK_DEST_UNSUPPORTED : 0;
-    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, caps);
+    uint8_t sl = service_level_dscp ? MAPPED_SERVICE_LEVEL : 0;
+    if (service_level_dscp) {
+        assert(mrc_dpdk_set_sl_dscp(NULL, sl, 0, 0) == EINVAL);
+        assert(mrc_dpdk_set_sl_dscp(context, 16, 0, 0) == EINVAL);
+        assert(mrc_dpdk_set_sl_dscp(context, sl, 64, 0) == EINVAL);
+        assert(mrc_dpdk_set_sl_dscp(context, sl, 0, 64) == EINVAL);
+        assert(mrc_dpdk_set_sl_dscp(context, sl, CONTROL_DSCP, 0) == EINVAL);
+        assert(mrc_dpdk_set_sl_dscp(context, sl, 0, CONTROL_DSCP) == EINVAL);
+        assert(mrc_dpdk_set_sl_dscp(context, sl, SERVICE_DATA_DSCP, SERVICE_RETRY_DSCP) == 0);
+        assert(mrc_dpdk_set_sl_dscp(context, 0, 8, 16) == 0);
+    }
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, caps, sl);
+    if (service_level_dscp) {
+        struct ibv_qp_attr verbs;
+        assert(mrc_query_qp(qp, &verbs, IBV_QP_AV, NULL, 0, NULL) == 0 && verbs.ah_attr.sl == sl);
+    }
     if (requester) {
         struct mrc_qp_attr attrs = {
             .timeout = last_hop_trim ? 20 : BLACKOUT_TIMEOUT_EXPONENT,
@@ -1705,6 +1766,8 @@ static void run_single_write(bool requester, const char *directory, const struct
     struct mrc_dpdk_route route = path_route(pool, requester);
     route.requester = requester;
     attach_qp(qp, &route);
+    if (service_level_dscp)
+        assert(mrc_dpdk_set_sl_dscp(context, sl, 14, 22) == 0);
     prepare_memif_links();
     if (last_hop_trim) {
         if (requester) {
@@ -1717,7 +1780,7 @@ static void run_single_write(bool requester, const char *directory, const struct
             assert(mrc_dpdk_set_trim_last_hop_dscp(qp, 0) == 0);
             assert(mrc_dpdk_set_trim_last_hop_dscp(qp, LAST_HOP_TRIM_DSCP) == 0);
         }
-        run_last_hop_trim(requester, directory, qp, cq, mr, &peer, local.qpn, data);
+        run_last_hop_trim(requester, directory, qp, cq, mr, &peer, local.qpn, data, service_level_dscp);
     } else if (requester) {
         char ready[PATH_MAX];
         path_for(ready, directory, "rx.ready");
@@ -2430,7 +2493,7 @@ static void run_duplex(bool client, const char *directory, const struct address 
         const unsigned int caps = rx_flow && index == unsupported_index
                                   ? MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED : 0;
         configure_qp(qps[index].qp, address, &peer[index], local[index].psn, true, true, 0,
-                     client ? cc_profile_id : 0, caps);
+                     client ? cc_profile_id : 0, caps, 0);
         if (rx_flow) {
             struct mrc_qp_attr attr;
             assert(mrc_query_qp(qps[index].qp, NULL, 0, &attr, MRC_QP_CAP, NULL) == 0);
@@ -2500,7 +2563,8 @@ int main(int argc, char **argv)
     bool endpoint_ops = strcmp(argv[3], "endpoint_ops") == 0;
     bool infinite_retry = strcmp(argv[3], "blackout_infinite") == 0;
     bool blackout = infinite_retry || strcmp(argv[3], "blackout_finite") == 0;
-    bool last_hop_trim = strcmp(argv[3], "last_hop_trim") == 0;
+    bool service_level_dscp = strcmp(argv[3], "service_level_dscp") == 0;
+    bool last_hop_trim = service_level_dscp || strcmp(argv[3], "last_hop_trim") == 0;
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
     bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
@@ -2571,7 +2635,7 @@ int main(int argc, char **argv)
     if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
     else if (blackout || last_hop_trim) {
-        enum single_write_case scenario = last_hop_trim ? LAST_HOP_TRIM :
+        enum single_write_case scenario = service_level_dscp ? SERVICE_LEVEL_DSCP : last_hop_trim ? LAST_HOP_TRIM :
             infinite_retry ? BLACKOUT_INFINITE : BLACKOUT_FINITE;
         run_single_write(client, directory, &address, context, pd, pool, scenario);
     } else if (bidirectional)

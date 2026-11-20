@@ -31,6 +31,15 @@ independent live peer. Both scripts cover IPv4, IPv6, and preserved SRv6
 with and without a final SRH. The relay moves Ethernet frames and the
 Python peer handles wire encoding, memory placement, and feedback.
 
+For §7.5.5.1, the public memif case selects SL 7 with `IBV_QP_AV` and
+observes DSCP 26 for the initial WRITEIMM and reliability probes, DSCP 34
+for the retry, and DSCP 48 for SACK, NACK, and Transport ACK. A different
+SL 0 mapping and a post-attach edit verify the selected mapping and its
+attachment lifetime. The independent requester cases verify the data
+and retry DSCPs over IPv4, IPv6, and both preserved SRv6 forms, including
+the outer class and the ECN bits. They also verify the standalone
+default that retries use the data DSCP when no retry class is specified.
+
 For §7.5.3, each responder replay sends a shortened regular trim and
 an intact WRITE marked with the configured last-hop DSCP. The replies
 carry distinct NACK reasons, the original UDP lengths, and the

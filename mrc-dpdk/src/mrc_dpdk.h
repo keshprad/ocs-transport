@@ -34,6 +34,13 @@ int mrc_dpdk_set_ev_store(struct mrc_context *context, const char *directory);
 
 struct rte_mempool;
 
+/* Map a service level from 0 through 15 to data and retransmission DSCPs.
+ * Both default to zero. Requester attachment snapshots the mapping chosen
+ * by the QP's address vector. Reliability probes use the data DSCP.
+ * DSCP 48 is reserved for Control. Returns zero or positive errno. */
+int mrc_dpdk_set_sl_dscp(struct mrc_context *context, unsigned int sl,
+                        unsigned int data_dscp, unsigned int retry_dscp);
+
 /* Application-owned, started DPDK ports with queue zero for RX and TX.
  * QPs in this process can share these ports. Keep application I/O on the
  * attached queues inside the MRC progress calls until the QPs detach. */

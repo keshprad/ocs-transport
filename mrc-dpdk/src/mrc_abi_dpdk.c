@@ -442,8 +442,14 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     error = mrc_abi_configure_addresses(config, &qp->source_gid, &verbs->ah_attr.grh.dgid);
     if (error)
         return error;
-    if (tx)
+    if (tx) {
         config->cc_profile = qp->cc_profile;
+        pthread_mutex_lock(&qp->context->mutex);
+        struct mrc_abi_sl_dscp dscp = qp->context->sl_dscp[verbs->ah_attr.sl];
+        pthread_mutex_unlock(&qp->context->mutex);
+        config->data_dscp = dscp.data;
+        config->retry_dscp = dscp.retry;
+    }
     if (tx && attrs->profile.ev_profile_id) {
         config->profile_id = attrs->profile.ev_profile_id;
         config->profile_store = mrc_abi_profile_store(qp->context);
@@ -553,6 +559,18 @@ static int attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
 unlock:
     pthread_mutex_unlock(&qp->mutex);
     return error;
+}
+
+MRC_PUBLIC int mrc_dpdk_set_sl_dscp(struct mrc_context *context, unsigned int sl,
+                                  unsigned int data_dscp, unsigned int retry_dscp)
+{
+    if (!context || sl >= MRC_ABI_SL_COUNT || data_dscp > 63 || retry_dscp > 63 ||
+        data_dscp == MRC_ENDPOINT_CONTROL_DSCP || retry_dscp == MRC_ENDPOINT_CONTROL_DSCP)
+        return EINVAL;
+    pthread_mutex_lock(&context->mutex);
+    context->sl_dscp[sl] = (struct mrc_abi_sl_dscp){ .data = (uint8_t)data_dscp, .retry = (uint8_t)retry_dscp };
+    pthread_mutex_unlock(&context->mutex);
+    return 0;
 }
 
 MRC_PUBLIC int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route)
