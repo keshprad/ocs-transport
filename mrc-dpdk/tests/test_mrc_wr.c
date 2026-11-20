@@ -115,6 +115,32 @@ static void test_out_of_order_and_wrap(void)
     assert(mrc_rx_classify(&f.qp, 2) == MRC_RX_DUPLICATE);
 }
 
+static void test_reuse_work_slots(void)
+{
+    struct fixture f;
+    struct mrc_wr_completion completion;
+    bool produced;
+    const uint32_t start = MRC_PSN_MASK - (WORK - 2);
+    init(&f, start, start, 0, 0);
+    for (unsigned int i = 0; i < WORK - 1; i++) {
+        uint32_t sequence = mrc_psn_add(start, (int32_t)i);
+        assert(offer(&f, MRC_WRITE_ONLY, sequence, (uint16_t)sequence, 0, VA + i, 1, 0,
+                     "x", 1) == MRC_WR_OK);
+        assert(advance(&f, &completion, &produced) == MRC_WR_OK && !produced);
+    }
+    assert(mrc_wr_ack_msn(&f.responder) == MRC_PSN_MASK);
+
+    /* Retain two later messages across the ring end until their prefix arrives. */
+    assert(offer(&f, MRC_WRITE_ONLY, 2, 2, 0, VA + 6, 1, 0, "c", 1) == MRC_WR_OK);
+    assert(offer(&f, MRC_WRITE_ONLY, 1, 1, 0, VA + 5, 1, 0, "b", 1) == MRC_WR_OK);
+    assert(advance(&f, &completion, &produced) == MRC_WR_OK && !produced);
+    assert(mrc_wr_ack_msn(&f.responder) == MRC_PSN_MASK);
+    assert(offer(&f, MRC_WRITE_ONLY, 0, 0, 0, VA + 4, 1, 0, "a", 1) == MRC_WR_OK);
+    assert(advance(&f, &completion, &produced) == MRC_WR_OK && !produced);
+    assert(mrc_wr_ack_msn(&f.responder) == 2 && memcmp(f.memory + 4, "abc", 3) == 0);
+    mrc_wr_destroy(&f.responder);
+}
+
 static void test_reject_malformed_without_placement(void)
 {
     struct fixture f;
@@ -352,6 +378,7 @@ static void test_provider_releases_on_error_and_destroy(void)
 int main(void)
 {
     test_out_of_order_and_wrap();
+    test_reuse_work_slots();
     test_reject_malformed_without_placement();
     test_imm_resource_errors();
     test_work_and_staging_bounds();

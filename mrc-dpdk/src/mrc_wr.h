@@ -75,6 +75,8 @@ struct mrc_wr_responder {
     uint32_t next_psn;
     uint32_t next_msn;
     uint16_t next_rqmsn;
+    size_t work_head;
+    size_t work_span; /* Distance from next MSN through the furthest pending WR. */
     size_t free_stage;
     size_t wimm_inflight;
     size_t recv_head;

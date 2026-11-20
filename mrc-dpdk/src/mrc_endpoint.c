@@ -83,8 +83,8 @@ struct mrc_requester {
     struct mrc_endpoint_node local_node;
     struct mrc_endpoint_node *node;
     struct mrc_tx_qp qp;
-    struct mrc_tx_packet slots[WINDOW];
-    struct send_record metadata[WINDOW];
+    struct mrc_tx_packet *slots;
+    struct send_record *metadata;
     struct mrc_ev_profile ev;
     struct mrc_mpr mpr;
     uint32_t next;
@@ -107,9 +107,9 @@ struct mrc_responder {
     bool mpr_pending;
     struct mrc_endpoint_node local_node;
     struct mrc_endpoint_node *node;
-    struct mrc_wr_slot work[WINDOW];
-    struct mrc_wr_staged staged[WINDOW];
-    uint8_t slots[WINDOW];
+    struct mrc_wr_slot *work;
+    struct mrc_wr_staged *staged;
+    uint8_t *slots;
     uint32_t unique_packets;
     struct mrc_cc_rx cc;
     struct mrc_cc_receiver_flow flow;
@@ -843,7 +843,7 @@ static int send_on_available_ev(struct mrc_requester *sender, uint32_t index, bo
 static bool retire_redundant_attempt(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                                       uint32_t index)
 {
-    struct send_record *record = &sender->metadata[index % WINDOW];
+    struct send_record *record = &sender->metadata[index % transfer->window];
     if (!record->counted_inflight || !record->redundant_attempt)
         return true;
 
@@ -874,7 +874,7 @@ static int fail_retry(const struct mrc_endpoint_config *transfer, struct mrc_req
     uint32_t first = (uint32_t)mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
     fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
                     " (first segment %u, next %u, last transmit path %u)\n",
-            psn, first, sender->next, ev_rail(transfer, sender->metadata[index % WINDOW].ev));
+            psn, first, sender->next, ev_rail(transfer, sender->metadata[index % transfer->window].ev));
     return fail_send(transfer, sender, index, MRC_PROVIDER_WC_RETRY_EXCEEDED, -ETIMEDOUT);
 }
 
@@ -1034,7 +1034,7 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         case MRC_NACK_NO_RESOURCE:
         case MRC_NACK_PSN_OOR_WINDOW: {
             uint32_t index = (uint32_t)mrc_psn_delta(nack->nack_psn, transfer->initial_psn);
-            struct send_record *record = &sender->metadata[index % WINDOW];
+            struct send_record *record = &sender->metadata[index % transfer->window];
             /* Use the reflected transmit entropy. Successive retries share
              * the RTX bit and their feedback may arrive on either rail. */
             if (record->nacked || packet->bth.retransmit != (state->retransmissions != 0) ||
@@ -1147,7 +1147,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
     for (uint32_t index = first; index < sender->next; index++) {
         uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
         struct mrc_tx_packet *packet = mrc_tx_packet(&sender->qp, psn);
-        struct send_record *record = &sender->metadata[index % WINDOW];
+        struct send_record *record = &sender->metadata[index % transfer->window];
         uint64_t age = now - packet->sent_at;
         if (packet->received && index != first)
             continue;
@@ -1677,7 +1677,8 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     if (!configuration || !qp || !counts || !requester || !configuration->pool ||
         !configuration->hz || !configuration->initial_rto ||
         !mrc_wire_pmtu_valid(endpoint_pmtu(configuration)) ||
-        configuration->window > WINDOW || mrc_endpoint_path_count(configuration) > MRC_EV_MAX_PATHS)
+        !configuration->window || configuration->window > MRC_MPR_MAX ||
+        mrc_endpoint_path_count(configuration) > MRC_EV_MAX_PATHS)
         return -EINVAL;
     struct mrc_provider_qp_attr attr;
     int result = mrc_provider_qp_query(qp, &attr);
@@ -1699,6 +1700,12 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     struct mrc_endpoint_config *transfer = &sender->transfer;
     transfer->sender = true;
     transfer->work = NULL;
+    sender->slots = calloc(transfer->window, sizeof(*sender->slots));
+    sender->metadata = calloc(transfer->window, sizeof(*sender->metadata));
+    if (!sender->slots || !sender->metadata) {
+        result = -ENOMEM;
+        goto failed;
+    }
     const unsigned int ev_count = transfer->profile_id ? transfer->profile.config.count :
                                   mrc_endpoint_path_count(transfer);
     sender->initial_probes = mrc_endpoint_path_mask(ev_count);
@@ -1862,7 +1869,7 @@ static int requester_step(struct mrc_requester *sender)
             return picked;
         if (!mrc_tx_track(&sender->qp, psn, now))
             return -EPROTO;
-        sender->metadata[index % WINDOW] = (struct send_record){
+        sender->metadata[index % transfer->window] = (struct send_record){
             .retry_deadline = now + transfer->initial_rto,
             .ev = (unsigned int)picked, .counted_inflight = true,
         };
@@ -1895,6 +1902,8 @@ void mrc_requester_destroy(struct mrc_requester *requester)
         if (requester->event_fd >= 0)
             close(requester->event_fd);
         free(requester->transfer.work);
+        free(requester->metadata);
+        free(requester->slots);
         free(requester);
     }
 }
@@ -1905,8 +1914,9 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
     if (!transfer || !qp || !counts || !responder || transfer->sender ||
         !transfer->pool || !transfer->hz || !transfer->initial_rto ||
         !mrc_wire_pmtu_valid(endpoint_pmtu(transfer)) ||
-        transfer->window > WINDOW || transfer->rx_staging_capacity > WINDOW ||
-        transfer->rx_work_capacity > WINDOW || mrc_endpoint_path_count(transfer) > MRC_EV_MAX_PATHS)
+        !transfer->window || transfer->window > MRC_MPR_MAX ||
+        transfer->rx_staging_capacity > MRC_MPR_MAX || !transfer->rx_work_capacity ||
+        transfer->rx_work_capacity > MRC_MPR_MAX || mrc_endpoint_path_count(transfer) > MRC_EV_MAX_PATHS)
         return -EINVAL;
     struct mrc_provider_qp_attr attr;
     int result = mrc_provider_qp_query(qp, &attr);
@@ -1919,10 +1929,17 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
     struct mrc_responder *receiver = calloc(1, sizeof(*receiver));
     if (!receiver)
         return -ENOMEM;
+    receiver->slots = calloc(transfer->window, sizeof(*receiver->slots));
+    receiver->work = calloc(transfer->rx_work_capacity, sizeof(*receiver->work));
+    if (!receiver->slots || !receiver->work) {
+        mrc_responder_destroy(receiver);
+        return -ENOMEM;
+    }
     uint16_t pmtu = endpoint_pmtu(transfer);
     if (transfer->rx_staging_capacity) {
-        receiver->staged_payload = malloc(transfer->rx_staging_capacity * pmtu);
-        if (!receiver->staged_payload) {
+        receiver->staged = calloc(transfer->rx_staging_capacity, sizeof(*receiver->staged));
+        receiver->staged_payload = malloc((size_t)transfer->rx_staging_capacity * pmtu);
+        if (!receiver->staged || !receiver->staged_payload) {
             mrc_responder_destroy(receiver);
             return -ENOMEM;
         }
@@ -2038,6 +2055,9 @@ void mrc_responder_destroy(struct mrc_responder *responder)
     if (responder) {
         mrc_wr_destroy(&responder->wr);
         free(responder->staged_payload);
+        free(responder->staged);
+        free(responder->work);
+        free(responder->slots);
         free(responder);
     }
 }

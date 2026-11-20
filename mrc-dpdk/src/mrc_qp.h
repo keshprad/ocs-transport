@@ -7,7 +7,9 @@
 #define MRC_PSN_MASK UINT32_C(0xffffff)
 #define MRC_PSN_HALF UINT32_C(0x800000)
 #define MRC_MPR_UNIT 128u
-#define MRC_MPR_MAX (UINT8_MAX * MRC_MPR_UNIT)
+#define MRC_MPR_DEFAULT_UNITS 8u
+#define MRC_MPR_MAX_UNITS UINT8_MAX
+#define MRC_MPR_MAX (MRC_MPR_MAX_UNITS * MRC_MPR_UNIT)
 #define MRC_SACK_BITS 64u
 
 /* The exact half-space is unordered and maps to -MRC_PSN_HALF. */

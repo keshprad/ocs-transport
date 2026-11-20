@@ -20,7 +20,8 @@ and no benchmark arguments for the option list. Use `--work-requests N` for
 multiple WRs and `--immediate N` to give the first WR an immediate value.
 Subsequent immediate values increment modulo 32 bits. The default receiver
 posts one receive credit per WRITEIMM. `--max-wimm-inflight N` sets the agreed
-credit limit and `--mpr N` sets the static window in units of 128 packets.
+credit limit. `--mpr N` sets the maximum PSN range in units of 128
+packets. It accepts 1 through 255 and defaults to 8.
 To mix sizes and operation types, pass the same comma-separated list on
 both peers, such as `4097,0@42,11,2049@7`. An `@VALUE` suffix makes that
 entry a WRITEIMM. Use the list by itself in place of the single size,
@@ -151,7 +152,9 @@ must be between 1 and the negotiated maximum, in units of 128 packets.
 The responder advertises the change in its next SACKs. The requester
 applies it when the SACK advances the cumulative PSN. Query each side
 with `mrc_query_qp()` and its directional MPR mask to read the current
-limit.
+limit. The public QP also defaults to 8 units and supports up to 255
+in each direction. Attachment sizes reliability and responder message
+storage to the configured values.
 
 To attach an SRv6 QP, supply one `mrc_dpdk_srv6_path` entry per rail in
 the counted route's `srv6_paths` array. Each rail

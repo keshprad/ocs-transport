@@ -169,7 +169,7 @@ def main():
     def check_mpr_updates():
         for mode, queried, advertised in (
             ("dynamic_mpr", [3, 1, 3], [3, 1, 3]),
-            ("dynamic_mpr_rts", [3, 1, 3], [3, 1, 3]),
+            ("dynamic_mpr_rts", [255, 1, 255], [255, 1, 255]),
             ("static_mpr", [3, 3, 3], [0, 0, 0]),
         ):
             tx, rx = run_case(mode)

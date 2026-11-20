@@ -157,6 +157,41 @@ static void test_sender_window(void)
     assert(!mrc_tx_packet(&tx, start));
 }
 
+static void test_maximum_window(void)
+{
+    const uint32_t start = MRC_PSN_MASK - 1;
+    const uint32_t last = mrc_psn_add(start, MRC_MPR_MAX - 1);
+    const uint32_t beyond = mrc_psn_add(start, MRC_MPR_MAX);
+    uint8_t rx_slots[MRC_MPR_MAX];
+    static struct mrc_tx_packet tx_slots[MRC_MPR_MAX];
+    struct mrc_rx_qp rx;
+    struct mrc_tx_qp tx;
+    bool sack_due;
+    struct mrc_sack sack;
+
+    assert(mrc_rx_init(&rx, start, MRC_MPR_MAX, rx_slots));
+    assert(mrc_tx_init(&tx, start, MRC_MPR_MAX, tx_slots));
+    for (uint32_t offset = 0; offset < MRC_MPR_MAX; offset++)
+        assert(mrc_tx_track(&tx, mrc_psn_add(start, (int32_t)offset), (uint64_t)offset + 1));
+    assert(!mrc_tx_track(&tx, beyond, 1));
+    assert(mrc_rx_classify(&rx, beyond) == MRC_RX_AHEAD_OF_WINDOW);
+    assert(mrc_rx_record(&rx, mrc_psn_add(last, -1), 0, 0, UINT32_MAX, &sack_due) == MRC_RX_NEW);
+    assert(mrc_rx_record(&rx, last, 0, MRC_RX_AR, UINT32_MAX, &sack_due) == MRC_RX_NEW && sack_due);
+    assert(mrc_rx_build_sack(&rx, last, &sack) && sack.ack_psn_offset == MRC_MPR_MAX &&
+           sack.ooo_count == 2 && sack.bitmap == 0);
+    assert(mrc_tx_apply_sack(&tx, &sack, false));
+    for (unsigned int offset = MRC_SACK_BITS; offset < MRC_MPR_MAX; offset += MRC_SACK_BITS) {
+        mrc_rx_sack_sent(&rx, &sack);
+        mrc_rx_build_probe_sack(&rx, 0x8000, &sack);
+    }
+    assert(sack.sack_offset == MRC_MPR_MAX - MRC_SACK_BITS && sack.bitmap == (UINT64_C(1) << 63));
+    assert(mrc_tx_apply_sack(&tx, &sack, true));
+    assert(mrc_tx_packet(&tx, last)->received && mrc_tx_packet(&tx, mrc_psn_add(last, -1))->received);
+    assert(!mrc_tx_packet(&tx, start)->received);
+    assert(mrc_tx_apply_transport_ack(&tx, last));
+    assert(mrc_tx_track(&tx, beyond, 2) && !mrc_tx_packet(&tx, beyond)->received);
+}
+
 static void test_local_ack_timeout(void)
 {
     uint64_t timeout;
@@ -177,6 +212,7 @@ int main(void)
     test_sack_rotation_and_probe();
     test_delivery_and_transport_ack();
     test_sender_window();
+    test_maximum_window();
     test_local_ack_timeout();
     puts("MRC QP state tests passed");
 }

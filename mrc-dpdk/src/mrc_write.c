@@ -19,6 +19,7 @@
 enum {
     BURST = 32,
     DEFAULT_WIMM_INFLIGHT = 8,
+    MAX_WIMM_INFLIGHT = 1024,
     DEFAULT_REQUESTOR_QPN = 0x101,
     DEFAULT_RESPONDER_QPN = 0x102,
     DEFAULT_PARTITION_KEY = 0xffff,
@@ -373,7 +374,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     uint8_t local_sid_value[MRC_IPV6_ADDR_LEN], peer_sid_value[MRC_IPV6_ADDR_LEN];
     uint32_t repeat = 0, immediate = 0;
     uint32_t exponent = 14, linear_retries = 3, exponential_retries = 4;
-    uint32_t mpr = WINDOW / MRC_MPR_UNIT, p_key = DEFAULT_PARTITION_KEY;
+    uint32_t mpr = MRC_MPR_DEFAULT_UNITS, p_key = DEFAULT_PARTITION_KEY;
     uint32_t rx_ooo_capacity = UINT32_MAX, rx_staging_capacity = UINT32_MAX;
     uint32_t rx_work_capacity = 0, rx_cq_capacity = 0;
     uint32_t dynamic_mpr = 0, mpr_change_to = 0;
@@ -428,7 +429,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
         if (!strcmp(key, "--p-key") && number(value, 1, UINT16_MAX, &p_key) &&
             (p_key & MRC_PKEY_PARTITION_MASK))
             continue;
-        if (!strcmp(key, "--mpr") && number(value, 1, WINDOW / MRC_MPR_UNIT, &mpr))
+        if (!strcmp(key, "--mpr") && number(value, 1, MRC_MPR_MAX_UNITS, &mpr))
             continue;
         if (!strcmp(key, "--dynamic-mpr") && number(value, 0, 1, &dynamic_mpr))
             continue;
@@ -436,7 +437,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
             number(value, 1, MRC_PSN_HALF - 1, &transfer->mpr_change_at))
             continue;
         if (!transfer->sender && !strcmp(key, "--mpr-change-to") &&
-            number(value, 1, WINDOW / MRC_MPR_UNIT, &mpr_change_to))
+            number(value, 1, MRC_MPR_MAX_UNITS, &mpr_change_to))
             continue;
         if (!strcmp(key, "--remote-key") && number(value, 0, UINT32_MAX, &transfer->remote_key)) {
             benchmark->remote_key_configured = true;
@@ -449,16 +450,16 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
             number(value, 1, MAX_WORK_REQUESTS, &repeat))
             continue;
         if (!strcmp(key, "--max-wimm-inflight") &&
-            number(value, 1, WINDOW, &transfer->max_wimm_inflight))
+            number(value, 1, MAX_WIMM_INFLIGHT, &transfer->max_wimm_inflight))
             continue;
         if (!transfer->sender && !strcmp(key, "--rx-ooo-capacity") &&
-            number(value, 0, WINDOW, &rx_ooo_capacity))
+            number(value, 0, MRC_MPR_MAX, &rx_ooo_capacity))
             continue;
         if (!transfer->sender && !strcmp(key, "--rx-staging-capacity") &&
-            number(value, 0, WINDOW, &rx_staging_capacity))
+            number(value, 0, MRC_MPR_MAX, &rx_staging_capacity))
             continue;
         if (!transfer->sender && !strcmp(key, "--rx-work-capacity") &&
-            number(value, 1, WINDOW, &rx_work_capacity))
+            number(value, 1, MRC_MPR_MAX, &rx_work_capacity))
             continue;
         if (!transfer->sender && !strcmp(key, "--rx-cq-capacity") &&
             number(value, 1, MAX_WORK_REQUESTS, &rx_cq_capacity))

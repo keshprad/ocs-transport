@@ -378,10 +378,11 @@ The public memif cases use `mrc_modify_qp()` with `MRC_QP_MPR_DEST` to
 lower and restore the advertised limit on attached RTR and RTS responders.
 The peer has already sent each WRITEIMM before the application changes the
 limit.
-The SACKs and both directional queries report `3, 1, 3` units across PSN
-wrap. All three WRITEIMMs place the expected bytes and complete on both
-peers. The static case returns zero in every SACK and keeps the negotiated
-limit of three in both queries.
+The SACKs and both directional queries report `3, 1, 3` for RTR and
+`255, 1, 255` for RTS across PSN wrap. All three WRITEIMMs in each case
+place the expected bytes and complete on both peers. The static case
+returns zero in every SACK and keeps the negotiated limit of three in
+both queries.
 
 A local memif run verified eight 256 KiB WRITEIMMs with an in-flight limit
 of two and provider-registered memory. The receiver lowered MPR from
@@ -389,6 +390,14 @@ eight units to one after 65 accepted packets. Both peers applied one MPR
 update and completed all eight work requests. The targeted case passed
 with both the installed Spark snapshot revision and the development build.
 The corresponding physical run needs the scoped negotiated pair profile.
+
+For §§7.4.4 and 7.5.4, the portable tests fill the requester window with
+32,640 entries, check the last valid receive PSN and first overflow, and
+exercise signed SACK offsets near the end of the window. A negotiated
+memif WRITEIMM sends 32,641 segments at PMTU 256, crossing PSN wrap and
+reusing tracking slots. Both peers apply the responder's change from
+255 to 32 units after 512 accepted packets. The receiver checks the
+entire buffer and consumes one WRITEIMM credit.
 
 ### Concurrent three-Spark verification
 

@@ -463,6 +463,15 @@ def main():
             f"Negotiated WRITEIMM did not complete across the receive-window change: {tx}, {rx}")
     print(json.dumps({"case": "dynamic_mpr_shrink_during_writeimm", "tx": tx, "rx": rx}))
 
+    packets = 255 * 128 + 1
+    tx, rx = transfer(binary, packets * 256, "--immediate", "99", "--pmtu", "256", "--mpr", "255",
+                      "--ack-timeout", "20", "--dynamic-mpr", "1", negotiate=True,
+                      rx_options=("--mpr", "255", "--mpr-change-at", "512", "--mpr-change-to", "32"))
+    require(tx["packets"] == rx["packets"] == packets and tx["mpr_updates"] == rx["mpr_updates"] == 1
+            and tx["registered_memory"] and rx["registered_memory"] and rx["immediate_completed"],
+            f"Full-range negotiated WRITEIMM failed: {tx}, {rx}")
+    print(json.dumps({"case": "maximum_negotiated_mpr", "tx": tx, "rx": rx}))
+
     tx, rx = transfer(binary, 1048576, negotiate=True, rx_options=change)
     require(tx["mpr_updates"] == rx["mpr_updates"] == 0,
             "The receive window changed without bilateral capability negotiation")

@@ -1999,7 +1999,7 @@ static uint8_t query_mpr(struct mrc_qp *qp, bool requester)
 
 static void run_mpr_updates(bool requester, const char *directory, struct mrc_qp *qp, struct mrc_cq *cq,
                             struct ibv_mr *mr, const struct connection *peer, uint32_t qpn,
-                            bool dynamic, enum ibv_qp_state state)
+                            bool dynamic, enum ibv_qp_state state, uint8_t maximum)
 {
     struct mpr_witness observed = {
         .requester_qpn = qpn, .responder_qpn = peer->qpn,
@@ -2019,12 +2019,14 @@ static void run_mpr_updates(bool requester, const char *directory, struct mrc_qp
         assert(mrc_modify_qp(qp, NULL, 0, &update, MRC_QP_MPR_DEST) == EOPNOTSUPP);
     } else {
         /* The upper bound is the negotiated limit rather than the device limit. */
-        update.mpr.mpr_dest = MPR_TEST_MAX + 1;
-        assert(mrc_modify_qp(qp, NULL, 0, &update, MRC_QP_MPR_DEST) == EINVAL);
+        if (maximum < UINT8_MAX) {
+            update.mpr.mpr_dest = maximum + 1;
+            assert(mrc_modify_qp(qp, NULL, 0, &update, MRC_QP_MPR_DEST) == EINVAL);
+        }
         update.mpr.mpr_dest = 0;
         assert(mrc_modify_qp(qp, NULL, 0, &update, MRC_QP_MPR_DEST) == EINVAL);
     }
-    assert(query_mpr(qp, requester) == MPR_TEST_MAX);
+    assert(query_mpr(qp, requester) == maximum);
 
     uint8_t queried[MPR_TEST_ROUNDS], advertised[MPR_TEST_ROUNDS] = {0};
     const uint8_t *data = mr->addr;
@@ -2032,7 +2034,7 @@ static void run_mpr_updates(bool requester, const char *directory, struct mrc_qp
         char ready_name[32], sent_name[32], marker[PATH_MAX];
         snprintf(ready_name, sizeof(ready_name), "rx.mpr-ready.%u", round);
         snprintf(sent_name, sizeof(sent_name), "tx.mpr-sent.%u", round);
-        uint8_t expected = dynamic && round == 1 ? 1 : MPR_TEST_MAX;
+        uint8_t expected = dynamic && round == 1 ? 1 : maximum;
         observed.psn = (SEND_PSN + round) & 0xffffff;
         observed.write_sent = observed.sack_received = false;
         observed.advertised = 0;
@@ -2126,6 +2128,7 @@ static void run_single_write(bool requester, const char *directory, const struct
     bool responder_rts = scenario == DYNAMIC_MPR_RTS;
     bool dynamic = scenario == DYNAMIC_MPR || responder_rts;
     bool mpr_updates = dynamic || scenario == STATIC_MPR;
+    uint8_t maximum = responder_rts ? UINT8_MAX : MPR_TEST_MAX;
     struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
     assert(cq);
     uint8_t data[MPR_TEST_ROUNDS * FIRST_BYTES] = {0};
@@ -2172,7 +2175,7 @@ static void run_single_write(bool requester, const char *directory, const struct
     }
     configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, caps, sl, IBV_MTU_1024);
     if (mpr_updates) {
-        struct mrc_qp_attr attrs = { .mpr = { .mpr = MPR_TEST_MAX, .mpr_dest = MPR_TEST_MAX } };
+        struct mrc_qp_attr attrs = { .mpr = { .mpr = maximum, .mpr_dest = maximum } };
         assert(mrc_modify_qp(qp, NULL, 0, &attrs, requester ? MRC_QP_MPR : MRC_QP_MPR_DEST) == 0);
     }
     if (responder_rts && !requester) {
@@ -2200,7 +2203,7 @@ static void run_single_write(bool requester, const char *directory, const struct
     prepare_memif_links();
     if (mpr_updates) {
         enum ibv_qp_state state = requester || responder_rts ? IBV_QPS_RTS : IBV_QPS_RTR;
-        run_mpr_updates(requester, directory, qp, cq, mr, &peer, local.qpn, dynamic, state);
+        run_mpr_updates(requester, directory, qp, cq, mr, &peer, local.qpn, dynamic, state, maximum);
     } else if (last_hop_trim) {
         if (requester) {
             assert(mrc_dpdk_set_trim_last_hop_dscp(qp, LAST_HOP_TRIM_DSCP) == ENOTCONN);

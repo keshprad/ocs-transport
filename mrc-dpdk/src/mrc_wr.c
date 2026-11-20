@@ -46,10 +46,17 @@ static void release_work(struct mrc_wr_slot *slot)
     slot->message = (struct mrc_wr_message){0};
 }
 
+static struct mrc_wr_slot *work_slot(const struct mrc_wr_responder *responder, size_t offset)
+{
+    size_t index = (responder->work_head + offset) % responder->config.work_capacity;
+    return &responder->config.work[index];
+}
+
 static void release_all_work(struct mrc_wr_responder *responder)
 {
-    for (size_t i = 0; i < responder->config.work_capacity; i++)
-        release_work(&responder->config.work[i]);
+    for (size_t i = 0; i < responder->work_span; i++)
+        release_work(work_slot(responder, i));
+    responder->work_span = 0;
 }
 
 void mrc_wr_destroy(struct mrc_wr_responder *responder)
@@ -130,19 +137,6 @@ static int validate_unanchored(const struct mrc_wr_responder *responder,
     return result;
 }
 
-static struct mrc_wr_slot *find_work(const struct mrc_wr_responder *responder, uint16_t msn,
-                                     struct mrc_wr_slot **available)
-{
-    for (size_t i = 0; i < responder->config.work_capacity; i++) {
-        struct mrc_wr_slot *slot = &responder->config.work[i];
-        if (slot->message.used && slot->message.msn == msn)
-            return slot;
-        if (available && !slot->message.used && !*available)
-            *available = slot;
-    }
-    return NULL;
-}
-
 static bool valid_position(const struct mrc_wr_message *slot, uint32_t pmtu, uint32_t psn,
                            uint64_t va, bool middle)
 {
@@ -169,8 +163,8 @@ static bool valid_anchor(const struct mrc_wr_responder *responder, const struct 
         return false;
 
     uint32_t end = first + candidate->packets;
-    for (size_t i = 0; i < responder->config.work_capacity; i++) {
-        const struct mrc_wr_message *other = &responder->config.work[i].message;
+    for (size_t i = 0; i < responder->work_span; i++) {
+        const struct mrc_wr_message *other = &work_slot(responder, i)->message;
         if (!other->used || other->msn == candidate->msn)
             continue;
 
@@ -249,8 +243,8 @@ static enum mrc_wr_result stage_middle(struct mrc_wr_responder *responder,
     if (index == NO_STAGE)
         return MRC_WR_NO_PKT_BUFFER;
 
-    for (size_t i = 0; i < responder->config.work_capacity; i++) {
-        const struct mrc_wr_message *other = &responder->config.work[i].message;
+    for (size_t i = 0; i < responder->work_span; i++) {
+        const struct mrc_wr_message *other = &work_slot(responder, i)->message;
         if (other->used && other->anchored && other->msn != slot->msn && covers(other, psn))
             return fail(responder, MRC_WR_INVALID);
     }
@@ -303,13 +297,8 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
     if (message >= responder->config.work_capacity)
         return MRC_WR_NO_RESOURCE;
 
-    struct mrc_wr_slot *available = NULL;
-    struct mrc_wr_slot *slot = find_work(responder, write->msn, &available);
-    if (!slot && !available)
-        return MRC_WR_NO_RESOURCE;
-
-    struct mrc_wr_slot *target = slot ? slot : available;
-    struct mrc_wr_message candidate = slot ? slot->message : (struct mrc_wr_message) {
+    struct mrc_wr_slot *target = work_slot(responder, message);
+    struct mrc_wr_message candidate = target->message.used ? target->message : (struct mrc_wr_message) {
         .staged_head = NO_STAGE, .dmalen = write->dma_len, .packets = packets,
         .r_key = write->r_key, .msn = write->msn, .rqmsn = write->rqmsn,
         .used = true, .uniform_rqmsn = true,
@@ -384,6 +373,8 @@ enum mrc_wr_result mrc_wr_receive(struct mrc_wr_responder *responder, uint32_t p
     }
 
     target->message = candidate;
+    if ((size_t)message >= responder->work_span)
+        responder->work_span = (size_t)message + 1;
     return MRC_WR_OK;
 }
 
@@ -397,8 +388,8 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
         return fail(responder, MRC_WR_INVALID);
 
     while (mrc_psn_delta(delivery_cack, responder->next_psn) >= 0) {
-        struct mrc_wr_slot *work = find_work(responder, (uint16_t)responder->next_msn, NULL);
-        if (!work)
+        struct mrc_wr_slot *work = work_slot(responder, 0);
+        if (!work->message.used)
             return fail(responder, MRC_WR_INVALID);
         const struct mrc_wr_message *slot = &work->message;
         if (!slot->anchored || slot->first_psn != responder->next_psn)
@@ -438,6 +429,8 @@ enum mrc_wr_result mrc_wr_advance(struct mrc_wr_responder *responder, uint32_t d
         responder->next_psn = mrc_psn_add(last, 1);
         responder->next_msn = mrc_psn_add(responder->next_msn, 1);
         release_work(work);
+        responder->work_head = (responder->work_head + 1) % responder->config.work_capacity;
+        responder->work_span--;
         if (*produced)
             break;
     }

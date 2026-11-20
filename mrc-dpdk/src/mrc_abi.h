@@ -12,7 +12,7 @@
 #define MRC_PUBLIC __attribute__((visibility("default")))
 
 enum {
-    MRC_ABI_MAX_MPR = 8,
+    MRC_ABI_MAX_MPR = UINT8_MAX,
     MRC_ABI_MAX_WIMM = 1024,
     MRC_ABI_MAX_QP_HINTS = 1024,
     MRC_ABI_SL_COUNT = 16,

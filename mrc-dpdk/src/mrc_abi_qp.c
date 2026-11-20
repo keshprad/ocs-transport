@@ -125,7 +125,7 @@ static int validate_init(struct mrc_context *context, const struct mrc_qp_init_a
 static struct mrc_qp_attr default_qp_attrs(void)
 {
     return (struct mrc_qp_attr){
-        .mpr = { .mpr = MRC_ABI_MAX_MPR, .mpr_dest = MRC_ABI_MAX_MPR },
+        .mpr = { .mpr = MRC_MPR_DEFAULT_UNITS, .mpr_dest = MRC_MPR_DEFAULT_UNITS },
         .timeout = 16, .retry = { .linear_cnt = 3, .exp_cnt = 4 },
     };
 }
@@ -316,8 +316,7 @@ static int validate_attrs(const struct mrc_qp_attr *attrs)
 {
     const unsigned int supported_caps = MRC_QP_CAP_TRIM_NACK_DEST_UNSUPPORTED |
         MRC_QP_CAP_DYNAMIC_MPR | MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED;
-    if (!attrs->mpr.mpr || attrs->mpr.mpr > MRC_ABI_MAX_MPR ||
-        !attrs->mpr.mpr_dest || attrs->mpr.mpr_dest > MRC_ABI_MAX_MPR ||
+    if (!attrs->mpr.mpr || !attrs->mpr.mpr_dest ||
         attrs->wimm.max_wimm > MRC_ABI_MAX_WIMM || attrs->wimm.max_wimm_dest > MRC_ABI_MAX_WIMM ||
         attrs->timeout > 24 || attrs->retry.linear_cnt > 7 || attrs->retry.exp_cnt > 25)
         return EINVAL;
