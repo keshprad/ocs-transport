@@ -966,13 +966,15 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         case MRC_NACK_PSN_OOR_WINDOW: {
             uint32_t index = (uint32_t)mrc_psn_delta(nack->nack_psn, transfer->initial_psn);
             struct send_record *record = &sender->metadata[index % WINDOW];
-            if (record->nacked || packet->bth.retransmit != (state->retransmissions != 0))
+            /* Use the reflected transmit entropy. Successive retries share
+             * the RTX bit and their feedback may arrive on either rail. */
+            if (record->nacked || packet->bth.retransmit != (state->retransmissions != 0) ||
+                nack->entropy != path_entropy(transfer, record->path, true))
                 return 0;
             bool trimmed = nack->reason == MRC_NACK_TRIMMED ||
                            nack->reason == MRC_NACK_TRIMMED_LASTHOP;
-            int ev = reflected_path(transfer, nack->entropy);
-            if (ev >= 0 && nack->reason == MRC_NACK_TRIMMED)
-                mrc_ev_feedback(&sender->ev, (unsigned int)ev, MRC_EV_SKIP_ONCE,
+            if (nack->reason == MRC_NACK_TRIMMED)
+                mrc_ev_feedback(&sender->ev, record->path, MRC_EV_SKIP_ONCE,
                                 false, 0, now_cycles);
             if (record->counted_inflight) {
                 struct mrc_cc_tx_sample sample = {

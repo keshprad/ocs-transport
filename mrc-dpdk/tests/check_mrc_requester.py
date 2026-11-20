@@ -323,6 +323,41 @@ class RetryTimerResponder(ReferenceResponder):
         return {"nack_exhaustion_delay_ms": round(1000 * delay)}
 
 
+class LateNackResponder(ReferenceResponder):
+    write_lengths = (7,)
+    opcodes = (0xCB,)
+
+    def __init__(self, wire, mode):
+        super().__init__(wire, mode, None)
+        self.attempts = []
+        self.pending_ack = None
+
+    def acknowledge_probe(self, rail, packet, token, timestamp):
+        super().acknowledge_probe(1 - rail, packet, token, timestamp)
+
+    def write(self, rail, packet):
+        attempt = len(self.attempts)
+        require(attempt < 3 and packet.bth.psn == INITIAL_PSN and packet.bth.opcode == self.opcodes[0]
+                and bool(packet.bth.flags & RTX) == bool(attempt),
+                f"Unexpected WRITE attempt {attempt}")
+        if self.attempts:
+            require(rail != self.attempts[-1][0], "Retransmission did not alternate rails")
+        self.attempts.append((rail, packet))
+        if attempt < 2:
+            self.nack(1 - rail, packet, NO_PKT_BUFFER)
+            return
+        # Both retries have RTX set. Replay the first retry's NACK while the
+        # second is outstanding, then delay its ACK by one quiet interval.
+        prior_rail, prior_packet = self.attempts[1]
+        self.nack(1 - prior_rail, prior_packet, NO_PKT_BUFFER)
+        self.pending_ack = (1 - rail, packet)
+
+    def idle(self):
+        if self.pending_ack is not None:
+            super().write(*self.pending_ack)
+            self.pending_ack = None
+
+
 class PortStatusResponder(ReferenceResponder):
     RAIL = 1
     # The second identifier appears older even under 16-bit serial-number arithmetic.
@@ -518,7 +553,8 @@ def stop_relay(wire, relay):
 
 
 def run_requester(binary, relay_binary, mode, nack_reason=None, *,
-                  port_status=None, flow_control=False, probe_correlation=False, retry_timer=None):
+                  port_status=None, flow_control=False, probe_correlation=False, retry_timer=None,
+                  late_nack=False):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -546,6 +582,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                 responder = RetryTimerResponder(wire, mode, exhausted=retry_timer == "exhausted")
                 ack_timeout = responder.timeout_exponent
                 wire.settimeout(0.01)
+            elif late_nack:
+                responder = LateNackResponder(wire, mode)
             elif probe_correlation:
                 responder = ProbeCorrelationResponder(wire, mode)
             elif flow_control:
@@ -565,6 +603,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
             if retry_timer is not None:
                 command += ["--linear-retries", "0", "--exp-retries", "0" if responder.exhausted else "4"]
+            if late_nack:
+                command += ["--linear-retries", "2", "--exp-retries", "0"]
             if nack_reason == NO_PKT_BUFFER:
                 responder.data_dscp, responder.retry_dscp = 26, 34
                 command += ["--data-dscp", "26", "--retry-dscp", "34"]
@@ -621,6 +661,11 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                 require(sum(counters["retries"]) == 4 and counters["nack_received_mask"] == 1 << NO_PKT_BUFFER,
                         f"Unexpected retry timer counters: {counters}")
                 counters.update(responder.check_intervals())
+            elif late_nack:
+                require(len(responder.attempts) == 3 and sum(counters["retries"]) == 2
+                        and counters["probe_replies"] == 2
+                        and counters["nack_received_mask"] == 1 << NO_PKT_BUFFER,
+                        f"Late NACK interfered with the current attempt: {counters}")
             elif port_status is not None:
                 require(counters["port_status_updates"] == 2 and counters["port_status_replies"] == 1,
                         f"Unexpected Port Status counters: {counters}")
@@ -659,17 +704,22 @@ def main():
     focused.add_argument("--flow-control-only", action="store_true", help="Run only the responder flow-control case")
     focused.add_argument("--probe-correlation-only", action="store_true", help="Run only the probe correlation case")
     focused.add_argument("--retry-timer-only", action="store_true", help="Run only the NACK and timeout retry cases")
+    focused.add_argument("--late-nack-only", action="store_true", help="Run only cross-rail late NACK cases")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
     binary, relay = args.binary.resolve(), args.relay.resolve()
     normal_suite = not (args.port_status_only or args.flow_control_only or args.probe_correlation_only
-                        or args.retry_timer_only)
+                        or args.retry_timer_only or args.late_nack_only)
     if normal_suite:
         for mode in args.mode or MODES:
             for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim"),
                                   (TRIM_LAST_HOP, "trim_last_hop")):
                 counters = run_requester(binary, relay, mode, reason)
                 print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
+    if normal_suite or args.late_nack_only:
+        for mode in args.mode or MODES:
+            counters = run_requester(binary, relay, mode, late_nack=True)
+            print(json.dumps({"mode": mode, "late_nack": True, **counters}))
     mode = (args.mode or ("ipv6",))[0]
     if normal_suite or args.port_status_only:
         for case in ("replace", "expire"):
