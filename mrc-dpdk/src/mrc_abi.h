@@ -137,7 +137,7 @@ int mrc_abi_bind_mr(const struct mrc_context *context, struct mrc_provider_pd *p
 int mrc_abi_configure_addresses(struct mrc_endpoint_config *config, const union ibv_gid *local,
                                 const union ibv_gid *peer);
 int mrc_abi_prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
-                              struct mrc_endpoint_srv6_path *prepared);
+                              struct mrc_endpoint_srv6_path *prepared, unsigned int count);
 
 /* Serialize shared DPDK queue I/O and route state. The dispatcher
  * never acquires context or QP locks. */

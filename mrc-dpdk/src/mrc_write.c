@@ -19,7 +19,6 @@
 enum {
     BURST = 32,
     DEFAULT_WIMM_INFLIGHT = 8,
-    ALL_PATHS = (1 << PATH_COUNT) - 1,
     DEFAULT_REQUESTOR_QPN = 0x101,
     DEFAULT_RESPONDER_QPN = 0x102,
     DEFAULT_PARTITION_KEY = 0xffff,
@@ -324,7 +323,7 @@ static bool valid_packet_options(const struct mrc_endpoint_config *transfer)
 static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
 {
     struct mrc_endpoint_config *transfer = &benchmark->transfer;
-    if (argc < 9 || (argc - 9) % 2 || (strcmp(argv[1], "tx") && strcmp(argv[1], "rx")))
+    if (argc < 7 || (argc - 5) % 2 || (strcmp(argv[1], "tx") && strcmp(argv[1], "rx")))
         return false;
     transfer->sender = strcmp(argv[1], "tx") == 0;
     transfer->max_wimm_inflight = DEFAULT_WIMM_INFLIGHT;
@@ -345,13 +344,21 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     } else {
         return false;
     }
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
-        struct mrc_endpoint_path *path = &transfer->paths[i];
-        if (!parse_port(argv[5 + 2 * i], &path->port) ||
-            rte_ether_unformat_addr(argv[6 + 2 * i], &path->peer))
+    int arg = 5;
+    for (; arg < argc && strncmp(argv[arg], "--", 2) != 0; arg += 2) {
+        if (transfer->path_count == MRC_EV_MAX_PATHS)
             return false;
+        struct mrc_endpoint_path *path = &transfer->paths[transfer->path_count];
+        if (!parse_port(argv[arg], &path->port) ||
+            rte_ether_unformat_addr(argv[arg + 1], &path->peer))
+            return false;
+        for (unsigned int i = 0; i < transfer->path_count; i++) {
+            if (transfer->paths[i].port == path->port)
+                return false;
+        }
+        transfer->path_count++;
     }
-    if (transfer->paths[0].port == transfer->paths[1].port)
+    if (!transfer->path_count)
         return false;
 
     transfer->requestor_qpn = DEFAULT_REQUESTOR_QPN;
@@ -370,8 +377,11 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     uint32_t rx_ooo_capacity = UINT32_MAX, rx_staging_capacity = UINT32_MAX;
     uint32_t rx_work_capacity = 0, rx_cq_capacity = 0;
     uint32_t dynamic_mpr = 0, mpr_change_to = 0;
-    for (int i = 9; i < argc; i += 2) {
-        const char *key = argv[i], *value = argv[i + 1];
+    uint32_t path_mask = mrc_endpoint_path_mask(transfer->path_count);
+    for (; arg < argc; arg += 2) {
+        const char *key = argv[arg], *value = argv[arg + 1];
+        if (strncmp(value, "--", 2) == 0)
+            return false;
         if (!strcmp(key, "--udp-port") && number(value, 1, UINT16_MAX, &udp_port))
             continue;
         if (!strcmp(key, "--pmtu") && number(value, MRC_MIN_PMTU, MRC_MAX_PMTU, &pmtu) &&
@@ -481,15 +491,15 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
             number64(value, 1, UINT64_MAX, &transfer->profile_id))
             continue;
         if (transfer->sender && !strcmp(key, "--deny-path-mask") &&
-            number(value, 0, ALL_PATHS, &transfer->ev_deny_mask))
+            number(value, 0, path_mask, &transfer->ev_deny_mask))
             continue;
-        if (transfer->sender && !strcmp(key, "--restore-path-after") &&
+        if (transfer->sender && transfer->path_count > 1 && !strcmp(key, "--restore-path-after") &&
             number(value, 1, MRC_PSN_HALF - 1, &transfer->restore_after))
             continue;
-        if (transfer->sender && !strcmp(key, "--drop-path-after") &&
+        if (transfer->sender && transfer->path_count > 1 && !strcmp(key, "--drop-path-after") &&
             number(value, 0, MRC_PSN_HALF - 1, &transfer->drop_after))
             continue;
-        if (transfer->sender && !strcmp(key, "--trim-path-after") &&
+        if (transfer->sender && transfer->path_count > 1 && !strcmp(key, "--trim-path-after") &&
             number(value, 0, MRC_PSN_HALF - 1, &transfer->trim_after))
             continue;
         return false;
@@ -538,7 +548,7 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     benchmark->port_stats = port_stats != 0;
     transfer->srv6 = local_sid;
     if (local_sid) {
-        for (unsigned int i = 0; i < PATH_COUNT; i++) {
+        for (unsigned int i = 0; i < transfer->path_count; i++) {
             struct mrc_endpoint_srv6_path *path = &transfer->paths[i].srv6;
             memcpy(path->local_sid, local_sid_value, MRC_IPV6_ADDR_LEN);
             memcpy(path->peer_sid, peer_sid_value, MRC_IPV6_ADDR_LEN);
@@ -692,14 +702,25 @@ struct port_snapshot {
     bool valid;
 };
 
-static void print_diagnostics(const struct mrc_endpoint_config *transfer, const struct mrc_endpoint_counters *counts,
-                              const struct port_snapshot start[PATH_COUNT], unsigned int opened)
+static void print_path_counts(FILE *stream, const uint32_t *values, unsigned int count,
+                              const char *separator)
 {
-    fprintf(stderr, "MRC progress: data TX=%u/%u retry=%u/%u data RX=%u/%u "
-                    "SACK=%u transport-ACK=%u probe-reply=%u NACK-TX=%#x NACK-RX=%#x\n",
-            counts->sent[0], counts->sent[1], counts->retries[0], counts->retries[1],
-            counts->received[0], counts->received[1], counts->sacks,
-            counts->transport_acks, counts->probe_replies,
+    for (unsigned int path = 0; path < count; path++)
+        fprintf(stream, "%s%" PRIu32, path ? separator : "", values[path]);
+}
+
+static void print_diagnostics(const struct mrc_endpoint_config *transfer, const struct mrc_endpoint_counters *counts,
+                              const struct port_snapshot *start, unsigned int opened)
+{
+    unsigned int path_count = mrc_endpoint_path_count(transfer);
+    fputs("MRC progress: data TX=", stderr);
+    print_path_counts(stderr, counts->sent, path_count, "/");
+    fputs(" retry=", stderr);
+    print_path_counts(stderr, counts->retries, path_count, "/");
+    fputs(" data RX=", stderr);
+    print_path_counts(stderr, counts->received, path_count, "/");
+    fprintf(stderr, " SACK=%u transport-ACK=%u probe-reply=%u NACK-TX=%#x NACK-RX=%#x\n",
+            counts->sacks, counts->transport_acks, counts->probe_replies,
             counts->nack_sent_mask, counts->nack_received_mask);
     if (counts->qp_error) {
         static const char *const statuses[] = {
@@ -749,10 +770,11 @@ int main(int argc, char **argv)
     struct mrc_endpoint_counters counts = {0};
     int result = -EINVAL;
     unsigned int opened = 0;
-    struct port_snapshot initial_stats[PATH_COUNT] = {0};
+    struct port_snapshot initial_stats[MRC_EV_MAX_PATHS] = {0};
     if (!parse_args(argc - consumed, argv + consumed, &benchmark)) {
         fprintf(stderr, "Usage: %s [EAL options] -- tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP\n"
-                        "       PORT0 PEER_MAC0 PORT1 PEER_MAC1 [--initial-psn N] [--udp-port N]\n"
+                        "       PORT PEER_MAC [PORT PEER_MAC ...] (1 to %u pairs)\n"
+                        "       [--initial-psn N] [--udp-port N]\n"
                         "       [--requestor-qpn N] [--responder-qpn N] [--p-key N] [--mpr N] [--pmtu N]\n"
                         "       [--remote-key N] [--remote-address N] [--immediate N]\n"
                         "       [--work-requests N] [--max-wimm-inflight N] [--posted-receives N (rx)]\n"
@@ -767,9 +789,10 @@ int main(int argc, char **argv)
                         "       [--rx-ooo-capacity N] [--rx-staging-capacity N] (rx)\n"
                         "       [--rx-work-capacity N] [--rx-cq-capacity N] (rx)\n"
                         "       [--srv6-local SID --srv6-peer SID] [--srv6-srh 0|1] [--port-stats 0|1]\n",
-                argv[0]);
+                argv[0], (unsigned int)MRC_EV_MAX_PATHS);
         goto done;
     }
+    unsigned int path_count = mrc_endpoint_path_count(transfer);
 
     result = open_ev_profile(&benchmark);
     if (result) {
@@ -783,7 +806,7 @@ int main(int argc, char **argv)
     uint16_t frame_length = mrc_endpoint_frame_capacity(transfer);
     uint16_t port_mtu = frame_length - RTE_ETHER_HDR_LEN;
     transfer->data = malloc(transfer->bytes ? transfer->bytes : 1);
-    transfer->pool = mrc_dpdk_packet_pool_for_frame(frame_length);
+    transfer->pool = mrc_dpdk_packet_pool_for_ports(frame_length, path_count);
     if (!transfer->data || !transfer->pool) {
         result = -ENOMEM;
         goto done;
@@ -795,7 +818,7 @@ int main(int argc, char **argv)
     result = register_buffer(&benchmark);
     if (result)
         goto done;
-    for (; opened < PATH_COUNT; opened++) {
+    for (; opened < path_count; opened++) {
         struct mrc_endpoint_path *path = &transfer->paths[opened];
         result = mrc_dpdk_open_port_with_mtu(path->port, transfer->pool, &path->local,
                                             port_mtu > RTE_ETHER_MTU ? port_mtu : 0);
@@ -809,31 +832,37 @@ int main(int argc, char **argv)
         goto done;
     }
     result = transfer->sender ? run_sender(&benchmark, &counts) : run_receiver(&benchmark, &counts);
-    if (!result)
-        printf("{\"role\":\"%s\",\"bytes\":%u,\"pmtu\":%u,\"packets\":%u,\"sent\":[%u,%u],"
-               "\"received\":[%u,%u],\"retries\":[%u,%u],\"dropped\":%u,\"sacks\":%u,"
+    if (!result) {
+        printf("{\"role\":\"%s\",\"bytes\":%u,\"pmtu\":%u,\"packets\":%u,\"sent\":[",
+               transfer->sender ? "tx" : "rx", transfer->bytes, transfer->pmtu, transfer->packets);
+        print_path_counts(stdout, counts.sent, path_count, ",");
+        fputs("],\"received\":[", stdout);
+        print_path_counts(stdout, counts.received, path_count, ",");
+        fputs("],\"retries\":[", stdout);
+        print_path_counts(stdout, counts.retries, path_count, ",");
+        printf("],\"dropped\":%u,\"sacks\":%u,"
                "\"trimmed\":%u,\"trim_nacks\":%u,\"transport_acks\":%u,"
                "\"nack_sent_mask\":%u,\"nack_received_mask\":%u,"
                "\"port_status_updates\":%u,\"port_status_replies\":%u,"
-               "\"probe_requests\":%u,\"probe_replies\":%u,\"probe_sent\":[%u,%u],"
-               "\"ev_skipped\":%u,\"ev_failed\":%u,\"ev_recovered\":%u,\"ev_admin_updates\":%u,"
+               "\"probe_requests\":%u,\"probe_replies\":%u,\"probe_sent\":[",
+               counts.dropped, counts.sacks, counts.trimmed, counts.trim_nacks,
+               counts.transport_acks, counts.nack_sent_mask, counts.nack_received_mask,
+               counts.port_status_updates, counts.port_status_replies,
+               counts.probe_requests, counts.probe_replies);
+        print_path_counts(stdout, counts.probe_sent, path_count, ",");
+        printf("],\"ev_skipped\":%u,\"ev_failed\":%u,\"ev_recovered\":%u,\"ev_admin_updates\":%u,"
                "\"ev_failed_mask\":%u,\"ev_recovered_mask\":%u,\"mpr_updates\":%u,"
                "\"dropped_transport_acks\":%u,"
                "\"duplicates\":%u,\"fast_retries\":%u,"
                "\"reorder_max\":%u,\"write_completions\":%u,\"immediate_completions\":%u,"
                "\"immediate_completed\":%s,\"registered_memory\":%s}\n",
-               transfer->sender ? "tx" : "rx", transfer->bytes, transfer->pmtu, transfer->packets,
-               counts.sent[0], counts.sent[1], counts.received[0], counts.received[1],
-               counts.retries[0], counts.retries[1], counts.dropped, counts.sacks,
-               counts.trimmed, counts.trim_nacks, counts.transport_acks,
-               counts.nack_sent_mask, counts.nack_received_mask, counts.port_status_updates, counts.port_status_replies, counts.probe_requests,
-               counts.probe_replies, counts.probe_sent[0], counts.probe_sent[1],
                counts.ev_skipped, counts.ev_failed, counts.ev_recovered, counts.ev_admin_updates,
                counts.ev_failed_mask, counts.ev_recovered_mask, counts.mpr_updates,
                counts.dropped_transport_acks,
                counts.duplicates, counts.fast_retries,
                counts.reorder_max, counts.write_completions, counts.immediate_completions,
                counts.immediate_completions ? "true" : "false", transfer->pd ? "true" : "false");
+    }
 
 done:
     if (opened && (result || benchmark.port_stats))

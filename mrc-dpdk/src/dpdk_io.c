@@ -1,10 +1,17 @@
 #include "dpdk_io.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
+
+enum {
+    DEFAULT_PACKET_COUNT = 8191,
+    DEFAULT_POOL_PORT_COUNT = 2,
+    RX_DESCRIPTORS = 1024,
+};
 
 struct rte_mempool *mrc_dpdk_packet_pool(void)
 {
@@ -13,12 +20,24 @@ struct rte_mempool *mrc_dpdk_packet_pool(void)
 
 struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length)
 {
+    return mrc_dpdk_packet_pool_for_ports(frame_length, DEFAULT_POOL_PORT_COUNT);
+}
+
+struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsigned int port_count)
+{
     unsigned int room = frame_length + RTE_PKTMBUF_HEADROOM;
-    if (room > UINT16_MAX)
+    if (room > UINT16_MAX || !port_count)
         return NULL;
     if (room < RTE_MBUF_DEFAULT_BUF_SIZE)
         room = RTE_MBUF_DEFAULT_BUF_SIZE;
-    return rte_pktmbuf_pool_create("mrc_packets", 8191, 0, 0, (uint16_t)room, SOCKET_ID_ANY);
+    unsigned int packets = DEFAULT_PACKET_COUNT;
+    if (port_count > DEFAULT_POOL_PORT_COUNT) {
+        unsigned int extra_ports = port_count - DEFAULT_POOL_PORT_COUNT;
+        if (extra_ports > (UINT_MAX - packets) / RX_DESCRIPTORS)
+            return NULL;
+        packets += extra_ports * RX_DESCRIPTORS;
+    }
+    return rte_pktmbuf_pool_create("mrc_packets", packets, 0, 0, (uint16_t)room, SOCKET_ID_ANY);
 }
 
 int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool, struct rte_ether_addr *mac)
@@ -36,7 +55,7 @@ int mrc_dpdk_open_port_with_mtu(uint16_t port, struct rte_mempool *pool,
     if (result)
         return result;
 
-    uint16_t rx_desc = 1024, tx_desc = 1024;
+    uint16_t rx_desc = RX_DESCRIPTORS, tx_desc = 1024;
     result = rte_eth_dev_adjust_nb_rx_tx_desc(port, &rx_desc, &tx_desc);
     int socket = rte_eth_dev_socket_id(port);
     if (!result)

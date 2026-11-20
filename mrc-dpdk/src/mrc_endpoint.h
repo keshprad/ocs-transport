@@ -9,7 +9,7 @@
 #include <rte_ether.h>
 
 enum {
-    PATH_COUNT = 2,
+    PATH_COUNT = 2, /* Legacy route size. */
     MRC_ENDPOINT_FRAME_CAPACITY = MRC_WIRE_SRV6_MAX_PREFIX_LEN + MRC_METH_LEN +
         MRC_TSETH_LEN + MRC_RETH_LEN + MRC_IMMDT_LEN + MRC_ICRC_LEN + MRC_MAX_PMTU,
     MRC_ENDPOINT_CONTROL_DSCP = 48,
@@ -30,8 +30,8 @@ struct mrc_endpoint_node {
     uint32_t local_down;
     uint32_t peer_ports;
     uint16_t token;
-    uint16_t pending[PATH_COUNT];
-    bool awaiting[PATH_COUNT];
+    uint16_t pending[MRC_EV_MAX_PATHS];
+    bool awaiting[MRC_EV_MAX_PATHS];
     uint64_t next_poll;
     uint64_t next_announce;
     uint64_t fast_poll_until;
@@ -119,7 +119,8 @@ struct mrc_endpoint_config {
     uint64_t hz;
     uint64_t idle_timeout;
     uint64_t initial_rto;
-    struct mrc_endpoint_path paths[PATH_COUNT];
+    uint8_t path_count; /* Zero selects the legacy two-rail route. */
+    struct mrc_endpoint_path paths[MRC_EV_MAX_PATHS];
     struct rte_mempool *pool;
     uint8_t *data;
     struct mrc_provider_pd *pd;
@@ -135,6 +136,16 @@ struct mrc_endpoint_config {
     struct mrc_endpoint_node *node;
 };
 
+static inline unsigned int mrc_endpoint_path_count(const struct mrc_endpoint_config *config)
+{
+    return config->path_count ? config->path_count : PATH_COUNT;
+}
+
+static inline uint32_t mrc_endpoint_path_mask(unsigned int count)
+{
+    return count >= MRC_EV_MAX_PATHS ? UINT32_MAX : (UINT32_C(1) << count) - 1;
+}
+
 struct mrc_endpoint_rx_counters {
     uint64_t frames;
     uint64_t matched;
@@ -143,10 +154,10 @@ struct mrc_endpoint_rx_counters {
 };
 
 struct mrc_endpoint_counters {
-    struct mrc_endpoint_rx_counters rx[PATH_COUNT];
-    uint32_t sent[PATH_COUNT];
-    uint32_t received[PATH_COUNT];
-    uint32_t retries[PATH_COUNT];
+    struct mrc_endpoint_rx_counters rx[MRC_EV_MAX_PATHS];
+    uint32_t sent[MRC_EV_MAX_PATHS];
+    uint32_t received[MRC_EV_MAX_PATHS];
+    uint32_t retries[MRC_EV_MAX_PATHS];
     uint32_t dropped;
     uint32_t trimmed;
     uint32_t trim_nacks;
@@ -156,7 +167,7 @@ struct mrc_endpoint_counters {
     uint32_t port_status_replies;
     uint32_t probe_requests;
     uint32_t probe_replies;
-    uint32_t probe_sent[PATH_COUNT];
+    uint32_t probe_sent[MRC_EV_MAX_PATHS];
     uint32_t ev_skipped, ev_failed, ev_recovered, ev_admin_updates;
     uint32_t ev_failed_mask, ev_recovered_mask;
     uint32_t mpr_updates;

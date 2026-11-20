@@ -72,6 +72,27 @@ struct mrc_dpdk_srv6_path {
     uint8_t segments_left;
 };
 
+struct mrc_dpdk_rail {
+    uint16_t port;
+    uint8_t peer_mac[6];
+};
+
+/* The route supplies 1 to 32 distinct rails. Their order defines the
+ * Port Status bitmap. Supply one SRv6 path per rail when encapsulating.
+ * Attachment copies the route arrays. The ports and pool stay live
+ * until the QP detaches. The other fields follow mrc_dpdk_route. */
+struct mrc_dpdk_route_config {
+    const struct mrc_dpdk_rail *rails;
+    unsigned int rail_count;
+    const struct mrc_dpdk_srv6_path *srv6_paths;
+    struct rte_mempool *pool;
+    uint16_t peer_pkey;
+    uint16_t udp_port;
+    uint8_t trim_dscp;
+    bool requester;
+    bool bidirectional;
+};
+
 /* Connectionless route over two application-owned, started DPDK ports.
  * The port numbers in controller operations are 1 and 2, in route order.
  * Zero pkey selects 0xffff. Zero peer_pkey uses pkey. Zero udp_port uses
@@ -103,6 +124,7 @@ int mrc_dpdk_detach_endpoint(struct mrc_context *context);
 int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route);
 int mrc_dpdk_attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
                            const struct mrc_dpdk_srv6_path paths[2]);
+int mrc_dpdk_attach_qp_rails(struct mrc_qp *qp, const struct mrc_dpdk_route_config *route);
 int mrc_dpdk_progress_qp(struct mrc_qp *qp);
 
 /* Advertise a 0-127 receiver window penalty in subsequent SACKs for this

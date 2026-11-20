@@ -1,4 +1,4 @@
-"""Run two DPDK endpoints connected only through two local memif devices."""
+"""Run two DPDK endpoints connected through local memif devices."""
 
 import json
 import os
@@ -9,8 +9,8 @@ from pathlib import Path
 
 
 MACS = {
-    "rx": ("02:00:00:00:00:10", "02:00:00:00:00:11"),
-    "tx": ("02:00:00:00:00:20", "02:00:00:00:00:21"),
+    role: tuple(f"02:00:00:00:00:{base + path:02x}" for path in range(8))
+    for role, base in (("rx", 0x10), ("tx", 0x20))
 }
 
 
@@ -19,11 +19,11 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def eal_args(binary, role, cpu, directory):
+def eal_args(binary, role, cpu, directory, *, rail_count=2):
     memif_role = "server" if role == "rx" else "client"
     args = [str(binary), f"--lcores=0@{cpu}", "--no-huge", "--no-pci",
             "--no-telemetry", f"--file-prefix={directory.name}-{role}", "-m", "64"]
-    for path, mac in enumerate(MACS[role]):
+    for path, mac in enumerate(MACS[role][:rail_count]):
         args += [f"--vdev=net_memif{path},role={memif_role},"
                  f"socket={directory / f'path{path}.sock'},socket-abstract=no,mac={mac}"]
     return args
@@ -46,7 +46,8 @@ def collect(process, expected_error=None):
     return json.loads(stdout.strip().splitlines()[-1])
 
 
-def run_pair(build_command, read_artifacts=None, expected_errors=None, sender_started=None):
+def run_pair(build_command, read_artifacts=None, expected_errors=None, sender_started=None, *,
+             rail_count=2):
     expected_errors = expected_errors or {}
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The two polling endpoints need at least two usable CPUs")
@@ -57,10 +58,10 @@ def run_pair(build_command, read_artifacts=None, expected_errors=None, sender_st
             receiver = start(build_command("rx", cpus[0], directory), directory)
             processes.append(receiver)
             deadline = time.monotonic() + 4
-            while not all((directory / f"path{path}.sock").exists() for path in range(2)):
+            while not all((directory / f"path{path}.sock").exists() for path in range(rail_count)):
                 if receiver.poll() is not None:
                     collect(receiver)
-                    raise RuntimeError("Receiver exited before creating both memif sockets")
+                    raise RuntimeError(f"Receiver exited before creating {rail_count} memif sockets")
                 require(time.monotonic() < deadline, "Timed out waiting for memif sockets")
                 time.sleep(0.01)
             sender = start(build_command("tx", cpus[1], directory), directory)

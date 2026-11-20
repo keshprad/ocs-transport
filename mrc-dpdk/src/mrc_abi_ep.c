@@ -68,7 +68,7 @@ static int configure_endpoint(struct mrc_abi_endpoint *endpoint, const struct mr
 
     struct mrc_endpoint_srv6_path srv6[PATH_COUNT] = {0};
     if (paths) {
-        result = mrc_abi_prepare_srv6_paths(paths, srv6);
+        result = mrc_abi_prepare_srv6_paths(paths, srv6, PATH_COUNT);
         if (result)
             return result;
         config->srv6 = true;

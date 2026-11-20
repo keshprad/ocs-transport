@@ -11,9 +11,11 @@ available, `python3 tests/check_mrc_write.py` exercises the OCP endpoint
 without using the physical NICs.
 
 The arguments after EAL are
-`tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP PORT0 PEER_MAC0 PORT1 PEER_MAC1`.
-Ports may be DPDK port IDs or names, including PCI BDFs. Both peers use
-matching QP and memory attributes. Run `mrc_write` with valid EAL parameters
+`tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP PORT PEER_MAC [PORT PEER_MAC ...]`.
+Supply 1 to 32 distinct DPDK ports by ID or name, including PCI BDFs.
+Both peers list the corresponding rails in the same order and use
+matching QP and memory attributes. The per-rail JSON arrays follow that
+order. Run `mrc_write` with valid EAL parameters
 and no benchmark arguments for the option list. Use `--work-requests N` for
 multiple WRs and `--immediate N` to give the first WR an immediate value.
 Subsequent immediate values increment modulo 32 bits. The default receiver
@@ -111,19 +113,22 @@ from its stored-timestamp RTT sample. The responder estimates its service
 duration from the DPDK RX poll to feedback preparation. This estimate
 includes shared ingress queue time and uses 128 ns wire units.
 With the DPDK extensions in `src/mrc_dpdk.h`, the application binds the
-verbs MR registrations, attaches two
-started DPDK ports to the QP, and drives progress from its polling worker.
+verbs MR registrations, attaches started DPDK ports to the QP, and
+drives progress from its polling worker.
 The application posts standard WRITE and WRITEIMM work requests and polls
 the public CQs. Keep the verbs context, PD, MRs, and DPDK resources live
 until their MRC uses have ended.
 
-Attach a QP in one direction or set `bidirectional` after both directions
-are configured and the QP reaches RTS. QPs in the same process can share
-the two DPDK ports. The progress calls dispatch inbound packets by QPN
+Use `mrc_dpdk_attach_qp_rails()` with 1 to 32 rail records. The
+two-rail helpers `mrc_dpdk_attach_qp()` and `mrc_dpdk_attach_srv6_qp()`
+use the same attachment path. Attach a QP in one direction or set
+`bidirectional` after both directions are configured and the QP reaches
+RTS. QPs in the same process can share their DPDK ports. The progress
+calls dispatch inbound packets by QPN
 and opcode and serialize I/O on the attached queues. Drive progress on
 each attached QP to process the packets dispatched to it. Use the same
 rail order for QPs to the same peer so they share node port status.
-Port status bits 0 and 1 correspond to the first and second route rails.
+Each Port Status bit is the zero-based index of its rail in the route.
 An endpoint announces the current mask on reachable rails when it changes
 and refreshes it about every 250 ms. A peer report restricts path selection
 for one second. When it expires, the requester resumes path selection
@@ -145,8 +150,8 @@ applies it when the SACK advances the cumulative PSN. Query each side
 with `mrc_query_qp()` and its directional MPR mask to read the current
 limit.
 
-To attach an SRv6 QP, pass a two-entry `mrc_dpdk_srv6_path` array to
-`mrc_dpdk_attach_srv6_qp()` alongside the existing DPDK route. Each rail
+To attach an SRv6 QP, supply one `mrc_dpdk_srv6_path` entry per rail in
+the counted route's `srv6_paths` array. Each rail
 uses its own local SID as the outer source and accepted destination, and
 the peer SID as the expected outer source on receive. The peer SID is
 also the default outer destination on send. To start at a different uSID
@@ -276,12 +281,13 @@ position corresponds to its Table 7-3 reason code.
 ### Persistent EV profiles
 
 The OCP controller ABI exposes device capabilities, built-in format queries,
-and profile configuration through `mrc_ctl.h`. This provider supports two
-rails and the AUTO, explicit, and generated EV modes. Select `MRC_DPDK_EV_FORMAT_UDP` for
+and profile configuration through `mrc_ctl.h`. It accepts 1 to 32 EVs
+per profile in AUTO, explicit, and generated modes. The attached QP uses
+one EV per configured rail. Select `MRC_DPDK_EV_FORMAT_UDP` for
 a UDP source-port EV or `MRC_DPDK_EV_FORMAT_STEV` for an IPv6 flow label and
 UDP source-port EV. The first four bytes of a controller EV hold a big-endian
-value. The remaining bytes are zero. Port numbers 1 and 2 follow the attached
-DPDK route's rail order.
+value. The remaining bytes are zero. The one-based port numbers follow
+the attached DPDK route's rail order.
 
 Select `MRC_DPDK_EV_FORMAT_SRV6` for a uSID destination in the first 16
 bytes, or `MRC_DPDK_EV_FORMAT_SRV6_SRH` for a uSID destination followed
@@ -298,7 +304,7 @@ and a lock with that group get mode `0640`. Application processes take
 read-only leases. Keep the directory and lock inode stable. The store
 reads legacy snapshots and updates them to the typed format on a write.
 
-Configure the profile OFFLINE, populate both explicit EVs, and set it
+Configure the profile OFFLINE, populate the explicit EVs, and set it
 ONLINE. In the application, set `MRC_QP_EV_PROFILE_ID` when bringing the
 QP to INIT. The application retains the profile until reset or destruction.
 The controller can change GOOD and DENIED while the profile is in use.
@@ -306,14 +312,14 @@ EV queries report administrative state. The transport tracks failure and
 congestion per QP.
 
 For generated mode, use `MRC_CTL_EV_MODE_GEN` with the built-in format
-ID, a count of two, and `MRC_CTL_EV_FIELDS_OP_MODIFY_FIELDS` when moving
+ID, the EV count, and `MRC_CTL_EV_FIELDS_OP_MODIFY_FIELDS` when moving
 to OFFLINE. UDP uses one field. STEV uses two fields in flow-label suffix
 and UDP source-port order. Each occupies a 16-bit slot, and narrower
 fields are zero-padded. In each field, the compact values between
 `min_val` and `max_val` overwrite the masked bits of `init_val`.
 Use a zero mask and zero bounds for a fixed field.
 
-The provider chooses the first two valid combinations in increasing
+The provider fills the profile with valid combinations in increasing
 compact-value order, varying the UDP field fastest and skipping UDP
 source port zero. It assigns one EV to each rail and persists both the
 field definitions and the generated values. Query fields or the EV array
@@ -322,8 +328,8 @@ before setting the profile ONLINE.
 Generated SRv6 uses eight or sixteen 16-bit slots in wire order, with
 the last field varying fastest. Fields narrower than their slot are
 zero-padded on the left. The provider skips unspecified and multicast
-destinations and SRH segments. It assigns the first two distinct usable
-values to rails 1 and 2.
+destinations and SRH segments. It assigns distinct usable values in
+rail order.
 
 To define a different field layout, use `mrc_ctl_modify_ev_fmt_profile()`
 with a format ID above 4. Move the format to OFFLINE with its UDP, STEV,

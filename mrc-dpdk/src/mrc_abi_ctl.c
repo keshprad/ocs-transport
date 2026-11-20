@@ -142,14 +142,14 @@ static int query_controller_device(struct ibv_context *verbs, struct mrc_context
                 used += profiles[i].config.count;
         }
     }
-    const unsigned int budget = MRC_CTL_STORE_MAX_PROFILES * PATH_COUNT;
+    const unsigned int budget = MRC_CTL_STORE_MAX_PROFILES * MRC_EV_MAX_PATHS;
     *out = (struct mrc_ctl_device_attr){
         .mrc_ctl_protocol_version = MRC_CTL_PROTOCOL_VERSION_1,
         .ev = {
             .ev_max_fmt_profiles = MRC_CTL_STORE_BUILTIN_FORMATS + MRC_CTL_STORE_MAX_CUSTOM_FORMATS,
             .ev_max_profiles = MRC_CTL_STORE_MAX_PROFILES,
             .ev_max_count = budget, .ev_free_count = used < budget ? budget - used : 0,
-            .ev_max_count_profile = PATH_COUNT, .ev_count_align = 1,
+            .ev_max_count_profile = MRC_EV_MAX_PATHS, .ev_count_align = 1,
             .ev_max_width = MRC_CTL_STORE_SRV6_EV_BYTES * 8,
             .ev_fmt_mode_mask = MRC_CTL_EV_FMT_MODE_UDP | MRC_CTL_EV_FMT_MODE_STEV | MRC_CTL_EV_FMT_MODE_SRV6,
             .ev_mode_mask = MRC_CTL_EV_MODE_AUTO | MRC_CTL_EV_MODE_EXP | MRC_CTL_EV_MODE_GEN,
@@ -533,16 +533,25 @@ static int generate_srv6_evs(struct mrc_ctl_store_config *config, const uint8_t 
     return 0;
 }
 
-static int configure_generated(struct mrc_ctl_store_config *config,
-                                const struct mrc_ctl_ev_field *fields, unsigned int count)
+static int populate_generated_evs(struct mrc_ctl_store_config *config)
 {
-    if (config->format == MRC_CTL_STORE_FORMAT_LEGACY || config->count != PATH_COUNT || !count)
-        return -EINVAL;
-
     unsigned int slots = profile_field_count(config);
     uint8_t widths[MRC_CTL_STORE_MAX_EV_FIELDS];
     for (unsigned int i = 0; i < slots; i++)
         widths[i] = (uint8_t)profile_field_width(config, i);
+    int error = mrc_ctl_store_format_is_srv6(config->format)
+                ? generate_srv6_evs(config, widths, slots)
+                : generate_udp_evs(config, widths, slots);
+    if (!error)
+        config->populated = mrc_endpoint_path_mask(config->count);
+    return error;
+}
+
+static int configure_generated(struct mrc_ctl_store_config *config,
+                                const struct mrc_ctl_ev_field *fields, unsigned int count)
+{
+    if (config->format == MRC_CTL_STORE_FORMAT_LEGACY || !config->count || !count)
+        return -EINVAL;
 
     memset(config->fields, 0, sizeof(config->fields));
     for (unsigned int i = 0; i < count; i++) {
@@ -552,18 +561,15 @@ static int configure_generated(struct mrc_ctl_store_config *config,
             .width = field->width, .init_val = field->init_val, .min_val = field->min_val,
             .max_val = field->max_val, .mask = field->mask,
         };
-        if (stored->width > widths[i] || !mrc_ctl_store_ev_field_valid(stored))
+        if (stored->width > profile_field_width(config, i) || !mrc_ctl_store_ev_field_valid(stored))
             return -EINVAL;
     }
 
-    int error = mrc_ctl_store_format_is_srv6(config->format)
-                ? generate_srv6_evs(config, widths, slots)
-                : generate_udp_evs(config, widths, slots);
+    int error = populate_generated_evs(config);
     if (error)
         return error;
 
     config->field_count = (uint8_t)count;
-    config->populated = (UINT32_C(1) << config->count) - 1;
     config->denied = 0;
     return 0;
 }
@@ -572,6 +578,7 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
 {
     const struct mrc_ctl_ev_profile_attr *attr = change->attr;
     unsigned int mask = change->mask;
+    const unsigned int old_count = config->count;
     enum mrc_ctl_store_mode mode = config->mode;
     struct mrc_ctl_store_ev_format layout = {
         .id = config->format_id, .format = config->format, .field_count = config->format_field_count,
@@ -603,7 +610,7 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
     if (mode == MRC_CTL_STORE_AUTO && (layout.id || mrc_ctl_store_format_is_srv6(layout.format)))
         return -EINVAL;
     if (mask & MRC_CTL_EV_PROFILE_COUNT) {
-        if (attr->ev_count != PATH_COUNT)
+        if (!attr->ev_count || attr->ev_count > MRC_EV_MAX_PATHS)
             return -EINVAL;
         config->count = (uint8_t)attr->ev_count;
     }
@@ -621,6 +628,15 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
         memset(config->srv6, 0, sizeof(config->srv6));
         config->field_count = 0;
         memset(config->fields, 0, sizeof(config->fields));
+    }
+    if (config->count < old_count) {
+        uint32_t keep = mrc_endpoint_path_mask(config->count);
+        config->populated &= keep;
+        config->denied &= keep;
+        for (unsigned int i = config->count; i < old_count; i++) {
+            config->entropy[i] = 0;
+            memset(config->srv6[i], 0, sizeof(config->srv6[i]));
+        }
     }
     if (mask & MRC_CTL_EV_PROFILE_MIN_ACTIVE) {
         if (attr->ev_min_active > config->count)
@@ -652,6 +668,8 @@ static int configure_profile(struct mrc_ctl_store_config *config, const struct e
                 return -EOPNOTSUPP;
         }
     }
+    if (config->count > old_count && config->mode == MRC_CTL_STORE_GENERATED && config->field_count)
+        return populate_generated_evs(config);
     return 0;
 }
 
@@ -717,7 +735,7 @@ static int edit_profile(struct mrc_ctl_store_profile *profile, void *argument)
         }
     }
     unsigned int count = profile->config.count;
-    uint32_t required = count == 32 ? UINT32_MAX : (UINT32_C(1) << count) - 1;
+    uint32_t required = mrc_endpoint_path_mask(count);
     if (to == MRC_CTL_STORE_ONLINE && profile->config.mode != MRC_CTL_STORE_AUTO &&
         profile->config.populated != required)
         return -EINVAL;

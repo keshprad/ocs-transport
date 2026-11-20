@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the OCP-format endpoint over two local DPDK memif links."""
+"""Exercise the OCP-format endpoint over local DPDK memif links."""
 
 import argparse
 import json
@@ -12,13 +12,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from memif_pair import MACS, eal_args, require, run_pair
+from memif_pair import MACS, collect, eal_args, require, run_pair, start
 
 
 def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
              trim_after=None, ipv6=False, work_requests=1, posted_receives=None,
              expected_errors=None, negotiate=False, srv6=False, tx_options=(), rx_options=(),
-             sender_started=None, writes=None):
+             sender_started=None, writes=None, rail_count=2):
     work = str(size)
     repeat = ("--work-requests", str(work_requests))
     total_bytes = size * work_requests
@@ -39,9 +39,11 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
         addresses = ({"tx": "2001:db8::1", "rx": "2001:db8::2"} if ipv6 else
                      {"tx": "192.0.2.1", "rx": "192.0.2.2"})
         local_ip, peer_ip = addresses[role], addresses[peer]
-        args = eal_args(binary, role, cpu, directory)
-        args += ["--", role, work, local_ip, peer_ip, "0", MACS[peer][0],
-                 "1", MACS[peer][1], "--ack-timeout", "16", *repeat, *options]
+        args = eal_args(binary, role, cpu, directory, rail_count=rail_count)
+        args += ["--", role, work, local_ip, peer_ip]
+        for rail, mac in enumerate(MACS[peer][:rail_count]):
+            args += [str(rail), mac]
+        args += ["--ack-timeout", "16", *repeat, *options]
         if srv6:
             sids = {"tx": "2001:db8:aaaa::1", "rx": "2001:db8:bbbb::3"}
             args += ["--srv6-local", sids[role], "--srv6-peer", sids[peer], "--srv6-srh", "1"]
@@ -64,7 +66,8 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
             args += ["--posted-receives", str(posted_receives)]
         return args + list(tx_options if tx else rx_options)
 
-    tx, rx, _ = run_pair(command, expected_errors=expected_errors, sender_started=sender_started)
+    tx, rx, _ = run_pair(command, expected_errors=expected_errors, sender_started=sender_started,
+                         rail_count=rail_count)
     if expected_errors:
         return tx, rx
     require(tx["bytes"] == rx["bytes"] == total_bytes, "Incorrect completed byte count")
@@ -72,6 +75,53 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
     require(tx["transport_acks"] > 0, "Requester did not receive a semantic transport ACK")
     require(tx["write_completions"] == work_requests, "Requester CQ did not report every WRITE")
     return tx, rx
+
+
+def check_rail_counts(binary):
+    for rail_count in (1, 2, 3, 4, 8):
+        tx, rx = transfer(binary, 1048573, "--immediate", "305419896",
+                          "--initial-psn", "16777214", rail_count=rail_count)
+        for counters in (tx, rx):
+            require(all(len(counters[key]) == rail_count
+                        for key in ("sent", "received", "retries", "probe_sent")),
+                    f"Wrong counter array lengths for {rail_count} rails: {counters}")
+        require(tx["sent"] == rx["received"] and all(tx["sent"]) and not any(tx["retries"]),
+                f"Healthy WRITEIMM did not use all {rail_count} rails: {tx}, {rx}")
+        require(rx["immediate_completions"] == 1,
+                f"WRITEIMM did not complete across PSN wrap with {rail_count} rails: {rx}")
+        print(json.dumps({"case": f"write_imm_wrap_{rail_count}_rails", "tx": tx, "rx": rx}))
+
+    tx, rx = transfer(binary, 1048576, rail_count=8, tx_options=("--deny-path-mask", "0x80"))
+    require(tx["sent"] == rx["received"] and all(tx["sent"][:7]) and tx["sent"][7] == 0,
+            f"The deny mask did not exclude only rail 7: {tx}, {rx}")
+    require(tx["probe_sent"][7] == 0 and any(tx["probe_sent"][:7]),
+            f"Unexpected probe routing with rail 7 denied: {tx}")
+    print(json.dumps({"case": "denied_rail_7", "tx": tx, "rx": rx}))
+
+    mac = MACS["rx"][0]
+    too_many_rails = []
+    for rail in range(33):
+        too_many_rails.extend((str(rail), f"02:00:00:00:00:{0x10 + rail:02x}"))
+    cases = (
+        ("no_rails", ()),
+        ("incomplete_rail_pair", ("0",)),
+        ("duplicate_port", ("0", mac, "0", MACS["rx"][1])),
+        ("more_than_32_rails", too_many_rails),
+        ("deny_mask_outside_rail_count", ("0", mac, "--deny-path-mask", "2")),
+    )
+    cpu = min(os.sched_getaffinity(0))
+    for name, args in cases:
+        with tempfile.TemporaryDirectory(prefix="mrc-") as temporary:
+            directory = Path(temporary)
+            command = eal_args(binary, "tx", cpu, directory, rail_count=8)
+            command += ["--", "tx", "13", "192.0.2.1", "192.0.2.2", *args]
+            with start(command, directory) as process:
+                try:
+                    collect(process, "Usage:")
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+        print(json.dumps({"case": f"reject_{name}"}))
 
 
 def controlled_ev_profile(binary, controller):
@@ -265,6 +315,7 @@ def main():
                         help="Path to test_mrc_ctl_abi for cross-process EV event verification")
     parser.add_argument("--pkey-only", action="store_true", help="Run only the P_Key membership cases")
     parser.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
+    parser.add_argument("--rails-only", action="store_true", help="Run only the runtime rail cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     controller = (args.controller or binary.with_name("mrc_ctl_profile")).resolve()
@@ -274,6 +325,9 @@ def main():
         return
     if args.pmtu_only:
         check_path_mtu(binary)
+        return
+    if args.rails_only:
+        check_rail_counts(binary)
         return
     require(controller.is_file(), f"Build mrc_ctl_profile first: {controller}")
 
@@ -369,6 +423,7 @@ def main():
 
     check_path_mtu(binary)
     check_partition_membership(binary)
+    check_rail_counts(binary)
 
     for ipv6, case in ((True, "srv6_write_imm_trim_nack"), (False, "srv6_ipv4_write_imm_trim_nack")):
         tx, rx = transfer(binary, 41989, "--immediate", "22", trim_after=16,

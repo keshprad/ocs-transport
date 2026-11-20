@@ -25,7 +25,7 @@ struct rx_queue {
 
 struct qp_direction {
     struct mrc_endpoint_config config;
-    struct rx_queue ingress[PATH_COUNT];
+    struct rx_queue *ingress;
 };
 
 struct peer_node {
@@ -68,7 +68,9 @@ static uint16_t take_packets(void *context, unsigned int path,
 
 static void discard_packets(struct qp_direction *direction)
 {
-    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+    if (!direction->ingress)
+        return;
+    for (unsigned int path = 0; path < mrc_endpoint_path_count(&direction->config); path++) {
         struct mrc_endpoint_rx_packet packets[RX_PENDING];
         uint16_t count = take_packets(direction, path, packets, RX_PENDING);
         for (uint16_t i = 0; i < count; i++)
@@ -79,7 +81,7 @@ static void discard_packets(struct qp_direction *direction)
 static int matched_path(const struct mrc_endpoint_config *config, uint16_t port,
                          const struct mrc_wire_packet *header, const struct mrc_wire_srv6 *routing)
 {
-    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+    for (unsigned int path = 0; path < mrc_endpoint_path_count(config); path++) {
         if (config->paths[path].port != port)
             continue;
         return mrc_endpoint_peer_matches(config, path, header) &&
@@ -102,6 +104,18 @@ static bool queue_packet(struct qp_direction *direction, unsigned int path,
 static struct qp_direction *node_direction(struct mrc_abi_route *route)
 {
     return route->request ? &route->tx : &route->rx;
+}
+
+static bool same_rail_order(const struct mrc_endpoint_config *a, const struct mrc_endpoint_config *b)
+{
+    const unsigned int count = mrc_endpoint_path_count(a);
+    if (count != mrc_endpoint_path_count(b))
+        return false;
+    for (unsigned int path = 0; path < count; path++) {
+        if (a->paths[path].port != b->paths[path].port)
+            return false;
+    }
+    return true;
 }
 
 static int node_path(struct mrc_abi_route *route, uint16_t port, const struct mrc_wire_packet *packet,
@@ -140,9 +154,11 @@ static bool reply_port_status(struct mrc_abi_route *current, uint16_t port, cons
             reply_path = path;
             continue;
         }
-        /* Apply the report to each matching peer state and send one reply. */
-        mrc_endpoint_record_port_status(&node_direction(route)->config, &route->node->state,
-                                        packet->body.endpoint_request.port_status_mask, now);
+        /* A shared report uses the same bit-to-port mapping on each route. */
+        const struct mrc_endpoint_config *config = &node_direction(route)->config;
+        if (same_rail_order(config, &node_direction(reply)->config))
+            mrc_endpoint_record_port_status(config, &route->node->state,
+                                            packet->body.endpoint_request.port_status_mask, now);
     }
     if (!reply)
         return false;
@@ -281,38 +297,36 @@ static bool dispatch_packet(struct mrc_abi_route *current, uint16_t port,
     return path >= 0 && queue_packet(direction, (unsigned int)path, packet);
 }
 
-static void poll_ports(struct mrc_abi_route *route, const uint16_t ports[PATH_COUNT])
+static void poll_port(struct mrc_abi_route *route, uint16_t port)
 {
-    for (unsigned int path = 0; path < PATH_COUNT; path++) {
-        uint16_t port = ports[path];
-        struct rte_mbuf *packets[RX_BURST];
-        uint16_t count = rte_eth_rx_burst(port, 0, packets, RX_BURST);
-        uint64_t arrival_cycles = count ? rte_get_timer_cycles() : 0;
-        for (uint16_t i = 0; i < count; i++) {
-            struct mrc_endpoint_rx_packet packet = { .mbuf = packets[i], .arrival_cycles = arrival_cycles };
-            if (!dispatch_packet(route, port, packet))
-                rte_pktmbuf_free(packets[i]);
-        }
+    struct rte_mbuf *packets[RX_BURST];
+    uint16_t count = rte_eth_rx_burst(port, 0, packets, RX_BURST);
+    uint64_t arrival_cycles = count ? rte_get_timer_cycles() : 0;
+    for (uint16_t i = 0; i < count; i++) {
+        struct mrc_endpoint_rx_packet packet = { .mbuf = packets[i], .arrival_cycles = arrival_cycles };
+        if (!dispatch_packet(route, port, packet))
+            rte_pktmbuf_free(packets[i]);
     }
 }
 
 static void receive_ports(struct mrc_abi_route *route)
 {
     const struct mrc_endpoint_config *config = &node_direction(route)->config;
-    const uint16_t ports[PATH_COUNT] = { config->paths[0].port, config->paths[1].port };
-    poll_ports(route, ports);
+    for (unsigned int path = 0; path < mrc_endpoint_path_count(config); path++)
+        poll_port(route, config->paths[path].port);
 }
 
 void mrc_abi_poll_endpoint_ports(const uint16_t ports[2])
 {
-    poll_ports(NULL, ports);
+    for (unsigned int path = 0; path < PATH_COUNT; path++)
+        poll_port(NULL, ports[path]);
 }
 
 static bool same_node_peer(const struct mrc_endpoint_config *a, const struct mrc_endpoint_config *b)
 {
     if (a->udp_port != b->udp_port || a->partition_key != b->partition_key ||
         a->peer_partition_key != b->peer_partition_key || a->ip_version != b->ip_version ||
-        a->srv6 != b->srv6)
+        a->srv6 != b->srv6 || !same_rail_order(a, b))
         return false;
     if (a->ip_version == MRC_WIRE_IP4) {
         if (a->local_ip != b->local_ip || a->peer_ip != b->peer_ip)
@@ -321,9 +335,9 @@ static bool same_node_peer(const struct mrc_endpoint_config *a, const struct mrc
                memcmp(a->peer_ip6, b->peer_ip6, MRC_IPV6_ADDR_LEN)) {
         return false;
     }
-    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+    for (unsigned int path = 0; path < mrc_endpoint_path_count(a); path++) {
         const struct mrc_endpoint_path *first = &a->paths[path], *second = &b->paths[path];
-        if (first->port != second->port || !rte_is_same_ether_addr(&first->local, &second->local) ||
+        if (!rte_is_same_ether_addr(&first->local, &second->local) ||
             !rte_is_same_ether_addr(&first->peer, &second->peer))
             return false;
         if (a->srv6 && (memcmp(first->srv6.local_sid, second->srv6.local_sid, MRC_IPV6_ADDR_LEN) ||
@@ -407,11 +421,11 @@ static bool sid_is_zero(const uint8_t sid[MRC_IPV6_ADDR_LEN])
 }
 
 int mrc_abi_prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
-                              struct mrc_endpoint_srv6_path *prepared)
+                              struct mrc_endpoint_srv6_path *prepared, unsigned int count)
 {
     if (!paths)
         return EINVAL;
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+    for (unsigned int i = 0; i < count; i++) {
         const struct mrc_dpdk_srv6_path *path = &paths[i];
         struct mrc_endpoint_srv6_path *output = &prepared[i];
         bool segment = !sid_is_zero(path->srh_segment);
@@ -432,7 +446,7 @@ int mrc_abi_prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
     return 0;
 }
 
-static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
+static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route_config *route,
                             const struct mrc_endpoint_srv6_path *srv6, struct qp_direction *direction,
                             bool tx)
 {
@@ -459,6 +473,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     *config = (struct mrc_endpoint_config){
         .sender = tx, .continuous_send = tx, .pool = route->pool, .pd = qp->pd->provider,
         .srv6 = srv6 != NULL,
+        .path_count = (uint8_t)route->rail_count,
         .pmtu = (uint16_t)(MRC_MIN_PMTU << (verbs->path_mtu - IBV_MTU_256)),
         .requestor_qpn = tx ? qp->qpn : verbs->dest_qp_num,
         .responder_qpn = tx ? verbs->dest_qp_num : qp->qpn,
@@ -507,12 +522,12 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         if (config->profile.state != MRC_CTL_STORE_ONLINE)
             return EINVAL;
     }
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+    for (unsigned int i = 0; i < route->rail_count; i++) {
         struct mrc_endpoint_path *path = &config->paths[i];
-        path->port = route->ports[i];
+        path->port = route->rails[i].port;
         if (srv6)
             path->srv6 = srv6[i];
-        memcpy(path->peer.addr_bytes, route->peer_macs[i], sizeof(path->peer.addr_bytes));
+        memcpy(path->peer.addr_bytes, route->rails[i].peer_mac, sizeof(path->peer.addr_bytes));
         error = -rte_eth_macaddr_get(path->port, &path->local);
         if (error)
             return error;
@@ -523,7 +538,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     const uint16_t frame_length = mrc_endpoint_frame_capacity(config);
     if (rte_pktmbuf_data_room_size(config->pool) < frame_length + RTE_PKTMBUF_HEADROOM)
         return EMSGSIZE;
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+    for (unsigned int i = 0; i < route->rail_count; i++) {
         uint16_t mtu;
         error = -rte_eth_dev_get_mtu(config->paths[i].port, &mtu);
         if (error)
@@ -531,7 +546,8 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         if (mtu < frame_length - RTE_ETHER_HDR_LEN)
             return EMSGSIZE;
     }
-    return 0;
+    direction->ingress = calloc(route->rail_count, sizeof(*direction->ingress));
+    return direction->ingress ? 0 : ENOMEM;
 }
 
 static int validate_attachment(struct mrc_qp *qp, bool tx, bool rx)
@@ -559,20 +575,37 @@ static void free_route(struct mrc_abi_route *route)
 {
     discard_packets(&route->tx);
     discard_packets(&route->rx);
+    free(route->tx.ingress);
+    free(route->rx.ingress);
     mrc_requester_destroy(route->request);
     mrc_responder_destroy(route->response);
     release_peer_node(route->node);
     free(route);
 }
 
-static int attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
-                     const struct mrc_endpoint_srv6_path *srv6)
+MRC_PUBLIC int mrc_dpdk_attach_qp_rails(struct mrc_qp *qp, const struct mrc_dpdk_route_config *route)
 {
-    if (!qp || !route || !route->pool || route->ports[0] == route->ports[1] || route->trim_dscp > 63)
+    if (!qp || !route || !route->pool || !route->rails || !route->rail_count ||
+        route->rail_count > MRC_EV_MAX_PATHS || route->trim_dscp > 63)
         return EINVAL;
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
-        if (!rte_eth_dev_is_valid_port(route->ports[i]) || route->ports[i] >= RTE_MAX_ETHPORTS)
+    for (unsigned int i = 0; i < route->rail_count; i++) {
+        for (unsigned int j = 0; j < i; j++) {
+            if (route->rails[j].port == route->rails[i].port)
+                return EINVAL;
+        }
+    }
+    for (unsigned int i = 0; i < route->rail_count; i++) {
+        if (route->rails[i].port >= RTE_MAX_ETHPORTS || !rte_eth_dev_is_valid_port(route->rails[i].port))
             return ENODEV;
+    }
+
+    struct mrc_endpoint_srv6_path prepared[MRC_EV_MAX_PATHS];
+    const struct mrc_endpoint_srv6_path *srv6 = NULL;
+    if (route->srv6_paths) {
+        int error = mrc_abi_prepare_srv6_paths(route->srv6_paths, prepared, route->rail_count);
+        if (error)
+            return error;
+        srv6 = prepared;
     }
 
     bool tx = route->requester || route->bidirectional;
@@ -633,17 +666,33 @@ MRC_PUBLIC int mrc_dpdk_set_sl_dscp(struct mrc_context *context, unsigned int sl
     return 0;
 }
 
+static int attach_legacy_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
+                            const struct mrc_dpdk_srv6_path *paths)
+{
+    if (!route)
+        return EINVAL;
+    struct mrc_dpdk_rail rails[PATH_COUNT];
+    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+        rails[i].port = route->ports[i];
+        memcpy(rails[i].peer_mac, route->peer_macs[i], sizeof(rails[i].peer_mac));
+    }
+    const struct mrc_dpdk_route_config config = {
+        .rails = rails, .rail_count = PATH_COUNT, .srv6_paths = paths,
+        .pool = route->pool, .peer_pkey = route->peer_pkey, .udp_port = route->udp_port,
+        .trim_dscp = route->trim_dscp, .requester = route->requester, .bidirectional = route->bidirectional,
+    };
+    return mrc_dpdk_attach_qp_rails(qp, &config);
+}
+
 MRC_PUBLIC int mrc_dpdk_attach_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route)
 {
-    return attach_qp(qp, route, NULL);
+    return attach_legacy_qp(qp, route, NULL);
 }
 
 MRC_PUBLIC int mrc_dpdk_attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
                                       const struct mrc_dpdk_srv6_path paths[2])
 {
-    struct mrc_endpoint_srv6_path prepared[PATH_COUNT];
-    int error = mrc_abi_prepare_srv6_paths(paths, prepared);
-    return error ? error : attach_qp(qp, route, prepared);
+    return paths ? attach_legacy_qp(qp, route, paths) : EINVAL;
 }
 
 MRC_PUBLIC int mrc_dpdk_set_rx_flow_control(struct mrc_qp *qp, uint8_t penalty, bool restore)

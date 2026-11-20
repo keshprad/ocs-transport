@@ -10,6 +10,7 @@ struct rte_mempool;
 
 struct rte_mempool *mrc_dpdk_packet_pool(void);
 struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length);
+struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsigned int port_count);
 int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool,
                       struct rte_ether_addr *mac);
 int mrc_dpdk_open_port_with_mtu(uint16_t port, struct rte_mempool *pool,

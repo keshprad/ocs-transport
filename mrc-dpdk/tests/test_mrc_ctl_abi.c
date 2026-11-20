@@ -527,6 +527,38 @@ static int configure_generated(struct mrc_context *context, struct generated_pro
     return mrc_ctl_modify_ev_profile(context, profile.id, &attr, GENERATED_PROFILE_ATTRS);
 }
 
+static void test_generated_profile_counts(struct mrc_context *context)
+{
+    const uint64_t id = 21;
+    struct mrc_ctl_ev_field field = { .width = 16, .init_val = 0xc100, .min_val = 1,
+                                      .max_val = 32, .mask = 0xff };
+    struct mrc_ctl_ev_profile_attr attr = generated_attributes(MRC_DPDK_EV_FORMAT_UDP, &field, 1);
+    attr.ev_count = 8;
+    assert(mrc_ctl_modify_ev_profile(context, id, &attr, GENERATED_PROFILE_ATTRS) == 0);
+
+    struct mrc_ctl_ev_profile_attr resize = { .ev_count = 33 };
+    assert(mrc_ctl_modify_ev_profile(context, id, &resize, MRC_CTL_EV_PROFILE_COUNT) == -1 && errno == EINVAL);
+    const unsigned int counts[] = { 8, 32, 4 };
+    for (unsigned int i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        resize.ev_count = counts[i];
+        assert(mrc_ctl_modify_ev_profile(context, id, &resize, MRC_CTL_EV_PROFILE_COUNT) == 0);
+        assert(set_profile_state(context, id, MRC_CTL_PROFILE_ONLINE) == 0);
+        struct mrc_ctl_ev_op_entry entries[32];
+        attr = (struct mrc_ctl_ev_profile_attr){
+            .ev_op = { .op = MRC_CTL_EV_OP_QUERY_EV_ARRAY, .entries = entries, .entry_count = 32 },
+        };
+        assert(mrc_ctl_query_ev_profile(context, id, &attr, MRC_CTL_EV_PROFILE_COUNT |
+                                        MRC_CTL_EV_PROFILE_EV_OP) == 0);
+        assert(attr.ev_count == counts[i] && attr.ev_op.entry_count == (int)counts[i]);
+        for (unsigned int path = 0; path < counts[i]; path++) {
+            assert(entries[path].ev.port == path + 1 && ev_value(&entries[path].ev) == 0xc101 + path);
+            assert(entries[path].state == MRC_CTL_EV_GOOD);
+        }
+        assert(set_profile_state(context, id, MRC_CTL_PROFILE_OFFLINE) == 0);
+    }
+    assert(set_profile_state(context, id, MRC_CTL_PROFILE_INIT) == 0);
+}
+
 static int set_format_state(struct mrc_context *context, uint64_t id, enum mrc_ctl_profile_state state)
 {
     struct mrc_ctl_ev_fmt_profile_attr attr = { .profile_state = state };
@@ -1124,7 +1156,7 @@ static void test_cc_lifecycle(struct ibv_context *verbs, const char *directory)
 
     assert(set_cc_state(controller, CC_PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
     struct mrc_ctl_cc_nscc_cfg invalid = nscc_config;
-    invalid.max_cwnd = 1111;
+    invalid.max_cwnd = 343; /* One byte below a 256-byte PMTU plus 88 nominal bytes. */
     assert(activate_cc(controller, CC_PROFILE_ID, &invalid) == -1 && errno == EINVAL);
     assert(query_cc(controller, CC_PROFILE_ID).cur_profile_state == MRC_CTL_PROFILE_OFFLINE);
     assert(activate_cc(controller, CC_PROFILE_ID, &nscc_config) == 0);
@@ -1392,6 +1424,7 @@ int main(int argc, char **argv)
         puts("Controller operations without CAP_NET_ADMIN were rejected");
     } else {
         test_port_administration(verbs, controller, false);
+        test_generated_profile_counts(controller);
         test_profile_lifecycle(verbs, controller, directory);
         puts("OCP controller EV profiles, live EV state, persistence, and QP leases passed");
         test_event_masks(verbs, directory);
