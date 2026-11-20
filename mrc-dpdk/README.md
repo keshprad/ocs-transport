@@ -316,6 +316,23 @@ stays online until the QP releases it. Use `offline 42` and `remove 42` to
 delete it after the run. See [conformance](CONFORMANCE.md) for the
 remaining controller and routing features.
 
+### RoCE port administration
+
+`mrc_ctl_query_port()` reports the administrative state of a
+one-based verbs port. `mrc_ctl_modify_port()` changes that state with
+`CAP_NET_ADMIN` in the network namespace that owns the port. The
+controller resolves the primary RoCE netdev through RDMA netlink.
+Disabling a port clears `IFF_UP` on that Linux interface, which affects
+all traffic on it. Administrative state is shared across processes.
+
+The port number is relative to the verbs device in the MRC context.
+On the Sparks, each RoCE device exposes physical port 1. The DPDK
+endpoint reads the link state of each attached port. It advertises
+reachability to the peer and leaves a down rail out of path selection
+until the link returns.
+On an unbonded mlx5 RoCE port, `ibv_query_port()` reports the port down
+when its netdev is administratively disabled. [Linux mlx5 RoCE port state](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/hw/mlx5/main.c)
+
 ### Spark double ring
 
 Run the [revision gate](CONFORMANCE.md#verification) immediately before

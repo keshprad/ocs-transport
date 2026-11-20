@@ -9,7 +9,7 @@ The conformance target is the [OCP Multipath Reliable Connection 1.0 specificati
 | §§7.2, 7.4–7.5, packet reliability | 24-bit PSN and window checks, wrap, selective SACK bitmaps, separate AETH, duplicate suppression, retransmit marking, logical timers, SACK-driven fast loss, reliability probe RTT sampling and startup retry per rail (probe exchanges observed on the Spark pair), and separately classified trimmed packets with TRIM NACK recovery. Negotiated Dynamic MPR advertises each change in SACKs and gates both first transmissions and retries, while preserving outstanding receive state. Over memif, all five mandatory Table 7-3 NACK reasons were generated and handled, including retry-budget exhaustion and terminal CQ overrun. | Independent live NACK interoperability and recovery after an actual port transition. Both receiver Sparks verified a 16 MiB WRITE after an injected path-1 blackhole. An independent memif peer checks alternate-rail retry on a packet-buffer NACK and confirms that a WRITEIMM credit stays occupied until a semantic ACK. Provider QP errors and typed send completions are verified for retry exhaustion and UNEXP_EVENT. Trim NACK generation and requester Service Time compensation are capability-gated. The responder reports DPDK RX-to-feedback preparation time or adjusts a 128 ns request timestamp. |
 | §§7.3, 7.4.7–7.4.8, 7.5.6, endpoint operations | ERTH/EETH byte fixtures and two-rail Port Status Updates observed over memif and the Spark pair. An independent peer verifies reserved QPN 2, Control traffic class, echoed opaque 16-bit identifiers, fresh reports after a lost response, single-rail gating after a second report, and expiry when reports stop. The privileged controller batch API also sends EV probes and Port Status Updates without a QP. Wire checks cover UDP, STEV, and SRv6 EVs, selectable request DSCP, Control replies, returned rail and RTT, partial timeouts, and rejection of a late reply from an earlier batch. | Endpoint-operation interoperability with an external implementation and physical port transitions. |
 | §§7.5.1, 8, congestion control | Nominal per-packet accounting, modulo 24-bit feedback, congestion-window admission and RTT/ECN-driven NSCC adjustments. The public QP binds an immutable ONLINE NSCC or disabled CC profile. Unit tests drive the configured maximum window, base RTT, target delay, thresholds, and increase and decrease parameters. The NSCC requester applies receiver-window penalties and restores the saved window on explicit feedback. Responder penalties can be set and cleared independently per QP. A controller profile can enable Quick Adapt. Unit tests exercise averaged-delay and trim triggers, the achieved-byte gate, the old-flight byte accounting phase, and interaction with receiver window limits. | Deployment measurements and link-rate-derived tuning for custom profiles. Verify ECN and trimming on a packet-switching fabric or with controlled injection. |
-| §§9–10, EVs and APIs | Two paths with configurable UDP source-port EVs, IPv6 flow-label reflection, preserved or already decapsulated SRv6 receive, and alternate-path retransmission. The OCP controller ABI manages persistent UDP, STEV, and SRv6 format profiles with programmable field widths. It persists AUTO, explicit, and generated EV profiles and GOOD/DENIED state and gates mutations on CAP_NET_ADMIN. Public QPs lease ONLINE EV and CC profiles. Explicit and generated SRv6 profiles supply per-rail outgoing uSID destinations with optional additional SRH containers on requester QPs. The controller can update administrative EV state during transfer and query and configure CC profiles with CAP_NET_ADMIN. Active-only rotation distinguishes denied, congestion-skipped, and failed EVs. A fresh correlated probe can restore a failed EV. Subscribed GOOD and ASSUMED_BAD transitions reach the controller's EV event CQ across processes. | Controller port administration and independent SRv6 fabric verification. |
+| §§9–10, EVs and APIs | Two paths with configurable UDP source-port EVs, IPv6 flow-label reflection, preserved or already decapsulated SRv6 receive, and alternate-path retransmission. The OCP controller ABI manages persistent UDP, STEV, and SRv6 format profiles with programmable field widths. It persists AUTO, explicit, and generated EV profiles and GOOD/DENIED state and gates mutations on CAP_NET_ADMIN. Public QPs lease ONLINE EV and CC profiles. Explicit and generated SRv6 profiles supply per-rail outgoing uSID destinations with optional additional SRH containers on requester QPs. The controller can update administrative EV state during transfer and configure CC profiles. Subscribed GOOD and ASSUMED_BAD transitions reach the controller's EV event CQ across processes. The controller also resolves and administers Linux-backed RoCE ports. Tests compare administrative queries with the Spark-04 interface flags and exercise the kernel setter on isolated virtual links. | Physical port administration under load and independent SRv6 fabric verification. |
 
 ## Specification questions for interoperability
 
@@ -61,6 +61,11 @@ QP, post new work while it runs, and poll its own CQ. The test starts after
 a QP reset with a noninitial work sequence. It verifies WRITE/WRITEIMM
 placement and completion IDs across separate admissions, PSN wrap, and
 continued immediate receive sequencing over two memif rails.
+The link lifecycle case stops one memif port and restarts it while the
+same QP remains attached. It verifies both rails before the stop, only
+the surviving rail during the stop, and both rails after restart. A
+test-only PMD query error after the DOWN observation checks that the
+requester retains the last known state.
 
 Use Spark-04 as the implementation source. After pushing the exact clean commit, run `tests/verify_spark_revisions.sh --sync "$(git rev-parse HEAD)"` to advance the detached test worktrees on Spark-02 and Spark-03. Run the same command without `--sync` immediately before each live test. The script checks that all three worktrees are clean and at the requested commit.
 
@@ -115,6 +120,15 @@ older snapshots and mixed snapshots with numeric and SRv6 values. Build the ABI 
 with `make MRC_INCLUDE_DIR=/path/to/headers tests/test_mrc_ctl_abi`. Run
 `./tests/test_mrc_ctl_abi --expect-no-cap` without CAP_NET_ADMIN and
 `unshare -Ur ./tests/test_mrc_ctl_abi` for the isolated positive case.
+The controller ABI test compares the RoCE port's reported administrative
+state with Linux interface flags. The test of enabling and disabling a
+Linux interface can run in a disposable network namespace.
+
+```sh
+make tests/test_mrc_port_netlink
+unshare -Urn sh -ec 'ip link add mrc-test-a type veth peer name mrc-test-b; exec ./tests/test_mrc_port_netlink --veth'
+```
+
 Run `unshare -Ur ./tests/test_mrc_abi` for synthetic event CQ coverage of
 legacy and current array layouts, completion notifications, one reader per
 store, and bounded overflow with loss reporting. Run

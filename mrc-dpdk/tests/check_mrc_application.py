@@ -33,6 +33,22 @@ def main():
             f"Unexpected application transfer results: {tx}, {rx}")
     print(json.dumps({"case": "application_posts_to_running_qp", "tx": tx, "rx": rx}))
 
+    def link_command(role, cpu, directory):
+        if role == "tx":
+            return eal_args(args.application.resolve(), role, cpu, directory) + ["--", "link_transition"]
+        return eal_args(args.receiver.resolve(), role, cpu, directory) + [
+            "--", "rx", "4096,4096,4096", "192.0.2.2", "192.0.2.1",
+            "0", MACS["tx"][0], "1", MACS["tx"][1],
+            "--initial-psn", "16777215", "--mpr", "1", "--max-wimm-inflight", "1",
+            "--ack-timeout", "16", "--timeout-ms", "5000",
+        ]
+
+    tx, rx, _ = run_pair(link_command)
+    require(tx["bytes"] == rx["bytes"] == 12288 and tx["write_completions"] == 3 and
+            tx["sent_by_round"] == [[2, 2], [4, 0], [2, 2]] and rx["received"] == [8, 4],
+            f"Unexpected link transition results: {tx}, {rx}")
+    print(json.dumps({"case": "application_rail_link_transition", "tx": tx, "rx": rx}))
+
 
 if __name__ == "__main__":
     main()

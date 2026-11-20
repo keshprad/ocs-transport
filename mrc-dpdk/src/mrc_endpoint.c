@@ -529,15 +529,19 @@ static void poll_port_status(const struct mrc_endpoint_config *transfer, struct 
     bool connecting = now < status->fast_poll_until || !status->local_ports;
     status->next_poll = now + transfer->hz / (connecting ? 1000 : 20);
 
-    uint32_t active = 0, down = 0;
+    uint32_t active = status->local_ports, down = status->local_down;
     for (unsigned int i = 0; i < PATH_COUNT; i++) {
+        uint32_t bit = UINT32_C(1) << i;
         struct rte_eth_link link;
         if (rte_eth_link_get_nowait(transfer->paths[i].port, &link))
             continue;
-        if (link.link_status)
-            active |= 1u << i;
-        else
-            down |= 1u << i;
+        if (link.link_status) {
+            active |= bit;
+            down &= ~bit;
+        } else {
+            active &= ~bit;
+            down |= bit;
+        }
     }
     status->local_down = down;
     if (active == status->local_ports && now < status->next_announce)

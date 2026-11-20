@@ -10,6 +10,7 @@
 /tests/test_mrc_provider
 /mrc_ctl_profile
 /tests/test_mrc_ctl_store
+/tests/test_mrc_port_netlink
 /libmrc-dpdk.so
 /tests/test_mrc_abi
 /tests/mrc_memif_relay

@@ -8,10 +8,13 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <net/if.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -156,6 +159,49 @@ static void remove_test_store(const char *directory)
     }
     assert(closedir(dir) == 0);
     assert(rmdir(directory) == 0);
+}
+
+static void test_port_administration(struct ibv_context *verbs, struct mrc_context *controller,
+                                     bool expect_no_cap)
+{
+    struct mrc_ctl_port_attr port_attr = {0};
+    assert(mrc_ctl_query_port(NULL, 1, &port_attr, MRC_CTL_PORT_ADMIN_STATE) == -1 && errno == EINVAL);
+    assert(mrc_ctl_query_port(controller, 0, &port_attr, MRC_CTL_PORT_ADMIN_STATE) == -1 && errno == EINVAL);
+    assert(mrc_ctl_query_port(controller, 1, NULL, MRC_CTL_PORT_ADMIN_STATE) == -1 && errno == EINVAL);
+    assert(mrc_ctl_query_port(controller, 1, &port_attr, MRC_CTL_PORT_ADMIN_STATE << 1) == -1 && errno == EINVAL);
+
+    struct ibv_device_attr device;
+    assert(ibv_query_device(verbs, &device) == 0);
+    for (unsigned int port = 1; port <= device.phys_port_cnt; port++) {
+        struct ibv_port_attr physical;
+        if (ibv_query_port(verbs, (uint8_t)port, &physical) || physical.link_layer != IBV_LINK_LAYER_ETHERNET)
+            continue;
+        /* GID slot 0 provides an independent view of the base netdev on the
+         * RoCE ports. The controller query resolves the port without a GID. */
+        struct ibv_gid_entry gid;
+        struct ifreq link = {0};
+        if (ibv_query_gid_ex(verbs, port, 0, &gid, 0) ||
+            !gid.ndev_ifindex || !if_indextoname(gid.ndev_ifindex, link.ifr_name))
+            continue;
+        int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        assert(fd >= 0);
+        assert(ioctl(fd, SIOCGIFFLAGS, &link) == 0);
+        assert(close(fd) == 0);
+
+        assert(mrc_ctl_query_port(controller, (uint8_t)port, &port_attr, MRC_CTL_PORT_ADMIN_STATE) == 0);
+        enum mrc_ctl_port_admin_state expected = (link.ifr_flags & IFF_UP) ?
+            MRC_CTL_PORT_ADMIN_ENABLED : MRC_CTL_PORT_ADMIN_DISABLED;
+        assert(port_attr.port_admin_state == expected);
+        if (expect_no_cap) {
+            /* The no-capability branch has already verified its privileges.
+             * Request the current state so this check never changes a real link. */
+            assert(mrc_ctl_modify_port(controller, (uint8_t)port, &port_attr,
+                                       MRC_CTL_PORT_ADMIN_STATE) == -1 && errno == EPERM);
+        }
+        puts("OCP controller port query matched the RoCE netdev's administrative state");
+        return;
+    }
+    puts("RoCE netdev cross-check skipped because no base GID was accessible");
 }
 
 static void test_controller_discovery(struct ibv_context *verbs, struct mrc_context *context)
@@ -1324,6 +1370,7 @@ int main(int argc, char **argv)
     struct mrc_context *controller = open_store(verbs, directory);
     if (expect_no_cap) {
         assert(configure_explicit(controller, PROFILE_ID, MRC_DPDK_EV_FORMAT_UDP) == -1 && errno == EPERM);
+        test_port_administration(verbs, controller, true);
         assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_INIT);
         assert(configure_generated(controller, generated_udp) == -1 && errno == EPERM);
         assert(profile_state(controller, GEN_UDP_PROFILE_ID) == MRC_CTL_PROFILE_INIT);
@@ -1344,6 +1391,7 @@ int main(int argc, char **argv)
         assert(mrc_destroy_context(controller) == 0);
         puts("Controller operations without CAP_NET_ADMIN were rejected");
     } else {
+        test_port_administration(verbs, controller, false);
         test_profile_lifecycle(verbs, controller, directory);
         puts("OCP controller EV profiles, live EV state, persistence, and QP leases passed");
         test_event_masks(verbs, directory);
