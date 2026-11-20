@@ -44,6 +44,7 @@ struct send_record {
     unsigned int path;
     bool fast_retransmitted;
     bool nacked;
+    bool nack_retry;
     bool counted_inflight;
     bool redundant_attempt;
 };
@@ -729,6 +730,22 @@ static int fail_send(const struct mrc_endpoint_config *transfer, struct mrc_requ
     return error;
 }
 
+static bool retry_limit_reached(const struct mrc_endpoint_config *transfer, unsigned int retransmissions)
+{
+    return transfer->exponential_retries != 25 &&
+           retransmissions >= transfer->linear_retries + transfer->exponential_retries;
+}
+
+static int fail_retry(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender, uint32_t index)
+{
+    uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
+    uint32_t first = (uint32_t)mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
+    fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
+                    " (first segment %u, next %u, last transmit path %u)\n",
+            psn, first, sender->next, sender->metadata[index % WINDOW].path);
+    return fail_send(transfer, sender, index, MRC_PROVIDER_WC_RETRY_EXCEEDED, -ETIMEDOUT);
+}
+
 static enum mrc_provider_wc_status aeth_error_status(uint8_t syndrome)
 {
     switch (syndrome) {
@@ -899,28 +916,32 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
         case MRC_NACK_PSN_OOR_WINDOW: {
             uint32_t index = (uint32_t)mrc_psn_delta(nack->nack_psn, transfer->initial_psn);
             struct send_record *record = &sender->metadata[index % WINDOW];
-            if (record->counted_inflight &&
-                packet->bth.retransmit == (state->retransmissions != 0)) {
+            if (record->nacked || packet->bth.retransmit != (state->retransmissions != 0))
+                return 0;
+            bool trimmed = nack->reason == MRC_NACK_TRIMMED ||
+                           nack->reason == MRC_NACK_TRIMMED_LASTHOP;
+            int ev = reflected_path(transfer, nack->entropy);
+            if (ev >= 0 && nack->reason == MRC_NACK_TRIMMED)
+                mrc_ev_feedback(&sender->ev, (unsigned int)ev, MRC_EV_SKIP_ONCE,
+                                false, 0, now_cycles);
+            if (record->counted_inflight) {
                 struct mrc_cc_tx_sample sample = {
                     .sent_at_ns = cycles_to_ns(transfer, state->sent_at),
                     .arrived_at_ns = cycles_to_ns(transfer, arrival_cycles),
                     .service_time_ns = peer_service_ns(transfer, nack->tx_timestamp),
                     .retransmissions = state->retransmissions,
                 };
-                bool trimmed = nack->reason == MRC_NACK_TRIMMED ||
-                               nack->reason == MRC_NACK_TRIMMED_LASTHOP;
-                int ev = reflected_path(transfer, nack->entropy);
-                if (ev >= 0 && nack->reason == MRC_NACK_TRIMMED)
-                    mrc_ev_feedback(&sender->ev, (unsigned int)ev, MRC_EV_SKIP_ONCE,
-                                    false, 0, now_cycles);
                 if (!mrc_cc_on_nack(&sender->cc, nominal_at(transfer, index), trimmed,
                                     packet->bth.retransmit, now, &sample))
                     return -EPROTO;
                 record->counted_inflight = false;
-                record->nacked = true;
-                counts->nack_received_mask |= UINT32_C(1) << nack->reason;
-                counts->trim_nacks += trimmed;
             }
+            record->nacked = true;
+            counts->nack_received_mask |= UINT32_C(1) << nack->reason;
+            counts->trim_nacks += trimmed;
+            if (retry_limit_reached(transfer, state->retransmissions))
+                return fail_retry(transfer, sender, index);
+            sender->next_retry_scan = now_cycles;
             return 0;
         }
         default:
@@ -978,18 +999,22 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
         struct mrc_tx_packet *packet = mrc_tx_packet(&sender->qp, psn);
         struct send_record *record = &sender->metadata[index % WINDOW];
+        /* Section 7.4.4 re-arms a NACK-driven retry at the base timeout.
+         * The transmission still counts toward the QP retry limit. */
+        unsigned int timeout_retries = record->nack_retry ? 0 : packet->retransmissions;
         uint64_t timeout_ns;
         if (!mrc_local_ack_timeout_ns(transfer->timeout_exponent,
                 transfer->linear_retries, transfer->exponential_retries,
-                packet->retransmissions, &timeout_ns))
+                timeout_retries, &timeout_ns))
             return -EPROTO;
         uint64_t age = now - packet->sent_at;
         if (packet->received && index != first)
             continue;
-        bool fast = !packet->received && !record->fast_retransmitted &&
+        bool nacked = record->nacked && !packet->received;
+        bool fast = !packet->received && !nacked && !record->fast_retransmitted &&
                     sender->highest_sacked - (int32_t)index >= FAST_LOSS_GAP &&
                     age >= transfer->initial_rto / 4;
-        if (!fast && !record->nacked && age < mrc_endpoint_cycles(transfer, timeout_ns))
+        if (!fast && !nacked && age < mrc_endpoint_cycles(transfer, timeout_ns))
             continue;
         if (!retire_redundant_attempt(transfer, sender, index))
             return -EPROTO;
@@ -1000,17 +1025,12 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         }
         if (!mrc_mpr_can_transmit(&sender->mpr, sender->qp.delivery_cack_psn, psn))
             continue;
-        if (transfer->exponential_retries != 25 && packet->retransmissions >=
-                transfer->linear_retries + transfer->exponential_retries) {
-            fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
-                            " (first segment %u, next %u, last transmit path %u)\n",
-                    psn, first, sender->next, record->path);
-            return fail_send(transfer, sender, index, MRC_PROVIDER_WC_RETRY_EXCEEDED, -ETIMEDOUT);
-        }
+        if (retry_limit_reached(transfer, packet->retransmissions))
+            return fail_retry(transfer, sender, index);
         if (!mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
             continue;
 
-        if (!packet->received && !record->nacked &&
+        if (!packet->received && !nacked &&
             packet->sent_at >= sender->ev.paths[record->path].changed_at)
             mrc_ev_timeout(&sender->ev, record->path, now);
 
@@ -1039,6 +1059,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         record->path = path;
         record->counted_inflight = true;
         record->redundant_attempt = packet->received;
+        record->nack_retry = nacked;
         record->nacked = false;
         record->fast_retransmitted |= fast;
         counts->fast_retries += fast;
