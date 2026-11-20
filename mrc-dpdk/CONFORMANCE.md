@@ -92,8 +92,11 @@ implementation. Use `--rails-only` for the standalone cases or
 `--counted-rails-only` for the public case.
 The controller test generates eight EVs, grows the offline profile to
 32 entries, then shrinks it to four. Each size is brought online and
-queried to check the EV value and port order. The connectionless
-controller endpoint attachment currently exposes a two-rail route.
+queried to check the EV value and port order. The counted connectionless
+controller case sends an EV probe and a Port Status Update on port 8
+and observes both replies there. The receiving fixture checks that bits
+1 and 8 in the API mask become bits 0 and 7 on the wire. It also verifies
+rejection of ports and mask bits outside the configured rail list.
 
 For §7.5.5.1, the public memif case selects SL 7 with `IBV_QP_AV` and
 observes DSCP 26 for the initial WRITEIMM and reliability probes, DSCP 34
@@ -367,15 +370,26 @@ The corresponding physical run needs the scoped negotiated pair profile.
 
 ### Concurrent three-Spark verification
 
-The [Spark cycle tests](README.md#concurrent-three-spark-tests) exercise
-three simultaneous 256 MiB WRITEs on the full double ring. The smoke
-profile checks both rails on all three edges. The recovery profile drops
-path-1 traffic on Spark-04's outgoing edge and checks that all three
-WRITEs complete and the affected EV recovers. All three scoped runners
-matched the pinned Git revision and binary digest. The first live smoke
-attempt stopped in receiver EAL setup because systemd exported two runtime
-paths in one variable. The unit renderer and preflight now require clearing
-that variable so EAL uses the per-role runtime path. The hardware cases are
-pending the unit refresh.
+The [Spark cycle tests](README.md#concurrent-three-spark-tests) passed
+both profiles on the Polatis double ring with three simultaneous
+256 MiB WRITEs per run. Before each run, all three test worktrees matched
+`0c537484a96b15e51c9cfd82491de83d65d554f4` and the installed binaries
+matched SHA-256 `dfd4498a8f3e965409f4f182767a126f29a3e23e9f6a9ff96406bb976eac7305`.
+The sender port-ready intervals overlapped by at least 1,944.2 ms in
+smoke and 2,124.3 ms in failover.
+
+| Edge | Smoke RX segments by rail | Smoke TX retries by rail | Failover RX segments by rail | Failover TX retries by rail |
+| --- | --- | --- | --- | --- |
+| Spark-04 to Spark-02 | 135,361 / 126,783 | 446 / 0 | 142,551 / 119,593 | 18,536 / 22,614 |
+| Spark-02 to Spark-03 | 131,188 / 130,956 | 22 / 16 | 130,645 / 131,499 | 22,265 / 21,261 |
+| Spark-03 to Spark-04 | 131,420 / 130,724 | 209 / 224 | 128,922 / 133,222 | 61,416 / 57,998 |
+
+Each receiver verified the written buffer. The failover profile
+used ACK timeout exponent 13 and suppressed rail-1 traffic on Spark-04
+from scheduled segments 512 through 2,047. Spark-04 recorded 127
+injected drops and its EV failure and recovery masks included rail 1.
+The failover journals also reported missed RX frames on all three
+requesters. DPDK reported zero port I/O errors and RX buffer exhaustion
+in both profiles.
 
 mlx5 setup requires `CAP_NET_RAW` and `CAP_NET_ADMIN` or an administrator-run endpoint. [DPDK mlx5 privilege documentation](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root)

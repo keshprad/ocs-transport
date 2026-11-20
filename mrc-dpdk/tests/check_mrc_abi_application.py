@@ -55,8 +55,11 @@ def check_live_profile(binary, controller):
 
 
 def check_endpoint_operations(binary, format_name):
+    rail_count = 8 if format_name == "counted" else 2
+    packets = 2 if format_name == "counted" else 7
+
     def command(role, cpu, directory):
-        args = eal_args(binary, role, cpu, directory) + [
+        args = eal_args(binary, role, cpu, directory, rail_count=rail_count) + [
             "--", role, str(directory), "endpoint_ops", format_name,
         ]
         if role == "tx":
@@ -64,10 +67,10 @@ def check_endpoint_operations(binary, format_name):
             args = ["unshare", "-Ur", "env", f"RUNTIME_DIRECTORY={directory}", *args]
         return args
 
-    tx, rx, _ = run_pair(command)
+    tx, rx, _ = run_pair(command, rail_count=rail_count)
     require(tx["role"] == "tx" and rx["role"] == "rx"
             and tx["format"] == rx["format"] == format_name
-            and tx["endpoint_packets"] == rx["endpoint_packets"] == 7,
+            and tx["endpoint_packets"] == rx["endpoint_packets"] == packets,
             f"Unexpected connectionless endpoint operation batch: {tx}, {rx}")
     print(json.dumps({"case": f"public_endpoint_ops_{format_name}", "tx": tx, "rx": rx}))
 
@@ -278,7 +281,7 @@ def main():
     if args.controller:
         controller = args.controller.resolve()
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
-        for format_name in ("udp", "stev", "srv6", "shared"):
+        for format_name in ("udp", "stev", "srv6", "shared", "counted"):
             check_endpoint_operations(binary, format_name)
         check_shared_port_status(binary)
         check_live_profile(binary, controller)

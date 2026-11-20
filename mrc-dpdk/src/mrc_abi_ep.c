@@ -12,7 +12,7 @@
 #include <rte_pause.h>
 
 enum {
-    CONTROLLER_PORT_MASK = ((1 << PATH_COUNT) - 1) << 1,
+    CONTROLLER_MAX_RAILS = sizeof(uint32_t) * CHAR_BIT - 1,
     ENDPOINT_TX_BURST = 32,
     NANOSECONDS_PER_SECOND = 1000000000,
 };
@@ -40,18 +40,21 @@ struct mrc_abi_endpoint {
     struct mrc_endpoint_config config;
     union ibv_gid local_gid;
     union ibv_gid peer_gid;
-    uint16_t ports[PATH_COUNT];
     struct endpoint_batch *batch;
 };
 
 /* Endpoint lists and batches are protected by the DPDK dispatch mutex. */
 static struct mrc_abi_endpoint *endpoints;
 
-static int configure_endpoint(struct mrc_abi_endpoint *endpoint, const struct mrc_dpdk_endpoint_route *route,
-                               const struct mrc_dpdk_srv6_path *paths)
+static int configure_endpoint(struct mrc_abi_endpoint *endpoint,
+                               const struct mrc_dpdk_endpoint_route_config *route)
 {
+    int result = mrc_abi_validate_rails(route->rails, route->rail_count);
+    if (result)
+        return result;
     struct mrc_endpoint_config *config = &endpoint->config;
     config->pool = route->pool;
+    config->path_count = (uint8_t)route->rail_count;
     config->partition_key = route->pkey ? route->pkey : UINT16_MAX;
     config->peer_partition_key = route->peer_pkey ? route->peer_pkey : config->partition_key;
     config->udp_port = route->udp_port ? route->udp_port : MRC_UDP_DEFAULT_PORT;
@@ -62,24 +65,23 @@ static int configure_endpoint(struct mrc_abi_endpoint *endpoint, const struct mr
     if (!(config->partition_key & 0x7fff) || !(config->peer_partition_key & 0x7fff))
         return EINVAL;
 
-    int result = mrc_abi_configure_addresses(config, &route->local_gid, &route->peer_gid);
+    result = mrc_abi_configure_addresses(config, &route->local_gid, &route->peer_gid);
     if (result)
         return result;
 
-    struct mrc_endpoint_srv6_path srv6[PATH_COUNT] = {0};
-    if (paths) {
-        result = mrc_abi_prepare_srv6_paths(paths, srv6, PATH_COUNT);
+    struct mrc_endpoint_srv6_path srv6[MRC_EV_MAX_PATHS];
+    if (route->srv6_paths) {
+        result = mrc_abi_prepare_srv6_paths(route->srv6_paths, srv6, route->rail_count);
         if (result)
             return result;
         config->srv6 = true;
     }
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+    for (unsigned int i = 0; i < route->rail_count; i++) {
         struct mrc_endpoint_path *path = &config->paths[i];
-        if (route->ports[i] >= RTE_MAX_ETHPORTS || !rte_eth_dev_is_valid_port(route->ports[i]))
-            return ENODEV;
-        path->port = route->ports[i];
-        path->srv6 = srv6[i];
-        memcpy(path->peer.addr_bytes, route->peer_macs[i], sizeof(path->peer.addr_bytes));
+        path->port = route->rails[i].port;
+        if (config->srv6)
+            path->srv6 = srv6[i];
+        memcpy(path->peer.addr_bytes, route->rails[i].peer_mac, sizeof(path->peer.addr_bytes));
         if (!rte_is_valid_assigned_ether_addr(&path->peer))
             return EINVAL;
         result = -rte_eth_macaddr_get(path->port, &path->local);
@@ -88,7 +90,6 @@ static int configure_endpoint(struct mrc_abi_endpoint *endpoint, const struct mr
     }
     endpoint->local_gid = route->local_gid;
     endpoint->peer_gid = route->peer_gid;
-    memcpy(endpoint->ports, route->ports, sizeof(endpoint->ports));
     return 0;
 }
 
@@ -104,9 +105,9 @@ static bool endpoint_overlaps(const struct mrc_abi_endpoint *a, const struct mrc
         !gids_match(&a->local_gid, &b->local_gid) || !gids_match(&a->peer_gid, &b->peer_gid))
         return false;
     /* The inner tuple must identify a single route even after SRv6 decapsulation. */
-    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+    for (unsigned int i = 0; i < mrc_endpoint_path_count(&a->config); i++) {
         const struct mrc_endpoint_path *first = &a->config.paths[i];
-        for (unsigned int j = 0; j < PATH_COUNT; j++) {
+        for (unsigned int j = 0; j < mrc_endpoint_path_count(&b->config); j++) {
             const struct mrc_endpoint_path *second = &b->config.paths[j];
             if (first->port == second->port && rte_is_same_ether_addr(&first->peer, &second->peer) &&
                 rte_is_same_ether_addr(&first->local, &second->local))
@@ -116,10 +117,11 @@ static bool endpoint_overlaps(const struct mrc_abi_endpoint *a, const struct mrc
     return false;
 }
 
-MRC_PUBLIC int mrc_dpdk_attach_endpoint(struct mrc_context *context, const struct mrc_dpdk_endpoint_route *route,
-                                        const struct mrc_dpdk_srv6_path paths[2])
+MRC_PUBLIC int mrc_dpdk_attach_endpoint_rails(struct mrc_context *context,
+                                              const struct mrc_dpdk_endpoint_route_config *route)
 {
-    if (!context || !route || !route->pool || route->ports[0] == route->ports[1])
+    if (!context || !route || !route->pool || !route->rails || !route->rail_count ||
+        route->rail_count > CONTROLLER_MAX_RAILS)
         return EINVAL;
     struct mrc_abi_endpoint *endpoint = calloc(1, sizeof(*endpoint));
     if (!endpoint)
@@ -131,7 +133,7 @@ MRC_PUBLIC int mrc_dpdk_attach_endpoint(struct mrc_context *context, const struc
     }
 
     pthread_mutex_lock(&mrc_abi_dispatch_mutex);
-    result = context->endpoint ? EBUSY : configure_endpoint(endpoint, route, paths);
+    result = context->endpoint ? EBUSY : configure_endpoint(endpoint, route);
     for (struct mrc_abi_endpoint *other = endpoints; !result && other; other = other->next) {
         if (endpoint_overlaps(endpoint, other))
             result = EADDRINUSE;
@@ -149,6 +151,24 @@ MRC_PUBLIC int mrc_dpdk_attach_endpoint(struct mrc_context *context, const struc
     return result;
 }
 
+MRC_PUBLIC int mrc_dpdk_attach_endpoint(struct mrc_context *context, const struct mrc_dpdk_endpoint_route *route,
+                                        const struct mrc_dpdk_srv6_path paths[2])
+{
+    if (!route || route->ports[0] == route->ports[1])
+        return EINVAL;
+    struct mrc_dpdk_rail rails[PATH_COUNT];
+    for (unsigned int i = 0; i < PATH_COUNT; i++) {
+        rails[i].port = route->ports[i];
+        memcpy(rails[i].peer_mac, route->peer_macs[i], sizeof(rails[i].peer_mac));
+    }
+    const struct mrc_dpdk_endpoint_route_config config = {
+        .rails = rails, .rail_count = PATH_COUNT, .srv6_paths = paths, .pool = route->pool,
+        .local_gid = route->local_gid, .peer_gid = route->peer_gid,
+        .pkey = route->pkey, .peer_pkey = route->peer_pkey, .udp_port = route->udp_port,
+    };
+    return mrc_dpdk_attach_endpoint_rails(context, &config);
+}
+
 MRC_PUBLIC int mrc_dpdk_progress_endpoint(struct mrc_context *context)
 {
     if (!context)
@@ -157,7 +177,7 @@ MRC_PUBLIC int mrc_dpdk_progress_endpoint(struct mrc_context *context)
     struct mrc_abi_endpoint *endpoint = context->endpoint;
     bool attached = endpoint != NULL;
     if (endpoint)
-        mrc_abi_poll_endpoint_ports(endpoint->ports);
+        mrc_abi_poll_endpoint_ports(&endpoint->config);
     pthread_mutex_unlock(&mrc_abi_dispatch_mutex);
     return attached ? 0 : ENODEV;
 }
@@ -210,11 +230,12 @@ static bool has_srh(const uint8_t value[MRC_CTL_EV_MAX_BYTES])
 static int validate_request(const struct mrc_abi_endpoint *endpoint, const struct mrc_ctl_ep_req *request,
                             uint8_t op)
 {
-    if (request->req_ev.port < 1 || request->req_ev.port > PATH_COUNT ||
+    const unsigned int count = mrc_endpoint_path_count(&endpoint->config);
+    if (request->req_ev.port < 1 || request->req_ev.port > count ||
         !gids_match(&request->sgid, &endpoint->local_gid) || !gids_match(&request->dgid, &endpoint->peer_gid))
         return EINVAL;
     if (op == MRC_ENDPOINT_PORT_STATUS &&
-        (request->op.port_status_update.port_status & ~(uint32_t)CONTROLLER_PORT_MASK))
+        (request->op.port_status_update.port_status & ~(mrc_endpoint_path_mask(count) << 1)))
         return EINVAL;
 
     const uint8_t *value = request->req_ev.val;
@@ -332,7 +353,7 @@ bool mrc_abi_dispatch_endpoint(uint16_t port, const struct mrc_wire_packet *pack
         return false;
     for (struct mrc_abi_endpoint *endpoint = endpoints; endpoint; endpoint = endpoint->next) {
         const struct mrc_endpoint_config *config = &endpoint->config;
-        for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        for (unsigned int path = 0; path < mrc_endpoint_path_count(config); path++) {
             if (config->paths[path].port != port || !mrc_endpoint_peer_matches(config, path, packet) ||
                 !mrc_endpoint_route_matches(config, path, routing))
                 continue;
@@ -371,7 +392,7 @@ static int run_batch(struct mrc_abi_endpoint *endpoint, struct endpoint_batch *b
         struct pending_request *pending = find_request(batch, requests[i].req_id);
         sent += send_request(endpoint, &requests[i], pending, batch->op, dscp);
         if ((i + 1) % ENDPOINT_TX_BURST == 0 && i + 1 < batch->count) {
-            mrc_abi_poll_endpoint_ports(endpoint->ports);
+            mrc_abi_poll_endpoint_ports(&endpoint->config);
             pthread_mutex_unlock(&mrc_abi_dispatch_mutex);
             pthread_mutex_lock(&mrc_abi_dispatch_mutex);
         }
@@ -383,7 +404,7 @@ static int run_batch(struct mrc_abi_endpoint *endpoint, struct endpoint_batch *b
         batch->wait_cycles = 1;
     batch->waiting = true;
     while (batch->received < sent && rte_get_timer_cycles() - batch->wait_started < batch->wait_cycles) {
-        mrc_abi_poll_endpoint_ports(endpoint->ports);
+        mrc_abi_poll_endpoint_ports(&endpoint->config);
         if (batch->received == sent)
             break;
         pthread_mutex_unlock(&mrc_abi_dispatch_mutex);

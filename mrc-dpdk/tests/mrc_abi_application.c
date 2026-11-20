@@ -659,6 +659,9 @@ enum {
     EP_TX_PKEY = 0x9912,
     EP_RX_PKEY = 0xa932,
     EP_ALL_CASES = (1 << EP_CASES) - 1,
+    COUNTED_EP_PROBE = 0xaf18,
+    COUNTED_EP_STATUS = 0xaf19,
+    COUNTED_EP_MASK = (1 << COUNTED_RAILS) | (1 << 1),
 };
 
 struct endpoint_witness {
@@ -994,6 +997,96 @@ static void run_endpoint_ops(bool client, const char *directory, const char *for
     }
     printf("{\"role\":\"%s\",\"format\":\"%s\",\"endpoint_packets\":%u,\"adjusted_rtts\":%u}\n",
            client ? "tx" : "rx", format, (unsigned int)__builtin_popcount(test.seen), test.adjusted_rtts);
+}
+
+static uint16_t observe_counted_endpoint(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                          uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)queue;
+    (void)capacity;
+    unsigned int *seen = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[14 + 40 + WIRE_UDP_LEN + WIRE_BTH_LEN + EP_REQUEST_HEADER_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        assert(port == COUNTED_RAILS - 1 && bth[0] == EP_REQUEST_OPCODE && wire_be24(bth + 5) == 2);
+        assert(udp.bytes >= WIRE_UDP_LEN + WIRE_BTH_LEN + EP_REQUEST_HEADER_LEN);
+        const uint8_t *erth = bth + WIRE_BTH_LEN;
+        uint32_t token = wire_be24(bth + 9);
+        if (token == COUNTED_EP_PROBE) {
+            assert(!(*seen & 1) && erth[1] == 1 && (udp.traffic_class >> 2) == EP_PROBE_DSCP);
+            *seen |= 1;
+        } else {
+            assert(token == COUNTED_EP_STATUS && !(*seen & 2) && erth[1] == 0);
+            assert(wire_be32(erth + 4) == (COUNTED_EP_MASK >> 1) && (udp.traffic_class >> 2) == EP_CONTROL_DSCP);
+            *seen |= 2;
+        }
+    }
+    return count;
+}
+
+static void run_counted_endpoint(bool client, const char *directory,
+                                  struct mrc_context *context, struct rte_mempool *pool)
+{
+    struct mrc_dpdk_rail rails[COUNTED_RAILS];
+    for (uint16_t i = 0; i < COUNTED_RAILS; i++)
+        rails[i] = (struct mrc_dpdk_rail){ .port = i, .peer_mac = { 2, 0, 0, 0, 0, (client ? 0x10 : 0x20) + i } };
+    struct mrc_dpdk_endpoint_route_config route = {
+        .rails = rails, .rail_count = 32, .pool = pool, .udp_port = EP_UDP_PORT,
+    };
+    assert(inet_pton(AF_INET6, client ? "::ffff:10.9.0.1" : "::ffff:10.9.0.2", route.local_gid.raw) == 1);
+    assert(inet_pton(AF_INET6, client ? "::ffff:10.9.0.2" : "::ffff:10.9.0.1", route.peer_gid.raw) == 1);
+    assert(mrc_dpdk_attach_endpoint_rails(context, &route) == EINVAL);
+    route.rail_count = COUNTED_RAILS;
+    assert(mrc_dpdk_attach_endpoint_rails(context, &route) == 0);
+    prepare_memif_rails(COUNTED_RAILS);
+
+    char marker[PATH_MAX];
+    if (client) {
+        path_for(marker, directory, "rx.endpoint-ready");
+        wait_for(marker);
+        struct mrc_ctl_ep_req request = {
+            .req_id = COUNTED_EP_PROBE, .sgid = route.local_gid, .dgid = route.peer_gid,
+            .ev_fmt_mode = MRC_CTL_EV_FMT_MODE_UDP,
+            .req_ev = { .port = COUNTED_RAILS + 1, .val = { 0, 0, 0xd1, 0x08 } },
+        };
+        struct mrc_ctl_ep_rsp reply;
+        int returned;
+        assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE,
+                                         &request, 1, 1000000000, &reply, &returned) == -1);
+        assert(errno == EINVAL && returned == 0);
+        request.req_ev.port = COUNTED_RAILS;
+        assert(mrc_ctl_ep_batch_send_wait(context, EP_PROBE_DSCP, MRC_CTL_EP_OP_EV_PROBE,
+                                         &request, 1, 1000000000, &reply, &returned) == 0);
+        assert(returned == 1 && reply.req_id == COUNTED_EP_PROBE && reply.port == COUNTED_RAILS);
+        request.req_id = COUNTED_EP_STATUS;
+        request.op.port_status_update.port_status = COUNTED_EP_MASK << 1;
+        assert(mrc_ctl_ep_batch_send_wait(context, 0, MRC_CTL_EP_OP_PORT_STATUS_UPDATE,
+                                         &request, 1, 1000000000, &reply, &returned) == -1);
+        assert(errno == EINVAL && returned == 0);
+        request.op.port_status_update.port_status = COUNTED_EP_MASK;
+        assert(mrc_ctl_ep_batch_send_wait(context, 0, MRC_CTL_EP_OP_PORT_STATUS_UPDATE,
+                                         &request, 1, 1000000000, &reply, &returned) == 0);
+        assert(returned == 1 && reply.req_id == COUNTED_EP_STATUS && reply.port == COUNTED_RAILS);
+        publish(directory, "tx.endpoint-done", NULL, 0);
+    } else {
+        const uint16_t port = COUNTED_RAILS - 1;
+        unsigned int seen = 0;
+        const struct rte_eth_rxtx_callback *callback = rte_eth_add_rx_callback(port, 0, observe_counted_endpoint, &seen);
+        assert(callback);
+        path_for(marker, directory, "tx.endpoint-done");
+        publish(directory, "rx.endpoint-ready", NULL, 0);
+        uint64_t deadline = rte_get_timer_cycles() + 4 * rte_get_timer_hz();
+        while (access(marker, F_OK) != 0) {
+            assert(rte_get_timer_cycles() < deadline);
+            assert(mrc_dpdk_progress_endpoint(context) == 0);
+        }
+        assert(seen == 3 && rte_eth_remove_rx_callback(port, 0, callback) == 0);
+        rte_free((void *)callback);
+    }
+    assert(mrc_dpdk_detach_endpoint(context) == 0);
+    printf("{\"role\":\"%s\",\"format\":\"counted\",\"endpoint_packets\":2,\"port\":%u}\n",
+           client ? "tx" : "rx", COUNTED_RAILS);
 }
 
 static void attach_srv6_qp(struct mrc_qp *qp, const struct mrc_dpdk_route *route,
@@ -3198,6 +3291,7 @@ int main(int argc, char **argv)
     }
 
     bool endpoint_shared = endpoint_ops && !strcmp(argv[4], "shared");
+    bool counted_endpoint = endpoint_ops && !strcmp(argv[4], "counted");
     struct address address = {0};
     struct ibv_context *verbs = open_verbs(&address, generated_stev || srv6 || endpoint_shared || last_hop_trim);
     if (!verbs) {
@@ -3209,7 +3303,7 @@ int main(int argc, char **argv)
     struct mrc_context *context = mrc_create_context(verbs, NULL);
     assert((!need_pd || pd) && context);
 
-    unsigned int rail_count = counted_route ? COUNTED_RAILS : DUPLEX_RAILS;
+    unsigned int rail_count = counted_route || counted_endpoint ? COUNTED_RAILS : DUPLEX_RAILS;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_for_ports(0, rail_count);
     assert(pool);
     for (unsigned int port = 0; port < rail_count; port++) {
@@ -3217,7 +3311,9 @@ int main(int argc, char **argv)
         assert(mrc_dpdk_open_port(port, pool, &local) == 0);
     }
 
-    if (endpoint_ops)
+    if (counted_endpoint)
+        run_counted_endpoint(client, directory, context, pool);
+    else if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
     else if (counted_route)
         run_counted_route(client, directory, &address, context, pd, pool);

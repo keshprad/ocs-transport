@@ -136,13 +136,14 @@ int mrc_abi_bind_mr(const struct mrc_context *context, struct mrc_provider_pd *p
 
 int mrc_abi_configure_addresses(struct mrc_endpoint_config *config, const union ibv_gid *local,
                                 const union ibv_gid *peer);
+int mrc_abi_validate_rails(const struct mrc_dpdk_rail *rails, unsigned int count);
 int mrc_abi_prepare_srv6_paths(const struct mrc_dpdk_srv6_path *paths,
                               struct mrc_endpoint_srv6_path *prepared, unsigned int count);
 
 /* Serialize shared DPDK queue I/O and route state. The dispatcher
  * never acquires context or QP locks. */
 extern pthread_mutex_t mrc_abi_dispatch_mutex;
-void mrc_abi_poll_endpoint_ports(const uint16_t ports[2]);
+void mrc_abi_poll_endpoint_ports(const struct mrc_endpoint_config *config);
 bool mrc_abi_dispatch_endpoint(uint16_t port, const struct mrc_wire_packet *packet,
                                const struct mrc_wire_srv6 *routing, uint64_t arrival_cycles);
 bool mrc_abi_qp_port_token_in_use(uint16_t token);

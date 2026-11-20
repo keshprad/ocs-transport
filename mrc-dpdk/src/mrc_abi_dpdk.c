@@ -309,17 +309,20 @@ static void poll_port(struct mrc_abi_route *route, uint16_t port)
     }
 }
 
-static void receive_ports(struct mrc_abi_route *route)
+static void poll_ports(struct mrc_abi_route *route, const struct mrc_endpoint_config *config)
 {
-    const struct mrc_endpoint_config *config = &node_direction(route)->config;
     for (unsigned int path = 0; path < mrc_endpoint_path_count(config); path++)
         poll_port(route, config->paths[path].port);
 }
 
-void mrc_abi_poll_endpoint_ports(const uint16_t ports[2])
+static void receive_ports(struct mrc_abi_route *route)
 {
-    for (unsigned int path = 0; path < PATH_COUNT; path++)
-        poll_port(NULL, ports[path]);
+    poll_ports(route, &node_direction(route)->config);
+}
+
+void mrc_abi_poll_endpoint_ports(const struct mrc_endpoint_config *config)
+{
+    poll_ports(NULL, config);
 }
 
 static bool same_node_peer(const struct mrc_endpoint_config *a, const struct mrc_endpoint_config *b)
@@ -583,26 +586,35 @@ static void free_route(struct mrc_abi_route *route)
     free(route);
 }
 
-MRC_PUBLIC int mrc_dpdk_attach_qp_rails(struct mrc_qp *qp, const struct mrc_dpdk_route_config *route)
+int mrc_abi_validate_rails(const struct mrc_dpdk_rail *rails, unsigned int count)
 {
-    if (!qp || !route || !route->pool || !route->rails || !route->rail_count ||
-        route->rail_count > MRC_EV_MAX_PATHS || route->trim_dscp > 63)
+    if (!rails || !count || count > MRC_EV_MAX_PATHS)
         return EINVAL;
-    for (unsigned int i = 0; i < route->rail_count; i++) {
+    for (unsigned int i = 0; i < count; i++) {
         for (unsigned int j = 0; j < i; j++) {
-            if (route->rails[j].port == route->rails[i].port)
+            if (rails[j].port == rails[i].port)
                 return EINVAL;
         }
     }
-    for (unsigned int i = 0; i < route->rail_count; i++) {
-        if (route->rails[i].port >= RTE_MAX_ETHPORTS || !rte_eth_dev_is_valid_port(route->rails[i].port))
+    for (unsigned int i = 0; i < count; i++) {
+        if (rails[i].port >= RTE_MAX_ETHPORTS || !rte_eth_dev_is_valid_port(rails[i].port))
             return ENODEV;
     }
+    return 0;
+}
+
+MRC_PUBLIC int mrc_dpdk_attach_qp_rails(struct mrc_qp *qp, const struct mrc_dpdk_route_config *route)
+{
+    if (!qp || !route || !route->pool || route->trim_dscp > 63)
+        return EINVAL;
+    int error = mrc_abi_validate_rails(route->rails, route->rail_count);
+    if (error)
+        return error;
 
     struct mrc_endpoint_srv6_path prepared[MRC_EV_MAX_PATHS];
     const struct mrc_endpoint_srv6_path *srv6 = NULL;
     if (route->srv6_paths) {
-        int error = mrc_abi_prepare_srv6_paths(route->srv6_paths, prepared, route->rail_count);
+        error = mrc_abi_prepare_srv6_paths(route->srv6_paths, prepared, route->rail_count);
         if (error)
             return error;
         srv6 = prepared;
@@ -611,7 +623,7 @@ MRC_PUBLIC int mrc_dpdk_attach_qp_rails(struct mrc_qp *qp, const struct mrc_dpdk
     bool tx = route->requester || route->bidirectional;
     bool rx = !route->requester || route->bidirectional;
     pthread_mutex_lock(&qp->mutex);
-    int error = validate_attachment(qp, tx, rx);
+    error = validate_attachment(qp, tx, rx);
     if (error)
         goto unlock;
     struct mrc_abi_route *object = calloc(1, sizeof(*object));

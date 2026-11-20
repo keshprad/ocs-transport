@@ -217,8 +217,10 @@ native events are available. [Linux uverbs event queues](https://github.com/torv
 
 ### Connectionless endpoint operations
 
-Use `mrc_dpdk_attach_endpoint()` to bind a controller context to two
-started DPDK ports and a peer. Supply the local and peer RoCEv2 GIDs,
+Use `mrc_dpdk_attach_endpoint_rails()` to bind a controller context to
+1 to 31 started DPDK ports and a peer. The two-rail
+`mrc_dpdk_attach_endpoint()` helper uses the same attachment path.
+Supply the local and peer RoCEv2 GIDs,
 the peer MAC on each rail, and the packet pool. Use IPv4-mapped GIDs
 for IPv4. Optionally supply per-rail SRv6 SIDs and return routes.
 The attachment can share the ports with public DPDK QPs.
@@ -229,7 +231,8 @@ distinct request IDs and a configured rail number for each request.
 An EV probe takes the UDP, STEV, or SRv6 EV from the request. The
 request DSCP is selectable and the response uses the Control class.
 Port Status requests and replies both use the Control class. The
-controller's Port Status mask uses bits 1 and 2 for the two rails.
+controller's 32-bit Port Status mask uses one-based rail numbers as bit
+positions, leaving bit 0 clear.
 The API reports replies in receive order, with the observed ingress
 rail and RTT. A timeout returns any replies that arrived before it.
 
@@ -495,13 +498,12 @@ files for each Spark, substituting its host number and snapshot directory.
 
 ```sh
 python3 tests/render_spark_cycle_units.py --host 04 \
-    --snapshot /opt/ocs-mrc/6a02243.H5ywnLiu --output-dir /tmp/spark-04-cycle-units
+    --snapshot /opt/ocs-mrc/0c53748.ZDc2j9 --output-dir /tmp/spark-04-cycle-units
 ```
 
-The existing snapshots are `/opt/ocs-mrc/6a02243.UZbqJcYi` on Spark-02,
-`/opt/ocs-mrc/6a02243.wLVmTv97` on Spark-03, and
-`/opt/ocs-mrc/6a02243.H5ywnLiu` on Spark-04. An administrator installs four
-units per Spark and permits passwordless `/usr/bin/systemctl start UNIT` and
+The installed cycle snapshot is `/opt/ocs-mrc/0c53748.ZDc2j9` on all
+three Sparks. An administrator installs four units per Spark and permits
+passwordless `/usr/bin/systemctl start UNIT` and
 `/usr/bin/systemctl stop UNIT` for those exact units. The four names are
 `ocs-mrc-cycle-rx-smoke.service`, `ocs-mrc-cycle-tx-smoke.service`,
 `ocs-mrc-cycle-rx-failover.service`, and `ocs-mrc-cycle-tx-failover.service`.
@@ -521,7 +523,7 @@ Run the test from Spark-04. Use the full revision of the installed snapshots
 and the corresponding detached test worktrees.
 
 ```sh
-revision=6a02243b88b8bac406a4877230cfc185f0c7fa7f
+revision=0c537484a96b15e51c9cfd82491de83d65d554f4
 python3 tests/check_spark_cycle.py --revision "$revision" --profile smoke --preflight-only
 python3 tests/check_spark_cycle.py --revision "$revision" --profile smoke
 python3 tests/check_spark_cycle.py --revision "$revision" --profile failover

@@ -109,6 +109,21 @@ struct mrc_dpdk_endpoint_route {
     uint16_t udp_port;
 };
 
+/* Counted connectionless route with 1 to 31 distinct rails. The controller
+ * uses a one-based 32-bit Port Status mask. Supply one optional SRv6
+ * path per rail. Attachment copies the route arrays. */
+struct mrc_dpdk_endpoint_route_config {
+    const struct mrc_dpdk_rail *rails;
+    unsigned int rail_count;
+    const struct mrc_dpdk_srv6_path *srv6_paths;
+    struct rte_mempool *pool;
+    union ibv_gid local_gid;
+    union ibv_gid peer_gid;
+    uint16_t pkey;
+    uint16_t peer_pkey;
+    uint16_t udp_port;
+};
+
 /* One connectionless route per context. Progress the endpoint to respond
  * to incoming requests. A blocking controller batch drives its own RX/TX.
  * The route can share DPDK queues with MRC QPs. Detach before stopping
@@ -116,6 +131,7 @@ struct mrc_dpdk_endpoint_route {
  * return zero or a positive errno. */
 int mrc_dpdk_attach_endpoint(struct mrc_context *context, const struct mrc_dpdk_endpoint_route *route,
                               const struct mrc_dpdk_srv6_path paths[2]);
+int mrc_dpdk_attach_endpoint_rails(struct mrc_context *context, const struct mrc_dpdk_endpoint_route_config *route);
 int mrc_dpdk_progress_endpoint(struct mrc_context *context);
 int mrc_dpdk_detach_endpoint(struct mrc_context *context);
 
