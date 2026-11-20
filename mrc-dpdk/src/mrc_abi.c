@@ -117,7 +117,7 @@ MRC_PUBLIC struct mrc_context *mrc_create_context(struct ibv_context *vcontext,
         errno = error;
         return NULL;
     }
-    error = mrc_abi_async_open(&context->async);
+    error = mrc_abi_async_open(&context->async, vcontext, device.phys_port_cnt);
     if (error) {
         pthread_mutex_destroy(&context->mutex);
         free(context);

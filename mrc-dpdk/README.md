@@ -146,6 +146,13 @@ Use `mrc_dpdk_get_async_fd()` to poll the queue or set nonblocking retrieval
 with `O_NONBLOCK`. An active QP that shares a failed CQ enters ERROR when
 its next query, post, or progress call observes the overrun.
 
+On Linux with uverbs asynchronous event allocation, the MRC context
+also delivers native device-fatal and port events through the same API
+and pollable FD. MRC allocates a dedicated event queue on the verbs
+command FD. The application retains its original libibverbs event queue.
+Kernel support and permission for this additional queue determine whether
+native events are available. [Linux uverbs event queues](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/core/uverbs_main.c)
+
 ### Connectionless endpoint operations
 
 Use `mrc_dpdk_attach_endpoint()` to bind a controller context to two

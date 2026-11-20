@@ -11,11 +11,27 @@
 #include <fcntl.h>
 #include <mrc_ctl.h>
 #include <poll.h>
+#include <rdma/ib_user_verbs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+enum { NO_ASYNC_OPEN_OVERRIDE = -1 };
+
+static int next_native_async_fd = NO_ASYNC_OPEN_OVERRIDE;
+
+int __real_mrc_verbs_async_open(const struct ibv_context *verbs);
+
+int __wrap_mrc_verbs_async_open(const struct ibv_context *verbs)
+{
+    if (next_native_async_fd == NO_ASYNC_OPEN_OVERRIDE)
+        return __real_mrc_verbs_async_open(verbs);
+    int fd = next_native_async_fd;
+    next_native_async_fd = NO_ASYNC_OPEN_OVERRIDE;
+    return fd;
+}
 
 static void transition_to_rts(struct mrc_provider_qp *qp)
 {
@@ -582,6 +598,147 @@ static void test_async_events(struct ibv_context *verbs)
     assert(ibv_dealloc_pd(pd) == 0);
 }
 
+static void send_native_async_event(int fd, enum ibv_event_type type, uint64_t element)
+{
+    const struct ib_uverbs_async_event_desc notice = { .event_type = type, .element = element };
+    assert(write(fd, &notice, sizeof(notice)) == sizeof(notice));
+}
+
+static void test_native_async_events(struct ibv_context *verbs)
+{
+    int pipe_fds[2];
+    assert(pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK) == 0);
+    next_native_async_fd = pipe_fds[0];
+    struct mrc_context *context = mrc_create_context(verbs, NULL);
+    assert(context && next_native_async_fd == NO_ASYNC_OPEN_OVERRIDE);
+    int fd;
+    assert(mrc_dpdk_get_async_fd(context, &fd) == 0 && fd != pipe_fds[0]);
+    int flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && !(flags & O_NONBLOCK));
+    expect_async_readiness(fd, false);
+
+    pthread_t getter;
+    struct async_call waiting = { .context = context, .result = -2 };
+    assert(pthread_create(&getter, NULL, run_async_call, &waiting) == 0);
+    assert(join_with_timeout(getter, 50) == ETIMEDOUT);
+    send_native_async_event(pipe_fds[1], IBV_EVENT_PORT_ACTIVE, 1);
+    assert(join_with_timeout(getter, 2000) == 0 && waiting.result == 0);
+    assert(waiting.event.event_type == IBV_EVENT_PORT_ACTIVE && waiting.event.element.port_num == 1);
+    mrc_ack_async_event(&waiting.event);
+    expect_async_readiness(fd, false);
+
+    assert(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    send_native_async_event(pipe_fds[1], IBV_EVENT_QP_FATAL, UINT64_MAX);
+    send_native_async_event(pipe_fds[1], IBV_EVENT_PORT_ERR, 0);
+    send_native_async_event(pipe_fds[1], IBV_EVENT_GID_CHANGE, UINT64_MAX);
+    expect_async_readiness(fd, true);
+    struct mrc_async_event event;
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+    expect_async_readiness(fd, false);
+
+    struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(cq);
+    send_native_async_event(pipe_fds[1], IBV_EVENT_PORT_ERR, 1);
+    overflow_cq(cq);
+    send_native_async_event(pipe_fds[1], IBV_EVENT_GID_CHANGE, 1);
+    const enum ibv_event_type port_events[] = { IBV_EVENT_PORT_ERR, IBV_EVENT_GID_CHANGE };
+    unsigned int port_event_count = 0;
+    bool saw_cq_error = false;
+    for (unsigned int i = 0; i < 3; i++) {
+        expect_async_readiness(fd, true);
+        assert(mrc_get_async_event(context, &event) == 0);
+        if (event.event_type == IBV_EVENT_CQ_ERR) {
+            assert(!saw_cq_error && event.element.cq == cq);
+            saw_cq_error = true;
+        } else {
+            assert(port_event_count < sizeof(port_events) / sizeof(port_events[0]));
+            assert(event.event_type == port_events[port_event_count] && event.element.port_num == 1);
+            port_event_count++;
+        }
+        mrc_ack_async_event(&event);
+    }
+    assert(saw_cq_error && port_event_count == 2);
+    assert(mrc_destroy_cq(cq) == 0);
+    expect_async_readiness(fd, false);
+
+    send_native_async_event(pipe_fds[1], IBV_EVENT_DEVICE_FATAL, 0);
+    expect_async_readiness(fd, true);
+    assert(mrc_get_async_event(context, &event) == 0 && event.event_type == IBV_EVENT_DEVICE_FATAL);
+    mrc_ack_async_event(&event);
+    assert(close(pipe_fds[1]) == 0);
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+    expect_async_readiness(fd, false);
+
+    cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(cq);
+    overflow_cq(cq);
+    expect_async_readiness(fd, true);
+    assert(mrc_get_async_event(context, &event) == 0);
+    assert(event.event_type == IBV_EVENT_CQ_ERR && event.element.cq == cq);
+    mrc_ack_async_event(&event);
+    expect_async_readiness(fd, false);
+    assert(mrc_destroy_cq(cq) == 0);
+    assert(mrc_destroy_context(context) == 0);
+    assert(fcntl(pipe_fds[0], F_GETFD) == -1 && errno == EBADF);
+
+    assert(pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK) == 0);
+    next_native_async_fd = pipe_fds[0];
+    context = mrc_create_context(verbs, NULL);
+    assert(context && next_native_async_fd == NO_ASYNC_OPEN_OVERRIDE);
+    assert(mrc_dpdk_get_async_fd(context, &fd) == 0);
+    flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    assert(close(pipe_fds[1]) == 0);
+    expect_async_readiness(fd, true);
+    assert(mrc_get_async_event(context, &event) == 0 && event.event_type == IBV_EVENT_DEVICE_FATAL);
+    mrc_ack_async_event(&event);
+    expect_async_readiness(fd, false);
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+    assert(mrc_destroy_context(context) == 0);
+}
+
+static void test_native_async_descriptor_ownership(struct ibv_context *verbs)
+{
+    int verbs_status_flags = fcntl(verbs->async_fd, F_GETFL);
+    int verbs_fd_flags = fcntl(verbs->async_fd, F_GETFD);
+    assert(verbs_status_flags >= 0 && verbs_fd_flags >= 0);
+    int probe = __real_mrc_verbs_async_open(verbs);
+    struct mrc_context *first = mrc_create_context(verbs, NULL);
+    struct mrc_context *second = mrc_create_context(verbs, NULL);
+    assert(first && second);
+    int fd;
+    assert(mrc_dpdk_get_async_fd(first, &fd) == 0);
+    int flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    assert(fcntl(verbs->async_fd, F_GETFL) == verbs_status_flags);
+    assert(fcntl(verbs->async_fd, F_GETFD) == verbs_fd_flags);
+
+    int first_native = first->async.native_fd;
+    int second_native = second->async.native_fd;
+    if (probe >= 0) {
+        assert(first_native >= 0 && second_native >= 0 && first_native != second_native);
+        assert(first_native != verbs->async_fd && second_native != verbs->async_fd);
+        assert(first_native != probe && second_native != probe);
+        int status = fcntl(first_native, F_GETFL);
+        int descriptor = fcntl(first_native, F_GETFD);
+        assert(status >= 0 && (status & O_NONBLOCK));
+        assert(descriptor >= 0 && (descriptor & FD_CLOEXEC));
+        assert(fcntl(first_native, F_SETFL, status & ~O_NONBLOCK) == 0);
+        int second_status = fcntl(second_native, F_GETFL);
+        assert(second_status >= 0 && (second_status & O_NONBLOCK));
+        assert(fcntl(first_native, F_SETFL, status) == 0);
+        assert(close(probe) == 0);
+    }
+    assert(mrc_destroy_context(first) == 0);
+    if (probe >= 0) {
+        assert(fcntl(first_native, F_GETFD) == -1 && errno == EBADF);
+        assert(fcntl(second_native, F_GETFD) >= 0);
+    }
+    assert(mrc_destroy_context(second) == 0);
+    assert(fcntl(verbs->async_fd, F_GETFL) == verbs_status_flags);
+    assert(fcntl(verbs->async_fd, F_GETFD) == verbs_fd_flags);
+}
+
 static void test_shared_cq_error(struct ibv_context *verbs)
 {
     struct mrc_context *context = mrc_create_context(verbs, NULL);
@@ -800,11 +957,17 @@ int main(void)
         fputs("The MRC ABI test needs an accessible libibverbs device.\n", stderr);
         return EXIT_FAILURE;
     }
+    test_native_async_descriptor_ownership(verbs);
     test_resources_and_completions(verbs);
     test_verbs_memory_binding(verbs);
     test_qp_hints(verbs);
     test_public_qp(verbs);
     test_async_events(verbs);
+    /* The provider queue also works on kernels without a native channel. */
+    next_native_async_fd = -EOPNOTSUPP;
+    test_async_events(verbs);
+    assert(next_native_async_fd == NO_ASYNC_OPEN_OVERRIDE);
+    test_native_async_events(verbs);
     test_shared_cq_error(verbs);
     test_ev_event_cq(verbs);
     assert(ibv_close_device(verbs) == 0);

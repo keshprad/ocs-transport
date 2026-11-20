@@ -38,6 +38,11 @@ struct mrc_abi_async_channel {
     struct mrc_abi_async_notice *head;
     struct mrc_abi_async_notice *tail;
     int fd;
+    int poll_fd;
+    int native_fd;
+    uint8_t port_count;
+    bool native_active;
+    bool native_fatal_seen;
 };
 
 struct mrc_abi_pd {
@@ -104,7 +109,8 @@ int mrc_abi_retain_context(struct mrc_context *context);
 void mrc_abi_release_context(struct mrc_context *context);
 int mrc_abi_hint_retain(struct mrc_context *context, struct mrc_qp_hint *hint);
 void mrc_abi_hint_release(struct mrc_qp_hint *hint);
-int mrc_abi_async_open(struct mrc_abi_async_channel *channel);
+int mrc_abi_async_open(struct mrc_abi_async_channel *channel, const struct ibv_context *verbs,
+                        uint8_t port_count);
 void mrc_abi_async_close(struct mrc_abi_async_channel *channel);
 int mrc_abi_async_prepare(struct mrc_abi_async_source *source);
 void mrc_abi_async_publish(struct mrc_abi_async_source *source, const struct mrc_async_event *event);

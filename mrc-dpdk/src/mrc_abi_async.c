@@ -1,9 +1,11 @@
 #include "mrc_abi.h"
+#include "mrc_verbs_async.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -14,8 +16,43 @@ struct mrc_abi_async_notice {
     struct mrc_async_event event;
 };
 
-int mrc_abi_async_open(struct mrc_abi_async_channel *channel)
+static int attach_native_channel(struct mrc_abi_async_channel *channel, const struct ibv_context *verbs)
 {
+    if (verbs->cmd_fd < 0 || verbs->async_fd < 0)
+        return 0;
+    /* With the default verbs event file installed, this opens an independent stream. */
+    int fd = mrc_verbs_async_open(verbs);
+    switch (fd) {
+    case -EINVAL:
+    case -ENOSYS:
+    case -ENOTTY:
+    case -EOPNOTSUPP:
+    case -EPROTONOSUPPORT:
+    case -EACCES:
+    case -EPERM:
+        return 0;
+    default:
+        if (fd < 0)
+            return -fd;
+        break;
+    }
+    channel->native_fd = fd;
+    channel->poll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (channel->poll_fd < 0)
+        return errno;
+    struct epoll_event readiness = { .events = EPOLLIN };
+    if (epoll_ctl(channel->poll_fd, EPOLL_CTL_ADD, channel->fd, &readiness) < 0 ||
+        epoll_ctl(channel->poll_fd, EPOLL_CTL_ADD, channel->native_fd, &readiness) < 0)
+        return errno;
+    channel->native_active = true;
+    return 0;
+}
+
+int mrc_abi_async_open(struct mrc_abi_async_channel *channel, const struct ibv_context *verbs,
+                       uint8_t port_count)
+{
+    channel->fd = channel->poll_fd = channel->native_fd = -1;
+    channel->port_count = port_count;
     int error = pthread_mutex_init(&channel->mutex, NULL);
     if (error)
         return error;
@@ -23,10 +60,10 @@ int mrc_abi_async_open(struct mrc_abi_async_channel *channel)
     if (error)
         goto destroy_mutex;
     channel->fd = eventfd(0, EFD_CLOEXEC);
-    if (channel->fd >= 0)
-        return 0;
-    error = errno;
-    pthread_cond_destroy(&channel->acked);
+    error = channel->fd < 0 ? errno : attach_native_channel(channel, verbs);
+    if (error)
+        mrc_abi_async_close(channel);
+    return error;
 
 destroy_mutex:
     pthread_mutex_destroy(&channel->mutex);
@@ -35,7 +72,12 @@ destroy_mutex:
 
 void mrc_abi_async_close(struct mrc_abi_async_channel *channel)
 {
-    close(channel->fd);
+    if (channel->poll_fd >= 0)
+        close(channel->poll_fd);
+    if (channel->native_fd >= 0)
+        close(channel->native_fd);
+    if (channel->fd >= 0)
+        close(channel->fd);
     pthread_cond_destroy(&channel->acked);
     pthread_mutex_destroy(&channel->mutex);
 }
@@ -132,20 +174,78 @@ static int take_notice(struct mrc_abi_async_channel *channel, struct mrc_async_e
     return error;
 }
 
+static bool native_port_event(enum ibv_event_type type)
+{
+    switch (type) {
+    case IBV_EVENT_PORT_ACTIVE:
+    case IBV_EVENT_PORT_ERR:
+    case IBV_EVENT_LID_CHANGE:
+    case IBV_EVENT_PKEY_CHANGE:
+    case IBV_EVENT_SM_CHANGE:
+    case IBV_EVENT_CLIENT_REREGISTER:
+    case IBV_EVENT_GID_CHANGE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int take_native_notice(struct mrc_abi_async_channel *channel, struct mrc_async_event *event)
+{
+    pthread_mutex_lock(&channel->mutex);
+    int error = EAGAIN;
+    while (channel->native_active) {
+        enum ibv_event_type type;
+        uint64_t element = 0;
+        int result = mrc_verbs_async_read(channel->native_fd, &type, &element);
+        if (result == -ENODEV || result == -ENXIO || result == -EIO) {
+            epoll_ctl(channel->poll_fd, EPOLL_CTL_DEL, channel->native_fd, NULL);
+            channel->native_active = false;
+            type = IBV_EVENT_DEVICE_FATAL;
+        } else if (result) {
+            error = -result;
+            break;
+        }
+
+        if (type == IBV_EVENT_DEVICE_FATAL) {
+            if (channel->native_fatal_seen)
+                continue;
+            channel->native_fatal_seen = true;
+            *event = (struct mrc_async_event){ .event_type = type };
+        } else if (native_port_event(type) && element && element <= channel->port_count) {
+            *event = (struct mrc_async_event){ .event_type = type, .element.port_num = (int)element };
+        } else {
+            continue;
+        }
+        error = 0;
+        break;
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    return error;
+}
+
+static int async_wait_fd(const struct mrc_abi_async_channel *channel)
+{
+    return channel->poll_fd >= 0 ? channel->poll_fd : channel->fd;
+}
+
 static int wait_notice(struct mrc_abi_async_channel *channel, struct mrc_async_event *event)
 {
+    int fd = async_wait_fd(channel);
     for (;;) {
         int error = take_notice(channel, event);
+        if (error == EAGAIN)
+            error = take_native_notice(channel, event);
         if (error != EAGAIN)
             return error;
 
-        int flags = fcntl(channel->fd, F_GETFL);
+        int flags = fcntl(fd, F_GETFL);
         if (flags < 0)
             return errno;
         if (flags & O_NONBLOCK)
             return EAGAIN;
 
-        struct pollfd wait = { .fd = channel->fd, .events = POLLIN };
+        struct pollfd wait = { .fd = fd, .events = POLLIN };
         if (poll(&wait, 1, -1) < 0)
             return errno;
         if (!(wait.revents & POLLIN))
@@ -186,6 +286,7 @@ MRC_PUBLIC void mrc_ack_async_event(struct mrc_async_event *event)
         source = event->element.qp ? &event->element.qp->async : NULL;
         break;
     default:
+        /* Native port and device records carry no MRC object reference. */
         return;
     }
     if (source) {
@@ -201,6 +302,6 @@ MRC_PUBLIC int mrc_dpdk_get_async_fd(struct mrc_context *context, int *fd)
 {
     if (!context || !fd)
         return EINVAL;
-    *fd = context->async.fd;
+    *fd = async_wait_fd(&context->async);
     return 0;
 }
