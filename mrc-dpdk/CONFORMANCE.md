@@ -89,7 +89,11 @@ including traffic on rail 7 and isolation of that rail by deny mask
 observes data on all eight rails. It also checks empty, oversized, and
 duplicate port lists. The legacy QP attachment APIs use the same
 implementation. Use `--rails-only` for the standalone cases or
-`--counted-rails-only` for the public case.
+`--counted-rails-only` for the public cases. For §9.3.2, the backpressure
+case rejects WRITE submissions on multiple queues. The requester finds
+an eligible queue in the same poll, then uses a different queue after
+the receiver discards one packet. The receiver checks both rail indices,
+the retransmit bit, the WRITEIMM completion, and the full buffer.
 The controller test generates eight EVs, grows the offline profile to
 32 entries, then shrinks it to four. Each size is brought online and
 queried to check the EV value and port order. The counted connectionless

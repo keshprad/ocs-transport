@@ -2250,24 +2250,77 @@ static void run_single_write(bool requester, const char *directory, const struct
     deregister_memory(context, mr);
 }
 
+enum {
+    BACKPRESSURE_FIRST_RAIL = COUNTED_RAILS - 2,
+    BACKPRESSURE_RETRY_RAIL = COUNTED_RAILS - 3,
+};
+
+struct counted_rail_witness {
+    uint32_t writes;
+    uint32_t retries;
+    uint32_t write_rejections;
+    uint32_t retry_rejections;
+    bool backpressure;
+    bool dropped;
+};
+
+static uint16_t backpressure_writes(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                     uint16_t count, void *argument)
+{
+    (void)queue;
+    struct counted_rail_witness *observed = argument;
+    assert(count == 1);
+    uint8_t prefix[14 + 40 + WIRE_UDP_LEN + WIRE_BTH_LEN];
+    struct observed_udp udp = read_udp(packets[0], prefix, sizeof(prefix));
+    const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+    if (bth[0] < WIRE_WRITE_FIRST || bth[0] > WIRE_WRITE_ONLY_IMM)
+        return count;
+    uint32_t rail = UINT32_C(1) << port;
+    if (bth[8] & 0x20) {
+        if (port == BACKPRESSURE_RETRY_RAIL)
+            observed->retries |= rail;
+        else
+            observed->retry_rejections |= rail;
+        return port == BACKPRESSURE_RETRY_RAIL;
+    }
+    if (port == BACKPRESSURE_FIRST_RAIL)
+        observed->writes |= rail;
+    else
+        observed->write_rejections |= rail;
+    return port == BACKPRESSURE_FIRST_RAIL;
+}
+
 static uint16_t observe_counted_rails(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
                                      uint16_t count, uint16_t capacity, void *argument)
 {
     (void)queue;
     (void)capacity;
-    uint32_t *rails = argument;
+    struct counted_rail_witness *observed = argument;
+    uint16_t kept = 0;
     for (uint16_t i = 0; i < count; i++) {
-        uint8_t prefix[14 + 40 + 8 + WIRE_BTH_LEN];
+        uint8_t prefix[14 + 40 + WIRE_UDP_LEN + WIRE_BTH_LEN];
         struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
-        uint8_t opcode = udp.header[WIRE_UDP_LEN];
-        if (opcode >= WIRE_WRITE_FIRST && opcode <= WIRE_WRITE_ONLY_IMM)
-            *rails |= UINT32_C(1) << port;
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (bth[0] >= WIRE_WRITE_FIRST && bth[0] <= WIRE_WRITE_ONLY_IMM) {
+            if (bth[8] & 0x20) {
+                observed->retries |= UINT32_C(1) << port;
+            } else {
+                if (observed->backpressure && !observed->dropped && wire_be24(bth + 9) == SEND_PSN) {
+                    observed->dropped = true;
+                    rte_pktmbuf_free(packets[i]);
+                    continue;
+                }
+                observed->writes |= UINT32_C(1) << port;
+            }
+        }
+        packets[kept++] = packets[i];
     }
-    return count;
+    return kept;
 }
 
 static void run_counted_route(bool requester, const char *directory, const struct address *address,
-                              struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool)
+                              struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                              bool backpressure)
 {
     struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
     assert(cq);
@@ -2309,13 +2362,19 @@ static void run_counted_route(bool requester, const char *directory, const struc
     assert(mrc_dpdk_attach_qp_rails(qp, &route) == 0);
     prepare_memif_rails(COUNTED_RAILS);
 
-    uint32_t observed = 0;
+    struct counted_rail_witness observed = { .backpressure = backpressure };
     const struct rte_eth_rxtx_callback *callbacks[COUNTED_RAILS];
     char ready[PATH_MAX];
     if (requester) {
         publish(directory, "tx.links-ready", NULL, 0);
         path_for(ready, directory, "rx.ready");
         wait_for(ready);
+        if (backpressure) {
+            for (uint16_t port = 0; port < COUNTED_RAILS; port++) {
+                callbacks[port] = rte_eth_add_tx_callback(port, 0, backpressure_writes, &observed);
+                assert(callbacks[port]);
+            }
+        }
         struct ibv_sge sg = { .addr = (uintptr_t)data, .length = sizeof(data), .lkey = mr->lkey };
         struct ibv_send_wr wr = {
             .wr_id = 70, .opcode = IBV_WR_RDMA_WRITE_WITH_IMM, .send_flags = IBV_SEND_SIGNALED,
@@ -2324,6 +2383,10 @@ static void run_counted_route(bool requester, const char *directory, const struc
         };
         struct ibv_send_wr *bad;
         assert(mrc_post_send(qp, &wr, &bad) == 0 && !bad);
+        if (backpressure) {
+            assert(mrc_dpdk_progress_qp(qp) == 0);
+            assert(observed.writes && __builtin_popcount(observed.write_rejections) >= 2);
+        }
     } else {
         path_for(ready, directory, "tx.links-ready");
         wait_for(ready);
@@ -2348,11 +2411,23 @@ static void run_counted_route(bool requester, const char *directory, const struc
     assert(completions == 1 && wc.qp_num == local.qpn && wc.status == IBV_WC_SUCCESS);
     if (requester) {
         assert(wc.wr_id == 70 && wc.opcode == IBV_WC_RDMA_WRITE);
+        if (backpressure) {
+            assert(__builtin_popcount(observed.retry_rejections) >= 2);
+            for (uint16_t port = 0; port < COUNTED_RAILS; port++) {
+                assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
+                rte_free((void *)callbacks[port]);
+            }
+        }
         publish(directory, "tx.done", NULL, 0);
     } else {
         assert(wc.wr_id == 81 && wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM && wc.byte_len == sizeof(data) &&
                (wc.wc_flags & IBV_WC_WITH_IMM) && ntohl(wc.imm_data) == FIRST_IMMEDIATE);
-        assert(observed == (UINT32_C(1) << COUNTED_RAILS) - 1);
+        if (backpressure) {
+            assert(observed.dropped && observed.writes == (UINT32_C(1) << BACKPRESSURE_FIRST_RAIL) &&
+                   observed.retries == (UINT32_C(1) << BACKPRESSURE_RETRY_RAIL));
+        } else {
+            assert((observed.writes | observed.retries) == (UINT32_C(1) << COUNTED_RAILS) - 1);
+        }
         for (size_t i = 0; i < sizeof(data); i++)
             assert(data[i] == pattern(i));
         path_for(ready, directory, "tx.done");
@@ -2365,8 +2440,10 @@ static void run_counted_route(bool requester, const char *directory, const struc
     assert(mrc_poll_cq(cq, 1, &wc) == 0);
     assert(mrc_destroy_qp(qp) == 0 && mrc_destroy_cq(cq) == 0);
     deregister_memory(context, mr);
-    printf("{\"role\":\"%s\",\"qpn\":%u,\"bytes\":%u,\"observed_rails\":%u}\n",
-           requester ? "tx" : "rx", local.qpn, (unsigned int)sizeof(data), observed);
+    printf("{\"role\":\"%s\",\"qpn\":%u,\"bytes\":%zu,\"observed_rails\":%u,\"retry_rails\":%u,"
+           "\"write_rejections\":%u,\"retry_rejections\":%u}\n",
+           requester ? "tx" : "rx", local.qpn, sizeof(data), observed.writes | observed.retries,
+           observed.retries, observed.write_rejections, observed.retry_rejections);
 }
 
 struct duplex_qp {
@@ -3256,7 +3333,8 @@ int main(int argc, char **argv)
     bool explicit_srv6 = strcmp(argv[3], "explicit_ev_srv6") == 0;
     bool generated_srv6 = strcmp(argv[3], "generated_ev_srv6_srh") == 0;
     bool srv6 = explicit_srv6 || generated_srv6 || srv6_transit || strcmp(argv[3], "srv6") == 0;
-    bool counted_route = strcmp(argv[3], "counted_route") == 0;
+    bool backpressure = strcmp(argv[3], "rail_backpressure") == 0;
+    bool counted_route = backpressure || strcmp(argv[3], "counted_route") == 0;
     bool ev_profile = generated_ev || explicit_srv6 || generated_srv6 || strcmp(argv[3], "ev_profile") == 0;
     enum simplex_wire_mode wire_mode = SIMPLEX_WIRE_NONE;
     if (inline_mode)
@@ -3316,7 +3394,7 @@ int main(int argc, char **argv)
     else if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
     else if (counted_route)
-        run_counted_route(client, directory, &address, context, pd, pool);
+        run_counted_route(client, directory, &address, context, pd, pool, backpressure);
     else if (mpr_updates) {
         enum single_write_case scenario = dynamic_mpr_rts ? DYNAMIC_MPR_RTS : dynamic_mpr ? DYNAMIC_MPR : STATIC_MPR;
         run_single_write(client, directory, &address, context, pd, pool, scenario);

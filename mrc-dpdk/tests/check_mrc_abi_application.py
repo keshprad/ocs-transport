@@ -126,7 +126,7 @@ def main():
     focused.add_argument("--pkey-port-status-only", action="store_true",
                          help="Run only the shared connected P_Key Port Status case")
     focused.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
-    focused.add_argument("--counted-rails-only", action="store_true", help="Run only the counted rail attachment case")
+    focused.add_argument("--counted-rails-only", action="store_true", help="Run only the eight-rail QP cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -188,15 +188,17 @@ def main():
             print(json.dumps({"case": f"public_qp_pmtu_{pmtu}", "tx": tx, "rx": rx}))
 
     def check_counted_route():
-        def command(role, cpu, directory):
-            return eal_args(binary, role, cpu, directory, rail_count=8) + [
-                "--", role, str(directory), "counted_route",
-            ]
+        for mode, rails, case in (("counted_route", 0xFF, "eight_rails"),
+                                  ("rail_backpressure", 0x60, "rail_backpressure")):
+            def command(role, cpu, directory):
+                return eal_args(binary, role, cpu, directory, rail_count=8) + [
+                    "--", role, str(directory), mode,
+                ]
 
-        tx, rx, _ = run_pair(command, rail_count=8)
-        require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 8193 and rx["observed_rails"] == 0xFF,
-                f"Unexpected eight-rail QP result: {tx}, {rx}")
-        print(json.dumps({"case": "public_qp_eight_rails", "tx": tx, "rx": rx}))
+            tx, rx, _ = run_pair(command, rail_count=8)
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 8193 and rx["observed_rails"] == rails,
+                    f"Unexpected eight-rail QP result: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{case}", "tx": tx, "rx": rx}))
 
     if args.last_hop_trim_only or args.service_level_dscp_only:
         check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)

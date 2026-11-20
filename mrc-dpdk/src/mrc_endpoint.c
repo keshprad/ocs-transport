@@ -88,7 +88,6 @@ struct mrc_requester {
     struct send_record metadata[WINDOW];
     struct mrc_ev_profile ev;
     struct mrc_mpr mpr;
-    uint64_t blocked_since[MRC_EV_MAX_PATHS];
     uint32_t next;
     int32_t highest_sacked;
     uint16_t probe_id;
@@ -763,6 +762,28 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     return 0;
 }
 
+static int send_on_available_rail(struct mrc_requester *sender, uint32_t index, bool retry,
+                                   uint32_t avoid, uint64_t now, uint32_t *busy_rails)
+{
+    uint32_t available = available_paths(sender, now);
+    int picked;
+    while ((picked = mrc_ev_pick(&sender->ev, available & ~*busy_rails, avoid, now)) >= 0) {
+        unsigned int path = (unsigned int)picked;
+        int result = send_write(&sender->transfer, sender, sender->counts, path, index, retry);
+        if (result == -EAGAIN) {
+            /* Retry this queue on the next poll. Local TX backpressure
+             * provides no evidence that the EV cannot reach the peer. */
+            *busy_rails |= UINT32_C(1) << path;
+            continue;
+        }
+        if (result)
+            return result;
+        mrc_ev_sent(&sender->ev, path);
+        return picked;
+    }
+    return -EAGAIN;
+}
+
 static bool retire_redundant_attempt(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                                       uint32_t index)
 {
@@ -1061,7 +1082,8 @@ static int arm_retry_timer(const struct mrc_endpoint_config *transfer, struct se
 }
 
 static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
-                             struct mrc_endpoint_counters *counts, uint32_t first, uint64_t now)
+                             struct mrc_endpoint_counters *counts, uint32_t first, uint64_t now,
+                             uint32_t *busy_rails)
 {
     for (uint32_t index = first; index < sender->next; index++) {
         uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
@@ -1101,20 +1123,11 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
             packet->sent_at >= sender->ev.paths[record->path].changed_at)
             mrc_ev_timeout(&sender->ev, record->path, now);
 
-        uint32_t available = available_paths(sender, now);
         uint32_t avoid = UINT32_C(1) << record->path;
-        int picked = mrc_ev_pick(&sender->ev, available, avoid, now);
-        int sent = -EAGAIN;
-        if (picked >= 0 && mrc_cc_can_send(&sender->cc, nominal_at(transfer, index))) {
-            sent = send_write(transfer, sender, counts, (unsigned int)picked, index, true);
-            if (sent == -EAGAIN) {
-                available &= ~(UINT32_C(1) << picked);
-                picked = mrc_ev_pick(&sender->ev, available, avoid, now);
-                if (picked >= 0)
-                    sent = send_write(transfer, sender, counts, (unsigned int)picked, index, true);
-            }
-        }
-        if (sent == -EAGAIN) {
+        int picked = -EAGAIN;
+        if (mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
+            picked = send_on_available_rail(sender, index, true, avoid, now, busy_rails);
+        if (picked == -EAGAIN) {
             /* Keep the retry eligible while waiting for a path or TX room.
              * An expired wait uses a retry slot without sending a packet. */
             if (!waiting || expired) {
@@ -1125,10 +1138,9 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
             }
             continue;
         }
-        if (sent)
-            return sent;
+        if (picked < 0)
+            return picked;
         unsigned int path = (unsigned int)picked;
-        mrc_ev_sent(&sender->ev, path);
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
         /* Section 7.4.4 uses the base timer for a NACK-driven transmission. */
@@ -1744,8 +1756,9 @@ static int requester_step(struct mrc_requester *sender)
                 counts->transport_acks, counts->retries[0], counts->retries[1], counts->dropped);
         return -ETIMEDOUT;
     }
+    uint32_t busy_rails = 0;
     if (now >= sender->next_retry_scan) {
-        result = retry_due_packets(transfer, sender, counts, first, now);
+        result = retry_due_packets(transfer, sender, counts, first, now, &busy_rails);
         if (result)
             return result;
         sender->next_retry_scan = now + transfer->initial_rto / 32 + 1;
@@ -1782,27 +1795,16 @@ static int requester_step(struct mrc_requester *sender)
         if ((work->with_immediate && wimm_inflight >= transfer->max_wimm_inflight) ||
             !mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
             break;
-        int picked = mrc_ev_pick(&sender->ev, available_paths(sender, now), 0, now);
+        int picked = send_on_available_rail(sender, index, false, 0, now, &busy_rails);
+        if (picked == -EAGAIN)
+            break;
         if (picked < 0)
-            break;
-        unsigned int path = (unsigned int)picked;
-        result = send_write(transfer, sender, counts, path, index, false);
-        if (result == -EAGAIN) {
-            if (!sender->blocked_since[path])
-                sender->blocked_since[path] = now;
-            if (now - sender->blocked_since[path] >= transfer->initial_rto)
-                mrc_ev_timeout(&sender->ev, path, now);
-            break;
-        }
-        if (result)
-            return result;
-        sender->blocked_since[path] = 0;
-        mrc_ev_sent(&sender->ev, path);
+            return picked;
         if (!mrc_tx_track(&sender->qp, psn, now))
             return -EPROTO;
         sender->metadata[index % WINDOW] = (struct send_record){
             .retry_deadline = now + transfer->initial_rto,
-            .path = path, .counted_inflight = true,
+            .path = (unsigned int)picked, .counted_inflight = true,
         };
         sender->next++;
         sender->scheduled_packets++;

@@ -133,6 +133,9 @@ An endpoint announces the current mask on reachable rails when it changes
 and refreshes it about every 250 ms. A peer report restricts path selection
 for one second. When it expires, the requester resumes path selection
 using its local link and EV state.
+If a TX queue declines a WRITE or retransmission, the requester tries
+the other eligible rails during the same poll. It considers that queue
+again on the next poll.
 
 Set the QP's service level in `ibv_qp_attr.ah_attr.sl` with `IBV_QP_AV`.
 Use `mrc_dpdk_set_sl_dscp(context, sl, data_dscp, retry_dscp)` to
