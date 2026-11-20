@@ -53,6 +53,12 @@ checks creation and query attributes, rejection of a READ flag, and
 linked receive posting that preserves the valid prefix on error.
 [OCP QP example](https://github.com/opencomputeproject/OCP-Multipath-Reliable-Connection/blob/main/examples/mrc_qp.md)
 
+For §7.5.2, the independent replay resends a buffered middle segment
+with an ACK request and then fills the preceding gap across PSN wrap.
+The responder emits a cumulative SACK before processing the final segment
+and completes the WRITEIMM once. The replay covers IPv4, IPv6, and
+preserved SRv6 with and without a final SRH.
+
 For §7.5.5.1, the public memif case selects SL 7 with `IBV_QP_AV` and
 observes DSCP 26 for the initial WRITEIMM and reliability probes, DSCP 34
 for the retry, and DSCP 48 for SACK, NACK, and Transport ACK. A different

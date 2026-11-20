@@ -305,7 +305,8 @@ def check_responses(replay, output_paths, outside, trim_sizes):
 
 
 @contextmanager
-def run_capture(binary, replay, requests, *, trim=False, last_hop=False, service_time=False):
+def run_capture(binary, replay, requests, *, work="13,1025@0xfec01234", trim=False,
+                last_hop=False, service_time=False):
     with tempfile.TemporaryDirectory(prefix="mrc-pcap-") as temp:
         directory = Path(temp)
         incoming = [directory / f"rx{path}.pcap" for path in range(2)]
@@ -317,7 +318,7 @@ def run_capture(binary, replay, requests, *, trim=False, last_hop=False, service
                    f"--file-prefix={directory.name}", "-m", "64"]
         for path in range(2):
             command.append(f"--vdev=net_pcap{path},rx_pcap={incoming[path]},tx_pcap={outgoing[path]}")
-        command += ["--", "rx", "13,1025@0xfec01234", replay.local_ip, replay.peer_ip,
+        command += ["--", "rx", work, replay.local_ip, replay.peer_ip,
                     "0", PEER_MACS[0].hex(":"), "1", PEER_MACS[1].hex(":"),
                     "--initial-psn", str(INITIAL_PSN), "--requestor-qpn", hex(REQUESTOR),
                     "--responder-qpn", hex(RESPONDER), "--p-key", hex(PKEY),
@@ -353,6 +354,33 @@ def run_replay(binary, replay):
                 f"Unexpected {replay.name} placement or error counters: {counters}\n{result.stderr}")
         check_responses(replay, outgoing, outside, trim_sizes)
         print(f"Independent {replay.name} packet replay passed placement, SACK, AETH, PETH, and both trim NACKs")
+
+
+def check_retransmitted_ack_request(binary, replay):
+    data = bytes((offset ^ (offset >> 8)) & 0xFF for offset in range(2049))
+    first = write_request(replay, 0, 0xC6, INITIAL_PSN, 1, 1, 0, len(data),
+                          data[:1024], flags=0)
+    middle = write_request(replay, 0, 0xC7, 0, 1, 1, 1024, len(data),
+                           data[1024:2048], flags=0)
+    middle_retry = write_request(replay, 0, 0xC7, 0, 1, 1, 1024, len(data),
+                                 data[1024:2048], flags=0xA0)
+    tail = write_request(replay, 0, 0xC9, 1, 1, 1, 2048, len(data),
+                         data[2048:], 0xFEC01234)
+    # One capture keeps the order fixed. The unmarked first segment fills
+    # the gap before the tail arrives to trigger write completion.
+    requests = ([middle, middle_retry, first, tail], [])
+    with run_capture(binary, replay, requests, work="2049@0xfec01234") as (result, outgoing):
+        require(result.returncode == 0, f"pcap endpoint failed\n{result.stdout}\n{result.stderr}")
+        counters = json.loads(result.stdout.strip().splitlines()[-1])
+        require(counters["received"] == [3, 0] and counters["duplicates"] == 1
+                and counters["immediate_completions"] == 1,
+                f"Unexpected {replay.name} placement or completion: {counters}")
+        sacks = [(packet.bth.psn, struct.unpack_from("!h", packet.body, 2)[0])
+                 for frame in read_capture(outgoing[0])
+                 if (packet := decode_response(replay, 0, frame)).bth.opcode == 0xDC]
+        require(sacks == [(INITIAL_PSN - 1, 2), (0, -1), (1, 0)],
+                f"Expected a cumulative SACK after filling the gap before the AR PSN: {sacks}")
+        print(f"Independent {replay.name} replay preserved the retransmitted ACK request")
 
 
 def check_service_time(binary, replay):
@@ -453,6 +481,7 @@ def main():
     require(binary.is_file(), f"Build mrc_write first: {binary}")
     for replay in REPLAYS:
         run_replay(binary, replay)
+        check_retransmitted_ack_request(binary, replay)
         check_reserved_opcode(binary, replay)
         check_service_time(binary, replay)
 

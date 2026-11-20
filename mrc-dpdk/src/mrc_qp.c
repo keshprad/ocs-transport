@@ -76,10 +76,9 @@ enum mrc_rx_disposition mrc_rx_record(struct mrc_rx_qp *qp, uint32_t psn,
         return disposition;
 
     uint32_t old_cack = qp->cack_psn;
+    int32_t offset = mrc_psn_delta(psn, mrc_psn_add(old_cack, 1));
     if (disposition == MRC_RX_NEW) {
-        unsigned int offset = (unsigned int)mrc_psn_delta(
-            psn, mrc_psn_add(qp->cack_psn, 1));
-        uint32_t index = (qp->first_index + offset) % qp->window;
+        uint32_t index = (qp->first_index + (uint32_t)offset) % qp->window;
         qp->slots[index] = RECEIVED | ((flags & MRC_RX_AR) ? AR_PENDING : 0);
         qp->ooo_count++;
         if (mrc_psn_delta(psn, qp->max_rcv_psn) > 0)
@@ -95,6 +94,10 @@ enum mrc_rx_disposition mrc_rx_record(struct mrc_rx_qp *qp, uint32_t psn,
                 qp->contiguous_history++;
             qp->ooo_count--;
         }
+    } else if (offset >= 0 && (flags & MRC_RX_AR)) {
+        /* A retry can request an ACK for an already tracked PSN beyond a gap. */
+        uint32_t index = (qp->first_index + (uint32_t)offset) % qp->window;
+        qp->slots[index] |= AR_PENDING;
     }
 
     qp->sack_trigger_count += payload_bytes > MIN_ACK_PACKET_SIZE

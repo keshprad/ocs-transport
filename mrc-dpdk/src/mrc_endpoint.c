@@ -1300,6 +1300,10 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
 
     uint32_t psn = packet->bth.psn;
     const struct mrc_wire_write *write = &packet->body.write;
+    unsigned int flags = (packet->bth.ack_request ? MRC_RX_AR : 0) |
+                         (packet->bth.retransmit ? MRC_RX_RTX : 0) |
+                         (packet_ecn(packet) == 3 ? MRC_RX_ECN : 0);
+    bool sack_due;
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, psn);
     if (disposition == MRC_RX_OUTSIDE_WINDOW) {
         send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
@@ -1308,6 +1312,7 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     }
     if (disposition == MRC_RX_DUPLICATE) {
         counts->duplicates++;
+        mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags, SACK_THRESHOLD, &sack_due);
         send_sack(transfer, receiver, counts, path, packet, false, arrival_cycles);
         send_ack(transfer, counts, path, receiver->qp.cack_psn, ACK_SYNDROME,
                  mrc_wr_ack_msn(&receiver->wr));
@@ -1336,10 +1341,6 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
     if (distance > 0 && (uint32_t)distance > counts->reorder_max)
         counts->reorder_max = (uint32_t)distance;
 
-    unsigned int flags = (packet->bth.ack_request ? MRC_RX_AR : 0) |
-                         (packet->bth.retransmit ? MRC_RX_RTX : 0) |
-                         (packet_ecn(packet) == 3 ? MRC_RX_ECN : 0);
-    bool sack_due;
     if (mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags,
                       SACK_THRESHOLD, &sack_due) != MRC_RX_NEW)
         return reject_write(transfer, receiver, counts, path, packet, MRC_WR_QP_ERROR, psn, arrival_cycles);
