@@ -5,6 +5,7 @@
 #include "mrc_ev.h"
 #include "mrc_ev_event_io.h"
 #include "mrc_mpr.h"
+#include "mrc_port_netlink.h"
 #include "mrc_qp.h"
 #include "mrc_wr.h"
 
@@ -613,24 +614,44 @@ static bool next_port_status_token(const struct mrc_endpoint_config *transfer, s
     return false;
 }
 
+static int query_path_link(uint16_t port, uint32_t af_packet_ifindex, bool *up)
+{
+    if (af_packet_ifindex)
+        return mrc_port_netlink_link_up(af_packet_ifindex, up);
+    struct rte_eth_link link;
+    int result = rte_eth_link_get_nowait(port, &link);
+    if (!result)
+        *up = link.link_status != RTE_ETH_LINK_DOWN;
+    return result;
+}
+
 static void poll_port_status(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                              uint64_t now)
 {
     if (now < status->next_poll)
         return;
-    if (!status->fast_poll_until)
+    const unsigned int paths = mrc_endpoint_path_count(transfer);
+    if (!status->fast_poll_until) {
         status->fast_poll_until = now + transfer->hz / 50;
+        /* The AF_PACKET PMD leaves its ethdev link status unchanged
+         * when the attached Linux interface gains or loses carrier. */
+        for (unsigned int i = 0; i < paths; i++) {
+            struct rte_eth_dev_info info;
+            if (!rte_eth_dev_info_get(transfer->paths[i].port, &info) &&
+                info.driver_name && !strcmp(info.driver_name, "net_af_packet"))
+                status->af_packet_ifindex[i] = info.if_index;
+        }
+    }
     bool connecting = now < status->fast_poll_until || !status->local_ports;
     status->next_poll = now + transfer->hz / (connecting ? 1000 : 20);
 
-    const unsigned int paths = mrc_endpoint_path_count(transfer);
     uint32_t active = status->local_ports, down = status->local_down;
     for (unsigned int i = 0; i < paths; i++) {
         uint32_t bit = UINT32_C(1) << i;
-        struct rte_eth_link link;
-        if (rte_eth_link_get_nowait(transfer->paths[i].port, &link))
+        bool up;
+        if (query_path_link(transfer->paths[i].port, status->af_packet_ifindex[i], &up))
             continue;
-        if (link.link_status) {
+        if (up) {
             active |= bit;
             down &= ~bit;
         } else {

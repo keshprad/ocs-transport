@@ -25,6 +25,7 @@ struct mrc_endpoint_rx_packet {
 };
 
 struct mrc_endpoint_node {
+    uint32_t af_packet_ifindex[MRC_EV_MAX_PATHS];
     uint32_t local_ports;
     uint32_t local_down;
     uint32_t peer_ports;

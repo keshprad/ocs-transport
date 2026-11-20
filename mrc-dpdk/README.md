@@ -625,6 +625,7 @@ make mrc_write MRC_INCLUDE_DIR=/path/to/ocp/headers tests/test_mrc_ctl_abi
 unshare -Urn python3 tests/check_mrc_srv6_fabric.py
 unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault ecn
 unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault trim
+unshare -Urn python3 tests/check_mrc_srv6_fabric.py --fault link
 ```
 
 Use `--af-packet-driver /path/to/librte_net_af_packet.so.24` for a
@@ -635,6 +636,11 @@ The test checks SRH advancement on both rails, terminal decapsulation
 on one rail, WRITEIMM completion and payload, and a live Dynamic MPR
 update. The ECN case marks the outer IPv6 header in the kernel. The trim
 case forwards sender-injected trims and checks alternate-rail recovery.
+The link case uses nftables and tc netem to observe and pace a 4 MiB
+transfer. It brings one sender interface down and back up, checks the
+Port Status masks on the surviving rail, and verifies that both rails
+forward traffic after restoration. For AF_PACKET ports, the endpoint
+reads the Linux interface's administrative and carrier flags.
 
 ## Behavioral parity with the emulator
 

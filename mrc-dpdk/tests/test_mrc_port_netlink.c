@@ -32,6 +32,12 @@ static void expect_admin_state(const char *name, bool expected)
     assert(((interface_flags(name) & IFF_UP) != 0) == expected);
 }
 
+static void expect_carrier(unsigned int index, bool expected)
+{
+    bool up = !expected;
+    assert(mrc_port_netlink_link_up(index, &up) == 0 && up == expected);
+}
+
 static void set_from_child(unsigned int index, bool enable)
 {
     pid_t child = fork();
@@ -69,17 +75,24 @@ static void test_veth(void)
     set_from_child(first_index, true);
     expect_admin_state(first, true);
     expect_admin_state(second, false);
+    expect_carrier(first_index, false);
     assert(mrc_port_netlink_set(second_index, true) == 0);
     expect_admin_state(second, true);
+    expect_carrier(first_index, true);
+    expect_carrier(second_index, true);
 
     set_from_child(first_index, false);
     expect_admin_state(first, false);
     expect_admin_state(second, true);
+    expect_carrier(first_index, false);
+    expect_carrier(second_index, false);
     assert((interface_flags(first) & stable_flags) == first_flags);
     assert((interface_flags(second) & stable_flags) == second_flags);
     assert(mrc_port_netlink_set(first_index, true) == 0);
     expect_admin_state(first, true);
     expect_admin_state(second, true);
+    expect_carrier(first_index, true);
+    expect_carrier(second_index, true);
     puts("Isolated veth port administration passed across processes");
 }
 
@@ -87,6 +100,7 @@ int main(int argc, char **argv)
 {
     bool enabled;
     assert(mrc_port_netlink_query(0, &enabled) == -EINVAL);
+    assert(mrc_port_netlink_link_up(0, &enabled) == -EINVAL);
     unsigned int lo = if_nametoindex("lo");
     assert(lo && mrc_port_netlink_query(lo, NULL) == -EINVAL);
     expect_admin_state("lo", (interface_flags("lo") & IFF_UP) != 0);

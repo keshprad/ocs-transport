@@ -19,6 +19,7 @@ ROLES = ("tx", "rx")
 MANAGEMENT = {"tx": "198.51.100.1", "rx": "198.51.100.2"}
 OOB_PORT = "46720"
 BYTES = 256 * 1024
+LINK_TEST_BYTES = 4 * 1024 * 1024
 
 
 def run(*command):
@@ -110,10 +111,14 @@ def route_stats(router, sid):
     return routes[0]["stats64"]
 
 
-def mark_ecn(router):
+def add_ingress_chain(router):
     namespace_run(router, "nft", "add", "table", "netdev", "mrc_fabric")
     namespace_run(router, "nft", "add", "chain", "netdev", "mrc_fabric", "ingress",
                   "{ type filter hook ingress device to-tx priority 0; policy accept; }")
+
+
+def mark_ecn(router):
+    add_ingress_chain(router)
     namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "ingress",
                   "ip6", "ecn", "ect0", "numgen", "inc", "mod", "16", "15", "counter", "ip6", "ecn", "set", "ce")
 
@@ -126,6 +131,53 @@ def ecn_stats(router):
     return counters[0]["packets"]
 
 
+def prepare_link_fault(routers):
+    for router, _ in routers:
+        namespace_run(router, "tc", "qdisc", "add", "dev", "to-rx", "root", "netem", "rate", "20mbit")
+    router = routers[0][0]
+    add_ingress_chain(router)
+    # Outer IPv6, one 24-byte SRH, inner IPv6, UDP, then the BTH and ERTH.
+    # Check the endpoint request opcode, ERTH Port Status operation and mask.
+    for name, mask in (("both_rails", "3"), ("surviving_rail", "1")):
+        namespace_run(router, "nft", "add", "counter", "netdev", "mrc_fabric", name)
+        namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "ingress",
+                      "ip6", "saddr", SID["tx"], "ip6", "nexthdr", "43",
+                      "@nh,896,8", "0xd8", "@nh,1000,8", "0", "@nh,1024,32", mask,
+                      "counter", "name", name)
+
+
+def watch_link_fault(sender, endpoints, routers):
+    router = routers[0][0]
+
+    def reports(name):
+        data = json.loads(namespace_run(router, "nft", "-j", "list", "counter", "netdev", "mrc_fabric", name))
+        return next(item["counter"]["packets"] for item in data["nftables"] if "counter" in item)
+
+    def forwarded():
+        return [route_stats(node, stage)["packets"] for node, stage in routers]
+
+    wait_for(lambda: reports("both_rails") > 0 and min(forwarded()) >= 64, sender,
+             lambda: f"No baseline traffic on both rails: {forwarded()}")
+    old_down_reports = reports("surviving_rail")
+    namespace_run(endpoints["tx"], "ip", "link", "set", "dev", "tx1", "down")
+    wait_for(lambda: reports("surviving_rail") > old_down_reports, sender,
+             lambda: "No Port Status update with only rail 0 after kernel link down")
+    before = forwarded()
+    wait_for(lambda: forwarded()[0] >= before[0] + 128, sender,
+             lambda: f"Traffic did not continue on the surviving rail: {forwarded()}")
+    during = forwarded()
+    require(during[1] == before[1], f"The down rail forwarded traffic: {before}, {during}")
+
+    old_up_reports = reports("both_rails")
+    namespace_run(endpoints["tx"], "ip", "link", "set", "dev", "tx1", "up")
+    wait_for(lambda: reports("both_rails") > old_up_reports, sender,
+             lambda: "No Port Status update with both rails after kernel link up")
+    wait_for(lambda: forwarded()[1] >= during[1] + 64, sender,
+             lambda: f"Traffic did not resume on rail 1: {forwarded()}")
+    return {"port_status_masks": [3, 1, 3], "forwarded_before": before,
+            "forwarded_while_down": during, "forwarded_after_restore": forwarded()}
+
+
 def command(args, role, cpu, directory, profile):
     cmd = [str(args.binary), f"--lcores=0@{cpu}", "--no-huge", "--no-pci",
            "--no-telemetry", f"--file-prefix={directory.name}-{role}", "-m", "64"]
@@ -134,10 +186,11 @@ def command(args, role, cpu, directory, profile):
     for rail in range(2):
         cmd += [f"--vdev=net_af_packet{rail},iface={role}{rail}"]
     peer = "tx" if role == "rx" else "rx"
-    cmd += ["--", role, str(BYTES), INNER[role], INNER[peer],
+    cmd += ["--", role, str(args.bytes), INNER[role], INNER[peer],
             "0", mac(role, 0, router=True), "1", mac(role, 1, router=True),
             "--srv6-local", SID[role], "--srv6-peer", SID[peer], "--srv6-srh", "1",
-            "--ack-timeout", "18", "--immediate", "99", "--dynamic-mpr", "1",
+            "--ack-timeout", "20" if args.fault == "link" else "18",
+            "--immediate", "99", "--dynamic-mpr", "1",
             "--oob-host", MANAGEMENT["rx"], "--oob-port", OOB_PORT]
     if role == "tx":
         cmd += ["--profile-dir", str(directory), "--profile-id", profile]
@@ -148,7 +201,7 @@ def command(args, role, cpu, directory, profile):
     return cmd
 
 
-def transfer(args, directory, resources, endpoints):
+def transfer(args, directory, resources, endpoints, routers):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The fabric test needs two polling cores")
     profile = run(str(args.controller), "--seed-generated-srv6-srh", str(directory)).strip()
@@ -168,12 +221,14 @@ def transfer(args, directory, resources, endpoints):
     wait_for(lambda: "DPDK port 1: net_af_packet1" in rx_log.read_text(), receiver,
              lambda: f"Receiver did not open both rails:\n{rx_log.read_text()}")
     sender, tx_log = start("tx", cpus[1])
+    link = watch_link_fault(sender, endpoints, routers) if args.fault == "link" else None
     results = []
     for process, log in ((sender, tx_log), (receiver, rx_log)):
         stdout, _ = process.communicate(timeout=12)
         require(process.returncode == 0, f"Endpoint exited {process.returncode}:\n{stdout}{log.read_text()}")
         results.append(json.loads(stdout.strip().splitlines()[-1]))
-    return results
+    tx, rx = results
+    return tx, rx, link
 
 
 def main():
@@ -182,13 +237,14 @@ def main():
     parser.add_argument("--binary", type=Path, default=root / "mrc_write")
     parser.add_argument("--controller", type=Path, default=root / "tests/test_mrc_ctl_abi")
     parser.add_argument("--af-packet-driver", type=Path)
-    parser.add_argument("--fault", choices=("ecn", "trim"))
+    parser.add_argument("--fault", choices=("ecn", "trim", "link"))
     args = parser.parse_args()
     for name in ("binary", "controller", "af_packet_driver"):
         path = getattr(args, name)
         if path is not None:
             require(path.is_file(), f"Missing {name}: {path}")
             setattr(args, name, path.resolve())
+    args.bytes = LINK_TEST_BYTES if args.fault == "link" else BYTES
     require([link["ifname"] for link in json.loads(run("ip", "-j", "link", "show"))] == ["lo"],
             "Run inside an empty network namespace with unshare -Urn")
     with tempfile.TemporaryDirectory(prefix="mrc-fabric-") as temp, ExitStack() as resources:
@@ -198,10 +254,12 @@ def main():
         routers = [build_rail(resources, endpoints, rail, decap_rail) for rail in range(2)]
         if args.fault == "ecn":
             mark_ecn(routers[0][0])
-        tx, rx = transfer(args, Path(temp), resources, endpoints)
+        elif args.fault == "link":
+            prepare_link_fault(routers)
+        tx, rx, link = transfer(args, Path(temp), resources, endpoints, routers)
         transit = [route_stats(router, stage) for router, stage in routers]
         decap = route_stats(routers[decap_rail][0], SID["rx"])
-        require(tx["bytes"] == rx["bytes"] == BYTES and sum(rx["received"]) == tx["packets"]
+        require(tx["bytes"] == rx["bytes"] == args.bytes and sum(rx["received"]) == tx["packets"]
                 and min(rx["received"]) > 0 and tx["write_completions"] == rx["immediate_completions"] == 1
                 and tx["registered_memory"] and rx["registered_memory"]
                 and tx["mpr_updates"] == rx["mpr_updates"] == 1,
@@ -220,6 +278,8 @@ def main():
             require(tx["trimmed"] > 0 and rx["trim_nacks"] > 0 and tx["trim_nacks"] > 0
                     and rx["nack_sent_mask"] & 2 and tx["nack_received_mask"] & 2
                     and tx["retries"][0] > 0, f"Trim did not trigger alternate-rail delivery: {results}")
+        elif args.fault == "link":
+            results["link"] = link
         print(json.dumps(results))
 
 

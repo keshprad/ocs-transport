@@ -247,6 +247,16 @@ router, checks the TRIM NACK, and verifies retransmission through the
 decapsulating rail. A hardware uSID fabric and switch-generated trimming
 remain separate verification targets.
 
+The link case brings a sender veth interface down and back up during
+one 4 MiB WRITEIMM. nftables observes Port Status masks `3, 1, 3`
+on the surviving rail. Kernel route counters verify continuing traffic
+there while rail 1 is down and renewed traffic on rail 1 after restore.
+The receiver verifies all 4,096 segments and one immediate completion.
+The prior AF_PACKET endpoint did not send the down mask because the PMD
+kept its startup link state. A separate veth fixture verifies that
+carrier drops when the peer goes down while the local port stays
+administratively enabled. ConnectX-7 link transitions remain to be tested.
+
 `make check-mrc-abi` also verifies asynchronous event ordering and
 acknowledgement, nonblocking retrieval, object destruction, and the effect
 of CQ overrun on a second QP sharing the CQ. It checks QP hint capacity,

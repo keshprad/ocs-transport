@@ -3,9 +3,9 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include <net/if.h>
 #include <rdma/rdma_netlink.h>
 #include <stddef.h>
 #include <string.h>
@@ -233,9 +233,9 @@ int mrc_port_netlink_uverbs_driver_id(uint32_t dev_index, uint32_t *driver_id)
     return 0;
 }
 
-int mrc_port_netlink_query(uint32_t ifindex, bool *enabled)
+static int query_link(uint32_t ifindex, unsigned int required_flags, bool *set)
 {
-    if (!ifindex || ifindex > INT_MAX || !enabled)
+    if (!ifindex || ifindex > INT_MAX || !set)
         return -EINVAL;
     const struct route_link_request request = {
         .header = {
@@ -254,8 +254,18 @@ int mrc_port_netlink_query(uint32_t ifindex, bool *enabled)
     memcpy(&link, reply.payload, sizeof(link));
     if (link.ifi_index != (int)ifindex)
         return -EBADMSG;
-    *enabled = (link.ifi_flags & IFF_UP) != 0;
+    *set = (link.ifi_flags & required_flags) == required_flags;
     return 0;
+}
+
+int mrc_port_netlink_query(uint32_t ifindex, bool *enabled)
+{
+    return query_link(ifindex, IFF_UP, enabled);
+}
+
+int mrc_port_netlink_link_up(uint32_t ifindex, bool *up)
+{
+    return query_link(ifindex, IFF_UP | IFF_LOWER_UP, up);
 }
 
 int mrc_port_netlink_set(uint32_t ifindex, bool enabled)

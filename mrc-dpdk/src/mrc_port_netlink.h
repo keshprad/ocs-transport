@@ -14,4 +14,7 @@ int mrc_port_netlink_uverbs_driver_id(uint32_t dev_index, uint32_t *driver_id);
 int mrc_port_netlink_query(uint32_t ifindex, bool *enabled);
 int mrc_port_netlink_set(uint32_t ifindex, bool enabled);
 
+/* Check both administrative enablement and lower-layer carrier. */
+int mrc_port_netlink_link_up(uint32_t ifindex, bool *up);
+
 #endif
