@@ -265,9 +265,12 @@ static void post_writes(struct mrc_qp *qp, const struct connection *peer,
     assert(mrc_post_send(qp, inline_mode ? &wr[1] : wr, &bad) == 0 && !bad);
 }
 
-static void post_receives(struct mrc_qp *qp)
+static void post_receives(struct mrc_qp *qp, struct ibv_sge *sge)
 {
-    struct ibv_recv_wr credits[] = {{ .wr_id = 81 }, { .wr_id = 82 }};
+    struct ibv_recv_wr credits[] = {
+        { .wr_id = 81, .sg_list = sge, .num_sge = 1 },
+        { .wr_id = 82 },
+    };
     credits[0].next = &credits[1];
     struct ibv_recv_wr *bad = NULL;
     assert(mrc_post_recv(qp, credits, &bad) == 0 && !bad);
@@ -1265,6 +1268,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     assert(cq);
 
     uint8_t first_data[TOTAL_BYTES], last_data[TOTAL_BYTES];
+    uint8_t recv_buffer = 0x5a;
     int access_flags = 0;
     if (!requester) {
         access_flags = IBV_ACCESS_LOCAL_WRITE;
@@ -1274,6 +1278,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     size_t first_length = requester ? FIRST_BYTES + IMMEDIATE_FIRST_SGE_BYTES : TOTAL_BYTES;
     struct ibv_mr *first = NULL;
     struct ibv_mr *last = NULL;
+    struct ibv_mr *receive = NULL;
     if (!requester || !inline_mode) {
         for (size_t i = 0; i < first_length; i++)
             first_data[i] = requester ? pattern(i) : 0;
@@ -1285,14 +1290,18 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             last_data[i] = pattern(first_length + i);
         last = register_memory(context, pd, last_data, length, 0);
     }
+    if (!requester)
+        receive = register_memory(context, pd, &recv_buffer, sizeof(recv_buffer), IBV_ACCESS_LOCAL_WRITE);
 
     struct mrc_qp_init_attr init = {
         .pd = pd, .protocol_version = MRC_PROTOCOL_VERSION_1,
         .send_cq = requester ? cq : NULL, .recv_cq = requester ? NULL : cq,
+        .send_ops_flags = requester ? IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM : 0,
         .cap = {
             .max_send_wr = requester ? 3 : 0,
             .max_send_sge = requester ? 2 : 0,
             .max_recv_wr = requester ? 0 : 2,
+            .max_recv_sge = requester ? 0 : 1,
             .max_inline_data = requester && inline_mode ? IMMEDIATE_BYTES : 0,
         },
     };
@@ -1367,7 +1376,10 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         else
             post_registered_writes(qp, &peer, first, last);
     } else {
-        post_receives(qp);
+        struct ibv_sge receive_sge = {
+            .addr = (uintptr_t)&recv_buffer, .length = sizeof(recv_buffer), .lkey = receive->lkey,
+        };
+        post_receives(qp, &receive_sge);
         if (!wire_error)
             assert(mrc_req_notify_cq(cq, 1) == 0);
         publish(directory, "rx.ready", NULL, 0);
@@ -1406,6 +1418,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     } else {
         for (size_t i = 0; i < TOTAL_BYTES; i++)
             assert(first_data[i] == (rejected_write ? 0 : pattern(i)));
+        assert(recv_buffer == 0x5a);
         if (wire_error) {
             char done[PATH_MAX];
             path_for(done, directory, "tx.done");
@@ -1424,6 +1437,8 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         deregister_memory(context, last);
     if (first)
         deregister_memory(context, first);
+    if (receive)
+        deregister_memory(context, receive);
     if (cq_overrun) {
         printf("{\"role\":\"%s\",\"qp_fatal\":true,\"cq_error\":%s,\"qpn\":%u}\n",
                requester ? "tx" : "rx", requester ? "false" : "true", local.qpn);

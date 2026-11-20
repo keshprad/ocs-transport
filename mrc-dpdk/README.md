@@ -157,10 +157,15 @@ the SIDs on preserved encapsulation and accepts already decapsulated
 frames after checking the inner peer, P_Key, and QPN. The fabric advances
 transit routes before delivery to the MRC endpoint.
 
-The attachment supports a 1024-byte PMTU, registered send buffers with
-up to 16 SGEs, and payload-free WRITEIMM receive posts. Use
-`IBV_SEND_SOLICITED` on a WRITEIMM to trigger an armed solicited-only
-receive CQ notification. The remaining APIs are tracked in
+The attachment supports a 1024-byte PMTU and up to 16 SGEs per send or
+receive WR. A WRITEIMM places its payload at the remote address in the
+request. Its receive post supplies only a completion credit and can
+include a scatter/gather list. Use `IBV_SEND_SOLICITED` on a WRITEIMM to
+trigger an armed solicited-only receive CQ notification.
+
+At QP creation, `send_ops_flags` accepts `IBV_QP_EX_WITH_RDMA_WRITE` and
+`IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM`. Post the corresponding operations
+with `mrc_post_send()`. The remaining APIs are tracked in
 [conformance](CONFORMANCE.md).
 
 Request up to 4,096 bytes of `max_inline_data` at QP creation and use

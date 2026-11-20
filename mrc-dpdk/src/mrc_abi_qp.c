@@ -7,7 +7,7 @@
 #include <stdlib.h>
 
 enum {
-    MAX_SEND_SGE = 16,
+    MAX_SGE = 16,
     MAX_QUEUE_DEPTH = 4096,
     MAX_REGISTERED_MRS = 4096,
     MAX_WRITE_BYTES = 1U << 30,
@@ -114,9 +114,10 @@ static int validate_init(struct mrc_context *context, const struct mrc_qp_init_a
     if (attr->protocol_version != MRC_PROTOCOL_VERSION_0 &&
         attr->protocol_version != MRC_PROTOCOL_VERSION_1)
         return EPROTONOSUPPORT;
+    const uint64_t supported_send_ops = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM;
     if (attr->cap.max_send_wr > MAX_QUEUE_DEPTH || attr->cap.max_recv_wr > MAX_QUEUE_DEPTH ||
-        attr->cap.max_send_sge > MAX_SEND_SGE || attr->cap.max_recv_sge ||
-        attr->cap.max_inline_data > MAX_INLINE_BYTES || attr->send_ops_flags)
+        attr->cap.max_send_sge > MAX_SGE || attr->cap.max_recv_sge > MAX_SGE ||
+        attr->cap.max_inline_data > MAX_INLINE_BYTES || (attr->send_ops_flags & ~supported_send_ops))
         return EOPNOTSUPP;
     return 0;
 }
@@ -565,8 +566,8 @@ static int post_write(struct mrc_qp *qp, const struct ibv_send_wr *wr)
     bool inlined = (wr->send_flags & IBV_SEND_INLINE) != 0;
     if (inlined && !qp->init.cap.max_inline_data)
         return EOPNOTSUPP;
-    struct mrc_provider_sge elements[MAX_SEND_SGE];
-    struct mrc_provider_inline_sge inline_elements[MAX_SEND_SGE];
+    struct mrc_provider_sge elements[MAX_SGE];
+    struct mrc_provider_inline_sge inline_elements[MAX_SGE];
     uint64_t length = 0;
     for (int i = 0; i < wr->num_sge; i++) {
         const struct ibv_sge *sg = &wr->sg_list[i];
@@ -630,7 +631,13 @@ MRC_PUBLIC int mrc_post_recv(struct mrc_qp *qp, struct ibv_recv_wr *wr, struct i
     pthread_mutex_lock(&qp->mutex);
     int error = wr && qp->route && !qp->responder ? EOPNOTSUPP : 0;
     while (wr && !error) {
-        error = wr->num_sge ? EINVAL : -mrc_provider_qp_post_recv(qp->provider, wr->wr_id);
+        if (wr->num_sge < 0 || (unsigned int)wr->num_sge > qp->init.cap.max_recv_sge ||
+            (wr->num_sge && !wr->sg_list)) {
+            error = EINVAL;
+            break;
+        }
+        /* WRITEIMM places data at the RETH address and consumes only a receive credit. */
+        error = -mrc_provider_qp_post_recv(qp->provider, wr->wr_id);
         if (!error)
             wr = wr->next;
     }

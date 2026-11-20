@@ -328,8 +328,12 @@ static void test_public_qp(struct ibv_context *verbs)
     assert(cq);
     struct mrc_qp_init_attr init = {
         .qp_context = &init, .send_cq = cq, .recv_cq = cq, .pd = pd,
-        .cap = { .max_send_wr = 2, .max_recv_wr = 1, .max_send_sge = 2 },
+        .cap = { .max_send_wr = 2, .max_recv_wr = 1, .max_send_sge = 2, .max_recv_sge = 1 },
+        .send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE | IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM,
     };
+    struct mrc_qp_init_attr unsupported = init;
+    unsupported.send_ops_flags |= IBV_QP_EX_WITH_RDMA_READ;
+    assert(mrc_create_qp(context, &unsupported) == NULL && errno == EOPNOTSUPP);
     struct mrc_qp *qp = mrc_create_qp(context, &init);
     assert(qp && init.protocol_version == MRC_PROTOCOL_VERSION_1);
     struct mrc_qp *second_qp = mrc_create_qp(context, &init);
@@ -346,13 +350,23 @@ static void test_public_qp(struct ibv_context *verbs)
     assert(mrc_query_qp(qp, &vattr, IBV_QP_STATE | IBV_QP_CAP, NULL, 0, &actual) == 0);
     assert(vattr.qp_state == IBV_QPS_RESET && vattr.cap.max_send_sge == 2);
     assert(actual.qp_context == &init && actual.pd == pd);
+    assert(actual.send_ops_flags == init.send_ops_flags && vattr.cap.max_recv_sge == 1);
     vattr = (struct ibv_qp_attr){ .qp_state = IBV_QPS_INIT, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE };
     assert(mrc_modify_qp(qp, &vattr, IBV_QP_STATE | IBV_QP_ACCESS_FLAGS, NULL, 0) == 0);
 
-    struct ibv_recv_wr recv[] = {{.wr_id = 71}, {.wr_id = 72}};
+    struct ibv_sge recv_sge = { .addr = (uintptr_t)first, .length = sizeof(first), .lkey = first_mr->lkey };
+    struct ibv_recv_wr recv[] = {
+        { .wr_id = 71, .sg_list = &recv_sge, .num_sge = 1 },
+        { .wr_id = 72, .num_sge = 1 },
+    };
     struct ibv_recv_wr *bad_recv;
     recv[0].next = &recv[1];
-    assert(mrc_post_recv(qp, recv, &bad_recv) == -1 && errno == ENOSPC && bad_recv == &recv[1]);
+    assert(mrc_post_recv(qp, recv, &bad_recv) == -1 && errno == EINVAL && bad_recv == &recv[1]);
+    recv[1].sg_list = &recv_sge;
+    recv[1].num_sge = 2;
+    assert(mrc_post_recv(qp, &recv[1], &bad_recv) == -1 && errno == EINVAL && bad_recv == &recv[1]);
+    recv[1].num_sge = 0;
+    assert(mrc_post_recv(qp, &recv[1], &bad_recv) == -1 && errno == ENOSPC && bad_recv == &recv[1]);
 
     struct ibv_device_attr device;
     union ibv_gid gid;
