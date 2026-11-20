@@ -37,6 +37,14 @@ SPARKS = {
 }
 TX_PEER = {"04": "02", "02": "03", "03": "04"}
 RX_PEER = {receiver: sender for sender, receiver in TX_PEER.items()}
+BASE_PROFILES = ("smoke", "failover")
+PROFILES = (*BASE_PROFILES, "negotiated")
+TRANSFER_BYTES = 256 * 1024 * 1024
+NEGOTIATED_REQUESTS = 8
+
+
+def oob_port(receiver):
+    return str(46000 + int(receiver))
 
 
 def snapshot_path(value):
@@ -57,6 +65,7 @@ def render_unit(host, snapshot, role, profile):
         first_pci, second_pci = "0000:01:00.1", "0002:01:00.1"
 
     runtime_dir = f"ocs-mrc-cycle-{role}"
+    bytes_per_request = TRANSFER_BYTES // NEGOTIATED_REQUESTS if profile == "negotiated" else TRANSFER_BYTES
     first_mac, second_mac = peer.macs
     library_dir = snapshot / "lib"
     command = [
@@ -69,7 +78,7 @@ def render_unit(host, snapshot, role, profile):
         "-d", str(library_dir / "librte_mempool_ring.so.24"),
         "-d", str(library_dir / "librte_net_mlx5.so.24"),
         "-a", first_pci, "-a", second_pci,
-        "--", role, "268435456", local.ip, peer.ip,
+        "--", role, str(bytes_per_request), local.ip, peer.ip,
         first_pci, first_mac, second_pci, second_mac,
         "--udp-port", "4971", "--timeout-ms", "120000", "--port-stats", "1",
     ]
@@ -77,6 +86,16 @@ def render_unit(host, snapshot, role, profile):
         command += ["--ack-timeout", "13"]
         if host == "04" and role == "tx":
             command += ["--drop-path-after", "512", "--restore-path-after", "2048"]
+    elif profile == "negotiated":
+        receiver = host if role == "rx" else TX_PEER[host]
+        command += ["--oob-host", "127.0.0.1", "--oob-port", oob_port(receiver),
+                    "--work-requests", str(NEGOTIATED_REQUESTS), "--immediate", "99",
+                    "--max-wimm-inflight", "2", "--mpr", "8", "--dynamic-mpr", "1"]
+        if role == "rx":
+            command += ["--responder-qpn", str(0x250000 + int(host)), "--initial-psn", "16777212",
+                        "--mpr-change-at", "65", "--mpr-change-to", "1"]
+        else:
+            command += ["--requestor-qpn", str(0x140000 + int(host))]
 
     return f"""[Unit]
 Description=OCS MRC Spark-{host} cycle {profile} ({role})
@@ -110,11 +129,14 @@ def main():
     parser.add_argument("--host", choices=SPARKS, required=True)
     parser.add_argument("--snapshot", type=snapshot_path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--include-negotiated", action="store_true",
+                        help="also render the negotiated WRITEIMM and Dynamic MPR units")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    profiles = PROFILES if args.include_negotiated else BASE_PROFILES
     for role in ("rx", "tx"):
-        for profile in ("smoke", "failover"):
+        for profile in profiles:
             filename = f"ocs-mrc-cycle-{role}-{profile}.service"
             unit = render_unit(args.host, args.snapshot, role, profile)
             (args.output_dir / filename).write_text(unit, encoding="utf-8")

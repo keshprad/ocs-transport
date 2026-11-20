@@ -3,6 +3,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -13,14 +14,14 @@ import sys
 import tempfile
 import time
 
-from render_spark_cycle_units import TX_PEER, render_unit
+from render_spark_cycle_units import (
+    NEGOTIATED_REQUESTS, PROFILES, TRANSFER_BYTES, TX_PEER, oob_port, render_unit,
+)
 
 
 HOSTS = ("spark-04", "spark-02", "spark-03")
 EDGES = tuple((host, "spark-" + TX_PEER[host[-2:]]) for host in HOSTS)
-PROFILES = ("smoke", "failover")
 ROLES = ("rx", "tx")
-TRANSFER_BYTES = 256 * 1024 * 1024
 PACKETS = TRANSFER_BYTES // 1024
 ACTIVE_STATES = ("activating", "active", "deactivating", "reloading", "refreshing")
 PORT_LINE = re.compile(r"DPDK port [0-9]+: (\S+)")
@@ -140,6 +141,50 @@ def in_parallel(items, action):
     if failures:
         raise CycleError("\n".join(failures))
     return values
+
+
+@contextmanager
+def negotiation_tunnels(commands, socket_dir):
+    # 04 -> 02 uses a local forward. 02 -> 03 goes through two SSH
+    # forwards on 04, and 03 -> 04 uses a remote forward.
+    opened = []
+    try:
+        for host in HOSTS[1:]:
+            local_port = oob_port(host[-2:])
+            remote_port = oob_port(TX_PEER[host[-2:]])
+            control = Path(socket_dir) / f"{host}.oob"
+            error_log = control.with_suffix(".log")
+            argv = ["ssh", "-S", str(control), "-o", "BatchMode=yes"]
+            opened.append((host, argv))
+            result = subprocess.run(
+                [*argv, "-fNT", "-E", str(error_log), "-o", "ConnectTimeout=8",
+                 "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+                 "-o", "ControlMaster=yes", "-o", "ControlPersist=no",
+                 "-o", "ExitOnForwardFailure=yes",
+                 "-L", f"127.0.0.1:{local_port}:127.0.0.1:{local_port}",
+                 "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{remote_port}", host],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=15, text=True,
+            )
+            detail = error_log.read_text().strip() if error_log.exists() else result.stderr.strip()
+            require(result.returncode == 0, f"{host}: negotiation tunnel failed: {detail}")
+            for bind_host, port in ((HOSTS[0], local_port), (host, remote_port)):
+                sockets = commands.run(bind_host, "ss", "-H", "-ltn", "sport", "=", f":{port}")
+                require(
+                    [line.split()[3] for line in sockets.splitlines()] == [f"127.0.0.1:{port}"],
+                    f"{bind_host}: expected exactly one loopback listener on port {port}",
+                )
+        yield
+    except subprocess.TimeoutExpired as exc:
+        raise CycleError(f"Timed out opening negotiation tunnels: {exc}") from exc
+    finally:
+        for host, argv in reversed(opened):
+            try:
+                result = subprocess.run([*argv, "-O", "exit", host], capture_output=True, timeout=5, text=True)
+                if result.returncode and Path(argv[2]).exists():
+                    print(f"{host}: negotiation tunnel cleanup failed: {result.stderr.strip()}", file=sys.stderr)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                print(f"{host}: negotiation tunnel cleanup failed: {exc}", file=sys.stderr)
 
 
 def verify_exec_start(endpoint, directory, value):
@@ -317,6 +362,7 @@ def validate_results(profile, logs, bounds):
     starts = []
     ends = []
     results = []
+    work_requests = NEGOTIATED_REQUESTS if profile == "negotiated" else 1
 
     for sender, receiver in EDGES:
         tx = Endpoint(sender, "tx", profile)
@@ -342,9 +388,20 @@ def validate_results(profile, logs, bounds):
             f"{edge}: WRITE did not stripe all expected packets across both rails",
         )
         require(
-            tx_log.result["write_completions"] == 1 and tx_log.result["transport_acks"] > 0,
+            tx_log.result["write_completions"] == work_requests and tx_log.result["transport_acks"] > 0,
             f"{edge}: requester did not complete the WRITE via transport ACK",
         )
+        negotiated = ""
+        if profile == "negotiated":
+            require(
+                tx_log.result["registered_memory"] and rx_log.result["registered_memory"]
+                and rx_log.result["immediate_completed"]
+                and rx_log.result["immediate_completions"] == work_requests
+                and tx_log.result["mpr_updates"] == rx_log.result["mpr_updates"] == 1,
+                f"{edge}: missing registered WRITEIMM completions or Dynamic MPR update:\n"
+                f"TX {tx_log.result}\nRX {rx_log.result}",
+            )
+            negotiated = f", {work_requests} WRITEIMMs and one MPR update at each peer"
         if tx.inject_loss:
             require(
                 tx_log.result["dropped"] > 0 and tx_log.result["retries"][0] > 0
@@ -358,7 +415,9 @@ def validate_results(profile, logs, bounds):
         lower, upper = bounds[sender]
         starts.append(max(tx_log.ports.values()) - lower)
         ends.append(tx_log.completed_us - upper)
-        results.append(f"{edge}: {TRANSFER_BYTES} bytes, RX rails {received}, TX retries {tx_log.result['retries']}")
+        results.append(
+            f"{edge}: {TRANSFER_BYTES} bytes, RX rails {received}, TX retries {tx_log.result['retries']}{negotiated}"
+        )
 
     overlap_us = min(ends) - max(starts)
     require(overlap_us > 0, f"Could not confirm overlapping sender intervals across the three hosts ({overlap_us / 1000:.1f} ms)")
@@ -422,7 +481,12 @@ def main():
             digests = in_parallel(HOSTS, lambda host: preflight_host(commands, host, args.profile, args.revision))
             require(len(set(digests.values())) == 1, f"Installed Spark snapshots differ: {digests}")
             print(f"All Spark {args.profile} services use snapshot SHA-256 {digests[HOSTS[0]]}.", flush=True)
-            if not args.preflight_only:
+            if args.profile == "negotiated":
+                with negotiation_tunnels(commands, socket_dir):
+                    print("Negotiation forwards are listening on loopback.", flush=True)
+                    if not args.preflight_only:
+                        exercise(commands, args.profile)
+            elif not args.preflight_only:
                 exercise(commands, args.profile)
     except (CycleError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"Spark cycle failed: {exc}", file=sys.stderr)

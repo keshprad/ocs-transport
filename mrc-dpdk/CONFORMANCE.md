@@ -411,7 +411,12 @@ of two and provider-registered memory. The receiver lowered MPR from
 eight units to one after 65 accepted packets. Both peers applied one MPR
 update and completed all eight work requests. The targeted case passed
 with both the installed Spark snapshot revision and the development build.
-The corresponding physical run needs the scoped negotiated pair profile.
+The three-Spark `negotiated` profile uses eight 32 MiB WRITEIMMs per edge.
+The same transfer passed over two local memif rails with eight
+completions on both peers, one Dynamic MPR update at each peer, and
+131,072 received segments per rail. A standalone check verified that all
+four SSH forwards opened on loopback and closed on exit. The physical
+run awaits the scoped negotiated service units on all three Sparks.
 
 For §§7.4.4 and 7.5.4, the portable tests fill the requester window with
 32,640 entries, check the last valid receive PSN and first overflow, and

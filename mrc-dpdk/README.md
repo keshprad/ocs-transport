@@ -503,11 +503,11 @@ the penalty.
 ### Concurrent three-Spark tests
 
 The cycle uses Spark-04 → Spark-02 → Spark-03 → Spark-04 on both Polatis
-rings. Each Spark receives one WRITE and sends another using separate PCI
-functions, lcores, and DPDK runtime directories. Both profiles send 256 MiB
-on each edge. In `failover`, Spark-04 injects a path-1 blackhole on its
-outgoing edge from scheduled segments 512 through 2047. The other two
-edges send their own WRITEs during the same run.
+rings. Each Spark receives and sends using separate PCI functions, lcores,
+and DPDK runtime directories. Each profile sends 256 MiB per edge.
+In `failover`, Spark-04 injects a path-1 blackhole on its outgoing edge
+from scheduled segments 512 through 2047. The other two edges keep sending
+during the same run.
 
 The test uses the installed root-owned endpoint snapshots. Render the unit
 files for each Spark, substituting its host number and snapshot directory.
@@ -517,8 +517,8 @@ python3 tests/render_spark_cycle_units.py --host 04 \
     --snapshot /opt/ocs-mrc/0c53748.ZDc2j9 --output-dir /tmp/spark-04-cycle-units
 ```
 
-The installed cycle snapshot is `/opt/ocs-mrc/0c53748.ZDc2j9` on all
-three Sparks. An administrator installs four units per Spark and permits
+The proven smoke and failover snapshot is `/opt/ocs-mrc/0c53748.ZDc2j9`.
+An administrator installs four units per Spark and permits
 passwordless `/usr/bin/systemctl start UNIT` and
 `/usr/bin/systemctl stop UNIT` for those exact units. The four names are
 `ocs-mrc-cycle-rx-smoke.service`, `ocs-mrc-cycle-tx-smoke.service`,
@@ -528,7 +528,7 @@ as emitted by the renderer. Run `sudo systemctl daemon-reload` after updating
 the units.
 
 The harness reads each unit's journal. Where ordinary journal access is
-unavailable, permit this exact command separately for each of the four units.
+unavailable, permit this exact command separately for each installed unit.
 Escape the commas in the option value when writing a sudoers rule.
 
 ```sh
@@ -551,6 +551,23 @@ then starts the senders in parallel. It validates delivered packets on both
 rails, successful WRITEs on each edge, overlapping sender intervals from
 port initialization to completion, and EV failure and recovery on the
 injected edge.
+
+The `negotiated` profile runs eight 32 MiB WRITEIMMs per edge. It uses a TCP
+QP handshake with registered memory and two in-flight WRITEIMM credits.
+Each receiver advertises an initial PSN four packets before wrap and
+reduces its MPR from eight units to one after 65 accepted segments. The
+harness checks eight requester completions, eight receiver immediate
+completions, and one MPR update on each peer.
+
+For this profile, render the units with `--include-negotiated` and install
+`ocs-mrc-cycle-rx-negotiated.service` and
+`ocs-mrc-cycle-tx-negotiated.service` on all three Sparks. Apply the same
+scoped start, stop, and journal rules to those two units. The controller
+opens management SSH tunnels on loopback ports 46002, 46003, and 46004.
+Those connections need SSH local and remote forwarding enabled. The QP
+handshakes use the tunnels and WRITEIMM packets travel over the optical
+rings. Use `--profile negotiated --preflight-only` to check the installed
+services and loopback listeners before running the new profile.
 
 ## Original multipath prototype
 
