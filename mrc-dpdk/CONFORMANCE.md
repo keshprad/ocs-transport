@@ -440,8 +440,8 @@ The three-Spark `negotiated` profile uses eight 32 MiB WRITEIMMs per edge.
 The same transfer passed over two local memif rails with eight
 completions on both peers, one Dynamic MPR update at each peer, and
 131,072 received segments per rail. A standalone check verified that all
-four SSH forwards opened on loopback and closed on exit. The physical
-run awaits the scoped negotiated service units on all three Sparks.
+four SSH forwards opened on loopback and closed on exit. The installed
+profile also passed on all three Sparks, as recorded below.
 
 For §§7.4.4 and 7.5.4, the portable tests fill the requester window with
 32,640 entries, check the last valid receive PSN and first overflow, and
@@ -477,29 +477,50 @@ in both profiles.
 
 mlx5 setup requires `CAP_NET_RAW` and `CAP_NET_ADMIN` or an administrator-run endpoint. [DPDK mlx5 privilege documentation](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root)
 
-### Hardware prerequisites for the Transport NAK validation build
+### Three-Spark verification after the Transport NAK fix
 
-Spark-02, Spark-03, and Spark-04 still have test worktrees at
-`0c537484a96b15e51c9cfd82491de83d65d554f4`. Their inactive smoke and
-failover services point to `/opt/ocs-mrc/0c53748.ZDc2j9`, with matching
-`mrc_write` SHA-256 `dfd4498a8f3e965409f4f182767a126f29a3e23e9f6a9ff96406bb976eac7305`.
-The negotiated transmit unit is absent on all three. An administrator
-must install the pinned snapshot and all six cycle units on each Spark,
-reload systemd, and enable the scoped start, stop, and journal access for
-the negotiated units. Sync the detached test worktrees to the published
-full revision after installation. The cycle harness checks the full
-revision and installed binary checksums before each profile. Run smoke,
-failover, and negotiated WRITEIMM/Dynamic MPR in that order.
+Spark-04, Spark-02, and Spark-03 passed smoke, injected failover, and
+negotiated WRITEIMM/Dynamic MPR in that order on the Polatis double ring.
+Before each run, all three test worktrees matched
+`fb324750bf52e92ed94ac5fe8633f407eee59e10`. The installed
+`/opt/ocs-mrc/fb32475.psTsQnf9/mrc_write` matched SHA-256
+`b85dc23a741c51b840d94222564daaf3598ff0d6e7eaec1f8bb7761aae91f3a7`
+on all three Sparks. All 18 sender and receiver journal invocations
+were checked against the live harness output.
 
-- Physical recovery needs scoped access to take a test rail down and
-  restore it during traffic, such as Spark-04's outgoing rail 1
-  (`enP2p1s0f0np0`, PCI `0002:01:00.0`). Check that traffic continues
-  on the surviving rail and returns to the restored rail.
-- All 12 Spark data ports report carrier up and MTU 1500. Jumbo
-  verification needs a scoped mlx5 test profile offering PMTU 4096
-  and access to raise and restore the MTU on both rails at both ends of
-  the test edge.
-- Independent MRC interoperability needs a separate MRC 1.0 endpoint.
-  Hardware SRv6, ECN, and switch-generated trimming need a fabric that
-  can forward the configured SIDs, mark congestion, and trim packets.
-  The Polatis double ring supplies optical connectivity.
+| Profile | Edge | RX segments by rail | TX retries by rail |
+| --- | --- | --- | --- |
+| Smoke | Spark-04 to Spark-02 | 133,145 / 128,999 | 108 / 0 |
+| Smoke | Spark-02 to Spark-03 | 131,072 / 131,072 | 0 / 0 |
+| Smoke | Spark-03 to Spark-04 | 130,935 / 131,209 | 0 / 0 |
+| Failover | Spark-04 to Spark-02 | 133,724 / 128,420 | 1,860 / 4,876 |
+| Failover | Spark-02 to Spark-03 | 131,776 / 130,368 | 1,633 / 1,514 |
+| Failover | Spark-03 to Spark-04 | 131,264 / 130,880 | 61 / 223 |
+| Negotiated | Spark-04 to Spark-02 | 131,072 / 131,072 | 0 / 0 |
+| Negotiated | Spark-02 to Spark-03 | 131,384 / 130,760 | 21 / 8 |
+| Negotiated | Spark-03 to Spark-04 | 131,072 / 131,072 | 0 / 0 |
+
+Every receiver verified 256 MiB of data. The three sender port-ready
+intervals overlapped by at least 1,878.1 ms for smoke, 1,902.0 ms for
+failover, and 1,783.1 ms for negotiated. In failover, Spark-04 recorded
+127 injected drops and reported both EV failure and recovery on rail 1.
+In the negotiated run, each edge completed eight 32 MiB WRITEIMMs with
+registered memory, eight immediate completions at the receiver, and one
+MPR update at each peer.
+
+### Remaining hardware prerequisites
+
+- Physical recovery requires administrator-operated or separately scoped
+  down/up control of Spark-04's outgoing rail 1 (`enP2p1s0f0np0`, PCI
+  `0002:01:00.0`) during traffic. Verify that traffic continues on the
+  surviving rail and resumes on the restored rail.
+- For a two-rail jumbo run from Spark-04 to Spark-02, the transmit ports
+  `enp1s0f0np0` and `enP2p1s0f0np0` on Spark-04 and the receive ports
+  `enp1s0f1np1` and `enP2p1s0f1np1` on Spark-02 all report MTU 1500.
+  The run requires separately scoped MTU 9000 setup and MTU 1500
+  restoration on those four ports, plus an mlx5 test profile that offers
+  PMTU 4096.
+- Independent MRC interoperability requires a separate MRC 1.0 endpoint.
+  Hardware SRv6, ECN, and switch-generated trimming require a fabric
+  that can forward the configured SIDs, mark congestion, and trim
+  packets. The Polatis double ring supplies optical connectivity.
