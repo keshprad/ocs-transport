@@ -374,16 +374,31 @@ class FastLossResponder(ReferenceResponder):
         self.delayed = []
         self.release_at = None
         self.retries = 0
+        self.first_retry_at = None
+        self.retry_interval = None
 
     def write(self, rail, packet):
         now = time.monotonic()
         index = (packet.bth.psn - INITIAL_PSN) & PSN_MASK
         if packet.bth.flags & RTX:
+            if self.case == "base_timer" and self.retries == 1:
+                require(index == 0, f"Timeout retransmitted unexpected packet {index}")
+                self.retry_interval = now - self.first_retry_at
+                require(0.7 * self.base_timeout <= self.retry_interval <= 1.4 * self.base_timeout,
+                        f"Timeout after fast retry was {self.retry_interval:.3f}s; "
+                        f"expected base {self.base_timeout:.3f}s")
+                self.retries += 1
+                super().write(rail, packet)
+                return
             require(self.case != "sparse" and index == 0 and self.retries == 0,
                     f"Spurious retransmission in {self.case} case at packet {index}")
             require(self.original_at is not None and now - self.original_at < 0.85 * self.base_timeout,
                     "Requester waited for the local ACK timer instead of recovering early")
             self.retries += 1
+            if self.case == "base_timer":
+                # Drop the SACK-driven retry itself to observe its timeout.
+                self.first_retry_at = now
+                return
             if self.case == "nack":
                 # The SACKs for the original flight remain visible while
                 # this NACK-triggered retry takes longer than the fast timer.
@@ -418,10 +433,13 @@ class FastLossResponder(ReferenceResponder):
             self.release_at = None
 
     def check_counters(self, counters):
-        require(self.retries == sum(counters["retries"]) == (self.case != "sparse")
-                and counters["fast_retries"] == (self.case == "loss")
+        expected_retries = {"sparse": 0, "nack": 1, "loss": 1, "base_timer": 2}
+        require(self.retries == sum(counters["retries"]) == expected_retries[self.case]
+                and counters["fast_retries"] == (self.case in ("loss", "base_timer"))
                 and counters["nack_received_mask"] == (1 << NO_PKT_BUFFER if self.case == "nack" else 0),
                 f"Incorrect fast-loss accounting in {self.case}: {counters}")
+        if self.case == "base_timer":
+            counters["timeout_after_fast_retry_ms"] = round(1000 * self.retry_interval)
 
 
 class PortStatusResponder(ReferenceResponder):
@@ -673,6 +691,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
             if retry_timer is not None:
                 command += ["--linear-retries", "0", "--exp-retries", "0" if responder.exhausted else "4"]
+            if fast_loss == "base_timer":
+                command += ["--linear-retries", "0", "--exp-retries", "3"]
             if late_nack:
                 command += ["--linear-retries", "2", "--exp-retries", "0"]
             if nack_reason == NO_PKT_BUFFER:
@@ -809,7 +829,7 @@ def main():
             counters = run_requester(binary, relay, mode, retry_timer=case)
             print(json.dumps({"mode": mode, "retry_timer": case, **counters}))
     if normal_suite or args.fast_loss_only:
-        for case in ("sparse", "nack", "loss"):
+        for case in ("sparse", "nack", "loss", "base_timer"):
             counters = run_requester(binary, relay, mode, fast_loss=case)
             print(json.dumps({"mode": mode, "fast_loss": case, **counters}))
 

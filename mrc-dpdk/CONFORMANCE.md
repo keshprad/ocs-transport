@@ -94,8 +94,11 @@ holds a 24-packet WRITEIMM behind a single far-ahead SACK, then releases
 the delayed packets without a retry. A second case delays a NACK-driven
 retransmission beyond the same threshold and observes exactly one retry.
 A third drops the original packet and confirms one fast retry before
-the local ACK timeout. Use `--fast-loss-only` with `--mode` to check
-IPv4, IPv6, and preserved SRv6 with or without an SRH.
+the local ACK timeout. A fourth drops the original and its fast retry
+with zero linear retries. The timeout following the fast retry uses
+the original Local ACK Timeout, as for a NACK-driven retry. Use
+`--fast-loss-only` with `--mode` to check IPv4, IPv6, and preserved SRv6
+with or without an SRH.
 
 The standalone memif suite uses 1, 2, 3, 4, and 8 configured rails for
 WRITEIMM across PSN wrap. It verifies per-rail data and probe counters,

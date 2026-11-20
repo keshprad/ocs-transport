@@ -1185,6 +1185,9 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
                     age >= transfer->initial_rto / 4;
         if (!expired && !waiting && !nacked && !fast)
             continue;
+        /* Restart the base timer for feedback-driven loss (§7.4.4).
+         * A timeout-driven retry retains the configured backoff (§7.4.2). */
+        bool feedback_retry = nacked || fast;
         if (!retire_redundant_attempt(transfer, sender, index))
             return -EPROTO;
         if (!packet->received && record->counted_inflight) {
@@ -1213,7 +1216,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
              * An expired wait uses a retry slot without sending a packet. */
             if (!waiting || expired) {
                 record->retry_wait = packet->received ? RETRY_WAIT_TRANSPORT_ACK : RETRY_WAIT_DELIVERY;
-                int result = arm_retry_timer(transfer, record, now, nacked && !waiting ? 0 : next_retry);
+                int result = arm_retry_timer(transfer, record, now, feedback_retry && !waiting ? 0 : next_retry);
                 if (result)
                     return result;
             }
@@ -1223,8 +1226,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
             return picked;
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
-        /* Section 7.4.4 uses the base timer for a NACK-driven transmission. */
-        int result = arm_retry_timer(transfer, record, now, nacked ? 0 : next_retry);
+        int result = arm_retry_timer(transfer, record, now, feedback_retry ? 0 : next_retry);
         if (result)
             return result;
         record->retries_used = next_retry;
