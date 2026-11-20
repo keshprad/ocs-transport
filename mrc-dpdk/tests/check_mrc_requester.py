@@ -538,6 +538,8 @@ class FlowControlResponder(ReferenceResponder):
 
     def acknowledge_write(self, rail, packet, index):
         if index <= FIRST_WRITE_END:
+            if index == FIRST_WRITE_END:
+                require(packet.bth.flags & 0x80, "Credit-exhausting WRITEIMM did not request an ACK")
             if self.cumulative == FIRST_WRITE_END:
                 self.sack(rail, packet, index=index, penalty=self.PENALTY, restore=True)
                 # Both messages use the same rail, so the penalty precedes the credit.

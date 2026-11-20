@@ -766,6 +766,22 @@ static enum mrc_ev_feedback ev_mark(uint8_t mark)
     }
 }
 
+static bool requester_can_admit(const struct mrc_requester *sender, uint32_t first, uint32_t index)
+{
+    const struct mrc_endpoint_config *transfer = &sender->transfer;
+    if (index >= transfer->packets || index - first >= transfer->window)
+        return false;
+    uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
+    if (!mrc_mpr_can_transmit(&sender->mpr, sender->qp.delivery_cack_psn, psn))
+        return false;
+
+    const struct mrc_endpoint_write *work = &transfer->work[request_index(transfer, index)];
+    if (!work->with_immediate)
+        return true;
+    const struct mrc_endpoint_write *oldest = &transfer->work[request_index(transfer, first)];
+    return work->preceding_immediates - oldest->preceding_immediates < transfer->max_wimm_inflight;
+}
+
 static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                        struct mrc_endpoint_counters *counts, unsigned int ev, uint32_t index,
                        bool retry)
@@ -797,9 +813,11 @@ static int send_write(const struct mrc_endpoint_config *transfer, struct mrc_req
     }
     packet.bth.solicited = write.solicited &&
         (packet.bth.opcode == MRC_WRITE_LAST_IMM || packet.bth.opcode == MRC_WRITE_ONLY_IMM);
+    /* Request feedback before a send window or WRITEIMM credit makes the QP idle. */
+    uint32_t first = (uint32_t)mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
     packet.bth.ack_request = retry || (index + 1) % BURST == 0 ||
-                             index + 1 == transfer->packets ||
-                             mrc_cc_ack_request(&sender->cc, nominal_bytes, SACK_THRESHOLD);
+                             mrc_cc_ack_request(&sender->cc, nominal_bytes, SACK_THRESHOLD) ||
+                             !requester_can_admit(sender, first, index + 1);
     uint32_t offset = (index - work->first_packet) * pmtu;
     packet.body.write = (struct mrc_wire_write){
         .rqmsn = write.with_immediate ?
@@ -1873,16 +1891,9 @@ static int requester_step(struct mrc_requester *sender)
     }
     if (general_probe)
         sender->next_probe = now + (sent_probe ? transfer->initial_rto : transfer->initial_rto / 32 + 1);
-    for (unsigned int i = 0; i < BURST && sender->next < transfer->packets &&
-         sender->next - first < transfer->window; i++) {
+    for (unsigned int i = 0; i < BURST; i++) {
         uint32_t index = sender->next;
-        uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
-        if (!mrc_mpr_can_transmit(&sender->mpr, sender->qp.delivery_cack_psn, psn))
-            break;
-        const struct mrc_endpoint_write *work = &transfer->work[request_index(transfer, index)];
-        uint32_t wimm_inflight = work->preceding_immediates -
-            transfer->work[request_index(transfer, first)].preceding_immediates;
-        if ((work->with_immediate && wimm_inflight >= transfer->max_wimm_inflight) ||
+        if (!requester_can_admit(sender, first, index) ||
             !mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
             break;
         int picked = send_on_available_ev(sender, index, false, 0, now, &busy_rails);
@@ -1890,6 +1901,7 @@ static int requester_step(struct mrc_requester *sender)
             break;
         if (picked < 0)
             return picked;
+        uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
         if (!mrc_tx_track(&sender->qp, psn, now))
             return -EPROTO;
         sender->metadata[index % transfer->window] = (struct send_record){

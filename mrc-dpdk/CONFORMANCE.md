@@ -73,7 +73,14 @@ checks creation and query attributes, rejection of a READ flag, and
 linked receive posting that preserves the valid prefix on error.
 [OCP QP example](https://github.com/opencomputeproject/OCP-Multipath-Reliable-Connection/blob/main/examples/mrc_qp.md)
 
-For §7.5.2, the independent replay resends a buffered middle segment
+For §7.5.2, the requester sets BTH.AR when the next segment is blocked
+by its tracking window, the peer's MPR, or the WRITEIMM credit limit.
+With only one credit and two queued WRITEIMMs, the independent peer
+checks BTH.AR on the first WRITEIMM's last segment and withholds the
+credit until a Transport ACK. The requester then completes both WRs.
+Run this with `--flow-control-only`.
+
+The independent responder replay resends a buffered middle segment
 with an ACK request and then fills the preceding gap across PSN wrap.
 The responder emits a cumulative SACK before processing the final segment
 and completes the WRITEIMM once. The replay covers IPv4, IPv6, and
