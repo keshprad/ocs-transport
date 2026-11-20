@@ -34,6 +34,7 @@ enum {
     WIRE_PROBE_REQUEST = 0xde,
     WIRE_SACK = 0xdc,
     WIRE_WRITE_FIRST = 0xc6,
+    WIRE_WRITE_ONLY_IMM = 0xcb,
     WIRE_BTH_LEN = 12,
     WIRE_PETH_LEN = 16,
     WIRE_SETH_LEN = 28,
@@ -48,6 +49,8 @@ enum {
     QA_BYTES = 2 * DUPLEX_BYTES + QA_PRIMER_BYTES + QA_TRIGGER_BYTES,
     RX_FLOW_RESTORE = 0x80,
     RX_FLOW_PENALTY_MASK = 0x7f,
+    BLACKOUT_TIMEOUT_EXPONENT = 16,
+    BLACKOUT_FINITE_RETRIES = 3,
 };
 
 struct address {
@@ -343,8 +346,8 @@ static void post_registered_writes(struct mrc_qp *qp, const struct connection *p
     post_writes(qp, peer, sg, false);
 }
 
-static void post_rejected_write(struct mrc_qp *qp, const struct connection *peer,
-                                 const struct ibv_mr *source)
+static void post_single_write_imm(struct mrc_qp *qp, const struct connection *peer,
+                                   const struct ibv_mr *source)
 {
     struct ibv_sge sg = {
         .addr = (uintptr_t)source->addr, .length = FIRST_BYTES, .lkey = source->lkey,
@@ -1326,7 +1329,7 @@ static void run_simplex(bool requester, const char *directory, const struct addr
         path_for(ready, directory, "rx.ready");
         wait_for(ready);
         if (rejected_write)
-            post_rejected_write(qp, &peer, first);
+            post_single_write_imm(qp, &peer, first);
         else if (inline_mode)
             post_inline_writes(qp, &peer);
         else
@@ -1417,6 +1420,204 @@ static void run_simplex(bool requester, const char *directory, const struct addr
             printf(",\"inline_fragment_retransmitted\":%s", observed_inline.retransmitted ? "true" : "false");
         puts("}");
     }
+}
+
+struct blackout_witness {
+    unsigned int dropped_writes[DUPLEX_RAILS];
+    unsigned int first_rails;
+    unsigned int retry_rails;
+    unsigned int probe_rails_after_write;
+    bool rail_restored;
+    bool recovery_probe;
+};
+
+static uint16_t blackhole_ingress(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                  uint16_t count, uint16_t capacity, void *argument)
+{
+    (void)queue;
+    (void)capacity;
+    struct blackout_witness *observed = argument;
+    unsigned int bit = 1u << port;
+    uint16_t kept = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + WIRE_UDP_LEN + WIRE_BTH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (observed->rail_restored && port == 0) {
+            if (bth[0] == WIRE_PROBE_REQUEST)
+                observed->recovery_probe = true;
+            if (bth[0] == WIRE_WRITE_ONLY_IMM)
+                assert(observed->recovery_probe && (bth[8] & 0x20));
+            packets[kept++] = packets[i];
+            continue;
+        }
+        if (bth[0] == WIRE_WRITE_ONLY_IMM) {
+            assert(wire_be24(bth + 9) == SEND_PSN);
+            observed->dropped_writes[port]++;
+            if (bth[8] & 0x20)
+                observed->retry_rails |= bit;
+            else
+                observed->first_rails |= bit;
+        } else if (bth[0] == WIRE_PROBE_REQUEST && observed->dropped_writes[port]) {
+            observed->probe_rails_after_write |= bit;
+        }
+        rte_pktmbuf_free(packets[i]);
+    }
+    return kept;
+}
+
+static uint64_t check_blackout_requester(struct mrc_context *context, struct mrc_qp *qp, struct mrc_cq *cq,
+                                         const char *directory, uint32_t qpn, bool infinite)
+{
+    int fd;
+    assert(mrc_dpdk_get_async_fd(context, &fd) == 0);
+    int flags = fcntl(fd, F_GETFL);
+    assert(flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+    uint64_t hz = rte_get_timer_hz();
+    uint64_t start = rte_get_timer_cycles();
+    uint64_t restore_at = 0;
+    struct ibv_wc wc;
+    struct mrc_async_event event;
+    struct ibv_qp_attr state;
+    int result, completions;
+    do {
+        uint64_t elapsed = rte_get_timer_cycles() - start;
+        assert(elapsed < 4 * hz && "requester did not complete the two-rail blackout case");
+        result = mrc_dpdk_progress_qp(qp);
+        completions = mrc_poll_cq(cq, 1, &wc);
+        assert(completions >= 0 && (completions || !result));
+        if (infinite && !restore_at && elapsed >= 3 * hz / 2) {
+            assert(!completions && !result);
+            assert(mrc_query_qp(qp, &state, IBV_QP_STATE, NULL, 0, NULL) == 0 &&
+                   state.qp_state == IBV_QPS_RTS);
+            assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+            restore_at = rte_get_timer_cycles();
+            publish(directory, "tx.retrying", NULL, 0);
+        }
+        rte_pause();
+    } while (!completions);
+    uint64_t finished = rte_get_timer_cycles();
+    assert(wc.wr_id == 70 && wc.qp_num == qpn && wc.opcode == IBV_WC_RDMA_WRITE);
+    assert(mrc_query_qp(qp, &state, IBV_QP_STATE, NULL, 0, NULL) == 0);
+    if (infinite) {
+        assert(restore_at && !result && wc.status == IBV_WC_SUCCESS && state.qp_state == IBV_QPS_RTS);
+        assert(finished - restore_at < 2 * hz / 5 && "restored rail did not retry the pending WRITE promptly");
+    } else {
+        /* Exponent 16 and three exponential retries allow about one
+         * second without a response when both rails remain unavailable. */
+        assert(finished - start >= 3 * hz / 4);
+        assert(result == ETIMEDOUT && wc.status == IBV_WC_RETRY_EXC_ERR && state.qp_state == IBV_QPS_ERR);
+        assert(mrc_get_async_event(context, &event) == 0 && event.event_type == IBV_EVENT_QP_FATAL &&
+               event.element.qp == qp);
+        mrc_ack_async_event(&event);
+    }
+    assert(mrc_poll_cq(cq, 1, &wc) == 0);
+    assert(mrc_get_async_event(context, &event) == -1 && errno == EAGAIN);
+    return (finished - (infinite ? restore_at : start)) * 1000 / hz;
+}
+
+static void run_blackout(bool requester, const char *directory, const struct address *address,
+                          struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                          bool infinite)
+{
+    struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(cq);
+    uint8_t data[FIRST_BYTES] = {0};
+    if (requester)
+        for (size_t i = 0; i < sizeof(data); i++)
+            data[i] = pattern(i);
+    struct ibv_mr *mr = register_memory(context, pd, data, sizeof(data),
+                                        requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .protocol_version = MRC_PROTOCOL_VERSION_1,
+        .send_cq = requester ? cq : NULL, .recv_cq = requester ? NULL : cq,
+        .cap = {
+            .max_send_wr = requester, .max_send_sge = requester, .max_recv_wr = !requester,
+        },
+    };
+    if (!requester)
+        skip_local_qp_numbers(context, &init, 1);
+    struct mrc_qp *qp = mrc_create_qp(context, &init);
+    struct connection local = {
+        .gid = address->gid, .psn = requester ? SEND_PSN : 135,
+        .remote_address = (uintptr_t)data, .rkey = mr->rkey,
+    };
+    assert(qp && mrc_get_qpn(qp, &local.qpn) == 0);
+    publish(directory, requester ? "tx.connection" : "rx.connection", &local, sizeof(local));
+    struct connection peer;
+    read_peer_connections(directory, requester, &peer, 1);
+    assert(local.qpn != peer.qpn);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, 0);
+    if (requester) {
+        struct mrc_qp_attr attrs = {
+            .timeout = BLACKOUT_TIMEOUT_EXPONENT, .retry.exp_cnt = infinite ? 25 : BLACKOUT_FINITE_RETRIES,
+        };
+        assert(mrc_modify_qp(qp, NULL, 0, &attrs, MRC_QP_TIMEOUT | MRC_QP_RETRY_CNT) == 0);
+    }
+    struct mrc_dpdk_route route = path_route(pool, requester);
+    route.requester = requester;
+    attach_qp(qp, &route);
+    prepare_memif_links();
+    if (requester) {
+        char ready[PATH_MAX];
+        path_for(ready, directory, "rx.ready");
+        wait_for(ready);
+        post_single_write_imm(qp, &peer, mr);
+        uint64_t elapsed_ms = check_blackout_requester(context, qp, cq, directory, local.qpn, infinite);
+        publish(directory, "tx.done", NULL, 0);
+        printf("{\"role\":\"tx\",\"qpn\":%u,\"completion\":\"%s\",\"%s\":%llu}\n", local.qpn,
+               infinite ? "success" : "retry-exceeded",
+               infinite ? "restore_ms" : "timeout_ms", (unsigned long long)elapsed_ms);
+    } else {
+        struct blackout_witness observed = {0};
+        const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS];
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            callbacks[port] = rte_eth_add_rx_callback(port, 0, blackhole_ingress, &observed);
+            assert(callbacks[port]);
+        }
+        struct ibv_recv_wr receive = { .wr_id = 81 };
+        struct ibv_recv_wr *bad = NULL;
+        assert(mrc_post_recv(qp, &receive, &bad) == 0 && !bad);
+        char done[PATH_MAX], recovering[PATH_MAX];
+        path_for(done, directory, "tx.done");
+        path_for(recovering, directory, "tx.retrying");
+        publish(directory, "rx.ready", NULL, 0);
+        uint64_t deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
+        while (access(done, F_OK) != 0) {
+            assert(rte_get_timer_cycles() < deadline && "requester did not finish during the blackout test");
+            if (infinite && !observed.rail_restored && access(recovering, F_OK) == 0)
+                observed.rail_restored = true;
+            assert(mrc_dpdk_progress_qp(qp) == 0);
+        }
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+        for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+            assert(rte_eth_remove_rx_callback(port, 0, callbacks[port]) == 0);
+            rte_free((void *)callbacks[port]);
+        }
+        assert(observed.dropped_writes[0] == 1 && observed.dropped_writes[1] == 1);
+        const unsigned int both_rails = (1u << DUPLEX_RAILS) - 1;
+        assert((observed.first_rails | observed.retry_rails) == both_rails &&
+               (observed.first_rails & observed.retry_rails) == 0 &&
+               observed.probe_rails_after_write == both_rails);
+        assert(observed.recovery_probe == infinite);
+        struct ibv_wc wc;
+        assert(mrc_poll_cq(cq, 1, &wc) == (int)infinite);
+        if (infinite)
+            assert(wc.wr_id == 81 && wc.qp_num == local.qpn && wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM &&
+                   wc.status == IBV_WC_SUCCESS && wc.byte_len == FIRST_BYTES &&
+                   (wc.wc_flags & IBV_WC_WITH_IMM) && ntohl(wc.imm_data) == FIRST_IMMEDIATE);
+        assert(mrc_poll_cq(cq, 1, &wc) == 0);
+        for (size_t i = 0; i < sizeof(data); i++)
+            assert(data[i] == (infinite ? pattern(i) : 0));
+        printf("{\"role\":\"rx\",\"qpn\":%u,\"blocked_writes\":[%u,%u],"
+               "\"failed_probe_rails\":%u,\"recovered\":%s}\n",
+               local.qpn, observed.dropped_writes[0], observed.dropped_writes[1],
+               observed.probe_rails_after_write, observed.recovery_probe ? "true" : "false");
+    }
+    assert(mrc_destroy_qp(qp) == 0);
+    assert(mrc_destroy_cq(cq) == 0);
+    deregister_memory(context, mr);
 }
 
 struct duplex_qp {
@@ -2138,6 +2339,8 @@ int main(int argc, char **argv)
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
     bool endpoint_ops = strcmp(argv[3], "endpoint_ops") == 0;
+    bool infinite_retry = strcmp(argv[3], "blackout_infinite") == 0;
+    bool blackout = infinite_retry || strcmp(argv[3], "blackout_finite") == 0;
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
     bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
@@ -2182,7 +2385,7 @@ int main(int argc, char **argv)
         profile_id = strtoull(argv[5], &end, 10);
         assert(!errno && profile_id && !*end);
     } else {
-        assert(argc == 4 && (bidirectional || error_mode != SIMPLEX_NO_ERROR || srv6 || inline_mode ||
+        assert(argc == 4 && (bidirectional || blackout || error_mode != SIMPLEX_NO_ERROR || srv6 || inline_mode ||
                              strcmp(argv[3], "simplex") == 0));
     }
 
@@ -2207,6 +2410,8 @@ int main(int argc, char **argv)
 
     if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
+    else if (blackout)
+        run_blackout(client, directory, &address, context, pd, pool, infinite_retry);
     else if (bidirectional)
         run_duplex(client, directory, &address, context, pd, pool, profile_store, profile_id, mode);
     else

@@ -99,6 +99,7 @@ def main():
     )
     parser.add_argument("--controller", type=Path,
                         help="Path to test_mrc_ctl_abi for privileged controller and endpoint cases")
+    parser.add_argument("--blackout-only", action="store_true", help="Run only the two-rail blackout cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -111,6 +112,22 @@ def main():
         require(tx["role"] == "tx" and rx["role"] == "rx",
                 f"Unexpected endpoint roles: {tx}, {rx}")
         return tx, rx
+
+    def check_blackouts():
+        for mode, completion, recovered in (
+            ("blackout_finite", "retry-exceeded", False),
+            ("blackout_infinite", "success", True),
+        ):
+            tx, rx = run_case(mode)
+            require(tx["qpn"] != rx["qpn"] and tx["completion"] == completion
+                    and rx["blocked_writes"] == [1, 1] and rx["failed_probe_rails"] == 3
+                    and rx["recovered"] == recovered,
+                    f"Unexpected requester or rail behavior during {mode}: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+    if args.blackout_only:
+        check_blackouts()
+        return
 
     tx, rx = run_case("simplex")
     require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
@@ -160,6 +177,8 @@ def main():
                 and rx["completions"] == 2,
                 f"Unexpected public async events or completions after {mode}: {tx}, {rx}")
         print(json.dumps({"case": f"public_async_events_on_{mode}", "tx": tx, "rx": rx}))
+
+    check_blackouts()
 
     if args.controller:
         controller = args.controller.resolve()

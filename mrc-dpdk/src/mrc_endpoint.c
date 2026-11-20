@@ -40,11 +40,19 @@ enum {
     REMOTE_OPERATION_NAK = 0x63,
 };
 
+enum retry_wait {
+    RETRY_NO_WAIT,
+    RETRY_WAIT_DELIVERY,
+    RETRY_WAIT_TRANSPORT_ACK,
+};
+
 struct send_record {
+    uint64_t retry_deadline;
+    uint32_t retries_used;
     unsigned int path;
     bool fast_retransmitted;
     bool nacked;
-    bool nack_retry;
+    enum retry_wait retry_wait;
     bool counted_inflight;
     bool redundant_attempt;
 };
@@ -730,10 +738,10 @@ static int fail_send(const struct mrc_endpoint_config *transfer, struct mrc_requ
     return error;
 }
 
-static bool retry_limit_reached(const struct mrc_endpoint_config *transfer, unsigned int retransmissions)
+static bool retry_limit_reached(const struct mrc_endpoint_config *transfer, uint32_t retries_used)
 {
     return transfer->exponential_retries != 25 &&
-           retransmissions >= transfer->linear_retries + transfer->exponential_retries;
+           retries_used >= transfer->linear_retries + transfer->exponential_retries;
 }
 
 static int fail_retry(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender, uint32_t index)
@@ -939,7 +947,7 @@ static int apply_control(const struct mrc_endpoint_config *transfer, struct mrc_
             record->nacked = true;
             counts->nack_received_mask |= UINT32_C(1) << nack->reason;
             counts->trim_nacks += trimmed;
-            if (retry_limit_reached(transfer, state->retransmissions))
+            if (retry_limit_reached(transfer, record->retries_used))
                 return fail_retry(transfer, sender, index);
             sender->next_retry_scan = now_cycles;
             return 0;
@@ -992,6 +1000,17 @@ uint64_t mrc_endpoint_cycles(const struct mrc_endpoint_config *transfer, uint64_
            (ns % 1000000000) * transfer->hz / 1000000000;
 }
 
+static int arm_retry_timer(const struct mrc_endpoint_config *transfer, struct send_record *record,
+                           uint64_t now, uint32_t retries)
+{
+    uint64_t timeout_ns;
+    if (!mrc_local_ack_timeout_ns(transfer->timeout_exponent, transfer->linear_retries,
+                                  transfer->exponential_retries, retries, &timeout_ns))
+        return -EPROTO;
+    record->retry_deadline = now + mrc_endpoint_cycles(transfer, timeout_ns);
+    return 0;
+}
+
 static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct mrc_requester *sender,
                              struct mrc_endpoint_counters *counts, uint32_t first, uint64_t now)
 {
@@ -999,22 +1018,20 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
         struct mrc_tx_packet *packet = mrc_tx_packet(&sender->qp, psn);
         struct send_record *record = &sender->metadata[index % WINDOW];
-        /* Section 7.4.4 re-arms a NACK-driven retry at the base timeout.
-         * The transmission still counts toward the QP retry limit. */
-        unsigned int timeout_retries = record->nack_retry ? 0 : packet->retransmissions;
-        uint64_t timeout_ns;
-        if (!mrc_local_ack_timeout_ns(transfer->timeout_exponent,
-                transfer->linear_retries, transfer->exponential_retries,
-                timeout_retries, &timeout_ns))
-            return -EPROTO;
         uint64_t age = now - packet->sent_at;
         if (packet->received && index != first)
             continue;
+        /* Delivery feedback cancels a pending data retry. The timer still
+         * permits a later retry to recover a missing semantic ACK. */
+        if (packet->received && record->retry_wait == RETRY_WAIT_DELIVERY)
+            record->retry_wait = RETRY_NO_WAIT;
+        bool waiting = record->retry_wait != RETRY_NO_WAIT;
+        bool expired = now >= record->retry_deadline;
         bool nacked = record->nacked && !packet->received;
         bool fast = !packet->received && !nacked && !record->fast_retransmitted &&
                     sender->highest_sacked - (int32_t)index >= FAST_LOSS_GAP &&
                     age >= transfer->initial_rto / 4;
-        if (!fast && !nacked && age < mrc_endpoint_cycles(transfer, timeout_ns))
+        if (!expired && !waiting && !nacked && !fast)
             continue;
         if (!retire_redundant_attempt(transfer, sender, index))
             return -EPROTO;
@@ -1025,41 +1042,55 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
         }
         if (!mrc_mpr_can_transmit(&sender->mpr, sender->qp.delivery_cack_psn, psn))
             continue;
-        if (retry_limit_reached(transfer, packet->retransmissions))
+        if (waiting && expired && record->retries_used < UINT32_MAX)
+            record->retries_used++;
+        if (retry_limit_reached(transfer, record->retries_used))
             return fail_retry(transfer, sender, index);
-        if (!mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
-            continue;
+        uint32_t next_retry = record->retries_used + (record->retries_used < UINT32_MAX);
 
-        if (!packet->received && !nacked &&
+        if (!packet->received && !nacked && !waiting &&
             packet->sent_at >= sender->ev.paths[record->path].changed_at)
             mrc_ev_timeout(&sender->ev, record->path, now);
 
         uint32_t available = available_paths(sender, now);
         uint32_t avoid = UINT32_C(1) << record->path;
         int picked = mrc_ev_pick(&sender->ev, available, avoid, now);
-        if (picked < 0)
-            continue;
-        unsigned int path = (unsigned int)picked;
-        int sent = send_write(transfer, sender, counts, path, index, true);
+        int sent = -EAGAIN;
+        if (picked >= 0 && mrc_cc_can_send(&sender->cc, nominal_at(transfer, index))) {
+            sent = send_write(transfer, sender, counts, (unsigned int)picked, index, true);
+            if (sent == -EAGAIN) {
+                available &= ~(UINT32_C(1) << picked);
+                picked = mrc_ev_pick(&sender->ev, available, avoid, now);
+                if (picked >= 0)
+                    sent = send_write(transfer, sender, counts, (unsigned int)picked, index, true);
+            }
+        }
         if (sent == -EAGAIN) {
-            available &= ~(UINT32_C(1) << path);
-            picked = mrc_ev_pick(&sender->ev, available, avoid, now);
-            if (picked < 0)
-                continue;
-            path = (unsigned int)picked;
-            sent = send_write(transfer, sender, counts, path, index, true);
-            if (sent == -EAGAIN)
-                continue;
+            /* Keep the retry eligible while waiting for a path or TX room.
+             * An expired wait uses a retry slot without sending a packet. */
+            if (!waiting || expired) {
+                record->retry_wait = packet->received ? RETRY_WAIT_TRANSPORT_ACK : RETRY_WAIT_DELIVERY;
+                int result = arm_retry_timer(transfer, record, now, nacked && !waiting ? 0 : next_retry);
+                if (result)
+                    return result;
+            }
+            continue;
         }
         if (sent)
             return sent;
+        unsigned int path = (unsigned int)picked;
         mrc_ev_sent(&sender->ev, path);
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
+        /* Section 7.4.4 uses the base timer for a NACK-driven transmission. */
+        int result = arm_retry_timer(transfer, record, now, nacked ? 0 : next_retry);
+        if (result)
+            return result;
+        record->retries_used = next_retry;
+        record->retry_wait = RETRY_NO_WAIT;
         record->path = path;
         record->counted_inflight = true;
         record->redundant_attempt = packet->received;
-        record->nack_retry = nacked;
         record->nacked = false;
         record->fast_retransmitted |= fast;
         counts->fast_retries += fast;
@@ -1672,6 +1703,7 @@ static int requester_step(struct mrc_requester *sender)
         if (!mrc_tx_track(&sender->qp, psn, now))
             return -EPROTO;
         sender->metadata[index % WINDOW] = (struct send_record){
+            .retry_deadline = now + transfer->initial_rto,
             .path = path, .counted_inflight = true,
         };
         sender->next++;
