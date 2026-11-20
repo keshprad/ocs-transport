@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import select
 import socket
 import subprocess
@@ -185,6 +186,38 @@ def check_reliability_nacks(binary):
     print(json.dumps({"case": "unexpected_completion_queue_overrun"}))
 
 
+def check_partition_membership(binary):
+    full, limited = "0xa345", "0x2345"
+    for name, tx_key, rx_key, ipv6 in (
+        ("full_to_limited", full, limited, False),
+        ("limited_to_full", limited, full, True),
+    ):
+        tx, rx = transfer(binary, 131085, "--immediate", "23", ipv6=ipv6,
+                          tx_options=("--p-key", tx_key), rx_options=("--p-key", rx_key))
+        require(tx["sacks"] > 0 and rx["immediate_completions"] == 1 and
+                rx["port_status_updates"] > 0 and tx["port_status_replies"] > 0,
+                f"{name} did not complete data, reliability feedback, and Port Status: {tx}, {rx}")
+        print(json.dumps({"case": f"pkey_{name}", "tx": tx, "rx": rx}))
+
+    for name, tx_key, rx_key in (
+        ("both_limited", limited, limited),
+        ("different_partitions", full, "0xa346"),
+    ):
+        tx, rx = transfer(binary, 13, "--timeout-ms", "1200",
+                          "--linear-retries", "1", "--exp-retries", "0",
+                          tx_options=("--p-key", tx_key), rx_options=("--p-key", rx_key),
+                          expected_errors={"tx": "Retry limit exhausted", "rx": "RX stalled after 0 of 1"})
+        require("state=ERROR work-errors=1 first-status=retry-exceeded" in tx,
+                f"{name} did not report a retry error: {tx}")
+        paths = re.findall(r"RX frames=(\d+) matched=(\d+) decode-rejected=(\d+) other-peer=(\d+)", rx)
+        require(len(paths) == 2 and any(int(frames) > 0 for frames, _, _, _ in paths) and
+                all(int(frames) == int(other) and matched == rejected == "0"
+                    for frames, matched, rejected, other in paths) and
+                "data RX=0/0 SACK=0 transport-ACK=0" in rx,
+                f"{name} did not reject the received frames by partition membership: {rx}")
+        print(json.dumps({"case": f"pkey_{name}"}))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
@@ -192,10 +225,14 @@ def main():
     parser.add_argument("--controller", type=Path, help="Path to mrc_ctl_profile")
     parser.add_argument("--event-controller", type=Path,
                         help="Path to test_mrc_ctl_abi for cross-process EV event verification")
+    parser.add_argument("--pkey-only", action="store_true", help="Run only the P_Key membership cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
     controller = (args.controller or binary.with_name("mrc_ctl_profile")).resolve()
     require(binary.is_file(), f"Build mrc_write first: {binary}")
+    if args.pkey_only:
+        check_partition_membership(binary)
+        return
     require(controller.is_file(), f"Build mrc_ctl_profile first: {controller}")
 
     tx, rx = transfer(binary, 13)
@@ -287,6 +324,8 @@ def main():
     require(tx["registered_memory"] and rx["registered_memory"],
             "Negotiated transfer did not use provider-registered memory")
     print(json.dumps({"case": "negotiated_qp", "tx": tx, "rx": rx}))
+
+    check_partition_membership(binary)
 
     for ipv6, case in ((True, "srv6_write_imm_trim_nack"), (False, "srv6_ipv4_write_imm_trim_nack")):
         tx, rx = transfer(binary, 41989, "--immediate", "22", trim_after=16,

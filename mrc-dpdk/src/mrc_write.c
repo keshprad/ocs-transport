@@ -404,7 +404,8 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
             continue;
         if (!strcmp(key, "--responder-qpn") && number(value, 3, MRC_PSN_MASK, &transfer->responder_qpn))
             continue;
-        if (!strcmp(key, "--p-key") && number(value, 1, UINT16_MAX, &p_key))
+        if (!strcmp(key, "--p-key") && number(value, 1, UINT16_MAX, &p_key) &&
+            (p_key & MRC_PKEY_PARTITION_MASK))
             continue;
         if (!strcmp(key, "--mpr") && number(value, 1, WINDOW / MRC_MPR_UNIT, &mpr))
             continue;
@@ -521,7 +522,6 @@ static bool parse_args(int argc, char **argv, struct benchmark *benchmark)
     transfer->mpr_change_to = (uint8_t)mpr_change_to;
     transfer->dynamic_mpr = dynamic_mpr != 0;
     transfer->partition_key = (uint16_t)p_key;
-    transfer->peer_partition_key = (uint16_t)p_key;
     benchmark->timeout_ms = timeout_ms;
     benchmark->oob_port = (uint16_t)oob_port;
     transfer->trim_nack_enabled = trim_nack != 0;

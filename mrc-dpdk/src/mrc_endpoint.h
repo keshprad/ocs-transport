@@ -89,7 +89,7 @@ struct mrc_endpoint_config {
     uint32_t rx_work_capacity;
     uint64_t remote_address;
     uint16_t partition_key;
-    uint16_t peer_partition_key;
+    uint16_t peer_partition_key; /* Zero uses RC partition membership. */
     uint32_t local_ip;
     uint32_t peer_ip;
     uint8_t local_ip6[MRC_IPV6_ADDR_LEN];
@@ -188,6 +188,9 @@ bool mrc_endpoint_transmit(const struct mrc_endpoint_config *transfer, unsigned 
 uint16_t mrc_endpoint_feedback_timestamp(const struct mrc_endpoint_config *transfer,
                                          uint64_t arrival_cycles, bool timestamp_present,
                                          bool tsr, uint16_t timestamp);
+int mrc_endpoint_pending_port_status(const struct mrc_endpoint_node *status, uint16_t token);
+void mrc_endpoint_record_port_status(const struct mrc_endpoint_config *transfer,
+                                     struct mrc_endpoint_node *status, uint32_t ports, uint64_t now);
 bool mrc_endpoint_receive_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                              struct mrc_endpoint_counters *counts, unsigned int path,
                              const struct mrc_wire_packet *packet, uint64_t arrival_cycles);

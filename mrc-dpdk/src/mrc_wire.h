@@ -29,6 +29,16 @@
 #define MRC_IPV6_ADDR_LEN 16
 #define MRC_IPV6_FLOW_LABEL_MASK UINT32_C(0x000fffff)
 #define MRC_ICRC_LEN 4
+#define MRC_PKEY_PARTITION_MASK UINT16_C(0x7fff)
+#define MRC_PKEY_FULL_MEMBER UINT16_C(0x8000)
+
+/* A connected RC partition needs the same nonzero partition and a full member. */
+static inline bool mrc_wire_pkey_compatible(uint16_t local, uint16_t peer)
+{
+    uint16_t partition = local & MRC_PKEY_PARTITION_MASK;
+    return partition != 0 && partition == (peer & MRC_PKEY_PARTITION_MASK) &&
+           ((local | peer) & MRC_PKEY_FULL_MEMBER) != 0;
+}
 
 enum mrc_opcode {
     MRC_WRITE_FIRST = 0xc6,

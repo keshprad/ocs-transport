@@ -104,42 +104,81 @@ static struct qp_direction *node_direction(struct mrc_abi_route *route)
     return route->request ? &route->tx : &route->rx;
 }
 
+static int node_path(struct mrc_abi_route *route, uint16_t port, const struct mrc_wire_packet *packet,
+                     const struct mrc_wire_srv6 *routing, bool srv6)
+{
+    if (!route || route->error)
+        return -1;
+    const struct mrc_endpoint_config *config = &node_direction(route)->config;
+    return config->srv6 == srv6 ? matched_path(config, port, packet, routing) : -1;
+}
+
+static void consume_port_status(struct mrc_abi_route *route, unsigned int path, const struct mrc_wire_packet *packet,
+                                struct mrc_endpoint_rx_packet received)
+{
+    route->counts.rx[path].frames++;
+    route->counts.rx[path].matched++;
+    mrc_endpoint_receive_op(&node_direction(route)->config, &route->node->state, &route->counts,
+                            path, packet, received.arrival_cycles);
+    rte_pktmbuf_free(received.mbuf);
+}
+
+static bool reply_port_status(struct mrc_abi_route *current, uint16_t port, const struct mrc_wire_packet *packet,
+                              const struct mrc_wire_srv6 *routing, struct mrc_endpoint_rx_packet received, bool srv6)
+{
+    int reply_path = node_path(current, port, packet, routing, srv6);
+    struct mrc_abi_route *reply = reply_path >= 0 ? current : NULL;
+    uint64_t now = rte_get_timer_cycles();
+    for (struct mrc_abi_route *route = routes; route; route = route->next) {
+        if (reply && route->node == reply->node)
+            continue;
+        int path = node_path(route, port, packet, routing, srv6);
+        if (path < 0)
+            continue;
+        if (!reply) {
+            reply = route;
+            reply_path = path;
+            continue;
+        }
+        /* Apply the report to each matching peer state and send one reply. */
+        mrc_endpoint_record_port_status(&node_direction(route)->config, &route->node->state,
+                                        packet->body.endpoint_request.port_status_mask, now);
+    }
+    if (!reply)
+        return false;
+    consume_port_status(reply, (unsigned int)reply_path, packet, received);
+    return true;
+}
+
 static bool route_node_packet(struct mrc_abi_route *route, uint16_t port,
                                const struct mrc_wire_packet *packet, const struct mrc_wire_srv6 *routing,
                                struct mrc_endpoint_rx_packet received, bool srv6, bool *matched)
 {
-    struct qp_direction *direction = node_direction(route);
-    if (direction->config.srv6 != srv6)
-        return false;
-    int path = matched_path(&direction->config, port, packet, routing);
+    int path = node_path(route, port, packet, routing, srv6);
     if (path < 0)
+        return false;
+    bool status_response = packet->bth.opcode == MRC_ENDPOINT_RESPONSE &&
+                           packet->body.endpoint_response.op == MRC_ENDPOINT_PORT_STATUS;
+    if (status_response && mrc_endpoint_pending_port_status(&route->node->state, (uint16_t)packet->bth.psn) < 0)
         return false;
     if (matched)
         *matched = true;
-    if (packet->bth.opcode == MRC_ENDPOINT_REQUEST &&
-        packet->body.endpoint_request.op == MRC_ENDPOINT_PORT_STATUS) {
-        /* Reachability belongs to the shared node. Reply even when this
-         * QP is idle and an endpoint worker is driving the ports. */
-        route->counts.rx[path].frames++;
-        route->counts.rx[path].matched++;
-        mrc_endpoint_receive_op(&direction->config, &route->node->state, &route->counts,
-                                (unsigned int)path, packet, received.arrival_cycles);
-        rte_pktmbuf_free(received.mbuf);
+    if (status_response) {
+        consume_port_status(route, (unsigned int)path, packet, received);
         return true;
     }
-    return queue_packet(direction, (unsigned int)path, received);
+    return queue_packet(node_direction(route), (unsigned int)path, received);
 }
 
 static bool queue_node_packet(struct mrc_abi_route *current, uint16_t port,
                                const struct mrc_wire_packet *header, const struct mrc_wire_srv6 *routing,
                                struct mrc_endpoint_rx_packet packet, bool srv6, bool *matched)
 {
-    /* Prefer the QP already progressing. QPs on the same path to this peer
-     * share node state, so one copy suffices and requests get one reply. */
+    /* Prefer the QP already progressing when several paths match. */
     if (current && route_node_packet(current, port, header, routing, packet, srv6, matched))
         return true;
     for (struct mrc_abi_route *route = routes; route; route = route->next) {
-        if (route == current || route->error)
+        if (route == current)
             continue;
         if (route_node_packet(route, port, header, routing, packet, srv6, matched))
             return true;
@@ -172,15 +211,15 @@ static struct mrc_abi_route *find_route(uint32_t qpn)
 bool mrc_abi_qp_port_token_in_use(uint16_t token)
 {
     for (struct mrc_abi_route *route = routes; route; route = route->next) {
-        if (route->error)
-            continue;
-        const struct mrc_endpoint_node *node = &route->node->state;
-        for (unsigned int i = 0; i < PATH_COUNT; i++) {
-            if (node->awaiting[i] && node->pending[i] == token)
-                return true;
-        }
+        if (!route->error && mrc_endpoint_pending_port_status(&route->node->state, token) >= 0)
+            return true;
     }
     return false;
+}
+
+static bool port_status_token_in_use(uint16_t token)
+{
+    return mrc_abi_qp_port_token_in_use(token) || mrc_abi_endpoint_port_token_in_use(token);
 }
 
 static bool dispatch_node_packet(struct mrc_abi_route *current, uint16_t port,
@@ -195,7 +234,9 @@ static bool dispatch_node_packet(struct mrc_abi_route *current, uint16_t port,
     bool status_request = packet.bth.opcode == MRC_ENDPOINT_REQUEST &&
                           packet.body.endpoint_request.op == MRC_ENDPOINT_PORT_STATUS;
     /* An existing QP needs the peer's reports for its rail reachability. */
-    if (status_request && node_packet(current, port, &packet, &routing, received))
+    if (status_request &&
+        (reply_port_status(current, port, &packet, &routing, received, routing.encapsulated) ||
+         (!routing.encapsulated && reply_port_status(current, port, &packet, &routing, received, true))))
         return true;
     if (mrc_abi_dispatch_endpoint(port, &packet, &routing, received.arrival_cycles)) {
         rte_pktmbuf_free(received.mbuf);
@@ -409,13 +450,19 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
     int error = ibv_query_pkey(qp->context->verbs, verbs->ah_attr.port_num, verbs->pkey_index, &pkey);
     if (error)
         return error > 0 ? error : (errno ? errno : -error);
+    uint16_t local_pkey = ntohs(pkey);
+    if (!(local_pkey & MRC_PKEY_PARTITION_MASK) ||
+        (route->peer_pkey && !(route->peer_pkey & MRC_PKEY_PARTITION_MASK)))
+        return EINVAL;
+    if (route->peer_pkey && !mrc_wire_pkey_compatible(local_pkey, route->peer_pkey))
+        return EACCES;
     *config = (struct mrc_endpoint_config){
         .sender = tx, .continuous_send = tx, .pool = route->pool, .pd = qp->pd->provider,
         .srv6 = srv6 != NULL,
         .requestor_qpn = tx ? qp->qpn : verbs->dest_qp_num,
         .responder_qpn = tx ? verbs->dest_qp_num : qp->qpn,
         .initial_psn = tx ? verbs->sq_psn : verbs->rq_psn,
-        .partition_key = ntohs(pkey), .peer_partition_key = route->peer_pkey ? route->peer_pkey : ntohs(pkey),
+        .partition_key = local_pkey, .peer_partition_key = route->peer_pkey,
         .mpr_max = mpr, .window = window,
         .max_wimm_inflight = tx ? attrs->wimm.max_wimm : attrs->wimm.max_wimm_dest,
         .rx_ooo_capacity = window, .rx_staging_capacity = window, .rx_work_capacity = window,
@@ -431,7 +478,7 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route *route
         .drop_after = UINT32_MAX, .restore_after = UINT32_MAX, .trim_after = UINT32_MAX,
         .mpr_change_at = UINT32_MAX, .hz = rte_get_timer_hz(),
         .receive = take_packets, .receive_context = direction,
-        .port_status_token_in_use = mrc_abi_endpoint_port_token_in_use,
+        .port_status_token_in_use = port_status_token_in_use,
     };
     if (!config->hz)
         return EIO;

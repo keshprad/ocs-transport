@@ -36,6 +36,13 @@ with TCP setup enabled. On the receiver, `--mpr-change-at PACKETS` and
 `--mpr-change-to UNITS` advertise a new limit after accepting that many
 segments. The new limit uses units of 128 packets, like `--mpr`.
 
+For a manually configured connection, `--p-key` selects the local
+P_Key. Both peers use the same nonzero partition number in the low
+15 bits, and at least one peer sets the full-member bit. TCP negotiation
+also pins the peer's offered key. For a public DPDK QP, the local key
+comes from the verbs partition table. A nonzero `route.peer_pkey` pins
+the peer to a specific compatible key.
+
 On the sender, `--data-dscp N` sets the DSCP for new WRITEs and
 reliability probes. `--retry-dscp N` can select a separate DSCP for
 retransmissions. The data DSCP defaults to zero and the retry DSCP

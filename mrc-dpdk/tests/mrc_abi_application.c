@@ -2218,12 +2218,14 @@ static void check_cc_window(struct mrc_qp *qp, const char *directory, bool clien
 static void duplex_round(struct duplex_qp *qps, const struct connection *local,
                          const struct connection *peer, struct mrc_cq *send_cq,
                          struct mrc_cq *recv_cq, const char *directory, bool client,
-                         unsigned int round, unsigned int first, bool observe_cc_window)
+                         unsigned int round, unsigned int first, bool observe_cc_window,
+                         bool sends_posted)
 {
     unsigned int active = 0;
     for (unsigned int index = first; index < DUPLEX_QPS; index++) {
         post_duplex_recv(&qps[index], index, round);
-        post_duplex_send(&qps[index], &peer[index], index, round, client, DUPLEX_BYTES);
+        if (!sends_posted)
+            post_duplex_send(&qps[index], &peer[index], index, round, client, DUPLEX_BYTES);
         active |= 1u << index;
     }
 
@@ -2420,7 +2422,7 @@ static struct service_time_witness check_rx_flow(struct duplex_qp *qps,
         }
         if (round == 0)
             assert(mrc_dpdk_set_rx_flow_control(qps[0].qp, 128, false) == EINVAL);
-        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, round, 0, false);
+        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, round, 0, false, false);
         assert(observed.data_sacks == both_qps);
         observed.check_startup = false;
     }
@@ -2636,7 +2638,124 @@ enum duplex_mode {
     DUPLEX_NORMAL,
     DUPLEX_RX_FLOW,
     DUPLEX_QA,
+    DUPLEX_PKEY_PORT_STATUS,
 };
+
+enum {
+    STATUS_CLOSE_TOKEN = 0xe123,
+    STATUS_OPEN_TOKEN = 0xe124,
+};
+
+struct port_status_witness {
+    unsigned int close_replies;
+    unsigned int open_replies;
+};
+
+static uint16_t observe_port_status_traffic(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                            uint16_t count, void *argument)
+{
+    (void)queue;
+    struct port_status_witness *observed = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[RTE_ETHER_HDR_LEN + WIRE_IPV6_LEN + WIRE_UDP_LEN + WIRE_BTH_LEN + 2];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (bth[0] >= WIRE_WRITE_FIRST && bth[0] <= WIRE_WRITE_ONLY_IMM)
+            assert(observed->open_replies && "WRITE sent while the node reports all ports closed");
+        if (bth[0] != EP_RESPONSE_OPCODE || wire_be24(bth + 5) != 2)
+            continue;
+        uint32_t token = wire_be24(bth + 9);
+        if (token != STATUS_CLOSE_TOKEN && token != STATUS_OPEN_TOKEN)
+            continue;
+        assert(port == 0 && (udp.traffic_class >> 2) == EP_CONTROL_DSCP);
+        assert(udp.bytes >= WIRE_UDP_LEN + WIRE_BTH_LEN + 2 && bth[WIRE_BTH_LEN + 1] == 0);
+        unsigned int *replies = token == STATUS_CLOSE_TOKEN ? &observed->close_replies : &observed->open_replies;
+        assert(++*replies == 1);
+    }
+    return count;
+}
+
+static void send_port_status(struct mrc_context *context, const struct mrc_dpdk_endpoint_route *route,
+                             uint16_t token, uint32_t mask)
+{
+    struct mrc_ctl_ep_req request = {
+        .req_id = token, .sgid = route->local_gid, .dgid = route->peer_gid,
+        .ev_fmt_mode = MRC_CTL_EV_FMT_MODE_UDP, .req_ev = { .port = 1, .val = { 0, 0, 0xd1, 0x10 } },
+        .op.port_status_update.port_status = mask,
+    };
+    struct mrc_ctl_ep_rsp reply;
+    int returned;
+    assert(mrc_ctl_ep_batch_send_wait(context, EP_CONTROL_DSCP, MRC_CTL_EP_OP_PORT_STATUS_UPDATE,
+                                     &request, 1, 1000000000, &reply, &returned) == 0);
+    assert(returned == 1 && reply.req_id == token && reply.port == request.req_ev.port);
+}
+
+static void progress_status_qps(struct duplex_qp *qps)
+{
+    for (unsigned int index = 0; index < DUPLEX_QPS; index++)
+        assert(mrc_dpdk_progress_qp(qps[index].qp) == 0);
+    rte_pause();
+}
+
+static void wait_for_status_reply(struct duplex_qp *qps, const unsigned int *replies)
+{
+    uint64_t deadline = rte_get_timer_cycles() + 3 * rte_get_timer_hz();
+    while (!*replies) {
+        assert(rte_get_timer_cycles() < deadline);
+        progress_status_qps(qps);
+    }
+}
+
+static unsigned int check_shared_port_status(struct mrc_context *context, const struct mrc_dpdk_route *route,
+                                             struct duplex_qp *qps, const struct connection *local,
+                                             const struct connection *peer, const char *directory,
+                                             bool client, uint16_t key)
+{
+    prepare_memif_links();
+    if (!client) {
+        struct mrc_dpdk_endpoint_route status_route = {
+            .ports = {route->ports[0], route->ports[1]}, .pool = route->pool,
+            .local_gid = local[0].gid, .peer_gid = peer[0].gid, .udp_port = route->udp_port,
+            .pkey = key, .peer_pkey = key,
+        };
+        memcpy(status_route.peer_macs, route->peer_macs, sizeof(status_route.peer_macs));
+        assert(mrc_dpdk_attach_endpoint(context, &status_route, NULL) == 0);
+        publish(directory, "rx.status-ready", NULL, 0);
+        char marker[PATH_MAX];
+        path_for(marker, directory, "tx.status-ready");
+        wait_for(marker);
+        send_port_status(context, &status_route, STATUS_CLOSE_TOKEN, 0);
+        path_for(marker, directory, "tx.status-checked");
+        wait_for(marker);
+        send_port_status(context, &status_route, STATUS_OPEN_TOKEN, 0x6);
+        assert(mrc_dpdk_detach_endpoint(context) == 0);
+        return 2;
+    }
+
+    struct port_status_witness observed = {0};
+    const struct rte_eth_rxtx_callback *callbacks[DUPLEX_RAILS];
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        callbacks[port] = rte_eth_add_tx_callback(port, 0, observe_port_status_traffic, &observed);
+        assert(callbacks[port]);
+    }
+    publish(directory, "tx.status-ready", NULL, 0);
+    char receiver_ready[PATH_MAX];
+    path_for(receiver_ready, directory, "rx.status-ready");
+    wait_for(receiver_ready);
+    wait_for_status_reply(qps, &observed.close_replies);
+    for (unsigned int index = 0; index < DUPLEX_QPS; index++)
+        post_duplex_send(&qps[index], &peer[index], index, 0, client, DUPLEX_BYTES);
+    uint64_t deadline = rte_get_timer_cycles() + rte_get_timer_hz() / 20;
+    while (rte_get_timer_cycles() < deadline)
+        progress_status_qps(qps);
+    publish(directory, "tx.status-checked", NULL, 0);
+    wait_for_status_reply(qps, &observed.open_replies);
+    for (uint16_t port = 0; port < DUPLEX_RAILS; port++) {
+        assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
+        rte_free((void *)callbacks[port]);
+    }
+    return observed.close_replies + observed.open_replies;
+}
 
 static void run_duplex(bool client, const char *directory, const struct address *address,
                        struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
@@ -2644,6 +2763,7 @@ static void run_duplex(bool client, const char *directory, const struct address 
 {
     const bool rx_flow = mode == DUPLEX_RX_FLOW;
     const bool quick_adapt = mode == DUPLEX_QA;
+    const bool pkey_status = mode == DUPLEX_PKEY_PORT_STATUS;
     const unsigned int unsupported_index = client ? 0 : 1;
     if (rx_flow) {
         struct mrc_device_attr device;
@@ -2687,6 +2807,12 @@ static void run_duplex(bool client, const char *directory, const struct address 
 
     struct mrc_dpdk_route route = path_route(pool, client);
     route.bidirectional = true;
+    uint16_t key = 0;
+    if (pkey_status) {
+        assert(ibv_query_pkey(pd->context, address->port, 0, &key) == 0);
+        key = ntohs(key);
+        assert((key & 0x8000) && (key & 0x7fff));
+    }
     for (unsigned int index = 0; index < DUPLEX_QPS; index++) {
         const unsigned int caps = rx_flow && index == unsupported_index
                                   ? MRC_QP_CAP_SVC_TIME_DEST_UNSUPPORTED : 0;
@@ -2698,17 +2824,28 @@ static void run_duplex(bool client, const char *directory, const struct address 
             assert(attr.cap == caps);
             assert(mrc_dpdk_set_rx_flow_control(qps[index].qp, 1, false) == ENOTCONN);
         }
+        if (pkey_status) {
+            if (index == 0) {
+                route.peer_pkey = (key & 0x7fff) == 1 ? 0x8002 : 0x8001;
+                assert(mrc_dpdk_attach_qp(qps[index].qp, &route) == EACCES);
+            }
+            route.peer_pkey = index == 0 ? 0 : key;
+        }
         attach_qp(qps[index].qp, &route);
     }
 
     struct qa_result qa = {0};
     struct service_time_witness service_time = {0};
+    unsigned int status_replies = 0;
+    if (pkey_status)
+        status_replies = check_shared_port_status(context, &route, qps, local, peer, directory, client, key);
     if (quick_adapt)
         qa = check_quick_adapt(&qps[0], local, peer, client ? send_cq : recv_cq, directory, client);
     else if (rx_flow)
         service_time = check_rx_flow(qps, local, peer, send_cq, recv_cq, directory, client);
     else
-        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0, cc_profile_id != 0);
+        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 0, 0,
+                     cc_profile_id != 0, pkey_status && client);
 
     struct ibv_qp_attr reset = { .qp_state = IBV_QPS_RESET };
     assert(mrc_modify_qp(qps[0].qp, &reset, IBV_QP_STATE, NULL, 0) == 0);
@@ -2716,7 +2853,7 @@ static void run_duplex(bool client, const char *directory, const struct address 
     if (rx_flow) {
         assert(mrc_dpdk_set_rx_flow_control(qps[0].qp, 1, false) == ENOTCONN);
     } else if (!quick_adapt) {
-        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 1, 1, false);
+        duplex_round(qps, local, peer, send_cq, recv_cq, directory, client, 1, 1, false, false);
         for (size_t offset = 0; offset < sizeof(qps[0].received); offset++)
             assert(qps[0].received[offset] == duplex_pattern(offset, 0, 0, !client));
     }
@@ -2746,6 +2883,8 @@ static void run_duplex(bool client, const char *directory, const struct address 
                (unsigned int)__builtin_popcount(service_time.data_qps),
                (unsigned int)__builtin_popcount(service_time.probe_qps));
     }
+    if (pkey_status)
+        printf(",\"port_status_replies\":%u", status_replies);
     puts("}");
 }
 
@@ -2769,8 +2908,10 @@ int main(int argc, char **argv)
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
     bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
-    bool bidirectional = cc_profile || qa_profile || rx_flow || strcmp(argv[3], "duplex") == 0;
-    enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW : DUPLEX_NORMAL;
+    bool pkey_status = strcmp(argv[3], "pkey_port_status") == 0;
+    bool bidirectional = cc_profile || qa_profile || rx_flow || pkey_status || strcmp(argv[3], "duplex") == 0;
+    enum duplex_mode mode = qa_profile ? DUPLEX_QA : rx_flow ? DUPLEX_RX_FLOW :
+        pkey_status ? DUPLEX_PKEY_PORT_STATUS : DUPLEX_NORMAL;
     enum simplex_error error_mode = SIMPLEX_NO_ERROR;
     if (!strcmp(argv[3], "wire_error"))
         error_mode = SIMPLEX_CQ_OVERRUN;

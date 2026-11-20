@@ -445,7 +445,10 @@ bool mrc_endpoint_peer_matches(const struct mrc_endpoint_config *transfer, unsig
     uint32_t expected_qpn = transfer->sender ? transfer->requestor_qpn : transfer->responder_qpn;
     if (packet->bth.opcode == MRC_ENDPOINT_REQUEST || packet->bth.opcode == MRC_ENDPOINT_RESPONSE)
         expected_qpn = MRC_ENDPOINT_QPN;
-    if (packet->bth.p_key != transfer->peer_partition_key || packet->bth.dqp != expected_qpn ||
+    uint16_t peer_pkey = transfer->peer_partition_key;
+    bool pkey_matches = peer_pkey ? packet->bth.p_key == peer_pkey
+                                  : mrc_wire_pkey_compatible(transfer->partition_key, packet->bth.p_key);
+    if (!pkey_matches || packet->bth.dqp != expected_qpn ||
         packet->ip_version != transfer->ip_version)
         return false;
 
@@ -514,15 +517,22 @@ static bool decode(const struct mrc_endpoint_config *transfer, unsigned int inde
     return true;
 }
 
+int mrc_endpoint_pending_port_status(const struct mrc_endpoint_node *status, uint16_t token)
+{
+    for (unsigned int path = 0; path < PATH_COUNT; path++) {
+        if (status->awaiting[path] && status->pending[path] == token)
+            return (int)path;
+    }
+    return -1;
+}
+
 static bool next_port_status_token(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                                    uint16_t *token)
 {
     for (uint32_t attempts = 0; attempts <= UINT16_MAX; attempts++) {
         *token = ++status->token;
-        bool pending = false;
-        for (unsigned int path = 0; path < PATH_COUNT; path++)
-            pending |= status->awaiting[path] && status->pending[path] == *token;
-        if (!pending && (!transfer->port_status_token_in_use || !transfer->port_status_token_in_use(*token)))
+        if (mrc_endpoint_pending_port_status(status, *token) < 0 &&
+            (!transfer->port_status_token_in_use || !transfer->port_status_token_in_use(*token)))
             return true;
     }
     return false;
@@ -578,18 +588,25 @@ static void poll_port_status(const struct mrc_endpoint_config *transfer, struct 
     }
 }
 
+void mrc_endpoint_record_port_status(const struct mrc_endpoint_config *transfer,
+                                     struct mrc_endpoint_node *status, uint32_t ports, uint64_t now)
+{
+    /* Report identifiers are private to the peer. Refresh soft state on
+     * each valid report regardless of the identifier's numeric value. */
+    status->peer_ports = ports & ALL_PATHS;
+    status->peer_valid_until = now + transfer->hz;
+}
+
 bool mrc_endpoint_receive_op(const struct mrc_endpoint_config *transfer, struct mrc_endpoint_node *status,
                              struct mrc_endpoint_counters *counts, unsigned int path,
                              const struct mrc_wire_packet *packet, uint64_t arrival_cycles)
 {
     if (packet->bth.opcode == MRC_ENDPOINT_RESPONSE) {
         if (packet->body.endpoint_response.op == MRC_ENDPOINT_PORT_STATUS) {
-            for (unsigned int i = 0; i < PATH_COUNT; i++) {
-                if (status->awaiting[i] && status->pending[i] == (uint16_t)packet->bth.psn) {
-                    status->awaiting[i] = false;
-                    counts->port_status_replies++;
-                    break;
-                }
+            int pending = mrc_endpoint_pending_port_status(status, (uint16_t)packet->bth.psn);
+            if (pending >= 0) {
+                status->awaiting[pending] = false;
+                counts->port_status_replies++;
             }
         }
         return true;
@@ -599,10 +616,7 @@ bool mrc_endpoint_receive_op(const struct mrc_endpoint_config *transfer, struct 
 
     const struct mrc_wire_endpoint_request *request = &packet->body.endpoint_request;
     if (request->op == MRC_ENDPOINT_PORT_STATUS) {
-        /* The identifier is private to the peer; its value gives no
-         * ordering guarantee. Refresh soft state on each valid report. */
-        status->peer_ports = request->port_status_mask & ALL_PATHS;
-        status->peer_valid_until = rte_get_timer_cycles() + transfer->hz;
+        mrc_endpoint_record_port_status(transfer, status, request->port_status_mask, rte_get_timer_cycles());
         counts->port_status_updates++;
     }
     struct mrc_wire_packet response = mrc_endpoint_packet_for(transfer, path, MRC_ENDPOINT_RESPONSE,

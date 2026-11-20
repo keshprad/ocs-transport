@@ -48,7 +48,8 @@ struct mrc_dpdk_route {
     uint16_t ports[2];
     uint8_t peer_macs[2][6];
     struct rte_mempool *pool;
-    uint16_t peer_pkey; /* Host order. Zero uses the local P_Key. */
+    /* Host order. Zero uses RC membership. A nonzero value pins the compatible peer key. */
+    uint16_t peer_pkey;
     uint16_t udp_port; /* Zero uses the OCP default. */
     uint8_t trim_dscp; /* Zero selects the default trim DSCP (49). */
     bool requester; /* Selects the direction when bidirectional is false. */

@@ -31,6 +31,20 @@ independent live peer. Both scripts cover IPv4, IPv6, and preserved SRv6
 with and without a final SRH. The relay moves Ethernet frames and the
 Python peer handles wire encoding, memory placement, and feedback.
 
+For §6.3.1, the standalone memif cases exchange WRITEIMM and Port Status
+between full and limited members of the same partition, with either peer
+acting as requester. Two limited members and distinct partitions produce
+no data placement or feedback. Direct and negotiated connected routes use
+the same RC membership check. TCP-negotiated routes also pin the offered
+peer P_Key. [Linux RXE P_Key comparison](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/sw/rxe/rxe_verbs.h)
+
+For §7.4.8, one Port Status report with a zero mask pauses writes on
+two QPs with overlapping membership and pinned-key filters. A second
+report reopens both rails and both QPs complete the queued writes.
+The public memif case observes one reply per report on the wire and
+verifies that attaching a QP with a peer key from another partition
+returns `EACCES`. Use `--pkey-port-status-only` to isolate this case.
+
 For §7.5.5.1, the public memif case selects SL 7 with `IBV_QP_AV` and
 observes DSCP 26 for the initial WRITEIMM and reliability probes, DSCP 34
 for the retry, and DSCP 48 for SACK, NACK, and Transport ACK. A different

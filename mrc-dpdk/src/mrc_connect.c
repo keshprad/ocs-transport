@@ -1,5 +1,6 @@
 #include "mrc_connect.h"
 #include "mrc_qp.h"
+#include "mrc_wire.h"
 
 #include <errno.h>
 #include <string.h>
@@ -24,8 +25,6 @@ enum {
     MR_KEY = 56,
     RESERVED_TRAILER = 60,
     MR_PRESENT = 1u << 0,
-    P_KEY_MEMBER = 1u << 15,
-    P_KEY_PARTITION = P_KEY_MEMBER - 1,
     RESPONDER_CAPS = MRC_CONNECT_TRIM_NACK | MRC_CONNECT_SERVICE_TIME,
     ALL_CAPS = RESPONDER_CAPS | MRC_CONNECT_DYNAMIC_MPR,
 };
@@ -80,7 +79,7 @@ static bool valid_offer(const struct mrc_connect_offer *offer)
            offer->receive.initial_psn <= MRC_PSN_MASK &&
            offer->receive.initial_msn <= MRC_PSN_MASK && offer->receive.max_mpr &&
            offer->pmtu >= 256 && offer->pmtu <= 4096 &&
-           !(offer->pmtu & (offer->pmtu - 1)) && (offer->p_key & P_KEY_PARTITION) &&
+           !(offer->pmtu & (offer->pmtu - 1)) && (offer->p_key & MRC_PKEY_PARTITION_MASK) &&
            !(offer->supported & ~(uint32_t)ALL_CAPS) && !(offer->offered & ~offer->supported) &&
            valid_memory(&offer->receive.memory);
 }
@@ -159,8 +158,7 @@ int mrc_connect_negotiate(const struct mrc_connect_offer *local,
     if (!qp || !valid_offer(local) || !valid_offer(peer))
         return -EINVAL;
 
-    if (((local->p_key ^ peer->p_key) & P_KEY_PARTITION) ||
-        !((local->p_key | peer->p_key) & P_KEY_MEMBER))
+    if (!mrc_wire_pkey_compatible(local->p_key, peer->p_key))
         return -EACCES;
 
     *qp = (struct mrc_connect_qp) {

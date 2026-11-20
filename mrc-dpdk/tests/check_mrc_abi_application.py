@@ -81,6 +81,22 @@ def check_duplex(tx, rx, completions=3):
                 f"Unexpected public bidirectional QP results: {result}")
 
 
+def check_shared_port_status(binary):
+    def command(role, cpu, directory):
+        args = eal_args(binary, role, cpu, directory) + [
+            "--", role, str(directory), "pkey_port_status",
+        ]
+        if role == "rx":
+            args = ["unshare", "-Ur", "env", f"RUNTIME_DIRECTORY={directory}", *args]
+        return args
+
+    tx, rx, _ = run_pair(command)
+    check_duplex(tx, rx)
+    require(tx["port_status_replies"] == rx["port_status_replies"] == 2,
+            f"Expected one reply to each shared Port Status report: {tx}, {rx}")
+    print(json.dumps({"case": "public_qp_shared_port_status", "tx": tx, "rx": rx}))
+
+
 def check_srv6(tx, rx, rx_decapped, rx_advanced):
     require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
             and tx["completions"] == rx["completions"] == 2
@@ -104,6 +120,8 @@ def main():
     focused.add_argument("--last-hop-trim-only", action="store_true", help="Run only the last-hop trim case")
     focused.add_argument("--service-level-dscp-only", action="store_true", help="Run only the service-level DSCP case")
     focused.add_argument("--dynamic-mpr-only", action="store_true", help="Run only the live MPR negotiation cases")
+    focused.add_argument("--pkey-port-status-only", action="store_true",
+                         help="Run only the shared connected P_Key Port Status case")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -167,6 +185,10 @@ def main():
         check_mpr_updates()
         return
 
+    if args.pkey_port_status_only:
+        check_shared_port_status(binary)
+        return
+
     tx, rx = run_case("simplex")
     require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
             and tx["completions"] == rx["completions"] == 2,
@@ -226,6 +248,7 @@ def main():
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
         for format_name in ("udp", "stev", "srv6", "shared"):
             check_endpoint_operations(binary, format_name)
+        check_shared_port_status(binary)
         check_live_profile(binary, controller)
         for mode, seed, expected in (
             ("generated_ev_udp", "--seed-gen", [0xC405, 0xC410]),
