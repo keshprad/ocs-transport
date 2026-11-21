@@ -610,11 +610,23 @@ The jumbo harness restored all four ports to MTU 1500. Both
 `ExecStopPost` cleanup hooks failed with `EBUSY` at the private
 backing path after DPDK exited. Each host retained 64 free 2 MiB
 pages with zero reservations in use. Neither backing directory was
-a mount point in the host namespace. The staged admin update releases
-that run's idle pages, removes the per-service `ReadWritePaths` bind
-mount, and releases future reservations before removing the
-directory. A repeat is pending to verify automatic cleanup.
+a mount point in the host namespace. The admin update released
+that run's idle pages and removed the per-service `ReadWritePaths`
+bind mount. The cleanup hook now releases the reservation before
+removing its backing directory.
 [systemd filesystem protection](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#ProtectSystem=)
+
+The corrected run verified the same three Git hashes and binary
+checksums. Spark-02 verified 256 MiB at negotiated PMTU 4096, with
+33,166 / 32,370 segments across both rails and eight immediate
+completions. Both endpoints recorded one Dynamic MPR update. The
+receiver's physical frame-size counter for 4,096 to 8,191 bytes
+increased by 65,679. Sender retries were 85 / 58. All four DPDK
+ports recorded zero input and output errors, missed packets, and
+buffer allocation failures. Both services exited successfully.
+The test automatically released all 64 temporary hugepages per
+host, removed the backing and reservation-state directories, and
+restored the four test ports to MTU 1500 with carrier up.
 
 ### Independent hardware interoperability
 
