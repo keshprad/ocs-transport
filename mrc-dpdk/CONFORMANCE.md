@@ -593,15 +593,28 @@ errors across both endpoints and five TX errors on Spark-04. On RX,
 214 headers reported WQE counters from 1,024 through 1,047 with
 1,024 configured descriptors. [Linux mlx5 completion status](https://github.com/torvalds/linux/blob/master/drivers/infiniband/hw/mlx5/cq.c#L281-L283)
 
-Both hosts had zero reserved hugepages and ran with `--no-huge` on
-4 KiB Linux pages. The next comparison keeps the pinned binary, PMTU
-4096, scalar mlx5 Rx, and test traffic fixed while switching EAL to
-2 MiB hugepages. The staged service updates on Spark-02 and Spark-04
-reserve 128 MiB per host during the test and restore the page pool to
-zero afterward. The syndrome does not establish which memory
-registration failed. Compare CQ errors and retry counts against the
-scalar baseline before attributing the errors to memory backing.
+Both hosts started at zero reserved hugepages. The comparison changed
+EAL backing from `--no-huge` on 4 KiB Linux pages to 64 temporary
+2 MiB pages per host. The pinned binary, PMTU 4096, scalar mlx5 Rx,
+and traffic profile were identical. Both endpoint processes exited
+successfully. Spark-02 verified 256 MiB in 65,536 segments, split
+33,588 / 31,948 across the two rails, with eight immediate
+completions and one Dynamic MPR update per endpoint. All four DPDK
+ports reported zero input and output errors. Sender retries fell
+from 5,395 to 296. This supports a memory-backing dependency.
+The exact failed registration in the 4 KiB configuration remains
+unverified.
 [DPDK Linux hugepage requirements](https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html#use-of-hugepages-in-the-linux-environment)
+
+The jumbo harness restored all four ports to MTU 1500. Both
+`ExecStopPost` cleanup hooks failed with `EBUSY` at the private
+backing path after DPDK exited. Each host retained 64 free 2 MiB
+pages with zero reservations in use. Neither backing directory was
+a mount point in the host namespace. The staged admin update releases
+that run's idle pages, removes the per-service `ReadWritePaths` bind
+mount, and releases future reservations before removing the
+directory. A repeat is pending to verify automatic cleanup.
+[systemd filesystem protection](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#ProtectSystem=)
 
 ### Independent hardware interoperability
 
