@@ -630,9 +630,11 @@ restored the four test ports to MTU 1500 with carrier up.
 
 ### Independent hardware interoperability
 
-A separate OCP MRC 1.0 endpoint and a fabric supporting hardware SRv6,
-ECN, and switch-generated trimming are unconfirmed and assumed
-unavailable for planning. The Polatis double ring supplies optical
-connectivity. Independent software packet replay and the Linux SRv6
-fabric results above provide protocol evidence. External endpoint and
-hardware forwarding behavior remain open.
+Hardware interoperability is blocked because the available lab
+equipment includes no NIC that implements OCP MRC 1.0 in hardware.
+Availability of a fabric supporting hardware SRv6, ECN, and
+switch-generated trimming is unconfirmed. The Polatis double ring
+supplies optical connectivity. Independent software packet replay,
+the Python memif peer, and Linux SRv6 fabric tests provide protocol
+evidence. Interoperability with an external MRC endpoint and hardware
+forwarding behavior remain unverified.
