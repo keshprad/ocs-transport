@@ -508,6 +508,31 @@ In the negotiated run, each edge completed eight 32 MiB WRITEIMMs with
 registered memory, eight immediate completions at the receiver, and one
 MPR update at each peer.
 
+### Three-Spark verification with Spark-01
+
+After recabling, both rails passed link-local reachability checks on
+Spark-04 → Spark-02 → Spark-01 → Spark-04. The staged reroute was
+installed on all three hosts, and the `rkp64` account verified 18 scoped
+passwordless commands on Spark-01, 28 on Spark-02, and 30 on Spark-04.
+
+Smoke, injected failover, and negotiated WRITEIMM/Dynamic MPR passed in
+that order. Before each profile, the three Git worktrees matched
+`32d67ee5464821c0ad19fbc8e35caa1a5bd3927f` and the installed binaries
+matched SHA-256 `edc9f659265dbc55e53506fcbfbf29419f34fe3c3599b00f0781e1ebc1f5b1d0`.
+
+| Profile | Spark-04 → Spark-02 RX segments | Spark-02 → Spark-01 RX segments | Spark-01 → Spark-04 RX segments |
+| --- | --- | --- | --- |
+| Smoke | 131,933 / 130,211 | 131,139 / 131,005 | 131,142 / 131,002 |
+| Failover | 132,751 / 129,393 | 130,693 / 131,451 | 134,502 / 127,642 |
+| Negotiated | 131,204 / 130,940 | 131,123 / 131,021 | 131,796 / 130,348 |
+
+Each entry lists rail 0 and rail 1. Each receiver verified 256 MiB.
+The sender intervals overlapped by at least 1,875.6 ms, 1,998.9 ms, and
+1,811.6 ms in profile order. The failover sender on Spark-04 recorded
+127 injected drops with failure and recovery on rail 1. The negotiated
+profile completed eight 32 MiB WRITEIMMs per edge and applied one
+Dynamic MPR update at each endpoint.
+
 ### Spark-04 to Spark-02 link recovery and jumbo MTU
 
 The two-rail link-recovery profile completed a 768 MiB WRITE using the
@@ -530,8 +555,25 @@ frame and headroom. The application regression checks that reservation.
 The corrected build passed independent jumbo packet replay and the Linux
 TAP test, which negotiated PMTU 4096 and counted 128 full-sized packets
 per rail. The hardware run restored all four ports to MTU 1500.
-Hardware verification needs the corrected pinned snapshot installed
-and a fresh run of the scoped jumbo profile.
+On the replacement ring, the same revision and checksum were verified
+before each pair run. The 768 MiB link-recovery test passed again at
+PMTU 1024. During the sampled 288.7 ms administrative outage, rail 0
+transmitted 43,138,402 bytes and rail 1 recorded 94 bytes. The restored
+rail then transmitted another 4,399,594 bytes before completion. Spark-02
+verified 428,292 segments on rail 0 and 358,140 on rail 1, with zero
+peer carrier transitions.
+
+The corrected mlx5 build opened both ports and negotiated PMTU 4096
+on both jumbo attempts. The sender scheduled 3,732 and 3,467 segments
+respectively before retries exhausted, and the receiver logged mlx5
+receive completion queue errors on both attempts. The second attempt also
+logged a transmit queue error on Spark-04. Both cleanups restored MTU 1500
+on the four test ports. The installed service could not write the driver
+dumps into its read-only working directory, leaving the CQ error syndrome
+unverified. DPDK 23.11 documents large MTU support on its scalar receive
+path. The next hardware test requires installing the staged pair service
+update that sets `rx_vec_en=0` and gives each service a runtime working
+directory for error dumps. [DPDK 23.11 mlx5 receive modes](https://doc.dpdk.org/guides-23.11/nics/mlx5.html#rx-burst-functions)
 
 ### Independent hardware interoperability
 
