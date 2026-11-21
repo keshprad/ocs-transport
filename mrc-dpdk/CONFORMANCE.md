@@ -568,12 +568,27 @@ on both jumbo attempts. The sender scheduled 3,732 and 3,467 segments
 respectively before retries exhausted, and the receiver logged mlx5
 receive completion queue errors on both attempts. The second attempt also
 logged a transmit queue error on Spark-04. Both cleanups restored MTU 1500
-on the four test ports. The installed service could not write the driver
-dumps into its read-only working directory, leaving the CQ error syndrome
-unverified. DPDK 23.11 documents large MTU support on its scalar receive
-path. The next hardware test requires installing the staged pair service
-update that sets `rx_vec_en=0` and gives each service a runtime working
-directory for error dumps. [DPDK 23.11 mlx5 receive modes](https://doc.dpdk.org/guides-23.11/nics/mlx5.html#rx-burst-functions)
+on the four test ports. Those units could not write driver dumps into
+their read-only working directories.
+
+With `rx_vec_en=0` on both rails, two hardware runs on the same pin
+completed 256 MiB at negotiated PMTU 4096. In the validated run,
+Spark-02 checked all 65,536 segments and eight immediate completions.
+It placed 33,040 segments on rail 0 and 32,496 on rail 1. Both endpoints
+applied one Dynamic MPR update. The Spark-02 physical frame-size
+counter for 4,096 to 8,191 bytes increased by 70,866, including
+retransmitted traffic. The four ports returned to MTU 1500 with
+carrier up. [DPDK 23.11 mlx5 receive modes](https://doc.dpdk.org/guides-23.11/nics/mlx5.html#rx-burst-functions)
+
+The validated run still reported mlx5 completion queue errors and
+5,395 sender retries. DPDK input error counters on rail 0 and rail 1
+increased by 8,071 and 13,105 at the sender and 10,118 and 12,062 at the
+receiver. The first scalar run's journal tail lost startup messages,
+so the verification run captured port readiness and PMTU negotiation
+live before collecting terminal results. The current units provide a
+writable working directory under systemd's private runtime directory.
+Reading dump headers and identifying the CQ syndrome requires
+administrator access.
 
 ### Independent hardware interoperability
 
