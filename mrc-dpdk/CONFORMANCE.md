@@ -587,8 +587,21 @@ receiver. The first scalar run's journal tail lost startup messages,
 so the verification run captured port readiness and PMTU negotiation
 live before collecting terminal results. The current units provide a
 writable working directory under systemd's private runtime directory.
-Reading dump headers and identifying the CQ syndrome requires
-administrator access.
+An administrator retrieved 240 dump headers. All reported mlx5 CQE
+syndrome `0x04` (local protection error). The headers include 235 RX
+errors across both endpoints and five TX errors on Spark-04. On RX,
+214 headers reported WQE counters from 1,024 through 1,047 with
+1,024 configured descriptors. [Linux mlx5 completion status](https://github.com/torvalds/linux/blob/master/drivers/infiniband/hw/mlx5/cq.c#L281-L283)
+
+Both hosts had zero reserved hugepages and ran with `--no-huge` on
+4 KiB Linux pages. The next comparison keeps the pinned binary, PMTU
+4096, scalar mlx5 Rx, and test traffic fixed while switching EAL to
+2 MiB hugepages. The staged service updates on Spark-02 and Spark-04
+reserve 128 MiB per host during the test and restore the page pool to
+zero afterward. The syndrome does not establish which memory
+registration failed. Compare CQ errors and retry counts against the
+scalar baseline before attributing the errors to memory backing.
+[DPDK Linux hugepage requirements](https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html#use-of-hugepages-in-the-linux-environment)
 
 ### Independent hardware interoperability
 
