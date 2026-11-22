@@ -205,6 +205,10 @@ int mrc_provider_qp_check_cqs(struct mrc_provider_qp *qp);
 int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_state expected,
                                enum mrc_provider_qp_state next);
 int mrc_provider_qp_destroy(struct mrc_provider_qp *qp);
+/* Begin an application-requested reset/destroy: enter ERROR and reject new
+ * work while retaining queued WRs and their MR leases until reset discards them.
+ * Unlike a fault/explicit ERROR transition, cancellation produces no CQEs. */
+int mrc_provider_qp_cancel(struct mrc_provider_qp *qp);
 /* Enter RESET, discarding outstanding WRs without producing completions.
  * Already published CQEs and the monotonic send sequence are preserved. */
 int mrc_provider_qp_reset(struct mrc_provider_qp *qp);

@@ -41,11 +41,13 @@ TRIM = 0x01
 TRIM_LAST_HOP = 0x02
 TRIM_NACKS = (TRIM, TRIM_LAST_HOP)
 NO_PKT_BUFFER = 0x07
+PSN_OOR_WINDOW = 0x0B
 RTX = 0x20
 ENDPOINT_QPN = 2
 ENDPOINT_REQUEST = 0xD8
 ENDPOINT_RESPONSE = 0xD9
 CONTROL_DSCP = 48
+RELAY_QUIESCED = b"\x80"
 
 
 def psn(index):
@@ -54,7 +56,7 @@ def psn(index):
 
 def payload(offset, length):
     # Application bytes expected from mrc_write, independently of its codec.
-    return bytes((i ^ (i >> 8)) & 0xFF for i in range(offset, offset + length))
+    return bytes((i ^ (i >> 8) ^ (i >> 16) ^ (i >> 24)) & 0xFF for i in range(offset, offset + length))
 
 
 class ReferenceResponder:
@@ -85,8 +87,12 @@ class ReferenceResponder:
         self.retry_rail = None
         self.first_write_acked = False
         self.finished = False
+        self.terminal_sent = False
+        self.relay_quiesced = False
+        self.rails_observed = 0
+        self.pending_nacks = []
 
-    def reply(self, rail, opcode, number, body, flags=0, *, original_udp_size=None):
+    def reply(self, rail, opcode, number, body, flags=0, *, original_udp_size=None, terminal=False):
         qp = ENDPOINT_QPN if opcode in (ENDPOINT_REQUEST, ENDPOINT_RESPONSE) else REQUESTOR
         source, destination = self.peers["rx"][rail], self.peers["tx"][rail]
         header = Bth(opcode, PKEY, qp, number, flags)
@@ -101,10 +107,13 @@ class ReferenceResponder:
         else:
             frame = encode_ipv4(source, destination, 0xD000 + rail, UDP_PORT, header, body,
                                 original_udp_size=original_udp_size)
-        self.wire.send(bytes([rail]) + frame)
+        if terminal:
+            require(not self.terminal_sent, "Repeated terminal feedback")
+            self.terminal_sent = True
+        self.wire.send(bytes([rail | (0x80 if terminal else 0)]) + frame)
 
     def sack(self, rail, packet, index=None, probe_id=None, timestamp=0, *,
-             penalty=0, restore=False, entropy=None, probe_psn=0):
+             penalty=0, restore=False, entropy=None, probe_psn=0, mark=0):
         # The first bitmap bit represents CACK + 1.
         bitmap = 0
         for received in self.received:
@@ -115,7 +124,7 @@ class ReferenceResponder:
         trigger = probe_id if probe_id is not None else (index - self.cumulative) & 0xFFFF
         ooo_count = bitmap.bit_count()
         reflected = packet.entropy if entropy is None else entropy
-        body = struct.pack("!BBHIHH", 0, 2 if probe_id is not None else 0, trigger,
+        body = struct.pack("!BBHIHH", 0, (mark << 5) | (2 if probe_id is not None else 0), trigger,
                            reflected, *PDC_IDS)
         body += struct.pack("!IBBhQ", cack, 0, 0, 1, bitmap)
         wire_bytes = ((self.received_bytes + 255) // 256) & PSN_MASK
@@ -125,16 +134,25 @@ class ReferenceResponder:
         self.reply(rail, 0xDC, number, body, packet.bth.flags & RTX)
         self.sacks_sent += 1
 
-    def transport_ack(self, rail, msn):
+    def transport_ack(self, rail, msn, *, terminal=False):
         body = struct.pack("!I", (0x1F << 24) | msn)
-        self.reply(rail, 0xD1, psn(self.cumulative), body)
+        self.reply(rail, 0xD1, psn(self.cumulative), body, terminal=terminal)
 
-    def nack(self, rail, packet, reason):
+    def nack(self, rail, packet, reason, *, terminal=False):
+        # Alternate-rail recovery is only a valid fixture assertion after the
+        # raw requester's asynchronous startup has actually used both rails.
+        if self.rails_observed != 3:
+            self.pending_nacks.append((rail, packet, reason, terminal))
+            return
         body = struct.pack("!HBBIHHI", 0, reason, 0, packet.entropy, *PDC_IDS, packet.bth.psn)
         body += struct.pack("!I", 0x20000000)
         original = packet.udp_size if reason in TRIM_NACKS else None
         self.reply(rail, 0xDD, packet.bth.psn, body, packet.bth.flags & RTX,
-                   original_udp_size=original)
+                   original_udp_size=original, terminal=terminal)
+        self.on_nack_sent()
+
+    def on_nack_sent(self):
+        pass
 
     def write(self, rail, packet):
         index = (packet.bth.psn - INITIAL_PSN) & PSN_MASK
@@ -193,7 +211,7 @@ class ReferenceResponder:
             self.finish_write(rail)
 
     def finish_write(self, rail):
-        self.transport_ack(rail, len(self.write_lengths))
+        self.transport_ack(rail, len(self.write_lengths), terminal=True)
         self.finished = True
 
     def acknowledge_probe(self, rail, packet, token, timestamp):
@@ -229,6 +247,7 @@ class ReferenceResponder:
         expected_entropy = ((expected_flow & 0xFFFF) << 16) | (0xC000 + rail)
         require(bth.pkey == PKEY and packet.entropy == expected_entropy and packet.flow_label == expected_flow,
                 "Incorrect requester partition or path entropy")
+        self.rails_observed |= 1 << rail
         endpoint_op = bth.opcode in (ENDPOINT_REQUEST, ENDPOINT_RESPONSE)
         require(bth.qp == (ENDPOINT_QPN if endpoint_op else RESPONDER), "Incorrect destination QP")
         if endpoint_op:
@@ -254,6 +273,10 @@ class ReferenceResponder:
             require(packet.traffic_class == (dscp << 2 | 2),
                     "WRITE did not use its configured DSCP with ECT(0)")
             self.write(rail, packet)
+        if self.rails_observed == 3 and self.pending_nacks:
+            pending, self.pending_nacks = self.pending_nacks, []
+            for reply_rail, request, reason, terminal in pending:
+                self.nack(reply_rail, request, reason, terminal=terminal)
 
 
 class RetryTimerResponder(ReferenceResponder):
@@ -262,9 +285,10 @@ class RetryTimerResponder(ReferenceResponder):
     timeout_exponent = 17
     base_timeout = (1024 << timeout_exponent) / 1e9
 
-    def __init__(self, wire, mode, exhausted):
+    def __init__(self, wire, mode, exhausted, reason=NO_PKT_BUFFER):
         super().__init__(wire, mode, None)
         self.exhausted = exhausted
+        self.retry_reason = reason
         self.attempts = []
         self.pending_nack = None
         self.nack_sent_at = None
@@ -292,9 +316,11 @@ class RetryTimerResponder(ReferenceResponder):
     def tick(self, now):
         if self.pending_nack is not None and now >= self.pending_nack[0]:
             _, rail, packet = self.pending_nack
-            self.nack_sent_at = now
-            self.nack(rail, packet, NO_PKT_BUFFER)
+            self.nack(rail, packet, self.retry_reason, terminal=self.exhausted)
             self.pending_nack = None
+
+    def on_nack_sent(self):
+        self.nack_sent_at = time.monotonic()
 
     def check_intervals(self):
         initial, first_retry, second_retry, nack_retry, next_retry = (at for at, _ in self.attempts)
@@ -332,9 +358,28 @@ class LateNackResponder(ReferenceResponder):
         super().__init__(wire, mode, None)
         self.attempts = []
         self.pending_ack = None
+        self.startup_probes = {}
+        self.rails_ready = False
+        self.pending_initial_nack = None
 
     def acknowledge_probe(self, rail, packet, token, timestamp):
-        super().acknowledge_probe(1 - rail, packet, token, timestamp)
+        if self.rails_ready:
+            super().acknowledge_probe(1 - rail, packet, token, timestamp)
+            return
+        self.startup_probes[rail] = (packet, token, timestamp)
+        if len(self.startup_probes) != 2:
+            return
+        # Cross-rail responses and alternate-rail retry assertions require
+        # both memif rails to exist. Observe probes on both before injecting
+        # the first NACK; do not race asynchronous raw benchmark startup.
+        self.rails_ready = True
+        for source_rail, probe in self.startup_probes.items():
+            super().acknowledge_probe(1 - source_rail, *probe)
+        self.startup_probes.clear()
+        if self.pending_initial_nack is not None:
+            source_rail, request = self.pending_initial_nack
+            self.nack(1 - source_rail, request, NO_PKT_BUFFER)
+            self.pending_initial_nack = None
 
     def write(self, rail, packet):
         attempt = len(self.attempts)
@@ -345,7 +390,11 @@ class LateNackResponder(ReferenceResponder):
             require(rail != self.attempts[-1][0], "Retransmission did not alternate rails")
         self.attempts.append((rail, packet))
         if attempt < 2:
-            self.nack(1 - rail, packet, NO_PKT_BUFFER)
+            if not self.rails_ready:
+                require(attempt == 0, "Retry arrived before both fixture rails became ready")
+                self.pending_initial_nack = (rail, packet)
+            else:
+                self.nack(1 - rail, packet, NO_PKT_BUFFER)
             return
         # Both retries have RTX set. Replay the first retry's NACK while the
         # second is outstanding, then delay its ACK by one quiet interval.
@@ -579,6 +628,46 @@ class FlowControlResponder(ReferenceResponder):
                     "Zero penalty with restore did not reopen room for multiple outstanding WRITE packets")
 
 
+class SackTriggerResponder(FlowControlResponder):
+    def __init__(self, wire, mode):
+        super().__init__(wire, mode)
+        self.invalid_sacks = 0
+        self.cross_rail_sacks = 0
+        self.finish_rail = None
+
+    def sack(self, rail, packet, index=None, **kwargs):
+        # Return valid data feedback on a different rail, retaining the
+        # original packet's entropy. The first WR's penalty and semantic ACK
+        # stay ordered on the same rail to establish the one-packet window.
+        if index is not None and index > FIRST_WRITE_END:
+            rail = 1 - rail
+            self.cross_rail_sacks += 1
+        super().sack(rail, packet, index=index, **kwargs)
+
+    def finish_write(self, rail):
+        # Let feedback on both rails drain before the semantic ACK ends the
+        # requester, so the exact SACK count is independent of rail polling.
+        self.finish_rail = rail
+
+    def idle(self):
+        if self.finish_rail is not None:
+            super().finish_write(self.finish_rail)
+            return
+        if self.held_packet is None:
+            return
+        if self.restricted_stages == 0 and self.invalid_sacks < 2:
+            rail, packet, index = self.held_packet
+            # Neither trigger has been sent. The CACK and byte credits are
+            # otherwise valid, and would release the held packet. Restoring
+            # the window or applying the mark must not affect the requester.
+            trigger = index + 1 if self.invalid_sacks == 0 else -1
+            ReferenceResponder.sack(self, 1 - rail, packet, index=trigger,
+                                    restore=True, mark=2)
+            self.invalid_sacks += 1
+            return
+        super().idle()
+
+
 class ProbeCorrelationResponder(FlowControlResponder):
     RESERVED_PSN = 0x5A5A5A
 
@@ -632,6 +721,33 @@ class ProbeCorrelationResponder(FlowControlResponder):
             super().finish_write(rail)
 
 
+def wait_relay_quiesced(wire, relay, responder):
+    require(responder.terminal_sent and not responder.pending_nacks,
+            "Fixture finished without delivering all feedback and terminal quiescence")
+    deadline = time.monotonic() + 2
+    previous_timeout = wire.gettimeout()
+    wire.settimeout(0.05)
+    try:
+        while not responder.relay_quiesced:
+            require(time.monotonic() < deadline, "Relay did not acknowledge terminal quiescence")
+            if relay.poll() is not None:
+                _, error = relay.communicate()
+                raise RuntimeError(f"Relay exited before quiescence: {error}")
+            try:
+                message = wire.recv(2048)
+            except TimeoutError:
+                continue
+            if message == RELAY_QUIESCED:
+                responder.relay_quiesced = True
+            else:
+                # These were already delivered before terminal feedback.
+                # All semantic data assertions have completed by this point.
+                require(len(message) > 1 and message[0] < 2,
+                        "Unexpected relay message while awaiting quiescence")
+    finally:
+        wire.settimeout(previous_timeout)
+
+
 def stop_relay(wire, relay):
     wire.send(b"")
     _, error = relay.communicate(timeout=3)
@@ -640,7 +756,8 @@ def stop_relay(wire, relay):
 
 def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                   port_status=None, flow_control=False, probe_correlation=False, retry_timer=None,
-                  late_nack=False, fast_loss=None):
+                  late_nack=False, fast_loss=None, sack_trigger=False, trim_disabled=False,
+                  retry_nack_reason=NO_PKT_BUFFER):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -665,7 +782,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
             command = eal_args(binary, "tx", cpus[1], directory)
             ack_timeout = 16 if nack_reason is not None else 20
             if retry_timer is not None:
-                responder = RetryTimerResponder(wire, mode, exhausted=retry_timer == "exhausted")
+                responder = RetryTimerResponder(wire, mode, exhausted=retry_timer == "exhausted",
+                                                reason=retry_nack_reason)
                 ack_timeout = responder.timeout_exponent
                 wire.settimeout(0.01)
             elif late_nack:
@@ -674,6 +792,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                 responder = FastLossResponder(wire, mode, fast_loss)
                 ack_timeout = responder.timeout_exponent
                 wire.settimeout(0.005)
+            elif sack_trigger:
+                responder = SackTriggerResponder(wire, mode)
             elif probe_correlation:
                 responder = ProbeCorrelationResponder(wire, mode)
             elif flow_control:
@@ -691,6 +811,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         "--p-key", hex(PKEY), "--remote-address", hex(ADDRESS), "--remote-key", hex(RKEY),
                         "--ack-timeout", str(ack_timeout),
                         "--max-wimm-inflight", "1", "--timeout-ms", "3000"]
+            if trim_disabled:
+                command += ["--trim-nack", "0"]
             if retry_timer is not None:
                 command += ["--linear-retries", "0", "--exp-retries", "0" if responder.exhausted else "4"]
             if fast_loss == "base_timer":
@@ -712,15 +834,17 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
             while not responder.finished:
                 now = time.monotonic()
                 require(now < deadline, "Independent peer did not complete the exchange")
-                responder.tick(now)
+                if not responder.terminal_sent:
+                    responder.tick(now)
                 try:
                     message = wire.recv(2048)
                 except TimeoutError:
                     if requester.poll() is not None:
                         if retry_timer == "exhausted":
                             exited_at = time.monotonic()
+                            wait_relay_quiesced(wire, relay, responder)
                             diagnostics = collect(requester, "Retry limit exhausted")
-                            require(f"NACK-RX={1 << NO_PKT_BUFFER:#x}" in diagnostics and
+                            require(f"NACK-RX={1 << responder.retry_reason:#x}" in diagnostics and
                                     "state=ERROR work-errors=1 first-status=retry-exceeded" in diagnostics,
                                     f"NACK did not fail the outstanding work correctly:\n{diagnostics}")
                             counters = responder.check_exhaustion(exited_at)
@@ -730,16 +854,24 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                     if relay.poll() is not None:
                         _, error = relay.communicate()
                         raise RuntimeError(f"memif relay exited during exchange\n{error}")
-                    responder.idle()
+                    if not responder.terminal_sent:
+                        responder.idle()
                     continue
-                responder.receive(message)
+                if message == RELAY_QUIESCED:
+                    require(responder.terminal_sent and not responder.relay_quiesced,
+                            "Unexpected relay quiescence acknowledgement")
+                    responder.relay_quiesced = True
+                    continue
+                if not responder.terminal_sent:
+                    responder.receive(message)
 
+            wait_relay_quiesced(wire, relay, responder)
             counters = collect(requester)
             total = sum(responder.write_lengths)
             work_requests = len(responder.write_lengths)
             require(responder.memory == payload(0, total), "Incomplete peer memory placement")
             require(counters["bytes"] == total and counters["packets"] == len(responder.opcodes) and
-                    (flow_control or counters["probe_replies"] > 0) and
+                    (flow_control or sack_trigger or counters["probe_replies"] > 0) and
                     counters["transport_acks"] == counters["write_completions"] == work_requests,
                     f"Unexpected requester counters: {counters}")
             if nack_reason is not None:
@@ -750,7 +882,7 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         counters["ev_skipped"] == (nack_reason == TRIM),
                         f"Unexpected NACK counters: {counters}")
             elif retry_timer is not None:
-                require(sum(counters["retries"]) == 4 and counters["nack_received_mask"] == 1 << NO_PKT_BUFFER,
+                require(sum(counters["retries"]) == 4 and counters["nack_received_mask"] == 1 << responder.retry_reason,
                         f"Unexpected retry timer counters: {counters}")
                 counters.update(responder.check_intervals())
             elif late_nack:
@@ -765,7 +897,14 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         f"Unexpected Port Status counters: {counters}")
                 counters["status_report_interval_ms"] = round(1000 * responder.report_interval)
                 counters["status_resume_delay_ms"] = round(1000 * responder.resume_delay)
-            elif flow_control:
+            elif flow_control or sack_trigger:
+                if sack_trigger:
+                    require(responder.invalid_sacks == 2 and responder.cross_rail_sacks > 0
+                            and counters["sacks"] == responder.sacks_sent - 2
+                            and counters["ev_failed"] == counters["ev_skipped"] == 0,
+                            f"Invalid SACK changed requester state: {counters}")
+                    counters["unsent_trigger_sacks_ignored"] = responder.invalid_sacks
+                    counters["cross_rail_sacks"] = responder.cross_rail_sacks
                 require(responder.restricted_stages == 2 and responder.restored_full_packets == 2
                         and not any(counters["retries"]) and counters["nack_received_mask"] == 0,
                         f"Unexpected receiver flow-control observations: {counters}")
@@ -800,21 +939,44 @@ def main():
     focused.add_argument("--retry-timer-only", action="store_true", help="Run only the NACK and timeout retry cases")
     focused.add_argument("--late-nack-only", action="store_true", help="Run only cross-rail late NACK cases")
     focused.add_argument("--fast-loss-only", action="store_true", help="Run only SACK fast-loss cases")
+    focused.add_argument("--sack-trigger-only", action="store_true",
+                         help="Run unsent SACK trigger and cross-rail feedback cases")
+    focused.add_argument("--trim-disabled-only", action="store_true",
+                         help="Inject NACKs with optional local trim generation disabled")
     args = parser.parse_args()
     require(args.binary.is_file() and args.relay.is_file(), "Build mrc_write and tests/mrc_memif_relay first")
     binary, relay = args.binary.resolve(), args.relay.resolve()
     normal_suite = not (args.port_status_only or args.flow_control_only or args.probe_correlation_only
-                        or args.retry_timer_only or args.late_nack_only or args.fast_loss_only)
+                        or args.retry_timer_only or args.late_nack_only or args.fast_loss_only
+                        or args.sack_trigger_only or args.trim_disabled_only)
     if normal_suite:
         for mode in args.mode or MODES:
             for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim"),
                                   (TRIM_LAST_HOP, "trim_last_hop")):
                 counters = run_requester(binary, relay, mode, reason)
                 print(json.dumps({"mode": mode, "injected_nack": label, **counters}))
+    if normal_suite:
+        for mode in args.mode or MODES:
+            counters = run_requester(binary, relay, mode, PSN_OOR_WINDOW)
+            print(json.dumps({"mode": mode, "injected_nack": "psn_oor_window", **counters}))
+            counters = run_requester(binary, relay, mode, retry_timer="exhausted",
+                                     retry_nack_reason=PSN_OOR_WINDOW)
+            print(json.dumps({"mode": mode, "psn_oor_window_exhausted": True, **counters}))
+    if normal_suite or args.trim_disabled_only:
+        for mode in args.mode or MODES:
+            for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim"),
+                                  (TRIM_LAST_HOP, "trim_last_hop")):
+                counters = run_requester(binary, relay, mode, reason, trim_disabled=True)
+                print(json.dumps({"mode": mode, "trim_generation": False,
+                                  "injected_nack": label, **counters}))
     if normal_suite or args.late_nack_only:
         for mode in args.mode or MODES:
             counters = run_requester(binary, relay, mode, late_nack=True)
             print(json.dumps({"mode": mode, "late_nack": True, **counters}))
+    if normal_suite or args.sack_trigger_only:
+        for mode in args.mode or MODES:
+            counters = run_requester(binary, relay, mode, sack_trigger=True)
+            print(json.dumps({"mode": mode, "sack_trigger": True, **counters}))
     mode = (args.mode or ("ipv6",))[0]
     if normal_suite or args.port_status_only:
         for case in ("replace", "expire"):

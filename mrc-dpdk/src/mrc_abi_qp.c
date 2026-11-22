@@ -216,8 +216,12 @@ MRC_PUBLIC int mrc_destroy_qp(struct mrc_qp *qp)
         return EINVAL;
     struct mrc_context *context = qp->context;
     pthread_mutex_lock(&qp->mutex);
-    mrc_abi_release_route(qp);
-    int error = -mrc_provider_qp_reset(qp->provider);
+    /* Cancellation enters ERROR before releasing reliability and CC state. */
+    int error = -mrc_provider_qp_cancel(qp->provider);
+    if (!error) {
+        mrc_abi_release_route(qp);
+        error = -mrc_provider_qp_reset(qp->provider);
+    }
     if (!error)
         error = -mrc_provider_qp_destroy(qp->provider);
     if (!error) {
@@ -479,10 +483,24 @@ MRC_PUBLIC int mrc_modify_qp(struct mrc_qp *qp, struct ibv_qp_attr *verbs, int v
         new_hint = requested_hint;
     }
 
-    if (state == MRC_PROVIDER_QP_RESET || state == MRC_PROVIDER_QP_ERROR)
-        mrc_abi_release_route(qp);
-    error = state == MRC_PROVIDER_QP_RESET ? -mrc_provider_qp_reset(qp->provider)
-        : -mrc_provider_qp_transition(qp->provider, provider.state, state);
+    if (state == MRC_PROVIDER_QP_RESET) {
+        error = -mrc_provider_qp_cancel(qp->provider);
+        if (!error) {
+            mrc_abi_release_route(qp);
+            error = -mrc_provider_qp_reset(qp->provider);
+        }
+    } else {
+        error = -mrc_provider_qp_transition(qp->provider, provider.state, state);
+        /* ERROR transitions flush work before the datapath loses its state.
+         * A CQ overflow may make the flush return an error after ERROR was
+         * entered, but the transport must still be detached in that case. */
+        if (state == MRC_PROVIDER_QP_ERROR) {
+            struct mrc_provider_qp_attr stopped;
+            if (mrc_provider_qp_query(qp->provider, &stopped) == 0 &&
+                stopped.state == MRC_PROVIDER_QP_ERROR)
+                mrc_abi_release_route(qp);
+        }
+    }
     if (!error && change_ev) {
         mrc_ctl_store_release(&qp->ev_lease);
         qp->ev_lease = new_ev_lease;

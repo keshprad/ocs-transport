@@ -79,6 +79,77 @@ static void close_ports(struct rte_mempool *pool)
     rte_mempool_free(pool);
 }
 
+static void check_requester_cancel(const struct mrc_endpoint_config *transfer)
+{
+    struct mrc_provider_pd *pd;
+    struct mrc_provider_cq *cq;
+    struct mrc_provider_qp *qp;
+    uint8_t data[13] = {0};
+    struct mrc_provider_mr_keys keys;
+    assert(mrc_provider_pd_create(1, &pd) == 0);
+    assert(mrc_provider_cq_create(1, &cq) == 0);
+    assert(mrc_provider_mr_register(pd, data, sizeof(data), 0x9000, 0, &keys) == 0);
+    const struct mrc_provider_qp_config config = {.qpn = 0x101, .pd = pd, .send_cq = cq, .send_capacity = 1};
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    activate(qp);
+    const struct mrc_provider_write write = {.wr_id = 0xcafe, .local_iova = 0x9000,
+        .lkey = keys.lkey, .length = sizeof(data), .remote_address = 0x100000000, .rkey = 1};
+    uint64_t sequence;
+    assert(mrc_provider_qp_post_write(qp, &write, &sequence) == 0);
+    struct mrc_requester *requester;
+    struct mrc_endpoint_counters counters = {0};
+    struct mrc_endpoint_config invalid = *transfer;
+    invalid.mpr_max = 0;
+    assert(mrc_requester_create(&invalid, qp, &counters, &requester) == -EINVAL);
+    struct mrc_provider_qp_attr attr;
+    assert(mrc_provider_qp_query(qp, &attr) == 0 && attr.state == MRC_PROVIDER_QP_RTS && attr.send_pending == 1);
+    assert(mrc_provider_mr_deregister(pd, keys.lkey) == -EBUSY);
+    assert(mrc_requester_create(transfer, qp, &counters, &requester) == 0);
+    mrc_requester_destroy(requester);
+    assert(mrc_provider_qp_query(qp, &attr) == 0 && attr.state == MRC_PROVIDER_QP_ERROR && !attr.send_pending);
+    struct mrc_provider_wc wc;
+    assert(mrc_provider_cq_poll(cq, &wc, 1) == 1 && wc.wr_id == write.wr_id && wc.status == MRC_PROVIDER_WC_FLUSHED);
+    assert(mrc_provider_cq_poll(cq, &wc, 1) == 0);
+    assert(mrc_provider_mr_deregister(pd, keys.lkey) == 0);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(cq) == 0);
+    assert(mrc_provider_pd_destroy(pd) == 0);
+}
+
+static void check_responder_cancel(const struct mrc_endpoint_config *source)
+{
+    struct mrc_provider_cq *cq;
+    struct mrc_provider_qp *qp;
+    assert(mrc_provider_cq_create(1, &cq) == 0);
+    const struct mrc_provider_qp_config config = {.qpn = 0x102, .recv_cq = cq, .recv_capacity = 1};
+    assert(mrc_provider_qp_create(&config, &qp) == 0);
+    activate(qp);
+    assert(mrc_provider_qp_post_recv(qp, 0xbeef) == 0);
+    uint8_t data[13] = {0};
+    struct mrc_endpoint_config transfer = *source;
+    transfer.sender = false;
+    transfer.data = data;
+    transfer.bytes = sizeof(data);
+    transfer.remote_address = 0x100000000;
+    transfer.remote_key = 1;
+    transfer.rx_work_capacity = 1;
+    struct mrc_endpoint_counters counters = {0};
+    struct mrc_responder *responder;
+    transfer.mpr_max = 0;
+    assert(mrc_responder_create(&transfer, qp, &counters, &responder) == -EINVAL);
+    struct mrc_provider_qp_attr attr;
+    assert(mrc_provider_qp_query(qp, &attr) == 0 && attr.state == MRC_PROVIDER_QP_RTS && attr.recv_pending == 1);
+    transfer.mpr_max = 1;
+    assert(mrc_responder_create(&transfer, qp, &counters, &responder) == 0);
+    mrc_responder_destroy(responder);
+    assert(mrc_provider_qp_query(qp, &attr) == 0 && attr.state == MRC_PROVIDER_QP_ERROR && !attr.recv_pending);
+    struct mrc_provider_wc wc;
+    assert(mrc_provider_cq_poll(cq, &wc, 1) == 1 && wc.wr_id == 0xbeef && wc.status == MRC_PROVIDER_WC_FLUSHED);
+    assert(mrc_provider_cq_poll(cq, &wc, 1) == 0);
+    assert(mrc_provider_qp_destroy(qp) == 0);
+    assert(mrc_provider_cq_destroy(cq) == 0);
+}
+
 static void run_application(void)
 {
     const uint64_t local_iova = 0x200000;
@@ -135,6 +206,8 @@ static void run_application(void)
     /* The application supplies connection and port attributes. The requester
      * reads the WR sizes, source buffers and remote addresses from the SQ. */
     struct mrc_endpoint_config transfer = requester_config();
+    check_requester_cancel(&transfer);
+    check_responder_cancel(&transfer);
 
     struct mrc_requester *requester;
     struct mrc_endpoint_counters counts = {0};

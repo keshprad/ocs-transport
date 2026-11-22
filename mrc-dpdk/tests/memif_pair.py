@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 MACS = {
-    role: tuple(f"02:00:00:00:00:{base + path:02x}" for path in range(8))
+    role: tuple(f"02:00:00:00:00:{base + path:02x}" for path in range(32))
     for role, base in (("rx", 0x10), ("tx", 0x20))
 }
 
@@ -22,7 +22,7 @@ def require(condition, message):
 def eal_args(binary, role, cpu, directory, *, rail_count=2):
     memif_role = "server" if role == "rx" else "client"
     args = [str(binary), f"--lcores=0@{cpu}", "--no-huge", "--no-pci",
-            "--no-telemetry", f"--file-prefix={directory.name}-{role}", "-m", "64"]
+            "--no-telemetry", f"--file-prefix={directory.name}-{role}", "-m", "256" if rail_count > 8 else "64"]
     for path, mac in enumerate(MACS[role][:rail_count]):
         args += [f"--vdev=net_memif{path},role={memif_role},"
                  f"socket={directory / f'path{path}.sock'},socket-abstract=no,mac={mac}"]

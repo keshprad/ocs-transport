@@ -150,6 +150,49 @@ static void test_directional_negotiation(void)
     assert(mrc_connect_negotiate(&local, &peer, &qp) == -EACCES);
 }
 
+static void test_capability_matrix(void)
+{
+    const unsigned int all = MRC_CONNECT_TRIM_NACK | MRC_CONNECT_DYNAMIC_MPR |
+                             MRC_CONNECT_SERVICE_TIME;
+    const unsigned int directional = MRC_CONNECT_TRIM_NACK | MRC_CONNECT_SERVICE_TIME;
+    unsigned int cases = 0;
+    for (unsigned int ls = 0; ls <= all; ls++)
+        for (unsigned int lo = 0; lo <= all; lo++) {
+            if (lo & ~ls)
+                continue;
+            for (unsigned int ps = 0; ps <= all; ps++)
+                for (unsigned int po = 0; po <= all; po++) {
+                    if (po & ~ps)
+                        continue;
+                    struct mrc_connect_offer local = sample_offer(), peer = sample_offer();
+                    local.supported = ls;
+                    local.offered = lo;
+                    peer.supported = ps;
+                    peer.offered = po;
+                    peer.receive.qpn = 300;
+                    peer.receive.max_mpr = 1;
+                    peer.receive.max_wimm = 0;
+                    peer.pmtu = 256;
+                    struct mrc_connect_qp qp, inverse;
+                    assert(mrc_connect_negotiate(&local, &peer, &qp) == 0);
+                    assert(mrc_connect_negotiate(&peer, &local, &inverse) == 0);
+                    bool dynamic = (lo & po & MRC_CONNECT_DYNAMIC_MPR) != 0;
+                    assert(qp.dynamic_mpr == dynamic && inverse.dynamic_mpr == dynamic);
+                    assert(qp.local_responder_features == (lo & directional));
+                    assert(qp.peer_responder_features == (po & directional));
+                    assert(inverse.local_responder_features == qp.peer_responder_features);
+                    assert(inverse.peer_responder_features == qp.local_responder_features);
+                    assert(qp.local_supported == ls && qp.peer_supported == ps);
+                    assert(qp.send.max_mpr == 1 && qp.send.max_wimm == 0);
+                    assert(qp.receive.max_mpr == local.receive.max_mpr);
+                    assert(qp.receive.max_wimm == local.receive.max_wimm);
+                    assert(qp.pmtu == 256 && inverse.pmtu == 256);
+                    cases++;
+                }
+        }
+    assert(cases == 729);
+}
+
 static void test_write_range(void)
 {
     struct mrc_connect_receive peer = {
@@ -178,6 +221,7 @@ int main(void)
     test_wire_format();
     test_strict_decoder();
     test_directional_negotiation();
+    test_capability_matrix();
     test_write_range();
     puts("MRC out-of-band connection tests passed");
 }

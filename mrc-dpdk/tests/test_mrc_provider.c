@@ -485,6 +485,20 @@ static void test_gathered_write_and_reset(void)
     ready_to_send(qp);
     assert(mrc_provider_qp_post_writev(qp, &write, sges, 3, &sequence) == 0 && sequence == 3);
     assert(mrc_provider_qp_post_recv(qp, 302) == 0);
+    /* Application cancellation enters ERROR while retaining all state needed
+     * by the datapath until its teardown completes. It emits no new CQEs. */
+    assert(mrc_provider_qp_cancel(qp) == 0);
+    struct mrc_provider_qp_attr retained;
+    assert(mrc_provider_qp_query(qp, &retained) == 0);
+    assert(retained.state == MRC_PROVIDER_QP_ERROR && retained.send_pending == 1 && retained.recv_pending == 1);
+    assert(mrc_provider_qp_get_write(qp, sequence, &view) == 0 && view.length == 8);
+    assert(mrc_provider_mr_deregister(pd, keys[0].lkey) == -EBUSY);
+    assert(mrc_provider_mr_deregister(pd, keys[1].lkey) == -EBUSY);
+    uint64_t rejected_sequence = 0;
+    assert(mrc_provider_qp_post_writev(qp, &write, sges, 3, &rejected_sequence) == -EINVAL);
+    assert(mrc_provider_qp_post_recv(qp, 303) == -EINVAL);
+    assert(mrc_provider_qp_destroy(qp) == -EBUSY);
+    assert(mrc_provider_qp_cancel(qp) == 0);
     assert(mrc_provider_qp_reset(qp) == 0);
 
     struct mrc_provider_qp_attr attr;

@@ -7,8 +7,15 @@
 
 From this directory, `make` builds `mrc_write`, `mrc_ctl_profile`, and the original prototype.
 `make check` runs the portable format and state tests. With the memif PMD
-available, `python3 tests/check_mrc_write.py` exercises the OCP endpoint
-without using the physical NICs.
+available, build `make tests/mrc_write_ready`, then run
+`python3 tests/check_mrc_write.py` to exercise the OCP endpoint without
+physical NICs. This test-only build waits up to three seconds for every
+configured rail before starting the requester, so packet-indexed fault
+injection cannot silently miss a late memif link. It also waits for the
+responder to stop polling before the client closes memif, then closes the
+server ports; shutdown waits are bounded by the configured drain/idle time.
+Pass `--binary ./mrc_write`
+to test the production CLI directly with its asynchronous startup.
 
 The arguments after EAL are
 `tx|rx BYTES_OR_WRITE_LIST LOCAL_IP PEER_IP PORT PEER_MAC [PORT PEER_MAC ...]`.
@@ -90,6 +97,13 @@ With the `net_memif` PMD available, build `tests/mrc_memif_relay` and run
 four wire modes. It injects packet-buffer and TRIM NACKs in separate runs
 and checks alternate-rail retries, payload across PSN wrap, and that a
 WRITEIMM credit stays occupied until its transport ACK.
+
+The expanded requirement checks also include `make check-mpr-retry` for
+independent dynamic/static window feedback and `make check-endpoint-rtt` for
+exact-clock Service Time arithmetic. With the pinned OCP headers,
+`make MRC_INCLUDE_DIR=/path/to/ocp/headers check-public-service-time` verifies
+public capability settings reach live endpoints. See [CONFORMANCE.md](CONFORMANCE.md)
+for the assertion-level mapping and remaining hardware/specification gaps.
 
 ### OCP application API
 
@@ -652,8 +666,25 @@ Each transfer uses separate endpoints, a
 management link for OOB negotiation, and two independent Linux routers.
 The test checks SRH advancement on both rails, terminal decapsulation
 on one rail, WRITEIMM completion and payload, and a live Dynamic MPR
-update. The ECN case marks the outer IPv6 header in the kernel. The trim
-case forwards sender-injected trims and checks alternate-rail recovery.
+update.
+
+The ECN case configures both routers to mark every sixteenth ECT(0)
+packet. It reads back each installed CE rule, counts packets with CE after
+marking, and checks SKIP SACKs for each reflected EV and the requester's
+response. On the decapsulation rail, an explicit nftables rule merges
+outer CE into an ECN-capable inner IPv6 header before `End.DX6`; the test
+counts CE again on the bare inner packets leaving the router. This policy
+is necessary on kernels whose native `End.DX6` action discards outer CE.
+A separate four-packet namespace test checks all inner ECN codepoints:
+Not-ECT remains Not-ECT, while ECT(0), ECT(1), and CE emerge as CE. Its
+counters are separate from the MRC transfer. The merge is restricted to
+the fixture's single-container IPv6/SRH/IPv6 layout and does not establish
+full RFC 6040 handling of an outer-CE/inner-Not-ECT packet. These checks
+verify deterministic software-switch configuration and endpoint feedback,
+not queue-driven WRED, native `End.DX6` ECN propagation, or physical-switch
+behavior.
+
+The trim case forwards sender-injected trims and checks alternate-rail recovery.
 The jumbo case uses the TAP PMD, `/dev/net/tun`, and Linux bridges with
 MTU 4500. It negotiates 4096-byte segments and checks that both routers
 see full-sized packets, including on the rail that decapsulates the SRH.

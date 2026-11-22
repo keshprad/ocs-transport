@@ -229,6 +229,8 @@ int mrc_requester_create(const struct mrc_endpoint_config *transfer, struct mrc_
                          struct mrc_endpoint_counters *counts, struct mrc_requester **requester);
 int mrc_requester_progress(struct mrc_requester *requester);
 uint8_t mrc_requester_mpr(const struct mrc_requester *requester);
+/* Destruction with pending sends enters provider ERROR and flushes them before
+ * releasing reliability/congestion state. Failed creation leaves work intact. */
 void mrc_requester_destroy(struct mrc_requester *requester);
 
 /* Set packets to zero for an ongoing responder with no benchmark end check. */
@@ -238,6 +240,7 @@ int mrc_responder_set_flow_control(struct mrc_responder *responder, uint8_t pena
 int mrc_responder_set_mpr(struct mrc_responder *responder, uint8_t units);
 int mrc_responder_progress(struct mrc_responder *responder);
 uint32_t mrc_responder_ack_msn(const struct mrc_responder *responder);
+/* Pending receive work is flushed in ERROR before assembly state is freed. */
 void mrc_responder_destroy(struct mrc_responder *responder);
 
 #endif

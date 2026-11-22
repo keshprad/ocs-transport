@@ -174,6 +174,17 @@ static void release_write_sources(struct work_entry *work)
     }
 }
 
+int mrc_provider_qp_cancel(struct mrc_provider_qp *qp)
+{
+    if (!qp)
+        return -EINVAL;
+    pthread_mutex_lock(&qp->mutex);
+    if (qp->state != MRC_PROVIDER_QP_RESET)
+        qp->state = MRC_PROVIDER_QP_ERROR;
+    pthread_mutex_unlock(&qp->mutex);
+    return 0;
+}
+
 int mrc_provider_qp_reset(struct mrc_provider_qp *qp)
 {
     if (!qp)

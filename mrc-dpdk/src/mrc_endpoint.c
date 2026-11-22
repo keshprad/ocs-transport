@@ -1302,6 +1302,12 @@ static void update_ev_denials(struct mrc_requester *sender, uint32_t current, ui
         if ((current ^ updated) & bit) {
             mrc_ev_deny(&sender->ev, ev, (updated & bit) != 0, now);
             sender->probes[ev].pending = false;
+            if (!(updated & bit)) {
+                /* Probe a re-enabled EV before newly admitted data can finish
+                 * the batch, even if the periodic probe timer is not due. */
+                sender->initial_probes |= bit;
+                sender->next_probe = now;
+            }
         }
     }
 }
@@ -1454,13 +1460,10 @@ static int receive_write(const struct mrc_endpoint_config *transfer, struct mrc_
                          (packet_ecn(packet) == 3 ? MRC_RX_ECN : 0);
     bool sack_due;
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, psn);
-    if (disposition == MRC_RX_INVALID_PSN)
+    /* §6.3.1 requires a silent drop outside the tracking window, even when
+     * AR, retransmit or ECN flags would otherwise request feedback. */
+    if (disposition == MRC_RX_INVALID_PSN || disposition == MRC_RX_AHEAD_OF_WINDOW)
         return 0;
-    if (disposition == MRC_RX_AHEAD_OF_WINDOW) {
-        send_nack(transfer, counts, path, &packet->bth, reflect_entropy(packet),
-                  MRC_NACK_PSN_OOR_WINDOW, 0, write_feedback_timestamp(transfer, packet, arrival_cycles));
-        return 0;
-    }
     if (disposition == MRC_RX_DUPLICATE) {
         counts->duplicates++;
         mrc_rx_record(&receiver->qp, psn, (uint32_t)write->data_len, flags, SACK_THRESHOLD, &sack_due);
@@ -1524,15 +1527,10 @@ static void receive_trimmed(const struct mrc_endpoint_config *transfer, const st
                             uint8_t reason, uint64_t arrival_cycles)
 {
     enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, trimmed->bth.psn);
-    if (disposition == MRC_RX_INVALID_PSN || disposition == MRC_RX_DUPLICATE)
+    /* A trim indication cannot make an outside-window PSN eligible for
+     * feedback; apply the same silent-drop rule as an intact request. */
+    if (disposition != MRC_RX_NEW)
         return;
-    if (disposition == MRC_RX_AHEAD_OF_WINDOW) {
-        uint16_t timestamp = mrc_endpoint_feedback_timestamp(transfer, arrival_cycles, trimmed->timestamp,
-                                                             trimmed->tsr, trimmed->tx_timestamp);
-        send_nack(transfer, counts, path, &trimmed->bth, entropy, MRC_NACK_PSN_OOR_WINDOW,
-                  0, timestamp);
-        return;
-    }
     if (!mrc_cc_nominal_size(trimmed->original_udp_len))
         return;
 
@@ -1582,6 +1580,9 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
                 packet.ipv4 = trimmed.ipv4;
             if (mrc_endpoint_peer_matches(transfer, path, &packet)) {
                 rx->matched++;
+                /* Rejected PSNs must not prolong the completion-drain timer. */
+                if (mrc_rx_classify(&receiver->qp, trimmed.bth.psn) != MRC_RX_NEW)
+                    return 0;
                 receiver->last_frame = rte_get_timer_cycles();
                 receive_trimmed(transfer, receiver, counts, path, &trimmed, reflect_entropy(&packet),
                                 trim_reason, arrival_cycles);
@@ -1601,6 +1602,11 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
         rx->matched++;
         if (mrc_endpoint_receive_op(transfer, receiver->node, counts, path, &packet, arrival_cycles))
             return 0;
+        if (mrc_wire_is_write(packet.bth.opcode)) {
+            enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, packet.bth.psn);
+            if (disposition == MRC_RX_INVALID_PSN || disposition == MRC_RX_AHEAD_OF_WINDOW)
+                return 0;
+        }
         receiver->last_frame = rte_get_timer_cycles();
         return receive_write(transfer, receiver, counts, path, &packet, arrival_cycles);
     }
@@ -1609,6 +1615,9 @@ static int receive_frame(const struct mrc_endpoint_config *transfer, struct mrc_
         !mrc_wire_decode_unsupported_opcode(frame, length, &packet, &route) &&
         mrc_endpoint_route_matches(transfer, path, &route) && mrc_endpoint_peer_matches(transfer, path, &packet)) {
         rx->matched++;
+        enum mrc_rx_disposition disposition = mrc_rx_classify(&receiver->qp, packet.bth.psn);
+        if (disposition == MRC_RX_INVALID_PSN || disposition == MRC_RX_AHEAD_OF_WINDOW)
+            return 0;
         return reject_write(transfer, receiver, counts, path, &packet, MRC_WR_INVALID,
                             packet.bth.psn, arrival_cycles);
     }
@@ -1720,6 +1729,18 @@ static void reset_requester_batch(struct mrc_requester *sender)
     sender->next = 0;
 }
 
+static void free_requester(struct mrc_requester *requester)
+{
+    if (requester) {
+        if (requester->event_fd >= 0)
+            close(requester->event_fd);
+        free(requester->transfer.work);
+        free(requester->metadata);
+        free(requester->slots);
+        free(requester);
+    }
+}
+
 int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct mrc_provider_qp *qp,
                          struct mrc_endpoint_counters *counts, struct mrc_requester **requester)
 {
@@ -1800,7 +1821,8 @@ int mrc_requester_create(const struct mrc_endpoint_config *configuration, struct
     return 0;
 
 failed:
-    mrc_requester_destroy(sender);
+    /* Creation never acquired ownership of the caller's posted work. */
+    free_requester(sender);
     return result;
 }
 
@@ -1942,12 +1964,25 @@ uint8_t mrc_requester_mpr(const struct mrc_requester *requester)
 void mrc_requester_destroy(struct mrc_requester *requester)
 {
     if (requester) {
-        if (requester->event_fd >= 0)
-            close(requester->event_fd);
-        free(requester->transfer.work);
-        free(requester->metadata);
-        free(requester->slots);
-        free(requester);
+        struct mrc_provider_qp_attr attr;
+        if (mrc_provider_qp_query(requester->provider_qp, &attr) == 0 &&
+            attr.send_pending && attr.state != MRC_PROVIDER_QP_ERROR)
+            /* Direct endpoint cancellation must enter ERROR before deleting
+             * reliability/CC state, just like the public QP teardown path. */
+            mrc_provider_qp_transition(requester->provider_qp, attr.state, MRC_PROVIDER_QP_ERROR);
+    }
+    free_requester(requester);
+}
+
+static void free_responder(struct mrc_responder *responder)
+{
+    if (responder) {
+        mrc_wr_destroy(&responder->wr);
+        free(responder->staged_payload);
+        free(responder->staged);
+        free(responder->work);
+        free(responder->slots);
+        free(responder);
     }
 }
 
@@ -1975,7 +2010,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
     receiver->slots = calloc(transfer->window, sizeof(*receiver->slots));
     receiver->work = calloc(transfer->rx_work_capacity, sizeof(*receiver->work));
     if (!receiver->slots || !receiver->work) {
-        mrc_responder_destroy(receiver);
+        free_responder(receiver);
         return -ENOMEM;
     }
     uint16_t pmtu = endpoint_pmtu(transfer);
@@ -1983,7 +2018,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
         receiver->staged = calloc(transfer->rx_staging_capacity, sizeof(*receiver->staged));
         receiver->staged_payload = malloc((size_t)transfer->rx_staging_capacity * pmtu);
         if (!receiver->staged || !receiver->staged_payload) {
-            mrc_responder_destroy(receiver);
+            free_responder(receiver);
             return -ENOMEM;
         }
     }
@@ -2007,7 +2042,7 @@ int mrc_responder_create(const struct mrc_endpoint_config *transfer, struct mrc_
     if (!mrc_rx_init(&receiver->qp, transfer->initial_psn, transfer->window, receiver->slots) ||
         !mrc_wr_init(&receiver->wr, &config) ||
         !mrc_mpr_init(&receiver->mpr, transfer->dynamic_mpr, transfer->mpr_max)) {
-        mrc_responder_destroy(receiver);
+        free_responder(receiver);
         return -EINVAL;
     }
     receiver->last_frame = receiver->last_progress = rte_get_timer_cycles();
@@ -2096,11 +2131,10 @@ uint32_t mrc_responder_ack_msn(const struct mrc_responder *responder)
 void mrc_responder_destroy(struct mrc_responder *responder)
 {
     if (responder) {
-        mrc_wr_destroy(&responder->wr);
-        free(responder->staged_payload);
-        free(responder->staged);
-        free(responder->work);
-        free(responder->slots);
-        free(responder);
+        struct mrc_provider_qp_attr attr;
+        if (mrc_provider_qp_query(responder->provider_qp, &attr) == 0 &&
+            (attr.recv_pending || responder->wr.work_span) && attr.state != MRC_PROVIDER_QP_ERROR)
+            mrc_provider_qp_transition(responder->provider_qp, attr.state, MRC_PROVIDER_QP_ERROR);
     }
+    free_responder(responder);
 }

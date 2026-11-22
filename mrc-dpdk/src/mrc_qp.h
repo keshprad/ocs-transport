@@ -87,6 +87,7 @@ bool mrc_tx_init(struct mrc_tx_qp *qp, uint32_t initial_psn, uint32_t window,
 bool mrc_tx_track(struct mrc_tx_qp *qp, uint32_t psn, uint64_t sent_at);
 struct mrc_tx_packet *mrc_tx_packet(const struct mrc_tx_qp *qp, uint32_t psn);
 
+/* Data triggers must identify a retained send. Rejection leaves state unchanged. */
 bool mrc_tx_apply_sack(struct mrc_tx_qp *qp, const struct mrc_sack *sack,
                        bool probe_response);
 /* Apply only a successful semantic Transport ACK. Returns true if it advances. */

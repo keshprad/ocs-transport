@@ -232,6 +232,12 @@ bool mrc_tx_apply_sack(struct mrc_tx_qp *qp, const struct mrc_sack *sack,
     if (sack->cack_psn > MRC_PSN_MASK || last >= (int32_t)tx_outstanding(qp))
         return false;
 
+    /* Validate the data trigger before applying any cumulative or selective
+     * delivery state. Probe responses carry an opaque token in this field. */
+    if (!probe_response &&
+        !mrc_tx_packet(qp, mrc_psn_add(sack->cack_psn, sack->ack_psn_offset)))
+        return false;
+
     if (mrc_psn_delta(sack->cack_psn, qp->delivery_cack_psn) > 0) {
         int32_t previous = mrc_psn_delta(qp->delivery_cack_psn, qp->first_psn);
         int32_t start = previous < 0 ? 0 : previous + 1;

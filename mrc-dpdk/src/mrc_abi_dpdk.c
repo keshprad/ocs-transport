@@ -484,7 +484,9 @@ static int configure_route(struct mrc_qp *qp, const struct mrc_dpdk_route_config
         .partition_key = local_pkey, .peer_partition_key = route->peer_pkey,
         .mpr_max = mpr, .window = window,
         .max_wimm_inflight = tx ? attrs->wimm.max_wimm : attrs->wimm.max_wimm_dest,
-        .rx_ooo_capacity = window, .rx_staging_capacity = window, .rx_work_capacity = window,
+        .rx_ooo_capacity = window, .rx_staging_capacity = window,
+        /* Semantic WRITEIMM credits are independent of the packet window. */
+        .rx_work_capacity = attrs->wimm.max_wimm_dest > window ? attrs->wimm.max_wimm_dest : window,
         .dynamic_mpr = (attrs->cap & MRC_QP_CAP_DYNAMIC_MPR) != 0,
         /* The local device advertises generation independently of the peer. */
         .trim_nack_enabled = !tx,

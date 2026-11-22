@@ -528,6 +528,9 @@ static void test_profile_lifecycle(struct ibv_context *verbs, struct mrc_context
     assert(configure_explicit(controller, PROFILE_ID, MRC_DPDK_EV_FORMAT_UDP) == 0);
     assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_OFFLINE);
     check_evs(controller, 0, 0);
+    assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == -1 && errno == EINVAL);
+    assert(profile_state(controller, PROFILE_ID) == MRC_CTL_PROFILE_OFFLINE);
+    check_evs(controller, 0, 0);
     populate_evs(controller);
     assert(set_profile_state(controller, PROFILE_ID, MRC_CTL_PROFILE_ONLINE) == 0);
 
@@ -1391,11 +1394,79 @@ static void watch_ev_events(struct mrc_context *controller, const char *director
     puts("]");
 }
 
+/* Exercise advertised global limits through the public API, including persistence
+ * and slot reuse. Keep this store separate from the lifecycle fixtures. */
+static void test_profile_capacity(struct ibv_context *verbs)
+{
+    enum { capacity = 32, first = 1000, extra = first + capacity };
+    char directory[] = "/tmp/mrc-ctl-capacity.XXXXXX";
+    assert(mkdtemp(directory));
+    struct mrc_context *context = open_store(verbs, directory);
+    for (unsigned int i = first; i < extra; i++) {
+        assert(configure_format(context, i, MRC_CTL_EV_FMT_MODE_UDP) == 0);
+        assert(configure_explicit(context, i, MRC_DPDK_EV_FORMAT_UDP) == 0);
+        assert(configure_cc_algorithm(context, i, nscc_algorithm) == 0);
+        struct mrc_ctl_ev_fmt_field field = {.width = 16};
+        assert(activate_format(context, i, &field, 1) == 0);
+        struct mrc_ctl_ev_profile_attr attr = {.ev_count = 32};
+        assert(mrc_ctl_modify_ev_profile(context, i, &attr, MRC_CTL_EV_PROFILE_COUNT) == 0);
+        struct mrc_ctl_ev_op_entry entries[32];
+        for (unsigned int n = 0; n < 32; n++)
+            entries[n] = (struct mrc_ctl_ev_op_entry){.ev = ev(n + 1, 0),
+                .ev_new = ev(n + 1, 0xc000 + n), .state = MRC_CTL_EV_GOOD};
+        assert(replace_evs(context, i, entries, 32) == 0);
+        assert(set_profile_state(context, i, MRC_CTL_PROFILE_ONLINE) == 0);
+        assert(activate_cc(context, i, &nscc_config) == 0);
+    }
+    assert(configure_format(context, extra, MRC_CTL_EV_FMT_MODE_UDP) == -1 && errno == ENOSPC);
+    assert(configure_explicit(context, extra, MRC_DPDK_EV_FORMAT_UDP) == -1 && errno == ENOSPC);
+    assert(configure_cc_algorithm(context, extra, nscc_algorithm) == -1 && errno == ENOSPC);
+    assert(mrc_destroy_context(context) == 0);
+    context = open_store(verbs, directory);
+    for (unsigned int i = first; i < extra; i++) {
+        struct mrc_ctl_ev_fmt_profile_attr format = {0};
+        assert(mrc_ctl_query_ev_fmt_profile(context, i, &format,
+               MRC_CTL_EV_FMT_PROFILE_CUR_STATE | MRC_CTL_EV_FMT_PROFILE_MODE) == 0);
+        assert(format.cur_profile_state == MRC_CTL_PROFILE_ONLINE &&
+               format.ev_fmt_mode == MRC_CTL_EV_FMT_MODE_UDP);
+        assert(profile_state(context, i) == MRC_CTL_PROFILE_ONLINE);
+        struct mrc_ctl_ev_op_entry entries[32] = {0};
+        struct mrc_ctl_ev_profile_attr attr = {.ev_op = {
+            .op = MRC_CTL_EV_OP_QUERY_EV_ARRAY, .entries = entries, .entry_count = 32}};
+        assert(mrc_ctl_query_ev_profile(context, i, &attr,
+               MRC_CTL_EV_PROFILE_EV_OP | MRC_CTL_EV_PROFILE_COUNT) == 0);
+        assert(attr.ev_count == 32 && attr.ev_op.entry_count == 32);
+        for (unsigned int n = 0; n < 32; n++)
+            assert(entries[n].ev.port == n + 1 && ev_value(&entries[n].ev) == 0xc000 + n &&
+                   entries[n].state == MRC_CTL_EV_GOOD);
+        struct mrc_ctl_cc_profile_attr cc = query_cc(context, i);
+        assert(cc.cur_profile_state == MRC_CTL_PROFILE_ONLINE && cc.algorithm &&
+               strcmp(cc.algorithm, nscc_algorithm) == 0);
+    }
+    assert(set_format_state(context, first, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_profile_state(context, first, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_cc_state(context, first, MRC_CTL_PROFILE_OFFLINE) == 0);
+    assert(set_format_state(context, first, MRC_CTL_PROFILE_INIT) == 0);
+    assert(set_profile_state(context, first, MRC_CTL_PROFILE_INIT) == 0);
+    assert(set_cc_state(context, first, MRC_CTL_PROFILE_INIT) == 0);
+    assert(configure_format(context, extra, MRC_CTL_EV_FMT_MODE_UDP) == 0);
+    assert(configure_explicit(context, extra, MRC_DPDK_EV_FORMAT_UDP) == 0);
+    assert(configure_cc_algorithm(context, extra, nscc_algorithm) == 0);
+    assert(configure_format(context, extra + 1, MRC_CTL_EV_FMT_MODE_UDP) == -1 && errno == ENOSPC);
+    assert(configure_explicit(context, extra + 1, MRC_DPDK_EV_FORMAT_UDP) == -1 && errno == ENOSPC);
+    assert(configure_cc_algorithm(context, extra + 1, nscc_algorithm) == -1 && errno == ENOSPC);
+    assert(mrc_destroy_context(context) == 0);
+    remove_test_store(directory);
+    puts("Public controller capacities: 32 ONLINE formats, 32 ONLINE EV profiles with 1024 total EVs, 32 ONLINE CC profiles; overflow, persistence and reuse passed");
+}
+
 int main(int argc, char **argv)
 {
     bool expect_no_cap = argc == 2 && strcmp(argv[1], "--expect-no-cap") == 0;
     bool seed = argc == 3 && strcmp(argv[1], "--seed-denied") == 0;
     bool unblock = argc == 3 && strcmp(argv[1], "--unblock") == 0;
+    bool seed_capacity_cc = argc == 3 && strcmp(argv[1], "--seed-capacity-cc") == 0;
+    bool check_capacity_cc = argc == 3 && strcmp(argv[1], "--check-capacity-cc-leases") == 0;
     bool seed_cc = argc == 3 && strcmp(argv[1], "--seed-cc") == 0;
     bool seed_qa = argc == 3 && strcmp(argv[1], "--seed-qa") == 0;
     bool seed_srv6 = argc == 3 && strcmp(argv[1], "--seed-explicit-srv6") == 0;
@@ -1418,7 +1489,7 @@ int main(int argc, char **argv)
         generated = &generated_stev;
     else if (argc == 3 && strcmp(argv[1], "--seed-gen-custom-stev") == 0)
         generated = &generated_custom_stev;
-    bool fixture = seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 ||
+    bool fixture = seed_capacity_cc || check_capacity_cc || seed || unblock || seed_cc || seed_qa || generated || seed_srv6 || unblock_srv6 ||
                    seed_srv6_srh || watch_events || watch_bad || mapped;
     if (argc != 1 && !expect_no_cap && !fixture) {
         fprintf(stderr, "Usage: %s [--expect-no-cap | --seed-denied DIR | --unblock DIR | "
@@ -1435,7 +1506,27 @@ int main(int argc, char **argv)
     }
     if (fixture) {
         struct mrc_context *controller = open_store(verbs, argv[2]);
-        if (watch_events || watch_bad) {
+        if (seed_capacity_cc) {
+            for (unsigned int i = 0; i < 32; i++) {
+                struct mrc_ctl_cc_nscc_cfg config = nscc_config;
+                config.base_rtt += i;
+                assert(configure_cc_algorithm(controller, 1000 + i, nscc_algorithm) == 0);
+                assert(activate_cc(controller, 1000 + i, &config) == 0);
+            }
+            puts("1000");
+        } else if (check_capacity_cc) {
+            for (unsigned int i = 0; i < 32; i++) {
+                struct mrc_ctl_cc_nscc_cfg config = nscc_config;
+                config.base_rtt += i;
+                check_cc_config(controller, 1000 + i, &config);
+                assert(set_cc_state(controller, 1000 + i, MRC_CTL_PROFILE_OFFLINE) == -1 && errno == EBUSY);
+            }
+            char marker[PATH_MAX];
+            assert(snprintf(marker, sizeof(marker), "%s/capacity-checked", argv[2]) > 0);
+            FILE *file = fopen(marker, "w");
+            assert(file && fclose(file) == 0);
+            puts("32");
+        } else if (watch_events || watch_bad) {
             watch_ev_events(controller, argv[2], watch_bad);
         } else if (seed) {
             seed_denied_profile(controller);
@@ -1496,6 +1587,7 @@ int main(int argc, char **argv)
         assert(mrc_destroy_context(controller) == 0);
         puts("Controller operations without CAP_NET_ADMIN were rejected");
     } else {
+        test_profile_capacity(verbs);
         test_port_administration(verbs, controller, false);
         test_generated_profile_counts(controller);
         test_profile_lifecycle(verbs, controller, directory);

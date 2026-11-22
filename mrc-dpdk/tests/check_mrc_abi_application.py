@@ -128,6 +128,11 @@ def main():
     focused.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
     focused.add_argument("--counted-rails-only", action="store_true", help="Run only the eight-rail QP cases")
     focused.add_argument("--mapped-evs-only", action="store_true", help="Run only the EV-to-rail mapping cases")
+    focused.add_argument("--boundaries-only", action="store_true",
+                         help="Run public WRITEIMM packet and MR boundary cases")
+    focused.add_argument("--capacity-only", action="store_true", help="Run 1024 outstanding WRITEIMM credit saturation")
+    focused.add_argument("--teardown-only", action="store_true", help="Run pending reset/destroy/ERROR cases")
+    focused.add_argument("--cc-capacity-only", action="store_true", help="Run simultaneous 32-profile traffic")
     args = parser.parse_args()
     binary = args.binary.resolve()
     require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
@@ -140,6 +145,49 @@ def main():
         require(tx["role"] == "tx" and rx["role"] == "rx",
                 f"Unexpected endpoint roles: {tx}, {rx}")
         return tx, rx
+
+    def check_boundaries():
+        for pmtu in (256, 512, 1024):
+            tx, rx = run_case(f"boundaries_{pmtu}")
+            require(tx["qpn"] != rx["qpn"] and tx["pmtu"] == rx["pmtu"] == pmtu
+                    and tx["completions"] == rx["completions"] == 10
+                    and tx["bytes"] == rx["bytes"] == 7 * pmtu + 11,
+                    f"Unexpected public boundary completions: {tx}, {rx}")
+            print(json.dumps({"case": "public_packet_boundaries", "tx": tx, "rx": rx}))
+
+    def check_wimm_capacity():
+        tx, rx = run_case("wimm_capacity")
+        require(tx["completions"] == rx["completions"] == 1025 and
+                tx["bytes"] == rx["bytes"] == 1025 and
+                rx["outstanding_before_ack"] == 1024 and rx["held_acks"] > 0,
+                f"Unexpected WRITEIMM saturation result: {tx}, {rx}")
+        print(json.dumps({"case": "public_1024_outstanding_writeimms", "tx": tx, "rx": rx}))
+
+    def check_pending_teardown():
+        for mode in ("reset_pending", "destroy_pending", "error_pending", "error_pending_overflow"):
+            tx, rx = run_case(mode)
+            require(tx["pending_cancelled"] and rx["pending_cancelled"] and
+                    tx["operation"] == rx["operation"] == mode,
+                    f"Unexpected pending teardown result: {tx}, {rx}")
+            print(json.dumps({"case": f"public_{mode}", "tx": tx, "rx": rx}))
+
+    def check_cc_capacity(controller):
+        with tempfile.TemporaryDirectory(prefix="mrc-cc-capacity-") as store:
+            first = control(controller, "--seed-capacity-cc", store)
+            def verify_leases(sender):
+                deadline = time.monotonic() + 4
+                while not (Path(store) / "capacity-live").exists():
+                    require(sender.poll() is None, "Requester exited before all 32 profiles were live")
+                    require(time.monotonic() < deadline, "Timed out waiting for 32-profile flight")
+                    time.sleep(0.01)
+                require(control(controller, "--check-capacity-cc-leases", store) == "32",
+                        "Controller did not verify all live profile leases")
+            tx, rx = run_case("cc_capacity", store, first, sender_started=verify_leases)
+            require(tx["profiles"] == rx["profiles"] == 32 and
+                    tx["completions"] == rx["completions"] == 32 and
+                    tx["bytes"] == rx["bytes"] == 32 * 2049,
+                    f"Unexpected CC profile capacity result: {tx}, {rx}")
+            print(json.dumps({"case": "public_32_cc_profiles_under_traffic", "tx": tx, "rx": rx}))
 
     def check_blackouts():
         for mode, completion, recovered in (
@@ -189,16 +237,17 @@ def main():
             print(json.dumps({"case": f"public_qp_pmtu_{pmtu}", "tx": tx, "rx": rx}))
 
     def check_counted_route():
-        for mode, rails, case in (("counted_route", 0xFF, "eight_rails"),
-                                  ("rail_backpressure", 0x60, "rail_backpressure")):
+        for mode, rails, case, count in (("counted_route", 0xFF, "eight_rails", 8),
+                                  ("rail_backpressure", 0x60, "rail_backpressure", 8),
+                                  ("maximum_rails", 0xFFFFFFFF, "maximum_rails", 32)):
             def command(role, cpu, directory):
-                return eal_args(binary, role, cpu, directory, rail_count=8) + [
+                return eal_args(binary, role, cpu, directory, rail_count=count) + [
                     "--", role, str(directory), mode,
                 ]
 
-            tx, rx, _ = run_pair(command, rail_count=8)
-            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 8193 and rx["observed_rails"] == rails,
-                    f"Unexpected eight-rail QP result: {tx}, {rx}")
+            tx, rx, _ = run_pair(command, rail_count=count)
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == count * 1024 + 1 and rx["observed_rails"] == rails,
+                    f"Unexpected counted-rail QP result: {tx}, {rx}")
             print(json.dumps({"case": f"public_qp_{case}", "tx": tx, "rx": rx}))
 
     def check_mapped_evs(controller):
@@ -228,6 +277,20 @@ def main():
         check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)
         return
 
+    if args.cc_capacity_only:
+        require(args.controller is not None, "CC capacity test needs --controller")
+        check_cc_capacity(args.controller.resolve())
+        return
+    if args.teardown_only:
+        check_pending_teardown()
+        return
+    if args.capacity_only:
+        check_wimm_capacity()
+        return
+    if args.boundaries_only:
+        check_boundaries()
+        return
+
     if args.blackout_only:
         check_blackouts()
         return
@@ -248,6 +311,9 @@ def main():
         check_counted_route()
         return
 
+    check_boundaries()
+    check_wimm_capacity()
+    check_pending_teardown()
     tx, rx = run_case("simplex")
     require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
             and tx["completions"] == rx["completions"] == 2,
@@ -307,6 +373,7 @@ def main():
     if args.controller:
         controller = args.controller.resolve()
         require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
+        check_cc_capacity(controller)
         for format_name in ("udp", "stev", "srv6", "shared", "counted"):
             check_endpoint_operations(binary, format_name)
         check_shared_port_status(binary)

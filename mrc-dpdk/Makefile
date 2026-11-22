@@ -66,7 +66,7 @@ libmrc-dpdk.so: $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
 tests/test_mrc_abi: tests/test_mrc_abi.c $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
 	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
 	$(PKG_CONFIG) --exists libibverbs libdpdk
-	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -Wl,--wrap=mrc_verbs_async_open -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -Wl,--wrap=mrc_verbs_async_open -Wl,--wrap=mrc_abi_release_route -o $@ $(filter %.c,$^) $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
 
 tests/mrc_abi_application: tests/mrc_abi_application.c src/dpdk_io.c src/dpdk_io.h src/mrc_dpdk.h libmrc-dpdk.so
 	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter %.c,$^) -L. -Wl,-rpath,'$$ORIGIN/..' -lmrc-dpdk $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
@@ -90,4 +90,62 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_port_netlink
 
 clean:
-	$(RM) mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_ctl_abi tests/mrc_abi_application tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store tests/test_mrc_port_netlink
+	$(RM) tests/mrc_endpoint_window tests/mrc_public_teardown tests/mrc_srv6_encode tests/mrc_write_ready tests/mrc_endpoint_rtt tests/mrc_public_service_time mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_ctl_abi tests/mrc_abi_application tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store tests/test_mrc_port_netlink
+
+# Private-state integration harness; the C file includes mrc_endpoint.c itself.
+tests/mrc_endpoint_rtt: tests/mrc_endpoint_rtt.c src/mrc_connect.c $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
+	$(PKG_CONFIG) --exists libdpdk
+	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter-out src/mrc_endpoint.c,$(filter %.c,$^)) $(DPDK_LIBS) $(LDLIBS)
+
+tests/mrc_endpoint_window: tests/mrc_endpoint_window.c src/mrc_connect.c $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
+	$(PKG_CONFIG) --exists libdpdk
+	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter-out src/mrc_endpoint.c,$(filter %.c,$^)) $(DPDK_LIBS) $(LDLIBS)
+
+.PHONY: check-endpoint-rtt
+check-endpoint-rtt: tests/mrc_endpoint_rtt
+	python3 tests/check_mrc_endpoint_rtt.py
+
+# Same live public application, with assertions at the ABI/endpoint boundary.
+tests/mrc_public_service_time: tests/mrc_public_service_time.c tests/mrc_abi_application.c $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
+	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
+	$(PKG_CONFIG) --exists libibverbs libdpdk
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -Wl,--wrap=mrc_modify_qp -Wl,--wrap=mrc_requester_create -Wl,--wrap=mrc_responder_create -o $@ $(filter-out tests/mrc_abi_application.c,$(filter %.c,$^)) $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
+
+tests/mrc_public_teardown: tests/mrc_public_teardown.c tests/mrc_abi_application.c $(MRC_ABI_SRC) $(MRC_ABI_DEPS)
+	@test -n "$(MRC_INCLUDE_DIR)" || { echo "Set MRC_INCLUDE_DIR to the directory containing the OCP MRC headers" >&2; exit 1; }
+	$(PKG_CONFIG) --exists libibverbs libdpdk
+	$(CC) $(CPPFLAGS) $(MRC_ABI_CFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -Wl,--wrap=mrc_abi_release_route -o $@ $(filter-out tests/mrc_abi_application.c,$(filter %.c,$^)) $(MRC_ABI_LIBS) $(DPDK_LIBS) $(LDLIBS)
+
+.PHONY: check-public-service-time
+check-public-service-time: tests/mrc_public_service_time
+	python3 tests/check_mrc_public_service_time.py
+
+.PHONY: check-mpr-retry
+check-mpr-retry: mrc_write tests/mrc_memif_relay
+	python3 tests/check_mrc_mpr_retry.py
+
+# Production benchmark with an explicit test-only all-rail startup barrier.
+tests/mrc_write_ready: tests/mrc_write_ready.c src/mrc_write.c src/mrc_connect.c src/mrc_oob.c src/mrc_connect.h src/mrc_oob.h $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
+	$(PKG_CONFIG) --exists libdpdk
+	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) $(LDFLAGS) -Wl,--wrap=mrc_requester_create -Wl,--wrap=mrc_responder_create -Wl,--wrap=mrc_dpdk_close_port -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(LDLIBS)
+
+# Independent Linux NEXT-CSID forwarding of production-encoded envelopes.
+tests/mrc_srv6_encode: tests/mrc_srv6_encode.c src/mrc_wire.c src/mrc_wire.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+.PHONY: check-srv6-csid
+check-srv6-csid: tests/mrc_srv6_encode
+	unshare -Urn python3 tests/check_mrc_srv6_csid.py
+
+.PHONY: check-public-teardown
+check-public-teardown: tests/mrc_public_teardown
+	python3 tests/check_mrc_abi_application.py --binary tests/mrc_public_teardown --teardown-only
+
+# Requires the pcap PMD runtime used by the independent wire tests.
+.PHONY: check-relay-protocol
+check-relay-protocol: tests/mrc_memif_relay
+	python3 tests/check_mrc_relay_protocol.py
+
+.PHONY: check-endpoint-window
+check-endpoint-window: tests/mrc_endpoint_window
+	./tests/mrc_endpoint_window

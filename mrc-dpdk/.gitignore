@@ -17,3 +17,12 @@
 /tests/mrc_endpoint_application
 /tests/mrc_abi_application
 /tests/test_mrc_ctl_abi
+/tests/mrc_endpoint_rtt
+/tests/mrc_public_service_time
+
+/tests/mrc_write_ready
+
+tests/mrc_public_teardown
+/tests/mrc_srv6_encode
+
+tests/mrc_endpoint_window

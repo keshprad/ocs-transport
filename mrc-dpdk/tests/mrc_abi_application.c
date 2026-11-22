@@ -1688,6 +1688,440 @@ static void run_simplex(bool requester, const char *directory, const struct addr
     }
 }
 
+struct wimm_capacity_gate {
+    bool released;
+    unsigned int held_acks;
+    struct rte_mbuf *latest[2];
+};
+
+static uint16_t hold_wimm_acks(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                               uint16_t count, void *argument)
+{
+    (void)queue;
+    struct wimm_capacity_gate *gate = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[14 + 40 + WIRE_UDP_LEN + WIRE_BTH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        if (!gate->released && udp.header[WIRE_UDP_LEN] == WIRE_TRANSPORT_ACK) {
+            assert(port < 2);
+            if (gate->latest[port])
+                rte_pktmbuf_free(gate->latest[port]);
+            gate->latest[port] = rte_pktmbuf_copy(packets[i], packets[i]->pool, 0, UINT32_MAX);
+            assert(gate->latest[port]);
+            gate->held_acks++;
+            /* Deliver a corrupt copy so TX succeeds while the requester cannot
+             * consume a semantic credit. Keep the valid cumulative ACK. */
+            assert(rte_pktmbuf_is_contiguous(packets[i]));
+            uint8_t *bytes = rte_pktmbuf_mtod(packets[i], uint8_t *);
+            bytes[rte_pktmbuf_pkt_len(packets[i]) - 1] ^= 1;
+        }
+    }
+    return count;
+}
+
+static void run_boundaries(bool requester, const char *directory, const struct address *address,
+                           struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                           unsigned int pmtu, bool capacity)
+{
+    const uint32_t boundary_lengths[] = {0, 1, 2, 3, 4, pmtu - 1, pmtu, pmtu + 1, 2 * pmtu, 2 * pmtu + 1};
+    const unsigned int rounds = capacity ? 1025 : 10;
+    uint32_t lengths[rounds];
+    for (unsigned int i = 0; i < rounds; i++)
+        lengths[i] = capacity ? 1 : boundary_lengths[i];
+    size_t bytes = 0;
+    for (unsigned int i = 0; i < rounds; i++)
+        bytes += lengths[i];
+    uint8_t *allocation = calloc(bytes + 2, 1);
+    assert(allocation);
+    allocation[0] = 0xa5;
+    allocation[bytes + 1] = 0x5a;
+    uint8_t *data = allocation + 1;
+    if (requester)
+        for (size_t i = 0; i < bytes; i++)
+            data[i] = pattern(i);
+    struct ibv_mr *mr = register_memory(context, pd, data, bytes,
+        requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    struct mrc_cq *cq = mrc_create_cq(context, rounds, NULL, NULL, 0);
+    assert(cq);
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .send_cq = requester ? cq : NULL, .recv_cq = requester ? NULL : cq,
+        .send_ops_flags = requester ? IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM : 0,
+        .cap = {.max_send_wr = requester ? rounds : 0, .max_send_sge = requester,
+                .max_recv_wr = requester ? 0 : rounds},
+    };
+    if (!requester)
+        skip_local_qp_numbers(context, &init, 1);
+    struct mrc_qp *qp = mrc_create_qp(context, &init);
+    struct connection local = {.gid = address->gid, .psn = SEND_PSN,
+                                .remote_address = (uintptr_t)data, .rkey = mr->rkey};
+    assert(qp && mrc_get_qpn(qp, &local.qpn) == 0);
+    publish(directory, requester ? "tx.connection" : "rx.connection", &local, sizeof(local));
+    struct connection peer;
+    read_peer_connections(directory, requester, &peer, 1);
+    enum ibv_mtu mtu = pmtu == 256 ? IBV_MTU_256 : pmtu == 512 ? IBV_MTU_512 : IBV_MTU_1024;
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, 0, 0, mtu);
+    if (capacity) {
+        struct mrc_qp_attr attrs = {0};
+        if (requester) attrs.wimm.max_wimm = 1024;
+        else attrs.wimm.max_wimm_dest = 1024;
+        assert(mrc_modify_qp(qp, NULL, 0, &attrs,
+               requester ? MRC_QP_MAX_WIMM : MRC_QP_MAX_WIMM_DEST) == 0);
+    }
+    struct mrc_dpdk_route route = path_route(pool, requester);
+    route.requester = requester;
+    attach_qp(qp, &route);
+    if (capacity) {
+        /* First verify legal independent WIMM=1024/MPR=1 attaches. Then use
+         * a larger packet window so semantic credits alone limit admission. */
+        struct ibv_qp_attr reset = {.qp_state = IBV_QPS_RESET};
+        assert(mrc_modify_qp(qp, &reset, IBV_QP_STATE, NULL, 0) == 0);
+        configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, 0, 0, mtu);
+        struct mrc_qp_attr attrs = {0};
+        if (requester) { attrs.mpr.mpr = 9; attrs.wimm.max_wimm = 1024; }
+        else { attrs.mpr.mpr_dest = 9; attrs.wimm.max_wimm_dest = 1024; }
+        assert(mrc_modify_qp(qp, NULL, 0, &attrs,
+               requester ? MRC_QP_MPR | MRC_QP_MAX_WIMM : MRC_QP_MPR_DEST | MRC_QP_MAX_WIMM_DEST) == 0);
+        attach_qp(qp, &route);
+    }
+    struct wimm_capacity_gate gate = {0};
+    const struct rte_eth_rxtx_callback *callbacks[2] = {0};
+    if (capacity && !requester)
+        for (uint16_t port = 0; port < 2; port++) {
+            callbacks[port] = rte_eth_add_tx_callback(port, 0, hold_wimm_acks, &gate);
+            assert(callbacks[port]);
+        }
+    uint64_t saturated_at = 0;
+
+    if (requester) {
+        char ready[PATH_MAX];
+        path_for(ready, directory, "rx.boundaries-ready");
+        wait_for(ready);
+        struct ibv_sge sges[rounds];
+        struct ibv_send_wr writes[rounds];
+        size_t offset = 0;
+        for (unsigned int i = 0; i < rounds; i++) {
+            sges[i] = (struct ibv_sge){.addr = (uintptr_t)(data + offset),
+                                      .length = lengths[i], .lkey = mr->lkey};
+            writes[i] = (struct ibv_send_wr){
+                .wr_id = i + 1, .next = i + 1 < rounds ? &writes[i + 1] : NULL,
+                .sg_list = lengths[i] ? &sges[i] : NULL, .num_sge = lengths[i] ? 1 : 0,
+                .opcode = IBV_WR_RDMA_WRITE_WITH_IMM, .send_flags = IBV_SEND_SIGNALED,
+                .imm_data = htonl(i + 1),
+                .wr.rdma = {.remote_addr = peer.remote_address + offset, .rkey = peer.rkey},
+            };
+            offset += lengths[i];
+        }
+        struct ibv_send_wr *bad = NULL;
+        assert(mrc_post_send(qp, writes, &bad) == 0 && !bad);
+    } else {
+        struct ibv_recv_wr receives[rounds];
+        for (unsigned int i = 0; i < rounds; i++)
+            receives[i] = (struct ibv_recv_wr){.wr_id = i + 1,
+                .next = i + 1 < rounds ? &receives[i + 1] : NULL};
+        struct ibv_recv_wr *bad = NULL;
+        assert(mrc_post_recv(qp, receives, &bad) == 0 && !bad);
+        publish(directory, "rx.boundaries-ready", NULL, 0);
+    }
+    unsigned int completed = 0;
+    uint64_t deadline = rte_get_timer_cycles() + 3 * rte_get_timer_hz();
+    char done[PATH_MAX];
+    path_for(done, directory, "tx.boundaries-done");
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+        struct ibv_wc wc;
+        int count = mrc_poll_cq(cq, 1, &wc);
+        assert(count >= 0);
+        if (count) {
+            assert(completed < rounds && wc.status == IBV_WC_SUCCESS && wc.wr_id == completed + 1);
+            assert(wc.opcode == (requester ? IBV_WC_RDMA_WRITE : IBV_WC_RECV_RDMA_WITH_IMM));
+            if (!requester)
+                assert((wc.wc_flags & IBV_WC_WITH_IMM) && ntohl(wc.imm_data) == completed + 1 &&
+                       wc.byte_len == lengths[completed]);
+            completed++;
+        }
+        if (capacity && !requester && !gate.released && completed >= 1024) {
+            assert(completed == 1024); /* The 1025th WR needs a semantic credit. */
+            if (!saturated_at) saturated_at = rte_get_timer_cycles();
+            if (rte_get_timer_cycles() - saturated_at > rte_get_timer_hz() / 50) {
+                assert(gate.held_acks > 0);
+                gate.released = true;
+                for (uint16_t port = 0; port < 2; port++)
+                    if (gate.latest[port]) {
+                        assert(rte_eth_tx_burst(port, 0, &gate.latest[port], 1) == 1);
+                        gate.latest[port] = NULL;
+                    }
+            }
+        }
+        rte_pause();
+    } while (completed < rounds || (!requester && access(done, F_OK) != 0));
+    if (requester)
+        publish(directory, "tx.boundaries-done", NULL, 0);
+    else
+        for (size_t i = 0; i < bytes; i++)
+            assert(data[i] == pattern(i));
+    assert(allocation[0] == 0xa5 && allocation[bytes + 1] == 0x5a);
+    if (capacity && !requester) {
+        assert(gate.released && saturated_at);
+        for (uint16_t port = 0; port < 2; port++) {
+            assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
+            rte_free((void *)callbacks[port]);
+        }
+    }
+    assert(mrc_destroy_qp(qp) == 0);
+    deregister_memory(context, mr);
+    assert(mrc_destroy_cq(cq) == 0);
+    free(allocation);
+    printf("{\"role\":\"%s\",\"qpn\":%u,\"pmtu\":%u,\"bytes\":%zu,\"completions\":%u,\"outstanding_before_ack\":%u,\"held_acks\":%u}\n",
+           requester ? "tx" : "rx", local.qpn, pmtu, bytes, completed,
+           capacity && !requester ? 1024 : 0, gate.held_acks);
+}
+
+static void run_pending_teardown(bool requester, const char *directory, const struct address *address,
+                                 struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                                 const char *operation)
+{
+    bool overflow = !strcmp(operation, "error_pending_overflow");
+    uint8_t data[FIRST_BYTES] = {0};
+    if (requester)
+        for (size_t i = 0; i < sizeof(data); i++) data[i] = pattern(i);
+    struct ibv_mr *mr = register_memory(context, pd, data, sizeof(data),
+        requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
+    assert(cq);
+    struct mrc_qp_init_attr init = {
+        .pd = pd, .send_cq = requester ? cq : NULL, .recv_cq = requester ? NULL : cq,
+        .cap = {.max_send_wr = requester ? (overflow ? 2 : 1) : 0, .max_send_sge = requester, .max_recv_wr = !requester},
+    };
+    if (!requester) skip_local_qp_numbers(context, &init, 1);
+    struct mrc_qp *qp = mrc_create_qp(context, &init);
+    struct connection local = {.gid = address->gid, .psn = SEND_PSN,
+        .remote_address = (uintptr_t)data, .rkey = mr->rkey};
+    assert(qp && mrc_get_qpn(qp, &local.qpn) == 0);
+    publish(directory, requester ? "tx.connection" : "rx.connection", &local, sizeof(local));
+    struct connection peer;
+    read_peer_connections(directory, requester, &peer, 1);
+    configure_qp(qp, address, &peer, local.psn, requester, !requester, 0, 0, 0, 0, IBV_MTU_1024);
+    struct mrc_dpdk_route route = path_route(pool, requester);
+    route.requester = requester;
+    attach_qp(qp, &route);
+    prepare_memif_links();
+    struct wimm_capacity_gate gate = {0};
+    const struct rte_eth_rxtx_callback *callbacks[2] = {0};
+    char ready[PATH_MAX], delivered[PATH_MAX], done[PATH_MAX];
+    path_for(ready, directory, "rx.cancel-ready");
+    path_for(delivered, directory, "rx.cancel-delivered");
+    path_for(done, directory, "tx.cancel-done");
+    if (requester) {
+        wait_for(ready);
+        post_single_write_imm(qp, &peer, mr, 0);
+    } else {
+        for (uint16_t port = 0; port < 2; port++) {
+            callbacks[port] = rte_eth_add_tx_callback(port, 0, hold_wimm_acks, &gate);
+            assert(callbacks[port]);
+        }
+        struct ibv_recv_wr receive = {.wr_id = 81}, *bad = NULL;
+        assert(mrc_post_recv(qp, &receive, &bad) == 0 && !bad);
+        publish(directory, "rx.cancel-ready", NULL, 0);
+    }
+    uint64_t deadline = rte_get_timer_cycles() + 3 * rte_get_timer_hz();
+    struct ibv_wc wc;
+    bool received = false;
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        assert(mrc_dpdk_progress_qp(qp) == 0);
+        int count = mrc_poll_cq(cq, 1, &wc);
+        assert(count >= 0);
+        if (requester) {
+            assert(count == 0); /* Reliability delivery must not finish the WR. */
+        } else if (count) {
+            assert(!received && wc.status == IBV_WC_SUCCESS && wc.wr_id == 81 &&
+                   wc.byte_len == FIRST_BYTES && ntohl(wc.imm_data) == FIRST_IMMEDIATE);
+            assert(gate.held_acks > 0);
+            received = true;
+            publish(directory, "rx.cancel-delivered", NULL, 0);
+        }
+    } while (access(requester ? delivered : done, F_OK) != 0);
+    if (requester) {
+        assert(mrc_dpdk_unbind_mr(context, mr) == EBUSY);
+        if (overflow) {
+            /* Queue another WR without transmitting it. Flushing two WRs into
+             * a one-entry CQ makes ERROR transition report a partial failure. */
+            struct ibv_sge sg = {.addr = (uintptr_t)data, .length = FIRST_BYTES, .lkey = mr->lkey};
+            struct ibv_send_wr wr = {.wr_id = 71, .sg_list = &sg, .num_sge = 1,
+                .opcode = IBV_WR_RDMA_WRITE_WITH_IMM, .send_flags = IBV_SEND_SIGNALED,
+                .wr.rdma = {.remote_addr = peer.remote_address, .rkey = peer.rkey}}, *bad = NULL;
+            assert(mrc_post_send(qp, &wr, &bad) == 0 && !bad);
+        }
+        if (!strcmp(operation, "destroy_pending")) {
+            assert(mrc_destroy_qp(qp) == 0);
+            qp = NULL;
+        } else {
+            bool error = overflow || !strcmp(operation, "error_pending");
+            struct ibv_qp_attr attrs = {.qp_state = error ? IBV_QPS_ERR : IBV_QPS_RESET};
+            assert(mrc_modify_qp(qp, &attrs, IBV_QP_STATE, NULL, 0) == (overflow ? EOVERFLOW : 0));
+            assert(mrc_query_qp(qp, &attrs, IBV_QP_STATE, NULL, 0, NULL) == 0);
+            assert(attrs.qp_state == (error ? IBV_QPS_ERR : IBV_QPS_RESET));
+            assert(mrc_dpdk_progress_qp(qp) == ENOTCONN);
+            if (error && !overflow) {
+                assert(mrc_poll_cq(cq, 1, &wc) == 1 && wc.wr_id == 70 &&
+                       wc.status == IBV_WC_WR_FLUSH_ERR);
+            }
+        }
+        if (overflow) assert(mrc_poll_cq(cq, 1, &wc) == -1 && errno == EOVERFLOW);
+        else assert(mrc_poll_cq(cq, 1, &wc) == 0);
+        publish(directory, "tx.cancel-done", NULL, 0);
+    } else {
+        assert(received);
+        for (size_t i = 0; i < sizeof(data); i++) assert(data[i] == pattern(i));
+        for (uint16_t port = 0; port < 2; port++) {
+            assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
+            rte_free((void *)callbacks[port]);
+            if (gate.latest[port]) rte_pktmbuf_free(gate.latest[port]);
+        }
+    }
+    if (qp) assert(mrc_destroy_qp(qp) == 0);
+    deregister_memory(context, mr);
+    assert(mrc_destroy_cq(cq) == 0);
+    printf("{\"role\":\"%s\",\"operation\":\"%s\",\"pending_cancelled\":true}\n",
+           requester ? "tx" : "rx", operation);
+}
+
+struct cc_capacity_witness { uint32_t qpn[32]; uint32_t sent; unsigned int packets[32]; };
+static uint16_t observe_cc_capacity(uint16_t port, uint16_t queue, struct rte_mbuf **packets,
+                                    uint16_t count, void *argument)
+{
+    (void)port;
+    (void)queue;
+    struct cc_capacity_witness *witness = argument;
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t prefix[14 + 40 + WIRE_UDP_LEN + WIRE_BTH_LEN];
+        struct observed_udp udp = read_udp(packets[i], prefix, sizeof(prefix));
+        const uint8_t *bth = udp.header + WIRE_UDP_LEN;
+        if (bth[0] != WIRE_WRITE_FIRST && bth[0] != WIRE_WRITE_MIDDLE && bth[0] != WIRE_WRITE_LAST_IMM) continue;
+        unsigned int slot = 0;
+        while (slot < 32 && witness->qpn[slot] != wire_be24(bth + 5)) slot++;
+        assert(slot < 32);
+        witness->sent |= UINT32_C(1) << slot;
+        witness->packets[slot]++;
+    }
+    return count;
+}
+
+static void run_cc_capacity(bool requester, const char *directory, const struct address *address,
+                              struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
+                              const char *store, uint64_t first_profile)
+{
+    enum { count = 32, bytes = 2049 };
+    uint8_t data[count][bytes];
+    memset(data, 0, sizeof(data));
+    if (requester)
+        for (size_t i = 0; i < sizeof(data); i++) ((uint8_t *)data)[i] = pattern(i);
+    assert(mrc_dpdk_set_ev_store(context, store) == 0);
+    struct ibv_mr *mr = register_memory(context, pd, data[0], sizeof(data),
+        requester ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    struct mrc_cq *cq = mrc_create_cq(context, count, NULL, NULL, 0);
+    assert(cq);
+    struct mrc_qp_init_attr init = {.pd = pd,
+        .send_cq = requester ? cq : NULL, .recv_cq = requester ? NULL : cq,
+        .cap = {.max_send_wr = requester, .max_send_sge = requester, .max_recv_wr = !requester}};
+    if (!requester) skip_local_qp_numbers(context, &init, count);
+    struct mrc_qp *qps[count];
+    struct connection local[count], peer[count];
+    for (unsigned int i = 0; i < count; i++) {
+        qps[i] = mrc_create_qp(context, &init);
+        local[i] = (struct connection){.gid = address->gid, .psn = SEND_PSN,
+            .remote_address = (uintptr_t)data[i], .rkey = mr->rkey};
+        assert(qps[i] && mrc_get_qpn(qps[i], &local[i].qpn) == 0);
+    }
+    publish(directory, requester ? "tx.connection" : "rx.connection", local, sizeof(local));
+    read_peer_connections(directory, requester, peer, count);
+    for (unsigned int i = 0; i < count; i++) {
+        assert(local[i].qpn != peer[i].qpn);
+        configure_qp(qps[i], address, &peer[i], local[i].psn, requester, !requester,
+                     0, requester ? first_profile + i : 0, 0, 0, IBV_MTU_1024);
+        if (requester) {
+            struct mrc_qp_attr attrs;
+            assert(mrc_query_qp(qps[i], NULL, 0, &attrs, MRC_QP_CC_PROFILE_ID, NULL) == 0 &&
+                   attrs.profile.cc_profile_id == first_profile + i);
+        }
+        struct mrc_dpdk_route route = path_route(pool, requester);
+        route.requester = requester;
+        attach_qp(qps[i], &route);
+    }
+    prepare_memif_links();
+    struct cc_capacity_witness witness = {0};
+    const struct rte_eth_rxtx_callback *callbacks[2] = {0};
+    if (requester) {
+        for (unsigned int i = 0; i < count; i++) witness.qpn[i] = peer[i].qpn;
+        for (uint16_t port = 0; port < 2; port++) {
+            callbacks[port] = rte_eth_add_tx_callback(port, 0, observe_cc_capacity, &witness);
+            assert(callbacks[port]);
+        }
+    }
+    char ready[PATH_MAX], checked[PATH_MAX], done[PATH_MAX];
+    path_for(ready, directory, "rx.cc-capacity-ready");
+    path_for(checked, store, "capacity-checked");
+    path_for(done, directory, "tx.cc-capacity-done");
+    if (requester) {
+        wait_for(ready);
+        for (unsigned int i = 0; i < count; i++) {
+            struct ibv_sge sg = {.addr = (uintptr_t)data[i], .length = bytes, .lkey = mr->lkey};
+            struct ibv_send_wr wr = {.wr_id = i + 1, .sg_list = &sg, .num_sge = 1,
+                .opcode = IBV_WR_RDMA_WRITE_WITH_IMM, .send_flags = IBV_SEND_SIGNALED,
+                .imm_data = htonl(i + 1),
+                .wr.rdma = {.remote_addr = peer[i].remote_address, .rkey = peer[i].rkey}}, *bad = NULL;
+            assert(mrc_post_send(qps[i], &wr, &bad) == 0 && !bad);
+            assert(mrc_dpdk_progress_qp(qps[i]) == 0);
+        }
+        uint64_t flight_deadline = rte_get_timer_cycles() + rte_get_timer_hz();
+        while (witness.sent != UINT32_MAX) {
+            assert(rte_get_timer_cycles() < flight_deadline);
+            for (unsigned int i = 0; i < count; i++) assert(mrc_dpdk_progress_qp(qps[i]) == 0);
+        }
+        struct ibv_wc wc;
+        assert(mrc_poll_cq(cq, 1, &wc) == 0);
+        for (unsigned int i = 0; i < count; i++) assert(witness.packets[i] == 1);
+        publish(store, "capacity-live", NULL, 0);
+    } else {
+        for (unsigned int i = 0; i < count; i++) {
+            struct ibv_recv_wr wr = {.wr_id = i + 1}, *bad = NULL;
+            assert(mrc_post_recv(qps[i], &wr, &bad) == 0 && !bad);
+        }
+        publish(directory, "rx.cc-capacity-ready", NULL, 0);
+    }
+    wait_for(checked); /* Independent controller verifies every live profile lease. */
+    uint32_t seen = 0;
+    uint64_t deadline = rte_get_timer_cycles() + 3 * rte_get_timer_hz();
+    do {
+        assert(rte_get_timer_cycles() < deadline);
+        for (unsigned int i = 0; i < count; i++) assert(mrc_dpdk_progress_qp(qps[i]) == 0);
+        struct ibv_wc wc;
+        int available;
+        while ((available = mrc_poll_cq(cq, 1, &wc)) > 0) {
+            assert(wc.wr_id >= 1 && wc.wr_id <= count && wc.status == IBV_WC_SUCCESS);
+            unsigned int i = wc.wr_id - 1;
+            assert(!(seen & (UINT32_C(1) << i)) && wc.qp_num == local[i].qpn);
+            seen |= UINT32_C(1) << i;
+            assert(wc.opcode == (requester ? IBV_WC_RDMA_WRITE : IBV_WC_RECV_RDMA_WITH_IMM));
+            if (!requester) assert(wc.byte_len == bytes && ntohl(wc.imm_data) == i + 1);
+        }
+        assert(available == 0);
+    } while (seen != UINT32_MAX || (!requester && access(done, F_OK) != 0));
+    if (requester) publish(directory, "tx.cc-capacity-done", NULL, 0);
+    else for (size_t i = 0; i < sizeof(data); i++) assert(((uint8_t *)data)[i] == pattern(i));
+    if (requester)
+        for (uint16_t port = 0; port < 2; port++) {
+            assert(rte_eth_remove_tx_callback(port, 0, callbacks[port]) == 0);
+            rte_free((void *)callbacks[port]);
+        }
+    for (unsigned int i = 0; i < count; i++) assert(mrc_destroy_qp(qps[i]) == 0);
+    deregister_memory(context, mr);
+    assert(mrc_destroy_cq(cq) == 0);
+    printf("{\"role\":\"%s\",\"profiles\":32,\"completions\":32,\"bytes\":%zu}\n",
+           requester ? "tx" : "rx", sizeof(data));
+}
+
 struct blackout_witness {
     unsigned int dropped_writes[DUPLEX_RAILS];
     unsigned int first_rails;
@@ -2361,9 +2795,10 @@ static uint16_t observe_counted_rails(uint16_t port, uint16_t queue, struct rte_
 
 static void run_counted_route(bool requester, const char *directory, const struct address *address,
                               struct mrc_context *context, struct ibv_pd *pd, struct rte_mempool *pool,
-                              bool backpressure, uint16_t ev_base, uint64_t profile_id)
+                              bool backpressure, uint16_t ev_base, uint64_t profile_id, bool maximum)
 {
-    const unsigned int rail_count = ev_base ? DUPLEX_RAILS : COUNTED_RAILS;
+    const unsigned int rail_count = maximum ? 32 : ev_base ? DUPLEX_RAILS : COUNTED_RAILS;
+    const size_t data_bytes = maximum ? 32 * 1024 + 1 : COUNTED_BYTES;
     struct mrc_cq *cq = mrc_create_cq(context, 1, NULL, NULL, 0);
     assert(cq);
     struct mrc_qp_init_attr init = {
@@ -2373,7 +2808,8 @@ static void run_counted_route(bool requester, const char *directory, const struc
     if (!requester)
         skip_local_qp_numbers(context, &init, 1);
     struct mrc_qp *qp = mrc_create_qp(context, &init);
-    uint8_t data[COUNTED_BYTES] = {0};
+    uint8_t data[data_bytes];
+    memset(data, 0, sizeof(data));
     if (requester) {
         for (size_t i = 0; i < sizeof(data); i++)
             data[i] = pattern(i);
@@ -2391,7 +2827,7 @@ static void run_counted_route(bool requester, const char *directory, const struc
     configure_qp(qp, address, &peer, local.psn, requester, !requester,
                  requester ? profile_id : 0, 0, 0, 0, IBV_MTU_1024);
 
-    struct mrc_dpdk_rail rails[COUNTED_RAILS];
+    struct mrc_dpdk_rail rails[32];
     for (uint16_t i = 0; i < rail_count; i++)
         rails[i] = (struct mrc_dpdk_rail){ .port = i, .peer_mac = { 2, 0, 0, 0, 0, (requester ? 0x10 : 0x20) + i } };
     struct mrc_dpdk_route_config route = { .rails = rails, .pool = pool, .requester = requester };
@@ -2406,7 +2842,7 @@ static void run_counted_route(bool requester, const char *directory, const struc
     prepare_memif_rails(rail_count);
 
     struct counted_rail_witness observed = { .backpressure = backpressure, .ev_base = ev_base };
-    const struct rte_eth_rxtx_callback *callbacks[COUNTED_RAILS];
+    const struct rte_eth_rxtx_callback *callbacks[32];
     char ready[PATH_MAX];
     if (requester) {
         publish(directory, "tx.links-ready", NULL, 0);
@@ -2469,7 +2905,7 @@ static void run_counted_route(bool requester, const char *directory, const struc
             assert(observed.dropped && observed.writes == (UINT32_C(1) << BACKPRESSURE_FIRST_RAIL) &&
                    observed.retries == (UINT32_C(1) << BACKPRESSURE_RETRY_RAIL));
         } else {
-            assert((observed.writes | observed.retries) == (UINT32_C(1) << rail_count) - 1);
+            assert((observed.writes | observed.retries) == (UINT32_MAX >> (32 - rail_count)));
         }
         if (ev_base)
             assert(observed.write_evs == 0xb && observed.probe_evs == 0xb);
@@ -3349,7 +3785,12 @@ int main(int argc, char **argv)
     assert(argc >= 4 && (strcmp(argv[1], "tx") == 0 || strcmp(argv[1], "rx") == 0));
     bool client = strcmp(argv[1], "tx") == 0;
     const char *directory = argv[2];
+    bool pending_teardown = !strcmp(argv[3], "reset_pending") || !strcmp(argv[3], "destroy_pending") || !strcmp(argv[3], "error_pending") || !strcmp(argv[3], "error_pending_overflow");
+    bool maximum_rails = strcmp(argv[3], "maximum_rails") == 0;
     bool endpoint_ops = strcmp(argv[3], "endpoint_ops") == 0;
+    bool wimm_capacity = !strcmp(argv[3], "wimm_capacity");
+    unsigned int boundary_pmtu = wimm_capacity ? 1024 : !strcmp(argv[3], "boundaries_256") ? 256 :
+        !strcmp(argv[3], "boundaries_512") ? 512 : !strcmp(argv[3], "boundaries_1024") ? 1024 : 0;
     bool infinite_retry = strcmp(argv[3], "blackout_infinite") == 0;
     bool blackout = infinite_retry || strcmp(argv[3], "blackout_finite") == 0;
     bool service_level_dscp = strcmp(argv[3], "service_level_dscp") == 0;
@@ -3357,6 +3798,7 @@ int main(int argc, char **argv)
     bool dynamic_mpr = strcmp(argv[3], "dynamic_mpr") == 0;
     bool dynamic_mpr_rts = strcmp(argv[3], "dynamic_mpr_rts") == 0;
     bool mpr_updates = dynamic_mpr || dynamic_mpr_rts || strcmp(argv[3], "static_mpr") == 0;
+    bool cc_capacity = !strcmp(argv[3], "cc_capacity");
     bool cc_profile = strcmp(argv[3], "cc_profile") == 0;
     bool qa_profile = strcmp(argv[3], "qa_profile") == 0;
     bool rx_flow = strcmp(argv[3], "rx_flow_control") == 0;
@@ -3381,7 +3823,7 @@ int main(int argc, char **argv)
     bool mapped_srv6 = strcmp(argv[3], "mapped_ev_srv6") == 0;
     bool srv6 = explicit_srv6 || generated_srv6 || mapped_srv6 || srv6_transit || strcmp(argv[3], "srv6") == 0;
     bool backpressure = strcmp(argv[3], "rail_backpressure") == 0;
-    bool counted_route = backpressure || strcmp(argv[3], "counted_route") == 0;
+    bool counted_route = maximum_rails || backpressure || strcmp(argv[3], "counted_route") == 0;
     uint16_t mapped_ev_base = 0;
     if (!strcmp(argv[3], "mapped_ev_udp"))
         mapped_ev_base = 0xc610;
@@ -3410,7 +3852,7 @@ int main(int argc, char **argv)
     uint64_t profile_id = 0;
     if (endpoint_ops) {
         assert(argc == 5);
-    } else if (ev_profile || cc_profile || qa_profile) {
+    } else if (ev_profile || cc_profile || qa_profile || cc_capacity) {
         assert(argc == 6);
         profile_store = argv[4];
         char *end;
@@ -3418,7 +3860,7 @@ int main(int argc, char **argv)
         profile_id = strtoull(argv[5], &end, 10);
         assert(!errno && profile_id && !*end);
     } else {
-        assert(argc == 4 && (counted_route || bidirectional || blackout || last_hop_trim || mpr_updates ||
+        assert(argc == 4 && (pending_teardown || boundary_pmtu || counted_route || bidirectional || blackout || last_hop_trim || mpr_updates ||
                              error_mode != SIMPLEX_NO_ERROR ||
                              wire_mode != SIMPLEX_WIRE_NONE || strcmp(argv[3], "simplex") == 0));
     }
@@ -3438,7 +3880,7 @@ int main(int argc, char **argv)
     if (mapped_ev_base && client)
         assert(mrc_dpdk_set_ev_store(context, profile_store) == 0);
 
-    unsigned int rail_count = counted_route || counted_endpoint ? COUNTED_RAILS : DUPLEX_RAILS;
+    unsigned int rail_count = maximum_rails ? 32 : counted_route || counted_endpoint ? COUNTED_RAILS : DUPLEX_RAILS;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_for_ports(0, rail_count);
     assert(pool);
     for (unsigned int port = 0; port < rail_count; port++) {
@@ -3446,12 +3888,18 @@ int main(int argc, char **argv)
         assert(mrc_dpdk_open_port(port, pool, &local) == 0);
     }
 
-    if (counted_endpoint)
+    if (cc_capacity)
+        run_cc_capacity(client, directory, &address, context, pd, pool, profile_store, profile_id);
+    else if (pending_teardown)
+        run_pending_teardown(client, directory, &address, context, pd, pool, argv[3]);
+    else if (boundary_pmtu)
+        run_boundaries(client, directory, &address, context, pd, pool, boundary_pmtu, wimm_capacity);
+    else if (counted_endpoint)
         run_counted_endpoint(client, directory, context, pool);
     else if (endpoint_ops)
         run_endpoint_ops(client, directory, argv[4], &address, verbs, context, pd, pool);
     else if (counted_route || mapped_ev_base)
-        run_counted_route(client, directory, &address, context, pd, pool, backpressure, mapped_ev_base, profile_id);
+        run_counted_route(client, directory, &address, context, pd, pool, backpressure, mapped_ev_base, profile_id, maximum_rails);
     else if (mpr_updates) {
         enum single_write_case scenario = dynamic_mpr_rts ? DYNAMIC_MPR_RTS : dynamic_mpr ? DYNAMIC_MPR : STATIC_MPR;
         run_single_write(client, directory, &address, context, pd, pool, scenario);
@@ -3469,8 +3917,16 @@ int main(int argc, char **argv)
     if (pd)
         assert(ibv_dealloc_pd(pd) == 0);
     assert(ibv_close_device(verbs) == 0);
+    /* The memif client disconnects before its server closes shared rings. */
+    if (maximum_rails && !client) {
+        char stopped[PATH_MAX];
+        path_for(stopped, directory, "tx.ports-closed");
+        wait_for(stopped);
+    }
     for (unsigned int port = 0; port < rail_count; port++)
         mrc_dpdk_close_port(port);
+    if (maximum_rails && client)
+        publish(directory, "tx.ports-closed", NULL, 0);
     rte_mempool_free(pool);
     assert(rte_eal_cleanup() == 0);
     return 0;

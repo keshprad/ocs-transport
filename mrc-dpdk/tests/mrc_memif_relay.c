@@ -9,11 +9,15 @@
 #include <unistd.h>
 
 #include <rte_eal.h>
+#include <rte_cycles.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_pause.h>
 
-enum { PORTS = 2, BURST = 32, FRAME_SIZE = 1514 };
+enum { PORTS = 2, BURST = 32, FRAME_SIZE = 1514, TERMINAL = 0x80 };
+static bool quiesced, quiesce_ack_pending;
+static uint64_t quiesce_deadline;
+static void discard_pending(void);
 
 static bool socket_address(struct sockaddr_un *address, const char *path)
 {
@@ -26,7 +30,9 @@ static bool socket_address(struct sockaddr_un *address, const char *path)
 }
 
 /* A datagram contains a one-byte port index followed by an Ethernet frame.
- * An empty datagram from the fixture terminates the relay. */
+ * Bit 7 marks terminal feedback: enqueue it, cease RX polling, and retain
+ * ports until the fixture observes client exit and sends an empty stop.
+ * A one-byte 0x80 response confirms quiescence. No further frames are allowed. */
 static int poll_fixture(int fd, struct rte_mempool *pool)
 {
     uint8_t bytes[1 + FRAME_SIZE];
@@ -39,7 +45,11 @@ static int poll_fixture(int fd, struct rte_mempool *pool)
                 return 0;
             return -errno;
         }
-        if (length <= 1 || length > (ssize_t)sizeof(bytes) || bytes[0] >= PORTS)
+        if (quiesced)
+            return -EPROTO;
+        uint8_t port = bytes[0] & ~TERMINAL;
+        bool terminal = (bytes[0] & TERMINAL) != 0;
+        if (length <= 1 || length > (ssize_t)sizeof(bytes) || port >= PORTS)
             return -EBADMSG;
 
         struct rte_mbuf *packet = rte_pktmbuf_alloc(pool);
@@ -51,8 +61,17 @@ static int poll_fixture(int fd, struct rte_mempool *pool)
             return -EMSGSIZE;
         }
         memcpy(frame, bytes + 1, (size_t)length - 1);
-        if (!mrc_dpdk_transmit(bytes[0], packet))
+        if (terminal) {
+            /* Release already-polled packets before the final feedback can
+             * cause the client to disconnect and unmap shared rings. */
+            discard_pending();
+            quiesced = true;
+            quiesce_deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
+        }
+        if (!mrc_dpdk_transmit(port, packet))
             return -EIO;
+        if (terminal)
+            quiesce_ack_pending = true;
     }
     return 0;
 }
@@ -78,19 +97,68 @@ static int deliver_frame(int fd, uint8_t port, const struct rte_mbuf *packet)
     return sent == (ssize_t)(length + 1) ? 0 : -EIO;
 }
 
+/* Keep one burst while the Python fixture drains its datagram queue.
+ * Continue polling fixture input between attempts to avoid a bidirectional
+ * socket-buffer deadlock. A stalled fixture fails within three seconds. */
+static struct rte_mbuf *pending[BURST];
+static uint16_t pending_count, pending_next;
+static uint8_t pending_port;
+static uint64_t pending_deadline;
+
+static void discard_pending(void)
+{
+    while (pending_next < pending_count)
+        rte_pktmbuf_free(pending[pending_next++]);
+    pending_count = pending_next = 0;
+}
+
+static int poll_quiesced(int fd)
+{
+    if (rte_get_timer_cycles() >= quiesce_deadline) {
+        fprintf(stderr, "memif relay quiesce timed out waiting for stop\n");
+        return -ETIMEDOUT;
+    }
+    if (quiesce_ack_pending) {
+        const uint8_t acknowledgement = TERMINAL;
+        ssize_t sent = send(fd, &acknowledgement, 1, 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return 0;
+            return -errno;
+        }
+        if (sent != 1)
+            return -EIO;
+        quiesce_ack_pending = false;
+    }
+    return 0;
+}
+
+static int flush_pending(int fd)
+{
+    while (pending_next < pending_count) {
+        int result = deliver_frame(fd, pending_port, pending[pending_next]);
+        if (result == -EAGAIN || result == -EWOULDBLOCK)
+            return rte_get_timer_cycles() >= pending_deadline ? -ETIMEDOUT : 1;
+        if (result)
+            return result;
+        rte_pktmbuf_free(pending[pending_next++]);
+    }
+    pending_count = pending_next = 0;
+    return 0;
+}
+
 static int poll_ports(int fd)
 {
-    int status = 0;
+    int result = flush_pending(fd);
+    if (result)
+        return result > 0 ? 0 : result;
     for (uint8_t port = 0; port < PORTS; port++) {
-        struct rte_mbuf *packets[BURST];
-        uint16_t received = rte_eth_rx_burst(port, 0, packets, BURST);
-        for (uint16_t i = 0; i < received; i++) {
-            if (!status)
-                status = deliver_frame(fd, port, packets[i]);
-            rte_pktmbuf_free(packets[i]);
-        }
-        if (status)
-            return status;
+        pending_count = rte_eth_rx_burst(port, 0, pending, BURST);
+        pending_port = port;
+        pending_deadline = rte_get_timer_cycles() + 3 * rte_get_timer_hz();
+        result = flush_pending(fd);
+        if (result)
+            return result > 0 ? 0 : result;
     }
     return 0;
 }
@@ -134,13 +202,14 @@ int main(int argc, char **argv)
     do {
         result = poll_fixture(fd, pool);
         if (!result)
-            result = poll_ports(fd);
+            result = quiesced ? poll_quiesced(fd) : poll_ports(fd);
         rte_pause();
     } while (!result);
     if (result == 1)
         result = 0;
 
 done:
+    discard_pending();
     if (result)
         fprintf(stderr, "memif relay failed: %s\n", strerror(-result));
     if (fd >= 0)

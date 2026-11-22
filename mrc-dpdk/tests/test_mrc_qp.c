@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 static void test_serial_arithmetic(void)
 {
@@ -55,6 +56,96 @@ static void test_receive_window_and_ar(void)
     assert(sack.ack_psn_offset == -2 && sack.bitmap == UINT64_C(0x5));
     assert(mrc_rx_classify(&rx, initial_psn) == MRC_RX_DUPLICATE);
     assert(mrc_rx_classify(&rx, mrc_psn_add(initial_psn, -1)) == MRC_RX_INVALID_PSN);
+}
+
+/* Exercise actual history growth, saturation and a complete PSN reuse cycle;
+ * setting the private counter directly would miss off-by-one update bugs. */
+static void test_receive_history_half_space(void)
+{
+    uint8_t slots[128], saved_slots[128];
+    struct mrc_rx_qp rx, saved;
+    const uint32_t start = MRC_PSN_MASK - 2;
+    assert(mrc_rx_init(&rx, start, sizeof(slots), slots));
+    for (uint32_t received = 1; received <= MRC_PSN_MASK + 129; received++) {
+        const uint32_t current = (start + received - 1) & MRC_PSN_MASK;
+        bool due;
+        assert(mrc_rx_record(&rx, current, 0, 0, UINT32_MAX, &due) == MRC_RX_NEW);
+        assert(rx.cack_psn == current && rx.ooo_count == 0);
+        if ((received & 4095) == 0) {
+            struct mrc_sack sack;
+            mrc_rx_build_probe_sack(&rx, 1, &sack);
+            mrc_rx_sack_sent(&rx, &sack);
+        }
+        if (received != 1 && received != 127 && received != 128 &&
+            received != MRC_PSN_HALF - 1 && received != MRC_PSN_HALF &&
+            received != MRC_PSN_HALF + 1 && received != MRC_PSN_MASK + 1 &&
+            received != MRC_PSN_MASK + 129)
+            continue;
+        const uint32_t history = received < MRC_PSN_HALF ? received : MRC_PSN_HALF - 1;
+        const uint32_t epsn = (current + 1) & MRC_PSN_MASK;
+        assert(rx.contiguous_history == history);
+        assert(mrc_rx_classify(&rx, current) == MRC_RX_DUPLICATE);
+        assert(mrc_rx_classify(&rx, (epsn - history) & MRC_PSN_MASK) == MRC_RX_DUPLICATE);
+        assert(mrc_rx_classify(&rx, epsn) == MRC_RX_NEW);
+        assert(mrc_rx_classify(&rx, (epsn + 127) & MRC_PSN_MASK) == MRC_RX_NEW);
+        const uint32_t invalid[] = {
+            (epsn - history - 1) & MRC_PSN_MASK,
+            (epsn - MRC_PSN_HALF) & MRC_PSN_MASK,
+        };
+        memcpy(&saved, &rx, sizeof(rx));
+        memcpy(saved_slots, slots, sizeof(slots));
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+            assert(mrc_rx_record(&rx, invalid[i], 1, MRC_RX_AR | MRC_RX_RTX,
+                                  0, &due) == MRC_RX_INVALID_PSN);
+            assert(!due && memcmp(&rx, &saved, sizeof(rx)) == 0);
+            assert(memcmp(slots, saved_slots, sizeof(slots)) == 0);
+        }
+        assert(mrc_rx_record(&rx, (epsn + 128) & MRC_PSN_MASK, 1, MRC_RX_AR,
+                              0, &due) == MRC_RX_AHEAD_OF_WINDOW);
+        assert(!due && memcmp(&rx, &saved, sizeof(rx)) == 0);
+        assert(memcmp(slots, saved_slots, sizeof(slots)) == 0);
+        /* The endpoint silently drops both invalid and forward-window PSNs. */
+    }
+}
+
+/* Both window edges remain side-effect free with feedback-requesting flags,
+ * sparse bitmap state, moving ePSN, and wrap at minimum/maximum MPR. */
+static void test_outside_window_preserves_state(void)
+{
+    const uint32_t starts[] = {0, MRC_PSN_HALF - 1, MRC_PSN_MASK - 1};
+    const uint32_t windows[] = {128, 384, MRC_MPR_MAX};
+    uint8_t slots[MRC_MPR_MAX], saved_slots[MRC_MPR_MAX];
+    for (size_t start = 0; start < sizeof(starts) / sizeof(starts[0]); start++) {
+        for (size_t size = 0; size < sizeof(windows) / sizeof(windows[0]); size++) {
+            struct mrc_rx_qp rx;
+            assert(mrc_rx_init(&rx, starts[start], windows[size], slots));
+            for (unsigned int step = 0; step < 3; step++) {
+                uint32_t epsn = mrc_psn_add(rx.cack_psn, 1);
+                bool due;
+                /* Last valid PSN is accepted, retaining a gap and AR state. */
+                uint32_t last = mrc_psn_add(epsn, windows[size] - 1);
+                assert(mrc_rx_record(&rx, last, 256, MRC_RX_AR, UINT32_MAX, &due) == MRC_RX_NEW);
+                assert(due && rx.ooo_count > 0);
+                struct mrc_rx_qp saved;
+                memcpy(&saved, &rx, sizeof(saved));
+                memcpy(saved_slots, slots, windows[size]);
+                const int32_t offsets[] = {(int32_t)windows[size], (int32_t)windows[size] + 1,
+                    MRC_PSN_HALF - 1, -(int32_t)MRC_PSN_HALF};
+                for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+                    uint32_t psn = mrc_psn_add(epsn, offsets[i]);
+                    enum mrc_rx_disposition expected = offsets[i] < 0 ? MRC_RX_INVALID_PSN : MRC_RX_AHEAD_OF_WINDOW;
+                    due = true;
+                    assert(mrc_rx_record(&rx, psn, UINT32_MAX, MRC_RX_AR | MRC_RX_RTX | MRC_RX_ECN,
+                                         0, &due) == expected);
+                    assert(!due && memcmp(&rx, &saved, sizeof(rx)) == 0);
+                    assert(memcmp(slots, saved_slots, windows[size]) == 0);
+                }
+                /* Legitimate traffic still advances ePSN after the drops. */
+                assert(mrc_rx_record(&rx, epsn, 256, 0, UINT32_MAX, &due) == MRC_RX_NEW);
+                assert(rx.cack_psn == epsn);
+            }
+        }
+    }
 }
 
 static void test_sack_rotation_and_probe(void)
@@ -140,6 +231,41 @@ static void test_delivery_and_transport_ack(void)
     assert(tx.first_psn == tx.next_psn);
 }
 
+static void test_unsent_sack_trigger(void)
+{
+    const uint32_t starts[] = {100, MRC_PSN_MASK - 1};
+    for (unsigned int i = 0; i < sizeof(starts) / sizeof(starts[0]); i++) {
+        struct mrc_tx_packet slots[128], before_slots[128];
+        struct mrc_tx_qp tx;
+        assert(mrc_tx_init(&tx, starts[i], 128, slots));
+        for (int offset = 0; offset < 4; offset++)
+            assert(mrc_tx_track(&tx, mrc_psn_add(starts[i], offset), offset + 1));
+        struct mrc_sack sack = {
+            .cack_psn = mrc_psn_add(starts[i], 1),
+            .sack_offset = 1, .bitmap = 3, .ooo_count = 2,
+        };
+        struct mrc_tx_qp before;
+        memcpy(&before, &tx, sizeof(tx));
+        memcpy(before_slots, slots, sizeof(slots));
+        const int offsets[] = {3, -2}; /* next unsent PSN and before the first send */
+        for (unsigned int j = 0; j < sizeof(offsets) / sizeof(offsets[0]); j++) {
+            sack.ack_psn_offset = offsets[j];
+            assert(!mrc_tx_apply_sack(&tx, &sack, false));
+            assert(memcmp(&tx, &before, sizeof(tx)) == 0);
+            assert(memcmp(slots, before_slots, sizeof(slots)) == 0);
+        }
+        /* A negative offset can identify a real send; do not reject it. */
+        sack.ack_psn_offset = -1;
+        assert(mrc_tx_apply_sack(&tx, &sack, false));
+        assert(tx.delivery_cack_psn == sack.cack_psn);
+        for (int offset = 0; offset < 4; offset++)
+            assert(mrc_tx_packet(&tx, mrc_psn_add(starts[i], offset))->received);
+        /* Probe offsets are opaque identifiers, not data PSNs. */
+        sack.ack_psn_offset = -32768;
+        assert(mrc_tx_apply_sack(&tx, &sack, true));
+    }
+}
+
 static void test_sender_window(void)
 {
     struct mrc_tx_packet slots[384];
@@ -205,14 +331,61 @@ static void test_local_ack_timeout(void)
     assert(timeout == (UINT64_C(1024) << 24));
 }
 
+static void test_local_ack_timeout_matrix(void)
+{
+    const uint64_t cap = UINT64_C(1024) * (UINT64_C(1) << 24);
+    for (unsigned int exponent = 0; exponent <= 31; exponent++) {
+        const uint64_t base = UINT64_C(1024) * (UINT64_C(1) << exponent);
+        for (unsigned int linear = 0; linear <= 7; linear++) {
+            for (unsigned int exponential = 0; exponential <= 25; exponential++) {
+                unsigned int end = linear + (exponential == 25 ? 40 : exponential + 1);
+                uint64_t expected = base;
+                for (unsigned int retry = 0; retry <= end; retry++) {
+                    uint64_t timeout = UINT64_MAX;
+                    bool valid = mrc_local_ack_timeout_ns(exponent, linear, exponential,
+                                                           retry, &timeout);
+                    if (exponential != 25 && retry > linear + exponential) {
+                        assert(!valid && timeout == UINT64_MAX);
+                        continue;
+                    }
+                    /* Table 7-1: each exponential retry doubles the prior
+                     * interval, capped at 2^24 * 1.024 us; linear stays base. */
+                    if (retry > linear)
+                        expected = expected >= cap / 2 ? cap : expected * 2;
+                    assert(valid && timeout == expected);
+                }
+                uint64_t timeout = UINT64_MAX;
+                bool valid = mrc_local_ack_timeout_ns(exponent, linear, exponential,
+                                                       UINT32_MAX, &timeout);
+                assert(valid == (exponential == 25));
+                assert(timeout == (valid ? cap : UINT64_MAX));
+            }
+        }
+    }
+    const unsigned int invalid[][3] = {
+        {32, 0, 0}, {UINT32_MAX, 0, 0}, {0, 8, 0},
+        {0, UINT32_MAX, 0}, {0, 0, 26}, {0, 0, UINT32_MAX},
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        uint64_t timeout = UINT64_MAX;
+        assert(!mrc_local_ack_timeout_ns(invalid[i][0], invalid[i][1], invalid[i][2], 0, &timeout));
+        assert(timeout == UINT64_MAX);
+    }
+    assert(!mrc_local_ack_timeout_ns(0, 0, 0, 0, NULL));
+}
+
 int main(void)
 {
     test_serial_arithmetic();
     test_receive_window_and_ar();
+    test_receive_history_half_space();
+    test_outside_window_preserves_state();
     test_sack_rotation_and_probe();
     test_delivery_and_transport_ack();
+    test_unsent_sack_trigger();
     test_sender_window();
     test_maximum_window();
     test_local_ack_timeout();
+    test_local_ack_timeout_matrix();
     puts("MRC QP state tests passed");
 }

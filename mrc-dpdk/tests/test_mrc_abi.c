@@ -33,6 +33,17 @@ int __wrap_mrc_verbs_async_open(const struct ibv_context *verbs)
     return fd;
 }
 
+void __real_mrc_abi_release_route(struct mrc_qp *qp);
+
+void __wrap_mrc_abi_release_route(struct mrc_qp *qp)
+{
+    struct mrc_provider_qp_attr attr;
+    assert(mrc_provider_qp_query(qp->provider, &attr) == 0);
+    /* Unacknowledged sends must enter ERROR before transport/CC state is freed. */
+    assert(!attr.send_pending || attr.state == MRC_PROVIDER_QP_ERROR);
+    __real_mrc_abi_release_route(qp);
+}
+
 static void transition_to_rts(struct mrc_provider_qp *qp)
 {
     assert(mrc_provider_qp_transition(qp, MRC_PROVIDER_QP_RESET, MRC_PROVIDER_QP_INIT) == 0);

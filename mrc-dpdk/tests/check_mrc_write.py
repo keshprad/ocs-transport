@@ -78,7 +78,7 @@ def transfer(binary, size, *options, drop_after=None, drop_final_acks=None,
 
 
 def check_rail_counts(binary):
-    for rail_count in (1, 2, 3, 4, 8):
+    for rail_count in (1, 2, 3, 4, 8, 32):
         tx, rx = transfer(binary, 1048573, "--immediate", "305419896",
                           "--initial-psn", "16777214", rail_count=rail_count)
         for counters in (tx, rx):
@@ -202,38 +202,60 @@ def check_controller_ev_events(binary, controller, bad_only):
                       "events": events, "tx_bytes": tx["bytes"], "rx_rail_packets": rx["received"]}))
 
 
-def check_reliability_nacks(binary):
+def check_reliability_nacks(binary, trim_flags=(1, 1)):
+    tx_trim = ("--trim-nack", str(trim_flags[0]))
+    rx_trim = ("--trim-nack", str(trim_flags[1]))
     for name, reason, size, count, limit in (
         ("no_bitmap", 0x06, 8192, 1, ("--rx-ooo-capacity", "0")),
         ("no_packet_buffer", 0x07, 5120, 2, ("--rx-staging-capacity", "0")),
         ("no_work_slot", 0x0A, 1024, 4, ("--rx-work-capacity", "1")),
     ):
         tx, rx = transfer(binary, size, "--exp-retries", "10", work_requests=count,
-                          drop_after=1, rx_options=limit)
+                          drop_after=1, negotiate=True, tx_options=tx_trim, rx_options=limit + rx_trim)
         expected = 1 << reason
         require(tx["nack_received_mask"] == rx["nack_sent_mask"] == expected,
                 f"{name} did not generate the required NACK: {tx}, {rx}")
         require(tx["retries"][0] > 0 and tx["write_completions"] == count,
                 f"{name} did not recover the rejected packet: {tx}, {rx}")
-        print(json.dumps({"case": name, "tx": tx, "rx": rx}))
+        print(json.dumps({"case": name, "trim_flags": trim_flags, "tx": tx, "rx": rx}))
 
     tx, rx = transfer(binary, 1024, "--timeout-ms", "500", "--mpr", "1",
                       "--linear-retries", "1", "--exp-retries", "0",
-                      tx_options=("--initial-psn", "128"),
-                      expected_errors={"tx": "NACK-RX=0x800", "rx": "NACK-TX=0x800"})
+                      tx_options=("--initial-psn", "128") + tx_trim, rx_options=rx_trim,
+                      expected_errors={"tx": "NACK-RX=0", "rx": "NACK-TX=0"})
     require("Retry limit exhausted for PSN 128" in tx and "RX stalled after 0 of 1" in rx and
             "state=ERROR work-errors=1 first-status=retry-exceeded work-flushed=0" in tx,
             f"An out-of-window packet was accepted or the retry limit was bypassed: {tx}, {rx}")
-    print(json.dumps({"case": "outside_receive_window"}))
+    print(json.dumps({"case": "outside_receive_window", "trim_flags": trim_flags}))
 
     tx, _ = transfer(binary, 1024, "--immediate", "23", work_requests=4, drop_after=1,
-                     rx_options=("--rx-cq-capacity", "1"),
+                     negotiate=True,
+                     tx_options=tx_trim, rx_options=("--rx-cq-capacity", "1", "--max-wimm-inflight", "4") + rx_trim,
                      expected_errors={"tx": "Unexpected remote event at PSN",
                                       "rx": "NACK-TX=0x2000000"})
     require("NACK-RX=0x2000000" in tx and "Retry limit exhausted" not in tx and
             "state=ERROR work-errors=1 first-status=remote-operation" in tx,
             f"UNEXP_EVENT did not terminate the requester: {tx}")
-    print(json.dumps({"case": "unexpected_completion_queue_overrun"}))
+    print(json.dumps({"case": "unexpected_completion_queue_overrun", "trim_flags": trim_flags}))
+
+
+def check_udp_destinations(binary):
+    for ipv6, srv6 in ((False, False), (True, False), (False, True), (True, True)):
+        for port in (1, 4791, 65535):
+            tx, rx = transfer(binary, 1031, "--udp-port", str(port), "--pmtu", "512",
+                              "--immediate", "23", "--initial-psn", "16777214",
+                              ipv6=ipv6, srv6=srv6)
+            require(rx["immediate_completions"] == 1 and tx["packets"] == 3,
+                    f"Configured UDP port did not carry complete wrapped WRITEIMM: {tx}, {rx}")
+            print(json.dumps({"case": "configured_udp_destination", "port": port,
+                              "ipv6": ipv6, "srv6": srv6, "tx": tx, "rx": rx}))
+    tx, rx = transfer(binary, 13, "--timeout-ms", "500", "--ack-timeout", "10",
+                      "--linear-retries", "0", "--exp-retries", "1",
+                      tx_options=("--udp-port", "4791"), rx_options=("--udp-port", "4971"),
+                      expected_errors={"tx": "Retry limit exhausted", "rx": "RX stalled after 0"})
+    require("first-status=retry-exceeded" in tx and "RX stalled after 0 of 1" in rx,
+            f"Mismatched UDP destination was accepted: {tx}, {rx}")
+    print(json.dumps({"case": "mismatched_udp_destination_rejected"}))
 
 
 def check_path_mtu(binary):
@@ -306,20 +328,63 @@ def check_partition_membership(binary):
         print(json.dumps({"case": f"pkey_{name}"}))
 
 
+def check_asymmetric_capabilities(binary):
+    # Each directional setting is exercised with neither, either, and both
+    # peers advertising it. MPR changes require both advertisements.
+    for feature in ("trim-nack", "service-time", "dynamic-mpr"):
+        for local, peer in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            tx_flags = {"trim-nack": 1, "service-time": 1, "dynamic-mpr": 1}
+            rx_flags = dict(tx_flags)
+            tx_flags[feature], rx_flags[feature] = local, peer
+            tx_options = tuple(value for key, flag in tx_flags.items() for value in (f"--{key}", str(flag)))
+            rx_options = tuple(value for key, flag in rx_flags.items() for value in (f"--{key}", str(flag)))
+            resize = ("--mpr-change-at", "65", "--mpr-change-to", "1") if rx_flags["dynamic-mpr"] else ()
+            tx, rx = transfer(binary, 262157, "--immediate", "23", negotiate=True,
+                              trim_after=3, ipv6=True,
+                              tx_options=tx_options + ("--mpr", "8"),
+                              rx_options=rx_options + ("--mpr", "8") + resize)
+            dynamic = tx_flags["dynamic-mpr"] and rx_flags["dynamic-mpr"]
+            require(tx["mpr_updates"] == rx["mpr_updates"] == int(dynamic),
+                    f"Dynamic MPR was not negotiated bilaterally: {tx}, {rx}")
+            require(rx["trimmed"] > 0 and sum(tx["retries"]) > 0
+                    and bool(rx["trim_nacks"]) == bool(rx_flags["trim-nack"])
+                    and bool(tx["trim_nacks"]) == bool(rx_flags["trim-nack"])
+                    and rx["immediate_completions"] == 1,
+                    f"Trim recovery followed the wrong peer's capability: {tx}, {rx}")
+            print(json.dumps({"case": "asymmetric_capabilities", "feature": feature,
+                              "tx_offer": local, "rx_offer": peer, "tx": tx, "rx": rx}))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path,
-                        default=Path(__file__).resolve().parents[1] / "mrc_write")
+                        default=Path(__file__).resolve().with_name("mrc_write_ready"))
     parser.add_argument("--controller", type=Path, help="Path to mrc_ctl_profile")
     parser.add_argument("--event-controller", type=Path,
                         help="Path to test_mrc_ctl_abi for cross-process EV event verification")
     parser.add_argument("--pkey-only", action="store_true", help="Run only the P_Key membership cases")
     parser.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
     parser.add_argument("--rails-only", action="store_true", help="Run only the runtime rail cases")
+    parser.add_argument("--capabilities-only", action="store_true",
+                        help="Run asymmetric OOB capability cases")
+    parser.add_argument("--mandatory-nacks-only", action="store_true",
+                        help="Run mandatory NACKs across all trim capability directions")
+    parser.add_argument("--udp-ports-only", action="store_true",
+                        help="Run configurable UDP destination and mismatch cases")
     args = parser.parse_args()
     binary = args.binary.resolve()
-    controller = (args.controller or binary.with_name("mrc_ctl_profile")).resolve()
-    require(binary.is_file(), f"Build mrc_write first: {binary}")
+    controller = (args.controller or Path(__file__).resolve().parents[1] / "mrc_ctl_profile").resolve()
+    require(binary.is_file(), f"Build tests/mrc_write_ready first (or pass --binary): {binary}")
+    if args.udp_ports_only:
+        check_udp_destinations(binary)
+        return
+    if args.mandatory_nacks_only:
+        for flags in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            check_reliability_nacks(binary, flags)
+        return
+    if args.capabilities_only:
+        check_asymmetric_capabilities(binary)
+        return
     if args.pkey_only:
         check_partition_membership(binary)
         return
@@ -331,6 +396,8 @@ def main():
         return
     require(controller.is_file(), f"Build mrc_ctl_profile first: {controller}")
 
+    check_asymmetric_capabilities(binary)
+    check_udp_destinations(binary)
     tx, rx = transfer(binary, 13)
     require(tx["packets"] == 1 and not rx["immediate_completed"], "WRITE ONLY failed")
     print(json.dumps({"case": "write_only", "tx": tx, "rx": rx}))
@@ -420,7 +487,8 @@ def main():
             f"Invalid rkey did not report remote access error and flush the send queue: {tx}")
     print(json.dumps({"case": "invalid_remote_key"}))
 
-    check_reliability_nacks(binary)
+    for flags in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        check_reliability_nacks(binary, flags)
 
     tx, rx = transfer(binary, 8195, "--immediate", "99", negotiate=True, work_requests=8,
                       rx_options=("--service-time", "1"))

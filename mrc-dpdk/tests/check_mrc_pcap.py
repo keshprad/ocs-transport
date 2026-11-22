@@ -164,7 +164,7 @@ def service_time_requests(replay):
     standalone = (None, False)
     compensated = (0xFFFF, False)
     opaque = (0x923B, True)
-    rail, expected = [], {}
+    rail, expected, trim_sizes = [], {}, {}
 
     # Start with opaque timestamps so the positive samples follow earlier feedback
     # preparation in the same receive burst, even on a fast idle core.
@@ -181,16 +181,15 @@ def service_time_requests(replay):
         rail.append(request(replay, 0, 0xDE, 0x7FED03, peth))
         expected["probe SACK", probe_id] = timing
 
-        outside = (INITIAL_PSN + 1024 + index) & 0xFFFFFF
-        rail.append(write_request(replay, 0, 0xCA, outside, 1, 0, 0, 13, data[:13],
-                                  timestamp=timestamp, opaque=is_opaque))
-        expected["NETH", 0x0B, outside] = timing
-
-    trim_size = None
-    if replay.srh:
-        trim, trim_size = trimmed_request(replay, data[:13], timestamp=compensated[0], opaque=False)
+        # In-window trim is a defined NACK trigger; outside-window requests
+        # must remain silent even when Service Time is enabled.
+        psn = (INITIAL_PSN + index) & 0xFFFFFF
+        trim, size = trimmed_request(replay, data[:13], psn=psn,
+                                     timestamp=timestamp, opaque=is_opaque)
         rail.append(trim)
-        expected["NETH", 0x01, INITIAL_PSN] = compensated
+        key = ("NETH", 0x01, psn)
+        expected[key] = timing
+        trim_sizes[key] = size
 
     rail.append(write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, 13, data[:13]))
     expected["WRITE SACK", INITIAL_PSN, False] = standalone
@@ -201,7 +200,7 @@ def service_time_requests(replay):
                               0xFEC01234, flags=0xA0, timestamp=opaque[0], opaque=True))
     expected["WRITE SACK", 1, True] = opaque
     head = write_request(replay, 1, 0xC6, 0, 2, 1, 13, 1025, data[13:1037])
-    return (rail, [head]), expected, trim_size
+    return (rail, [head]), expected, trim_sizes
 
 
 def write_capture(path, frames):
@@ -278,12 +277,11 @@ def check_responses(replay, output_paths, outside, trim_sizes):
             "Selective ACK did not reflect the retransmission flag")
     nacks = [packet for packet in responses[0] if packet.bth.opcode == 0xDD]
     by_reason = {packet.body[2]: packet for packet in nacks}
-    expected_reasons = {0x01, 0x02, 0x0B}
+    expected_reasons = {0x01, 0x02}
     require(len(nacks) == len(expected_reasons) and by_reason.keys() == expected_reasons,
             "Unexpected reliability NACKs")
-    window = by_reason[0x0B]
-    require(window.bth.psn == outside and int.from_bytes(window.body[13:16], "big") == outside,
-            "Out-of-window NACK did not reflect the request PSN")
+    require(all(packet.bth.psn != outside for rail in responses for packet in rail),
+            "Out-of-window request produced feedback")
     for reason, size, timestamp, rtx in (
         (0x01, trim_sizes[0], TRIM_TIMESTAMP, False),
         (0x02, trim_sizes[1], TRIM_LAST_HOP_TIMESTAMP, True),
@@ -355,7 +353,7 @@ def run_replay(binary, replay):
                 counters["duplicates"] == 1 and counters["immediate_completions"] == 1 and
                 counters["probe_requests"] == 1 and
                 counters["trimmed"] == counters["trim_nacks"] == 2 and
-                counters["nack_sent_mask"] == (1 << 0x0B | 1 << 0x02 | 1 << 0x01) and
+                counters["nack_sent_mask"] == (1 << 0x02 | 1 << 0x01) and
                 f"decode-rejected={rejected} other-peer=0" in result.stderr,
                 f"Unexpected {replay.name} placement or error counters: {counters}\n{result.stderr}")
         check_responses(replay, outgoing, outside, trim_sizes)
@@ -372,6 +370,9 @@ def check_psn_feedback_bounds(binary, replay):
                 for psn in (before_start, ambiguous, window_end)]
     requests += [trimmed_request(replay, unplaced, psn=psn)[0]
                  for psn in (before_start, ambiguous, window_end + 1)]
+    # Valid envelope/iCRC but unsupported opcode must not bypass window silence.
+    requests += [request(replay, 0, RESERVED_OPCODE, psn, b"")
+                 for psn in (before_start, ambiguous, window_end, window_end + 1)]
     requests.append(write_request(replay, 0, 0xCA, INITIAL_PSN, 1, 0, 0, 13, valid))
     with run_capture(binary, replay, (requests, ()), work="13", trim=True) as (result, outgoing):
         require(result.returncode == 0, f"pcap endpoint failed\n{result.stdout}\n{result.stderr}")
@@ -379,12 +380,12 @@ def check_psn_feedback_bounds(binary, replay):
         feedback = [packet for packet in responses if packet.bth.opcode in (0xD1, 0xDC, 0xDD)]
         nacks = [(packet.bth.psn, packet.body[2], int.from_bytes(packet.body[13:16], "big"))
                  for packet in feedback if packet.bth.opcode == 0xDD]
-        require(nacks == [(psn, 0x0B, psn) for psn in (window_end, window_end + 1)],
-                f"Expected window NACKs only for forward PSNs beyond the receive window: {nacks}")
+        require(nacks == [],
+                f"Outside-window requests must be silently dropped, including trimmed requests: {nacks}")
         acks = [(packet.bth.opcode, packet.bth.psn) for packet in feedback if packet.bth.opcode != 0xDD]
         require(acks == [(0xDC, INITIAL_PSN), (0xD1, INITIAL_PSN)],
                 f"Expected SACK and AETH only for the accepted WRITE: {acks}")
-        print(f"Independent {replay.name} replay distinguished invalid and forward out-of-window PSNs")
+        print(f"Independent {replay.name} replay silently dropped pre-start, half-space, and forward out-of-window PSNs")
 
 
 def check_retransmitted_ack_request(binary, replay):
@@ -495,9 +496,61 @@ def check_jumbo_requester(binary, pmtu):
         print(f"Independent IPv4 requester capture passed WRITEIMM wire geometry at {pmtu}-byte PMTU")
 
 
+def check_packet_boundaries(binary, replay):
+    sizes = (13, 0, 1, 2, 3, 4, 255, 256, 257, 1023, 1024, 1025)
+    pmtu = 256
+    data = bytes((i ^ (i >> 8)) & 0xff for i in range(sum(sizes)))
+    first = write_request(replay, 0, 0xCB, INITIAL_PSN, 1, 1, 0, sizes[0], data[:13], 1,
+                          timestamp=0x1234)
+    # Truncate every nonempty prefix, covering outer/inner IP, UDP, BTH,
+    # METH, TSETH, RETH, immediate data, payload, padding, and iCRC.
+    rejected = [first[:length] for length in range(1, len(first))]
+    # Valid iCRC does not make a short extended header valid.
+    for length in (0, 4, 8, 12, 16, 20):
+        rejected.append(request(replay, 0, 0xCB, INITIAL_PSN, bytes(length), flags=0x10))
+    token = 0x9abc
+    probe = request(replay, 0, 0xDE, 0x123456,
+                    struct.pack("!7HBB", 0, 0, token, 0, *PDC_IDS, 0, 0, 0))
+    rail = [*rejected, probe]
+    offset = 0
+    psn = INITIAL_PSN
+    packets = 0
+    for wr, size in enumerate(sizes, 1):
+        fragments = max(1, (size + pmtu - 1) // pmtu)
+        for fragment in range(fragments):
+            last = fragment + 1 == fragments
+            opcode = 0xCB if fragments == 1 else 0xC9 if last else 0xC6 if fragment == 0 else 0xC7
+            start = offset + fragment * pmtu
+            payload = data[start:start + min(pmtu, size - fragment * pmtu)]
+            rail.append(write_request(replay, 0, opcode, psn, wr, wr, start, size, payload,
+                                      wr if last else None))
+            psn = (psn + 1) & 0xffffff
+            packets += 1
+        offset += size
+    work = ",".join(f"{size}@{wr}" for wr, size in enumerate(sizes, 1))
+    with run_capture(binary, replay, (rail, []), work=work, pmtu=pmtu) as (result, outgoing):
+        require(result.returncode == 0, f"Boundary replay failed\n{result.stdout}\n{result.stderr}")
+        counters = json.loads(result.stdout.strip().splitlines()[-1])
+        require(counters["received"] == [packets, 0] and counters["duplicates"] == 0
+                and counters["immediate_completions"] == len(sizes)
+                and counters["probe_requests"] == 1 and counters["nack_sent_mask"] == 0,
+                f"Malformed prefixes affected placement or completion: {counters}")
+        replies = [decode_response(replay, 0, frame) for frame in read_capture(outgoing[0])]
+        probes = [packet for packet in replies if packet.bth.opcode == 0xDC and packet.body[1] & 2]
+        require(len(probes) == 1 and struct.unpack_from("!H", probes[0].body, 2)[0] == token
+                and int.from_bytes(probes[0].body[13:16], "big") == (INITIAL_PSN - 1) & 0xffffff
+                and int.from_bytes(probes[0].body[20:28], "big") == 0
+                and int.from_bytes(probes[0].body[33:36], "big") == 0,
+                "Rejected packet prefix changed reliability state or byte credits")
+        require(all(packet.bth.opcode != 0xD1 or packet.body[0] == 0x1f for packet in replies),
+                "Boundary ACK advertised unsupported flow-control credits")
+        print(f"Independent {replay.name} boundaries passed {len(rejected)} rejected prefixes, "
+              f"{len(sizes)} WRITEIMMs, and {packets} packets across PSN wrap")
+
+
 def check_service_time(binary, replay):
-    requests, expected, trim_size = service_time_requests(replay)
-    with run_capture(binary, replay, requests, trim=trim_size is not None,
+    requests, expected, trim_sizes = service_time_requests(replay)
+    with run_capture(binary, replay, requests, trim=True,
                      service_time=True) as (result, outgoing):
         require(result.returncode == 0, f"pcap service-time endpoint failed\n{result.stdout}\n{result.stderr}")
         counters = json.loads(result.stdout.strip().splitlines()[-1])
@@ -524,7 +577,7 @@ def check_service_time(binary, replay):
                         "Service-time NETH did not reflect the request PSN")
                 key = ("NETH", body[2], packet.bth.psn)
                 if body[2] == 0x01:
-                    require(packet.udp_size == trim_size, "Service-time trim NACK changed the original UDP length")
+                    require(packet.udp_size == trim_sizes[key], "Service-time trim NACK changed the original UDP length")
                 field = 18
             elif packet.bth.opcode == 0xD9:
                 require(len(body) == 36 and (body[1] >> 2) & 3 == 0,
@@ -589,9 +642,14 @@ def check_reserved_opcode(binary, replay):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "mrc_write")
-    binary = parser.parse_args().binary.resolve()
+    parser.add_argument("--boundaries-only", action="store_true")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
     require(binary.is_file(), f"Build mrc_write first: {binary}")
     for replay in REPLAYS:
+        check_packet_boundaries(binary, replay)
+        if args.boundaries_only:
+            continue
         run_replay(binary, replay)
         check_psn_feedback_bounds(binary, replay)
         check_retransmitted_ack_request(binary, replay)
@@ -599,6 +657,8 @@ def main():
         check_jumbo_pmtu(binary, replay)
         check_reserved_opcode(binary, replay)
         check_service_time(binary, replay)
+    if args.boundaries_only:
+        return
     for pmtu in (2048, 4096):
         check_jumbo_requester(binary, pmtu)
 

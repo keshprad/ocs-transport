@@ -2,9 +2,12 @@
 """Run the OCP MRC endpoint through two Linux SRv6 forwarding planes."""
 
 import argparse
+import ipaddress
 import json
 import os
 import subprocess
+import struct
+import sys
 import tempfile
 import time
 from contextlib import ExitStack
@@ -135,10 +138,121 @@ def add_ingress_chain(router):
                   "{ type filter hook ingress device to-tx priority 0; policy accept; }")
 
 
-def mark_ecn(router):
+def mark_ecn(router, decapsulates=False):
     add_ingress_chain(router)
     namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "ingress",
                   "ip6", "ecn", "ect0", "numgen", "inc", "mod", "16", "15", "counter", "ip6", "ecn", "set", "ce")
+    # A second rule observes the resulting packet bits, not just the number
+    # selected by the marking policy. Neither rule models queue-driven WRED.
+    namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "ingress",
+                  "ip6", "ecn", "ce", "counter")
+    if decapsulates:
+        # This kernel's End.DX6 removes outer CE without copying it inward.
+        # Apply the RFC 6040 CE merge explicitly for this fixture's fixed
+        # IPv6/SRH/IPv6 stack. The inner ECN mask must be nonzero: Not-ECT
+        # packets are never converted to CE by this rule.
+        namespace_run(router, "nft", "add", "counter", "netdev", "mrc_fabric", "decap_propagated")
+        namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "ingress",
+                      "ip6", "saddr", SID["tx"], "ip6", "nexthdr", "43", "ip6", "ecn", "ce",
+                      "@nh,512,16", "&", "0x30", "!=", "0",
+                      "counter", "name", "decap_propagated",
+                      "@nh,512,16", "set", "@nh,512,16", "|", "0x30")
+        namespace_run(router, "nft", "add", "chain", "netdev", "mrc_fabric", "after_decap",
+                      "{ type filter hook egress device to-rx priority 0; policy accept; }")
+        namespace_run(router, "nft", "add", "counter", "netdev", "mrc_fabric", "decap_ce")
+        namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "after_decap",
+                      "ip6", "saddr", INNER["tx"], "ip6", "daddr", INNER["rx"],
+                      "ip6", "ecn", "ce", "counter", "name", "decap_ce")
+    namespace_run(router, "nft", "add", "chain", "netdev", "mrc_fabric", "feedback",
+                  "{ type filter hook ingress device to-rx priority 0; policy accept; }")
+    for rail in range(2):
+        name = f"skip_ev_{rail}"
+        namespace_run(router, "nft", "add", "counter", "netdev", "mrc_fabric", name)
+        # This fixture returns a single-container SRH: outer IPv6 (40), SRH
+        # (24), inner IPv6 (40), UDP (8), BTH (12), then SETH. Check the SACK
+        # opcode, SKIP mark, and reflected request EV independently of ingress.
+        entropy = ((0x0100 + rail) << 16) | (0xC000 + rail)
+        namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "feedback",
+                      "ip6", "saddr", SID["rx"], "ip6", "nexthdr", "43",
+                      "@nh,896,8", "0xdc", "@nh,1000,8", "&", "0x60", "==", "0x20",
+                      "@nh,1024,32", hex(entropy), "counter", "name", name)
+
+
+def ecn_observation(router, decapsulates=False):
+    table = json.loads(namespace_run(router, "nft", "-j", "list", "table", "netdev", "mrc_fabric"))
+    rules = [item["rule"] for item in table["nftables"]
+             if "rule" in item and item["rule"]["chain"] == "ingress"]
+    require(len(rules) == (3 if decapsulates else 2), f"Missing ECN marking/observation rules: {table}")
+    require(any(expr.get("mangle") == {"key": {"payload": {"protocol": "ip6", "field": "ecn"}},
+                                      "value": "ce"} for expr in rules[0]["expr"]),
+            f"Installed switch rule does not set CE: {table}")
+    counts = [next(expr["counter"]["packets"] for expr in rule["expr"] if "counter" in expr)
+              for rule in rules[:2]]
+    require(counts[0] > 0 and counts[0] == counts[1],
+            f"Selected packets did not acquire CE on this switch: {counts}")
+    named = {item["counter"]["name"]: item["counter"]["packets"]
+             for item in table["nftables"] if "counter" in item}
+    result = {"policy": "deterministic_every_16th_ect0", "marked": counts[0],
+              "ce_after_policy": counts[1], "skip_sacks_by_ev": [named[f"skip_ev_{rail}"] for rail in range(2)]}
+    if decapsulates:
+        # Read back the Not-ECT exclusion rather than relying on the command
+        # succeeding; payload offset 512 is the inner IPv6 header after SRH.
+        matches = [expr["match"] for expr in rules[2]["expr"] if "match" in expr]
+        guard = {"op": "!=", "left": {"&": [{"payload": {"base": "nh", "offset": 512, "len": 16}}, 48]},
+                 "right": 0}
+        require(guard in matches,
+                f"CE propagation lacks its inner Not-ECT guard: {rules[2]}")
+        require(named["decap_propagated"] == named["decap_ce"] == counts[0],
+                f"CE was not preserved into each decapsulated packet: {named}, {counts}")
+        result.update(decap_policy="explicit_ect_inner_ce_merge", decap_propagated=named["decap_propagated"],
+                      ce_after_decap=named["decap_ce"])
+    return result
+
+
+def check_ecn_decap_policy():
+    """Exercise the configured merge with all four inner ECN codepoints.
+
+    These synthetic IPv6 packets contain no MRC traffic and run in separate
+    namespaces so their counters cannot satisfy the actual transfer checks.
+    This checks preservation only; it does not claim full RFC 6040 behavior
+    for an outer-CE/inner-Not-ECT combination (which would require dropping).
+    """
+    with ExitStack() as resources:
+        endpoints = {role: open_namespace(resources) for role in ROLES}
+        router, stage = build_rail(resources, endpoints, 1, 1, False)
+        mark_ecn(router, decapsulates=True)
+        namespace_run(router, "nft", "add", "counter", "netdev", "mrc_fabric", "decap_not_ect")
+        namespace_run(router, "nft", "add", "rule", "netdev", "mrc_fabric", "after_decap",
+                      "ip6", "saddr", INNER["tx"], "ip6", "daddr", INNER["rx"],
+                      "ip6", "ecn", "not-ect", "counter", "name", "decap_not_ect")
+        address = lambda value: ipaddress.IPv6Address(value).packed
+        ethernet = bytes.fromhex(mac("tx", 1, True).replace(":", ""))
+        ethernet += bytes.fromhex(mac("tx", 1).replace(":", "")) + b"\x86\xdd"
+        srh = struct.pack("!BBBBBBH", 41, 2, 4, 1, 0, 0, 0) + address(SID["rx"])
+        packets = []
+        for inner_ecn in range(4):
+            inner = struct.pack("!IHBB16s16s", (6 << 28) | (inner_ecn << 20), 8, 17, 64,
+                                address(INNER["tx"]), address(INNER["rx"]))
+            inner += struct.pack("!HHHH", 43210, 43211, 8, 0)
+            outer = struct.pack("!IHBB16s16s", (6 << 28) | (3 << 20), len(srh) + len(inner),
+                                43, 64, address(SID["tx"]), address(stage))
+            packets.append((ethernet + outer + srh + inner).hex())
+        namespace_run(endpoints["tx"], sys.executable, "-c",
+                      "import socket,sys; s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW); "
+                      "s.bind((sys.argv[1],0)); [s.send(bytes.fromhex(p)) for p in sys.argv[2:]]",
+                      "tx1", *packets)
+        deadline = time.monotonic() + 2
+        while True:
+            table = json.loads(namespace_run(router, "nft", "-j", "list", "table", "netdev", "mrc_fabric"))
+            counts = {item["counter"]["name"]: item["counter"]["packets"]
+                      for item in table["nftables"] if "counter" in item}
+            if counts["decap_ce"] + counts["decap_not_ect"] == 4:
+                break
+            require(time.monotonic() < deadline, f"Missing ECN guard test packets: {counts}")
+            time.sleep(0.01)
+        require(counts["decap_propagated"] == counts["decap_ce"] == 3 and counts["decap_not_ect"] == 1,
+                f"ECT merge corrupted Not-ECT or lost CE: {counts}")
+        return {"inner_not_ect_preserved": 1, "inner_ect_or_ce_preserved_as_ce": 3}
 
 
 def ingress_packets(router):
@@ -314,13 +428,15 @@ def main():
         args.bytes = JUMBO_BYTES
     require([link["ifname"] for link in json.loads(run("ip", "-j", "link", "show"))] == ["lo"],
             "Run inside an empty network namespace with unshare -Urn")
+    ecn_policy_test = check_ecn_decap_policy() if args.fault == "ecn" else None
     with tempfile.TemporaryDirectory(prefix="mrc-fabric-") as temp, ExitStack() as resources:
         endpoints = {role: open_namespace(resources) for role in ROLES}
         build_management(endpoints)
         decap_rail = 0 if args.fault == "trim" else 1
         routers = [build_rail(resources, endpoints, rail, decap_rail, args.jumbo) for rail in range(2)]
         if args.fault == "ecn":
-            mark_ecn(routers[0][0])
+            for rail, (router, _) in enumerate(routers):
+                mark_ecn(router, decapsulates=rail == decap_rail)
         elif args.fault == "link":
             prepare_link_fault(routers)
         elif args.jumbo:
@@ -341,9 +457,14 @@ def main():
         results = {"case": "linux_srv6_fabric", "fault": args.fault, "tx": tx, "rx": rx,
                    "end": transit, "decap_rail": decap_rail, "end_dx6": decap}
         if args.fault == "ecn":
-            results["ecn_marked"] = ingress_packets(routers[0][0])
-            require(results["ecn_marked"] > 0 and tx["ev_skipped"] > 0,
-                    f"Kernel CE marks did not reach MRC feedback: {results}")
+            results["ecn_policy_selftest"] = ecn_policy_test
+            results["ecn_switches"] = [ecn_observation(router, rail == decap_rail)
+                                       for rail, (router, _) in enumerate(routers)]
+            results["ecn_marked"] = sum(item["marked"] for item in results["ecn_switches"])
+            reflected = [sum(item["skip_sacks_by_ev"][rail] for item in results["ecn_switches"])
+                         for rail in range(2)]
+            require(min(reflected) > 0 and tx["ev_skipped"] >= 2,
+                    f"Both preserved and decapsulated CE marks must reach MRC feedback: {results}")
         elif args.fault == "trim":
             require(tx["trimmed"] > 0 and rx["trim_nacks"] > 0 and tx["trim_nacks"] > 0
                     and rx["nack_sent_mask"] & 2 and tx["nack_received_mask"] & 2
