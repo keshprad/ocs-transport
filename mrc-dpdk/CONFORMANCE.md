@@ -1110,6 +1110,31 @@ In the negotiated run, each edge completed eight 32 MiB WRITEIMMs with
 registered memory, eight immediate completions at the receiver, and one
 MPR update at each peer.
 
+### Three-Spark verification with Spark-01
+
+After recabling, both rails passed link-local reachability checks on
+Spark-04 → Spark-02 → Spark-01 → Spark-04. The staged reroute was
+installed on all three hosts, and the `rkp64` account verified 18 scoped
+passwordless commands on Spark-01, 28 on Spark-02, and 30 on Spark-04.
+
+Smoke, injected failover, and negotiated WRITEIMM/Dynamic MPR passed in
+that order. Before each profile, the three Git worktrees matched
+`32d67ee5464821c0ad19fbc8e35caa1a5bd3927f` and the installed binaries
+matched SHA-256 `edc9f659265dbc55e53506fcbfbf29419f34fe3c3599b00f0781e1ebc1f5b1d0`.
+
+| Profile | Spark-04 → Spark-02 RX segments | Spark-02 → Spark-01 RX segments | Spark-01 → Spark-04 RX segments |
+| --- | --- | --- | --- |
+| Smoke | 131,933 / 130,211 | 131,139 / 131,005 | 131,142 / 131,002 |
+| Failover | 132,751 / 129,393 | 130,693 / 131,451 | 134,502 / 127,642 |
+| Negotiated | 131,204 / 130,940 | 131,123 / 131,021 | 131,796 / 130,348 |
+
+Each entry lists rail 0 and rail 1. Each receiver verified 256 MiB.
+The sender intervals overlapped by at least 1,875.6 ms, 1,998.9 ms, and
+1,811.6 ms in profile order. The failover sender on Spark-04 recorded
+127 injected drops with failure and recovery on rail 1. The negotiated
+profile completed eight 32 MiB WRITEIMMs per edge and applied one
+Dynamic MPR update at each endpoint.
+
 ### Spark-04 to Spark-02 link recovery and jumbo MTU
 
 The two-rail link-recovery profile completed a 768 MiB WRITE using the
@@ -1132,14 +1157,86 @@ frame and headroom. The application regression checks that reservation.
 The corrected build passed independent jumbo packet replay and the Linux
 TAP test, which negotiated PMTU 4096 and counted 128 full-sized packets
 per rail. The hardware run restored all four ports to MTU 1500.
-Hardware verification needs the corrected pinned snapshot installed
-and a fresh run of the scoped jumbo profile.
+On the replacement ring, the same revision and checksum were verified
+before each pair run. The 768 MiB link-recovery test passed again at
+PMTU 1024. During the sampled 288.7 ms administrative outage, rail 0
+transmitted 43,138,402 bytes and rail 1 recorded 94 bytes. The restored
+rail then transmitted another 4,399,594 bytes before completion. Spark-02
+verified 428,292 segments on rail 0 and 358,140 on rail 1, with zero
+peer carrier transitions.
+
+The corrected mlx5 build opened both ports and negotiated PMTU 4096
+on both jumbo attempts. The sender scheduled 3,732 and 3,467 segments
+respectively before retries exhausted, and the receiver logged mlx5
+receive completion queue errors on both attempts. The second attempt also
+logged a transmit queue error on Spark-04. Both cleanups restored MTU 1500
+on the four test ports. Those units could not write driver dumps into
+their read-only working directories.
+
+With `rx_vec_en=0` on both rails, two hardware runs on the same pin
+completed 256 MiB at negotiated PMTU 4096. In the validated run,
+Spark-02 checked all 65,536 segments and eight immediate completions.
+It placed 33,040 segments on rail 0 and 32,496 on rail 1. Both endpoints
+applied one Dynamic MPR update. The Spark-02 physical frame-size
+counter for 4,096 to 8,191 bytes increased by 70,866, including
+retransmitted traffic. The four ports returned to MTU 1500 with
+carrier up. [DPDK 23.11 mlx5 receive modes](https://doc.dpdk.org/guides-23.11/nics/mlx5.html#rx-burst-functions)
+
+The validated run still reported mlx5 completion queue errors and
+5,395 sender retries. DPDK input error counters on rail 0 and rail 1
+increased by 8,071 and 13,105 at the sender and 10,118 and 12,062 at the
+receiver. The first scalar run's journal tail lost startup messages,
+so the verification run captured port readiness and PMTU negotiation
+live before collecting terminal results. The current units provide a
+writable working directory under systemd's private runtime directory.
+An administrator retrieved 240 dump headers. All reported mlx5 CQE
+syndrome `0x04` (local protection error). The headers include 235 RX
+errors across both endpoints and five TX errors on Spark-04. On RX,
+214 headers reported WQE counters from 1,024 through 1,047 with
+1,024 configured descriptors. [Linux mlx5 completion status](https://github.com/torvalds/linux/blob/master/drivers/infiniband/hw/mlx5/cq.c#L281-L283)
+
+Both hosts started at zero reserved hugepages. The comparison changed
+EAL backing from `--no-huge` on 4 KiB Linux pages to 64 temporary
+2 MiB pages per host. The pinned binary, PMTU 4096, scalar mlx5 Rx,
+and traffic profile were identical. Both endpoint processes exited
+successfully. Spark-02 verified 256 MiB in 65,536 segments, split
+33,588 / 31,948 across the two rails, with eight immediate
+completions and one Dynamic MPR update per endpoint. All four DPDK
+ports reported zero input and output errors. Sender retries fell
+from 5,395 to 296. This supports a memory-backing dependency.
+The exact failed registration in the 4 KiB configuration remains
+unverified.
+[DPDK Linux hugepage requirements](https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html#use-of-hugepages-in-the-linux-environment)
+
+The jumbo harness restored all four ports to MTU 1500. Both
+`ExecStopPost` cleanup hooks failed with `EBUSY` at the private
+backing path after DPDK exited. Each host retained 64 free 2 MiB
+pages with zero reservations in use. Neither backing directory was
+a mount point in the host namespace. The admin update released
+that run's idle pages and removed the per-service `ReadWritePaths`
+bind mount. The cleanup hook now releases the reservation before
+removing its backing directory.
+[systemd filesystem protection](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#ProtectSystem=)
+
+The corrected run verified the same three Git hashes and binary
+checksums. Spark-02 verified 256 MiB at negotiated PMTU 4096, with
+33,166 / 32,370 segments across both rails and eight immediate
+completions. Both endpoints recorded one Dynamic MPR update. The
+receiver's physical frame-size counter for 4,096 to 8,191 bytes
+increased by 65,679. Sender retries were 85 / 58. All four DPDK
+ports recorded zero input and output errors, missed packets, and
+buffer allocation failures. Both services exited successfully.
+The test automatically released all 64 temporary hugepages per
+host, removed the backing and reservation-state directories, and
+restored the four test ports to MTU 1500 with carrier up.
 
 ### Independent hardware interoperability
 
-A separate OCP MRC 1.0 endpoint and a fabric supporting hardware SRv6,
-ECN, and switch-generated trimming are unconfirmed and assumed
-unavailable for planning. The Polatis double ring supplies optical
-connectivity. Independent software packet replay and the Linux SRv6
-fabric results above provide protocol evidence. External endpoint and
-hardware forwarding behavior remain open.
+Hardware interoperability is blocked because the available lab
+equipment includes no NIC that implements OCP MRC 1.0 in hardware.
+Availability of a fabric supporting hardware SRv6, ECN, and
+switch-generated trimming is unconfirmed. The Polatis double ring
+supplies optical connectivity. Independent software packet replay,
+the Python memif peer, and Linux SRv6 fabric tests provide protocol
+evidence. Interoperability with an external MRC endpoint and hardware
+forwarding behavior remain unverified.
