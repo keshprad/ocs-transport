@@ -268,3 +268,21 @@ The sender windows overlapped by at least 99.97%, with at most
 0.099 ms start skew. Total requester retries across both rails were
 two, two, and zero. The last run verified exactly 16,777,216 data
 packets per rail with zero DPDK misses or packet errors.
+
+### Three-Spark ring sweep
+
+Once the two-Spark target is verified, install the pinned ring services
+on Spark-04, Spark-02, and Spark-01. The ring uses the first PCIe path
+on each cable. Each Spark sends on `0000:01:00.0` and receives on
+`0000:01:00.1`, with both functions in raw Ethernet mode.
+
+```sh
+python3 tests/check_spark_ring_bandwidth.py \
+  --destination "/opt/ocs-roce-bw/$REVISION" --sha256 "$BINARY_SHA256"
+```
+
+Each directed edge verifies 16 GiB using 16 QPs, PMTU 1024, and
+four polling cores per endpoint. The runner uses the management
+links for TCP setup and releases all three senders after every
+receiver is ready. It records each edge's rate, CPU and retries, and
+a lower bound on the interval when all three transfers were active.
