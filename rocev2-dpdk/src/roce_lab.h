@@ -8,6 +8,7 @@ enum { ROCE_LAB_TIMEOUT = 30, ROCE_LAB_RETRIES = 7 };
 struct roce_lab_options {
     bool sender;
     uint32_t size;
+    uint32_t writes;
     uint32_t control_ip;
     uint16_t control_port;
     uint32_t data_ip;
@@ -31,8 +32,8 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
 bool roce_lab_ready(int fd);
 int roce_lab_receive(int fd, char expected, bool nonblocking);
 bool roce_lab_send(int fd, char message);
-void roce_lab_fill(uint8_t *buffer, uint32_t size, bool sender);
-bool roce_lab_verify(const uint8_t *buffer, uint32_t size);
+void roce_lab_fill(uint8_t *buffer, size_t size, bool sender);
+bool roce_lab_verify(const uint8_t *buffer, size_t size);
 uint64_t roce_now_ns(void);
 
 #endif

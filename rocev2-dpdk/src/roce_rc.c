@@ -29,17 +29,21 @@ static bool for_qp(const struct roce_packet *packet, const struct roce_qp *qp)
 
 bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
                          uint32_t psn, struct roce_region remote,
-                         const uint8_t *source, unsigned int retry_limit, uint32_t window)
+                         const uint8_t *source, unsigned int retry_limit,
+                         uint32_t window, uint32_t writes)
 {
     if (!roce_valid_pmtu(qp->pmtu) || psn > ROCE_PSN_MASK || !remote.size || !source ||
-        remote.size - 1 > UINT64_MAX - remote.address || !window || window > ROCE_SEND_WINDOW_MAX)
+        remote.size > UINT32_MAX || !writes || !window || window > ROCE_SEND_WINDOW_MAX)
         return false;
-    uint32_t packets = (remote.size - 1) / qp->pmtu + 1;
-    if (packets >= PSN_HALF_RANGE)
+    uint32_t packets = (uint32_t)((remote.size - 1) / qp->pmtu + 1);
+    uint64_t bytes = remote.size * writes;
+    if (packets > UINT32_MAX / writes || bytes > SIZE_MAX ||
+        bytes - 1 > UINT64_MAX - remote.address)
         return false;
     *r = (struct roce_requester) {
         .qp = *qp, .remote = remote, .source = source, .initial_psn = psn,
-        .total = packets, .window = window, .retry_limit = retry_limit, .retries_left = retry_limit,
+        .packets_per_write = packets, .total = packets * writes, .window = window,
+        .retry_limit = retry_limit, .retries_left = retry_limit,
     };
     return true;
 }
@@ -53,22 +57,24 @@ bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
     if (index - r->acked >= r->window)
         return false;
 
-    bool first = index == 0;
-    bool last = index + 1 == r->total;
+    uint32_t segment = index % r->packets_per_write;
+    bool first = segment == 0;
+    bool last = segment + 1 == r->packets_per_write;
     enum roce_opcode opcode;
     if (first)
         opcode = last ? ROCE_WRITE_ONLY : ROCE_WRITE_FIRST;
     else
         opcode = last ? ROCE_WRITE_LAST : ROCE_WRITE_MIDDLE;
     *packet = outgoing(&r->qp, opcode, r->initial_psn + index);
-    size_t offset = (size_t)index * r->qp.pmtu;
-    packet->payload = r->source + offset;
-    packet->payload_length = last ? r->remote.size - offset : r->qp.pmtu;
+    size_t segment_offset = (size_t)segment * r->qp.pmtu;
+    size_t write_offset = (size_t)(index / r->packets_per_write) * r->remote.size;
+    packet->payload = r->source + write_offset + segment_offset;
+    packet->payload_length = last ? r->remote.size - segment_offset : r->qp.pmtu;
     packet->ack_requested = last || (index + 1) % ACK_INTERVAL == 0 ||
                             index + 1 - r->acked == r->window;
-    packet->remote_address = r->remote.address;
+    packet->remote_address = r->remote.address + write_offset;
     packet->rkey = r->remote.rkey;
-    packet->write_length = r->remote.size;
+    packet->write_length = (uint32_t)r->remote.size;
     return true;
 }
 
@@ -111,9 +117,11 @@ void roce_requester_feedback(struct roce_requester *r,
 {
     if (r->failed || packet->opcode != ROCE_ACK || !for_qp(packet, &r->qp))
         return;
-    uint32_t index = (packet->psn - r->initial_psn) & ROCE_PSN_MASK;
-    if (index < r->acked || index >= r->sent)
+    /* Only PSNs in the current outstanding window can acknowledge data. */
+    uint32_t delta = (packet->psn - r->initial_psn - r->acked) & ROCE_PSN_MASK;
+    if (delta >= r->sent - r->acked)
         return;
+    uint32_t index = r->acked + delta;
 
     if (packet->syndrome <= ROCE_ACK_NO_CREDIT) {
         advance(r, index + 1, now);
@@ -178,15 +186,14 @@ bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *
             r->failed = true;
             return respond(r, feedback, ROCE_NAK_ACCESS, r->expected);
         }
-        r->offset = (uint32_t)offset;
+        r->offset = offset;
     }
 
     memcpy(r->buffer + r->offset, packet->payload, expected_length);
     r->offset += (uint32_t)expected_length;
     r->remaining = remaining - (uint32_t)expected_length;
     r->expected = (r->expected + 1) & ROCE_PSN_MASK;
-    if (r->accepted < PSN_HALF_RANGE - 1)
-        ++r->accepted;
+    ++r->accepted;
     r->reported_gap = false;
     if (last)
         r->msn = (r->msn + 1) & ROCE_PSN_MASK;

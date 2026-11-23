@@ -41,7 +41,7 @@ open. No overall clause count is asserted.
 | --- | --- | --- |
 | WIRE | `make check` → `tests/check_wire.py` | Independent BTH/RETH/AETH and iCRC vectors for five opcodes, plus negative decode cases |
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
-| MEMIF | `make check-memif` | Two production DPDK processes verified 3 bytes in one packet and 1,048,579 bytes in 2,049 packets with PMTU negotiated from 1024 and 512 |
+| MEMIF | `make check-memif` | Two production DPDK processes verified 3 bytes in one packet, 1,048,579 bytes in 2,049 packets with PMTU negotiated from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
 | SPARK | [Spark wire interoperability](README.md#spark-wire-interoperability) | Native controls passed both ways. Two mixed runs each verified all 8,195 bytes in both directions on ConnectX-7 at PMTU 1024. |
 

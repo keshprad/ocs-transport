@@ -2,7 +2,7 @@
 
 `roce_write` originates and responds to host-memory IPv4 RoCEv2 Reliable
 Connected WRITEs on one DPDK Ethernet port. `roce_verbs_write` exercises the
-same test with a native verbs QP. Each process transfers one message. The
+same test with a native verbs QP. By default each process transfers one message. The
 sender reports success after its transport completion and the receiver's
 byte-for-byte verification.
 
@@ -105,7 +105,13 @@ Both endpoints report payload bytes, elapsed time, and polling-thread CPU
 time. The timed interval begins after control setup and ends when the
 requester processes the final ACK or the responder places the final
 segment. The executables report bandwidth after the receiver verifies
-its buffer. Each probe transfers one finite WRITE.
+its buffer. For a longer DPDK-to-DPDK run, append `--writes N` at both
+ends. `BYTES` then gives the size of each WRITE, and each host allocates a
+buffer of `BYTES × N`. The sender pipelines successive WRITEs on the same
+QP, and the receiver verifies every byte across all destination regions
+after the transfer. For example, use `BYTES=1048576` and `--writes 4096`
+to send 4 GiB in 1 MiB WRITEs. The transfer has one setup exchange and
+one timed interval.
 
 The requester accepts `--tx-burst N` (1–32, default 32) and
 `--send-window N` (1–512 packets, default 32). Use `--tx-burst 1`
@@ -132,6 +138,12 @@ The table shows median requester payload rates for three byte-verified
 | Arm CRC instructions | 1 | 32 | 12.454 |
 | Arm CRC instructions | 32 | 32 | 10.274 |
 | Arm CRC instructions | 32 | 256 | 19.380 |
+
+The pipelined mode verified 4,096 1 MiB WRITEs at 17.73 Gbit/s over memif
+at PMTU 1024, with zero retries and approximately one polling core per
+endpoint. A separate PMTU 256 stress run verified 4,097 WRITEs and
+16,781,312 packets with zero retries, exercising both offsets above
+4 GiB and a full cycle of 24-bit PSNs.
 
 The memif timings compare datapath changes on one host. Measure the
 physical DPDK link before selecting a default window or burst size. For

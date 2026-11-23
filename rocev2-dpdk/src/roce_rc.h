@@ -19,7 +19,7 @@ struct roce_qp {
 struct roce_region {
     uint64_t address;
     uint32_t rkey;
-    uint32_t size;
+    uint64_t size;
 };
 
 struct roce_requester {
@@ -27,6 +27,7 @@ struct roce_requester {
     struct roce_region remote;
     const uint8_t *source;
     uint32_t initial_psn;
+    uint32_t packets_per_write;
     uint32_t total;
     uint32_t window;
     uint32_t acked;
@@ -45,9 +46,9 @@ struct roce_responder {
     uint8_t *buffer;
     uint32_t expected;
     uint32_t msn;
-    uint32_t offset;
+    uint64_t offset;
     uint32_t remaining;
-    uint32_t accepted;
+    uint64_t accepted;
     bool reported_gap;
     bool failed;
 };
@@ -55,7 +56,8 @@ struct roce_responder {
 bool roce_valid_pmtu(uint16_t pmtu);
 bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
                          uint32_t psn, struct roce_region remote,
-                         const uint8_t *source, unsigned int retry_limit, uint32_t window);
+                         const uint8_t *source, unsigned int retry_limit,
+                         uint32_t window, uint32_t writes);
 bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
                          struct roce_packet *packet);
 void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now);

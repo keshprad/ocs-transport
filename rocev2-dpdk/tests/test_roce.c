@@ -37,7 +37,7 @@ static void test_sequence_nak_and_lost_final_ack(void)
     const uint32_t psn = ROCE_PSN_MASK - 1;
     struct roce_region region = { .address = UINT64_C(0x100100000), .rkey = 0x21, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, psn, region, source, 3, ROCE_SEND_WINDOW_DEFAULT));
+    assert(roce_requester_init(&tx, &send_qp, psn, region, source, 3, ROCE_SEND_WINDOW_DEFAULT, 1));
     struct roce_responder rx = responder(destination, region, psn);
     struct roce_packet first = transmit(&tx, 0), lost = transmit(&tx, 0);
     struct roce_packet third = transmit(&tx, 0), last = transmit(&tx, 0), ack;
@@ -78,7 +78,7 @@ static void test_window_timeout_and_address_validation(void)
     uint8_t source[33 * 256] = {1}, dest[sizeof(source)] = {0};
     struct roce_region region = { .address = UINT64_C(0xffffffff00000000), .rkey = 4, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, 6, region, source, 1, ROCE_SEND_WINDOW_DEFAULT));
+    assert(roce_requester_init(&tx, &send_qp, 6, region, source, 1, ROCE_SEND_WINDOW_DEFAULT, 1));
     struct roce_responder rx = responder(dest, region, 6);
     struct roce_packet ack, packet;
     for (unsigned int i = 0; i < 32; ++i) {
@@ -118,7 +118,7 @@ static void test_single_packet_and_access_errors(void)
     struct roce_region region = { .address = 1000, .rkey = 77, .size = sizeof(destination) };
     struct roce_region remote = { .address = 1007, .rkey = 77, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, 2, remote, source, 3, ROCE_SEND_WINDOW_DEFAULT));
+    assert(roce_requester_init(&tx, &send_qp, 2, remote, source, 3, ROCE_SEND_WINDOW_DEFAULT, 1));
     struct roce_responder rx = responder(destination, region, 2);
     struct roce_packet packet = transmit(&tx, 0), ack;
     assert(packet.opcode == ROCE_WRITE_ONLY && packet.payload_length == sizeof(source));
@@ -153,7 +153,7 @@ static void test_short_tx_burst(void)
     uint8_t source[80 * 256] = {0};
     struct roce_region region = { .address = 1000, .rkey = 77, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, 5, region, source, 3, 64));
+    assert(roce_requester_init(&tx, &send_qp, 5, region, source, 3, 64, 1));
     struct roce_packet packet;
     assert(roce_requester_next(&tx, 31, &packet) && packet.ack_requested);
     assert(roce_requester_next(&tx, 63, &packet) && packet.ack_requested);
@@ -167,12 +167,55 @@ static void test_short_tx_burst(void)
     assert(tx.next == 16 && tx.sent == 16 && tx.last_progress == 1);
 }
 
+static void test_pipelined_writes(void)
+{
+    enum { WRITE_SIZE = 259, WRITES = 3 };
+    uint8_t source[WRITE_SIZE * WRITES];
+    uint8_t destination[sizeof(source)] = {0};
+    for (size_t i = 0; i < sizeof(source); ++i)
+        source[i] = (uint8_t)((i * 17) ^ (i >> 8));
+
+    struct roce_region region = { .address = 1000, .rkey = 77, .size = WRITE_SIZE };
+    uint32_t start = ROCE_PSN_MASK - 1;
+    struct roce_requester tx;
+    assert(roce_requester_init(&tx, &send_qp, start, region, source, 3, 64, WRITES));
+    region.size = sizeof(destination);
+    struct roce_responder rx = responder(destination, region, start);
+    struct roce_packet packets[2 * WRITES], feedback;
+    for (unsigned int i = 0; i < 2 * WRITES; ++i) {
+        assert(roce_requester_next(&tx, i, &packets[i]));
+        assert(packets[i].psn == ((start + i) & ROCE_PSN_MASK));
+        assert(packets[i].opcode == (i % 2 ? ROCE_WRITE_LAST : ROCE_WRITE_FIRST));
+        assert(packets[i].remote_address == region.address + (i / 2) * WRITE_SIZE);
+    }
+    roce_requester_sent(&tx, 2 * WRITES, 1);
+    for (unsigned int i = 0; i < 2 * WRITES; ++i) {
+        bool last = i % 2 != 0;
+        assert(roce_responder_receive(&rx, &packets[i], &feedback) == last);
+        if (last) {
+            assert(feedback.msn == i / 2 + 1);
+            roce_requester_feedback(&tx, &feedback, 2);
+            assert(tx.acked == i + 1);
+        }
+    }
+    assert(rx.msn == WRITES && rx.accepted == 2 * WRITES);
+    assert(memcmp(source, destination, sizeof(source)) == 0);
+
+    /* Verify cumulative progress after the logical index crosses an entire PSN cycle. */
+    tx.acked = ROCE_PSN_MASK + 1u;
+    tx.total = tx.next = tx.sent = tx.acked + 5;
+    feedback.psn = (tx.initial_psn + tx.acked + 4) & ROCE_PSN_MASK;
+    roce_requester_feedback(&tx, &feedback, 3);
+    assert(tx.acked == tx.sent && tx.last_progress == 3);
+}
+
 int main(void)
 {
     test_sequence_nak_and_lost_final_ack();
     test_window_timeout_and_address_validation();
     test_single_packet_and_access_errors();
     test_short_tx_burst();
+    test_pipelined_writes();
     puts("RoCEv2 RC state tests passed");
     return 0;
 }
