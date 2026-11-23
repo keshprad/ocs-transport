@@ -113,8 +113,10 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   Keep the standard RC retry and completion behavior in hardware tests.
 - **§§4.3–4.4.** Profile packet assembly, CRC, and receive placement separately.
   BURST uses DPDK scatter/gather for transmit and Intel DSA for receive copies.
-  For Spark, measure the current CPU-copy baseline before evaluating transmit
-  buffer chaining, CRC acceleration, or a receive-copy offload.
+  The Spark CPU-copy baseline uses Arm CRC instructions and a per-core
+  mbuf cache. See [bandwidth probes](README.md#bandwidth-probes) for the
+  measurements. Transmit buffer chaining and receive-copy offload remain
+  open.
 - **§5.1 and Appendix A.7.** Report QP count, batch size, and core usage with
   throughput. BURST's single-QP result is about 121 Gbit/s in its x86/400G
   testbed. The DPDK test supports 16 QPs and independent RC state. The

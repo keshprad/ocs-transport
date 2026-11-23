@@ -153,11 +153,14 @@ endpoint. A separate PMTU 256 stress run verified 4,097 WRITEs and
 16,781,312 packets with zero retries, exercising both offsets above
 4 GiB and a full cycle of 24-bit PSNs.
 
-In three matched 1 GiB memif trials per configuration, the median
-requester rate was 19.17 Gbit/s on one QP and 18.85 Gbit/s on 16 QPs.
-Both used PMTU 1024, 1 MiB WRITEs, 16 packets per TX burst, a
-256-packet window per QP, and one polling core at each end. All six
-trials verified the entire buffer with zero retries.
+In a local DPDK memif A/B test, enabling a 256-mbuf cache on each polling
+core raised the median single-QP requester rate from 22.16 to 40.16 Gbit/s
+over three 1 GiB runs per variant. With the cache enabled in the endpoint,
+a separate run of three 1 GiB trials per QP count measured 42.20 Gbit/s
+on one QP and 43.54 Gbit/s on 16 QPs. Both experiments pinned RX to CPU 5
+and TX to CPU 9 on Spark-04 and used PMTU 1024, 1 MiB WRITEs, 16 packets
+per TX burst, and a 256-packet window per QP. Every transfer verified with
+zero retries and used approximately one polling core per endpoint.
 
 The memif timings compare datapath changes on one host. Measure the
 physical DPDK link before selecting a default window or burst size. For

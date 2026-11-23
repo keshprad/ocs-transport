@@ -26,6 +26,12 @@ struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length)
 
 struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsigned int port_count)
 {
+    return mrc_dpdk_packet_pool_with_cache(frame_length, port_count, 0);
+}
+
+struct rte_mempool *mrc_dpdk_packet_pool_with_cache(uint16_t frame_length, unsigned int port_count,
+                                                  unsigned int cache_size)
+{
     /* mlx5 includes the Ethernet FCS in its single-segment RX size check. */
     unsigned int room = frame_length + RTE_ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM;
     if (room > UINT16_MAX || !port_count)
@@ -39,7 +45,7 @@ struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsign
             return NULL;
         packets += extra_ports * RX_DESCRIPTORS;
     }
-    return rte_pktmbuf_pool_create("mrc_packets", packets, 0, 0, (uint16_t)room, SOCKET_ID_ANY);
+    return rte_pktmbuf_pool_create("mrc_packets", packets, cache_size, 0, (uint16_t)room, SOCKET_ID_ANY);
 }
 
 int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool, struct rte_ether_addr *mac)

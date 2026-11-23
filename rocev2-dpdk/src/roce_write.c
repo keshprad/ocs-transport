@@ -16,6 +16,7 @@
 enum {
     RX_BURST = 32, MAX_TX_BURST = 32, NS_PER_SEC = 1000000000,
     RETRY_NS = 10000000, CONTROL_POLL_NS = 1000000,
+    MBUF_CACHE_SIZE = 256,
 };
 
 struct datapath_options {
@@ -341,7 +342,7 @@ int main(int argc, char **argv)
         goto cleanup_eal;
 
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
-    struct rte_mempool *pool = mrc_dpdk_packet_pool_for_ports(frame, 1);
+    struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, 1, MBUF_CACHE_SIZE);
     uint8_t *buffer = malloc((size_t)bytes);
     if (!pool || !buffer) {
         fprintf(stderr, "packet pool or host buffer allocation failed\n");
