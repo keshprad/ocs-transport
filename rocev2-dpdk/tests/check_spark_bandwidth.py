@@ -24,7 +24,6 @@ from check_spark_cycle import ACTIVE_STATES, Commands, CycleError, require, star
 WRITE_BYTES = 1048576
 PAYLOAD = 16 * (1 << 30)
 PMTU = 1024
-PACKETS = PAYLOAD // PMTU
 TX_BURST = 16
 SEND_WINDOW = 256
 CONTROL_IP = "10.61.0.13"
@@ -50,10 +49,20 @@ class Profile:
     workers: int
     rail: int = 1
     aggregate: bool = False
+    pmtu: int = PMTU
+    ethernet_mtu: int | None = None
 
     @property
     def writes(self):
         return PAYLOAD // (self.qps * WRITE_BYTES)
+
+    @property
+    def packets(self):
+        return self.qps * self.writes * ((WRITE_BYTES + self.pmtu - 1) // self.pmtu)
+
+    @property
+    def uses_tunnel(self):
+        return self.aggregate or self.ethernet_mtu is not None
 
     @property
     def cpus(self):
@@ -75,7 +84,12 @@ AGGREGATE_PROFILES = {
     "aggregate-1": Profile(28870, 16, 4, rail=1, aggregate=True),
     "aggregate-2": Profile(28871, 16, 4, rail=2, aggregate=True),
 }
-ALL_PROFILES = PROFILES | AGGREGATE_PROFILES
+BURST_STYLE_PROFILES = {
+    f"mtu-{mtu}-{name}": Profile(base + i, profile.qps, profile.workers, pmtu=pmtu, ethernet_mtu=mtu)
+    for mtu, pmtu, base in ((1500, 1024, 28876), (4200, 4096, 28880))
+    for i, (name, profile) in enumerate(PROFILES.items())
+}
+ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES
 
 
 @dataclass(frozen=True)
@@ -109,14 +123,14 @@ def unit_argv(endpoint, destination, runtime):
     _, pci, _, data_ip = endpoint.link
     cpus = ",".join(map(str, profile.cpus))
     lock = profile.runtime_dir / "function.lock"
-    control_ip = LOOPBACK if profile.aggregate else CONTROL_IP
+    control_ip = LOOPBACK if profile.uses_tunnel else CONTROL_IP
     argv = [
         "/usr/bin/flock", "--exclusive", "--nonblock", str(lock),
         str(destination / "roce_write"), "-l", cpus, "--iova-mode=va", "--no-huge",
         "--no-telemetry", f"--file-prefix=ocs-roce-bw-{endpoint.profile}",
         "-d", str(runtime / "librte_mempool_ring.so.24"),
         "-d", str(runtime / "librte_net_mlx5.so.24"), "-a", pci,
-        "--", endpoint.role, str(WRITE_BYTES), control_ip, str(profile.port), data_ip, str(PMTU),
+        "--", endpoint.role, str(WRITE_BYTES), control_ip, str(profile.port), data_ip, str(profile.pmtu),
         pci, "--report-bw", "--tx-burst", str(TX_BURST), "--send-window", str(SEND_WINDOW),
         "--writes", str(profile.writes), "--qps", str(profile.qps), "--workers", str(profile.workers),
     ]
@@ -136,7 +150,7 @@ def verify_unit(commands, endpoint, destination):
     require("RUNTIME_DIRECTORY" in shlex.split(props.get("UnsetEnvironment", "")),
             f"{endpoint.label}: missing UnsetEnvironment=RUNTIME_DIRECTORY")
     environment = shlex.split(props.get("Environment", ""))
-    if endpoint.settings.aggregate:
+    if endpoint.settings.uses_tunnel:
         require(f"XDG_RUNTIME_DIR={endpoint.settings.runtime_dir}" in environment,
                 f"{endpoint.label}: wrong DPDK runtime directory")
     runtimes = [Path(word.split("=", 1)[1]) for word in environment
@@ -170,10 +184,17 @@ def verify_link(commands, link):
     }
 
 
+def require_idle(commands, host):
+    active = commands.run(host, "systemctl", "list-units", "--state=running,activating,deactivating",
+                          "--no-pager", "--no-legend", "--plain", "ocs-mrc*.service", "ocs-roce*.service")
+    require(not active.strip(), f"{host}: another lab service is running")
+
+
 def preflight(commands, profiles, destination, digest):
     aggregate = ALL_PROFILES[profiles[0]].aggregate
     links = {name: {} for name in profiles} if aggregate else {}
     for role, (host, _, _, _) in PORTS.items():
+        require_idle(commands, host)
         if aggregate:
             for name in profiles:
                 endpoint = Endpoint(role, name)
@@ -182,9 +203,6 @@ def preflight(commands, profiles, destination, digest):
                 }
         else:
             links[role] = verify_link(commands, PORTS[role])
-        active = commands.run(host, "systemctl", "list-units", "--state=running,activating,deactivating",
-                              "--no-pager", "--no-legend", "--plain", "ocs-mrc*.service", "ocs-roce*.service")
-        require(not active.strip(), f"{host}: another lab service is running")
 
         executable = destination / "roce_write"
         for path in (destination, executable):
@@ -208,26 +226,26 @@ def verify_loopback_listener(commands, host, port):
 
 
 @contextmanager
-def aggregate_tunnel(commands, socket_dir):
+def control_tunnel(commands, socket_dir, profiles):
     host = PORTS["rx"][0]
-    control = Path(socket_dir) / "aggregate-forward"
+    control = Path(socket_dir) / "bandwidth-forward"
     ssh = ["ssh", "-S", str(control), "-o", "BatchMode=yes"]
     argv = [
         *ssh, "-fNT", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5",
         "-o", "ServerAliveCountMax=2", "-o", "ControlMaster=yes",
         "-o", "ControlPersist=no", "-o", "ExitOnForwardFailure=yes",
     ]
-    for profile in AGGREGATE_PROFILES.values():
+    for profile in profiles:
         argv += ["-L", f"{LOOPBACK}:{profile.port}:{LOOPBACK}:{profile.port}"]
     try:
         result = subprocess.run([*argv, host], capture_output=True, text=True, timeout=15,
                                 stdin=subprocess.DEVNULL)
-        require(result.returncode == 0, f"{host}: could not open aggregate tunnel: {result.stderr.strip()}")
-        for profile in AGGREGATE_PROFILES.values():
+        require(result.returncode == 0, f"{host}: could not open benchmark tunnel: {result.stderr.strip()}")
+        for profile in profiles:
             verify_loopback_listener(commands, PORTS["tx"][0], profile.port)
         yield
     except subprocess.TimeoutExpired as error:
-        raise CycleError(f"{host}: timed out opening aggregate tunnel") from error
+        raise CycleError(f"{host}: timed out opening benchmark tunnel") from error
     finally:
         if control.exists():
             failed = sys.exc_info()[0] is not None
@@ -235,10 +253,10 @@ def aggregate_tunnel(commands, socket_dir):
                 result = subprocess.run([*ssh, "-O", "exit", host], capture_output=True,
                                         text=True, timeout=5, stdin=subprocess.DEVNULL)
                 require(result.returncode == 0 or not control.exists(),
-                        f"{host}: aggregate tunnel cleanup failed: {result.stderr.strip()}")
+                        f"{host}: benchmark tunnel cleanup failed: {result.stderr.strip()}")
             except (CycleError, OSError, subprocess.TimeoutExpired) as error:
                 if not failed:
-                    raise CycleError(f"{host}: could not close aggregate tunnel: {error}") from error
+                    raise CycleError(f"{host}: could not close benchmark tunnel: {error}") from error
                 print(error, file=sys.stderr)
 
 
@@ -339,13 +357,13 @@ def parse_result(endpoint, messages):
         require(int(fields.get("start_ns", "0")) > 0, f"{endpoint.label}: missing monotonic start")
 
     if endpoint.role == "tx":
-        pattern = rf"WRITE complete: {PAYLOAD} bytes, {PACKETS} packets, ([0-9]+) retries, peer verified"
+        pattern = rf"WRITE complete: {PAYLOAD} bytes, {profile.packets} packets, ([0-9]+) retries, peer verified"
         matches = [re.fullmatch(pattern, message) for message in messages]
         retries = [int(match[1]) for match in matches if match]
         require(len(retries) == 1, f"{endpoint.label}: missing verified sender completion or retry count")
         fields["retries"] = str(retries[0])
     else:
-        marker = f"WRITE verified: {PAYLOAD} bytes, {PACKETS} packets"
+        marker = f"WRITE verified: {PAYLOAD} bytes, {profile.packets} packets"
         require(messages.count(marker) == 1, f"{endpoint.label}: missing byte verification")
     counters = [line for line in messages if line.startswith("PORT_STATS ")]
     if counters:
@@ -366,7 +384,7 @@ def run_endpoints(commands, profiles, output, sample):
         ready_deadline = time.monotonic() + 20
         for endpoint in receivers:
             wait_endpoint(commands, endpoint, invocations[endpoint], ready_deadline, ready=True)
-            if aggregate:
+            if endpoint.settings.uses_tunnel:
                 verify_loopback_listener(commands, endpoint.host, endpoint.settings.port)
         release_ns = None
         with ExitStack() as gates:
@@ -439,14 +457,89 @@ def save_report(output, report):
     pending.replace(output / "results.json")
 
 
+def set_link_mtu(commands, link, mtu):
+    commands.run(link["host"], "sudo", "-n", "/usr/sbin/ip", "link", "set", "dev",
+                 link["interface"], "mtu", mtu)
+
+
+@contextmanager
+def temporary_mtu(commands, links, mtu):
+    changed = []
+    try:
+        for link in links.values():
+            host, interface = link["host"], link["interface"]
+            path = f"/sys/class/net/{interface}/mtu"
+            previous = int(commands.run(host, "cat", path))
+            if previous != mtu:
+                commands.run(host, "sudo", "-n", "-l", "/usr/sbin/ip", "link", "set",
+                             "dev", interface, "mtu", previous)
+                changed.append((link, path, previous))
+                set_link_mtu(commands, link, mtu)
+            require(int(commands.run(host, "cat", path)) == mtu,
+                    f"{host} {interface}: expected Ethernet MTU {mtu}")
+        yield
+    finally:
+        failed = sys.exc_info()[0] is not None
+        errors = []
+        for link, path, previous in reversed(changed):
+            try:
+                if int(commands.run(link["host"], "cat", path)) == mtu:
+                    set_link_mtu(commands, link, previous)
+                    require(int(commands.run(link["host"], "cat", path)) == previous,
+                            f"{link['host']} {link['interface']}: MTU restore failed")
+            except (CycleError, OSError, ValueError) as error:
+                errors.append(str(error))
+        if errors:
+            if not failed:
+                raise CycleError("\n".join(errors))
+            print("\n".join(errors), file=sys.stderr)
+
+
+def run_profiles(commands, profiles, output, samples, report, *, keep_going=False):
+    failures = []
+    for profile in profiles:
+        trials = []
+        config = ALL_PROFILES[profile]
+        profile_result = {"trials": trials}
+        if config.ethernet_mtu is not None:
+            profile_result.update(ethernet_mtu=config.ethernet_mtu, pmtu=config.pmtu)
+        report["profiles"][profile] = profile_result
+        for sample in range(1, samples + 1):
+            try:
+                results, _ = run_endpoints(commands, (profile,), output, sample)
+            except CycleError as error:
+                profile_result["failure"] = {"sample": sample, "error": str(error)}
+                save_report(output, report)
+                if not keep_going:
+                    raise
+                for host, _, _, _ in PORTS.values():
+                    require_idle(commands, host)
+                failures.append(profile)
+                print(f"{profile} sample {sample} failed\n{error}", file=sys.stderr, flush=True)
+                break
+            trials.append(results[profile])
+            median = {role: statistics.median(float(trial[role]["payload_gbps"]) for trial in trials)
+                      for role in PORTS}
+            profile_result["median_payload_gbps"] = median
+            save_report(output, report)
+        else:
+            print(f"{profile} median verified payload TX {median['tx']:.3f} RX {median['rx']:.3f} Gbit/s",
+                  flush=True)
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", required=True, type=Path, help="pinned installed snapshot directory")
     parser.add_argument("--sha256", required=True, help="expected SHA-256 of the installed roce_write binary")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--profile", action="append", choices=PROFILES, help="repeat to select profiles")
     selection.add_argument("--aggregate", action="store_true",
                            help="run four-worker 16-QP transfers concurrently on both 100 Gbit/s rails")
+    selection.add_argument("--burst-style-bench", action="store_true",
+                           help="compare the same WRITE profiles at Ethernet MTUs 1500 and 4200")
+    parser.add_argument("--profile", action="append", choices=PROFILES, help="repeat to select profiles")
+    parser.add_argument("--mtu", type=int, choices=(1500, 4200),
+                        help="limit --burst-style-bench to this Ethernet MTU")
     parser.add_argument("--samples", type=int, default=3, help="trials per profile (default 3)")
     parser.add_argument("--output", type=Path, help="new directory for logs and results")
     args = parser.parse_args()
@@ -458,7 +551,18 @@ def main():
         parser.error(f"--destination must name a snapshot directly under {DESTINATION_ROOT}")
     if args.samples <= 0:
         parser.error("--samples must be positive")
-    profiles = tuple(AGGREGATE_PROFILES) if args.aggregate else tuple(dict.fromkeys(args.profile or PROFILES))
+    if args.aggregate and args.profile:
+        parser.error("--aggregate cannot be combined with --profile")
+    if args.mtu is not None and not args.burst_style_bench:
+        parser.error("--mtu requires --burst-style-bench")
+    selected = tuple(dict.fromkeys(args.profile or PROFILES))
+    mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
+    if args.aggregate:
+        profiles = tuple(AGGREGATE_PROFILES)
+    elif args.burst_style_bench:
+        profiles = tuple(f"mtu-{mtu}-{name}" for mtu in mtus for name in selected)
+    else:
+        profiles = selected
 
     require(socket.gethostname().split(".")[0] == "spark-7e64", "run the benchmark from Spark-04")
     with tempfile.TemporaryDirectory(prefix="roce-bw-control-") as sockets:
@@ -472,7 +576,7 @@ def main():
         if args.aggregate:
             trials = []
             report["aggregate"] = {"trials": trials}
-            with aggregate_tunnel(commands, sockets):
+            with control_tunnel(commands, sockets, AGGREGATE_PROFILES.values()):
                 for sample in range(1, args.samples + 1):
                     rails, release_ns = run_endpoints(commands, profiles, output, sample)
                     trial = aggregate_result(rails, release_ns)
@@ -487,19 +591,17 @@ def main():
             print(f"aggregate median verified payload TX {median:.3f} Gbit/s", flush=True)
             return
         report["profiles"] = {}
-        for profile in profiles:
-            trials = []
-            profile_result = {"trials": trials}
-            report["profiles"][profile] = profile_result
-            for sample in range(1, args.samples + 1):
-                results, _ = run_endpoints(commands, (profile,), output, sample)
-                trials.append(results[profile])
-                median = {role: statistics.median(float(trial[role]["payload_gbps"]) for trial in trials)
-                          for role in PORTS}
-                profile_result["median_payload_gbps"] = median
-                save_report(output, report)
-            print(f"{profile} median verified payload TX {median['tx']:.3f} RX {median['rx']:.3f} Gbit/s",
-                  flush=True)
+        if args.burst_style_bench:
+            failures = []
+            with control_tunnel(commands, sockets, [ALL_PROFILES[name] for name in profiles]):
+                for mtu in mtus:
+                    batch = [name for name in profiles if ALL_PROFILES[name].ethernet_mtu == mtu]
+                    with temporary_mtu(commands, links, mtu):
+                        failures.extend(run_profiles(commands, batch, output, args.samples, report,
+                                                     keep_going=True))
+            require(not failures, f"Failed profiles: {', '.join(failures)}")
+        else:
+            run_profiles(commands, profiles, output, args.samples, report)
 
 
 if __name__ == "__main__":

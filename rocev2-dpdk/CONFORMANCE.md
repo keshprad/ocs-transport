@@ -127,6 +127,11 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   Requester retries were 61, 73, and 147. The paired systemd invocation
   IDs for the median result are `9bf2eaf0c60b42f6814d0264ef5e5a41`
   and `5988fd39a3c9489b983a9bd35ed60a40`.
+- The paired MTU sweep verified 16 GiB per single-QP trial at both
+  PMTU 1024 and PMTU 4096, with zero retries in all six trials. At
+  PMTU 4096 each trial verified 4,194,304 data packets. See the
+  [standard and BURST-style results](README.md#standard-mtu-and-burst-style-sweep)
+  for the multi-QP jumbo failures.
 - The dual-rail physical sweep reached 92.568 Gbit/s verified median
   with 16 QPs and four mlx5 queue pairs per rail, matching the
   92.340 Gbit/s native control. The median sample verified 16 GiB per

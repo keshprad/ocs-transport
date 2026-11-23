@@ -223,6 +223,45 @@ The receiver verified all 16 GiB in every trial. Each worker used a
 | 16 | 2 | 42.205 | 42.195 | 2.000 / 2.000 | 39,942, 35,759, 34,747 |
 | 16 | 4 | 90.506 | 90.515 | 3.978 / 4.000 | 61, 73, 147 |
 
+### Standard MTU and BURST-style sweep
+
+The paired sweep compares Ethernet MTU 1500 with a 1024-byte RoCE
+payload against Ethernet MTU 4200 with a 4096-byte RoCE payload.
+The latter matches the packet size used in [BURST §5](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=10).
+Both profiles use the same pinned binary and first physical path.
+Each sample verifies 16 GiB in 1 MiB WRITEs. The sweep runs one QP
+on one worker and 16 QPs on one, two, and four workers at both MTUs.
+The TX burst and per-QP send window remain 16 and 256 packets.
+
+```sh
+python3 tests/check_spark_bandwidth.py --burst-style-bench \
+  --destination "/opt/ocs-roce-bw/$REVISION" --sha256 "$BINARY_SHA256"
+```
+
+The installed `ocs-roce-bw-mtu-*` units use loopback control over
+management SSH. The runner checks the expected packet count for each
+profile and restores the interfaces' original MTUs after the sweep.
+If a profile fails, it saves the failure and proceeds once both hosts'
+lab services are idle.
+Use `--mtu 4200 --profile multi-4` with this command to rerun just the
+four-worker jumbo profile.
+
+On November 23, 2026, the `a2c307f` build produced the following
+requester medians on Spark-04 → Spark-02.
+
+| QPs | Workers per endpoint | MTU 1500 Gbit/s | MTU 4200 Gbit/s |
+| --- | --- | --- | --- |
+| 1 | 1 | 29.024 | 41.643 |
+| 16 | 1 | 23.733 | Failed |
+| 16 | 2 | 43.380 | Failed |
+| 16 | 4 | 90.018 | Failed twice |
+
+Each completed profile verified 16 GiB in each of three trials.
+One-QP trials at both MTUs completed with zero retries and about one
+polling core per endpoint. Each jumbo attempt with 16 QPs ended in
+retry exhaustion and Spark-04 logged mlx5 RX queue errors. The cause
+of those driver errors remains open.
+
 ### Physical dual-rail sweep
 
 The native runner accepts a local perftest 6.30 binary and checks the
