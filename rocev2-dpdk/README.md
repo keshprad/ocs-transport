@@ -234,6 +234,22 @@ and batched 16-QP controls.
 python3 tests/check_spark_native_bandwidth.py --perftest "$PERFTEST_BIN"
 ```
 
+The matched native control used three trials per configuration and the
+middle four seconds of each eight-second perftest 6.30 run.
+
+| Active interface paths | Native one-QP Gbit/s | Native 16-QP Gbit/s |
+| --- | --- | --- |
+| First rail only | 92.600 | 92.320 |
+| Second rail only | 92.640 | 92.330 |
+| Both concurrently | 92.640 | 92.340 |
+
+The batched native samples overlapped for at least 3.65 seconds and
+each rail was under load throughout both measurement windows. The
+two PCIe functions on each Spark reach the same QSFP port. The
+measured usable aggregate for this lab link is 92.34 Gbit/s with
+16 QPs per rail. The first-rail DPDK result reached 98.0% of its
+matched native rate. [NVIDIA DGX Spark port mapping](https://docs.nvidia.com/dgx/dgx-spark/spark-clustering.html)
+
 With the pinned aggregate services installed and all four data
 functions in raw Ethernet mode, add `--aggregate` to the DPDK runner.
 Each rail uses 16 QPs and four polling cores per endpoint and verifies
