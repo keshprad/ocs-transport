@@ -18,6 +18,7 @@
 /tests/mrc_abi_application
 /tests/test_mrc_ctl_abi
 /tests/mrc_endpoint_rtt
+/tests/mrc_endpoint_requester
 /tests/mrc_public_service_time
 
 /tests/mrc_write_ready

@@ -206,6 +206,8 @@ bool mrc_tx_track(struct mrc_tx_qp *qp, uint32_t psn, uint64_t sent_at)
     uint32_t index = (qp->first_index + outstanding) % qp->window;
     qp->slots[index] = (struct mrc_tx_packet) { .sent_at = sent_at };
     qp->next_psn = mrc_psn_add(qp->next_psn, 1);
+    if (qp->sent_history < MRC_PSN_HALF - 1)
+        qp->sent_history++;
     return true;
 }
 
@@ -228,17 +230,21 @@ static void mark_received(const struct mrc_tx_qp *qp, uint32_t psn)
 bool mrc_tx_apply_sack(struct mrc_tx_qp *qp, const struct mrc_sack *sack,
                        bool probe_response)
 {
-    int32_t last = mrc_psn_delta(sack->cack_psn, qp->first_psn);
-    if (sack->cack_psn > MRC_PSN_MASK || last >= (int32_t)tx_outstanding(qp))
+    int32_t cack_age = mrc_psn_delta(qp->next_psn, sack->cack_psn);
+    /* The cumulative ACK may also be the PSN just before the first send. */
+    if (sack->cack_psn > MRC_PSN_MASK || cack_age <= 0 || (uint32_t)cack_age > qp->sent_history + 1)
         return false;
 
-    /* Validate the data trigger before applying any cumulative or selective
-     * delivery state. Probe responses carry an opaque token in this field. */
-    if (!probe_response &&
-        !mrc_tx_packet(qp, mrc_psn_add(sack->cack_psn, sack->ack_psn_offset)))
-        return false;
+    uint32_t trigger = mrc_psn_add(sack->cack_psn, sack->ack_psn_offset);
+    if (!probe_response) {
+        /* Transport ACKs can retire slots before the matching SACK arrives. */
+        int32_t trigger_age = mrc_psn_delta(qp->next_psn, trigger);
+        if (trigger_age <= 0 || (uint32_t)trigger_age > qp->sent_history)
+            return false;
+    }
 
     if (mrc_psn_delta(sack->cack_psn, qp->delivery_cack_psn) > 0) {
+        int32_t last = mrc_psn_delta(sack->cack_psn, qp->first_psn);
         int32_t previous = mrc_psn_delta(qp->delivery_cack_psn, qp->first_psn);
         int32_t start = previous < 0 ? 0 : previous + 1;
         for (int32_t offset = start; offset <= last; offset++)
@@ -246,7 +252,7 @@ bool mrc_tx_apply_sack(struct mrc_tx_qp *qp, const struct mrc_sack *sack,
         qp->delivery_cack_psn = sack->cack_psn;
     }
     if (!probe_response)
-        mark_received(qp, mrc_psn_add(sack->cack_psn, sack->ack_psn_offset));
+        mark_received(qp, trigger);
     for (unsigned int bit = 0; bit < MRC_SACK_BITS; bit++) {
         if (sack->bitmap & (UINT64_C(1) << bit))
             mark_received(qp, mrc_psn_add(sack->cack_psn, sack->sack_offset + (int32_t)bit));

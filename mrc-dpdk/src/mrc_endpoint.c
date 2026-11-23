@@ -75,6 +75,8 @@ struct mrc_requester {
     uint64_t next_profile_check;
     uint64_t next_retry_scan;
     uint64_t next_probe;
+    uint64_t first_send_deadline;
+    uint32_t first_send_retries;
     uint32_t denied;
     int event_fd;
     bool event_dropped;
@@ -911,9 +913,13 @@ static int fail_retry(const struct mrc_endpoint_config *transfer, struct mrc_req
 {
     uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
     uint32_t first = (uint32_t)mrc_psn_delta(sender->qp.first_psn, transfer->initial_psn);
-    fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
-                    " (first segment %u, next %u, last transmit path %u)\n",
-            psn, first, sender->next, ev_rail(transfer, sender->metadata[index % transfer->window].ev));
+    if (index == sender->next) {
+        fprintf(stderr, "Retry limit exhausted before first transmission of PSN %" PRIu32 "\n", psn);
+    } else {
+        fprintf(stderr, "Retry limit exhausted for PSN %" PRIu32
+                        " (first segment %u, next %u, last transmit path %u)\n",
+                psn, first, sender->next, ev_rail(transfer, sender->metadata[index % transfer->window].ev));
+    }
     return fail_send(transfer, sender, index, MRC_PROVIDER_WC_RETRY_EXCEEDED, -ETIMEDOUT);
 }
 
@@ -1159,14 +1165,14 @@ uint64_t mrc_endpoint_cycles(const struct mrc_endpoint_config *transfer, uint64_
            (ns % 1000000000) * transfer->hz / 1000000000;
 }
 
-static int arm_retry_timer(const struct mrc_endpoint_config *transfer, struct send_record *record,
+static int arm_retry_timer(const struct mrc_endpoint_config *transfer, uint64_t *deadline,
                            uint64_t now, uint32_t retries)
 {
     uint64_t timeout_ns;
     if (!mrc_local_ack_timeout_ns(transfer->timeout_exponent, transfer->linear_retries,
                                   transfer->exponential_retries, retries, &timeout_ns))
         return -EPROTO;
-    record->retry_deadline = now + mrc_endpoint_cycles(transfer, timeout_ns);
+    *deadline = now + mrc_endpoint_cycles(transfer, timeout_ns);
     return 0;
 }
 
@@ -1241,7 +1247,8 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
              * An expired wait uses a retry slot without sending a packet. */
             if (!waiting || expired) {
                 record->retry_wait = packet->received ? RETRY_WAIT_TRANSPORT_ACK : RETRY_WAIT_DELIVERY;
-                int result = arm_retry_timer(transfer, record, now, feedback_retry && !waiting ? 0 : next_retry);
+                int result = arm_retry_timer(transfer, &record->retry_deadline, now,
+                                             feedback_retry && !waiting ? 0 : next_retry);
                 if (result)
                     return result;
             }
@@ -1251,7 +1258,7 @@ static int retry_due_packets(const struct mrc_endpoint_config *transfer, struct 
             return picked;
         if (!mrc_tx_note_retransmit(&sender->qp, psn, now))
             return -EPROTO;
-        int result = arm_retry_timer(transfer, record, now, feedback_retry ? 0 : next_retry);
+        int result = arm_retry_timer(transfer, &record->retry_deadline, now, feedback_retry ? 0 : next_retry);
         if (result)
             return result;
         record->retries_used = next_retry;
@@ -1926,18 +1933,38 @@ static int requester_step(struct mrc_requester *sender)
         if (!requester_can_admit(sender, first, index) ||
             !mrc_cc_can_send(&sender->cc, nominal_at(transfer, index)))
             break;
+        if (sender->first_send_deadline && now >= sender->first_send_deadline) {
+            if (retry_limit_reached(transfer, sender->first_send_retries))
+                return fail_retry(transfer, sender, index);
+            result = arm_retry_timer(transfer, &sender->first_send_deadline, now,
+                                     ++sender->first_send_retries);
+            if (result)
+                return result;
+        }
         int picked = send_on_available_ev(sender, index, false, 0, now, &busy_rails);
-        if (picked == -EAGAIN)
+        if (picked == -EAGAIN) {
+            /* Waiting for a path or TX room must also consume the retry budget. */
+            if (transfer->exponential_retries != 25 && !sender->first_send_deadline)
+                sender->first_send_deadline = now + transfer->initial_rto;
             break;
+        }
         if (picked < 0)
             return picked;
         uint32_t psn = mrc_psn_add(transfer->initial_psn, (int32_t)index);
         if (!mrc_tx_track(&sender->qp, psn, now))
             return -EPROTO;
-        sender->metadata[index % transfer->window] = (struct send_record){
-            .retry_deadline = now + transfer->initial_rto,
+        struct send_record *record = &sender->metadata[index % transfer->window];
+        *record = (struct send_record){
+            .retry_deadline = now + transfer->initial_rto, .retries_used = sender->first_send_retries,
             .ev = (unsigned int)picked, .counted_inflight = true,
         };
+        if (record->retries_used) {
+            result = arm_retry_timer(transfer, &record->retry_deadline, now, record->retries_used);
+            if (result)
+                return result;
+        }
+        sender->first_send_deadline = 0;
+        sender->first_send_retries = 0;
         sender->next++;
         sender->scheduled_packets++;
     }

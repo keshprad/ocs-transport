@@ -79,6 +79,7 @@ struct mrc_tx_qp {
     uint32_t delivery_cack_psn;
     uint32_t next_psn;
     uint32_t first_index;
+    uint32_t sent_history;
 };
 
 /* Slots must hold window packet records. The window also bounds retained sends. */
@@ -87,7 +88,7 @@ bool mrc_tx_init(struct mrc_tx_qp *qp, uint32_t initial_psn, uint32_t window,
 bool mrc_tx_track(struct mrc_tx_qp *qp, uint32_t psn, uint64_t sent_at);
 struct mrc_tx_packet *mrc_tx_packet(const struct mrc_tx_qp *qp, uint32_t psn);
 
-/* Data triggers must identify a retained send. Rejection leaves state unchanged. */
+/* Data triggers must identify a sent PSN, including retired sends. */
 bool mrc_tx_apply_sack(struct mrc_tx_qp *qp, const struct mrc_sack *sack,
                        bool probe_response);
 /* Apply only a successful semantic Transport ACK. Returns true if it advances. */

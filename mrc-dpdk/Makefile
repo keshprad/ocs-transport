@@ -90,6 +90,7 @@ check: tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr
 	./tests/test_mrc_port_netlink
 
 clean:
+	$(RM) tests/mrc_endpoint_requester
 	$(RM) tests/mrc_endpoint_window tests/mrc_public_teardown tests/mrc_srv6_encode tests/mrc_write_ready tests/mrc_endpoint_rtt tests/mrc_public_service_time mrc_bench mrc_write mrc_ctl_profile tests/mrc_memif_relay tests/mrc_endpoint_application libmrc-dpdk.so tests/test_mrc_abi tests/test_mrc_ctl_abi tests/mrc_abi_application tests/test_mrc_qp tests/test_mrc_wire tests/test_mrc_cc tests/test_mrc_wr tests/test_mrc_connect tests/test_mrc_ev tests/test_mrc_mpr tests/test_mrc_provider tests/test_mrc_ctl_store tests/test_mrc_port_netlink
 
 # Private-state integration harness; the C file includes mrc_endpoint.c itself.
@@ -100,6 +101,14 @@ tests/mrc_endpoint_rtt: tests/mrc_endpoint_rtt.c src/mrc_connect.c $(MRC_ENDPOIN
 tests/mrc_endpoint_window: tests/mrc_endpoint_window.c src/mrc_connect.c $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
 	$(PKG_CONFIG) --exists libdpdk
 	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter-out src/mrc_endpoint.c,$(filter %.c,$^)) $(DPDK_LIBS) $(LDLIBS)
+
+tests/mrc_endpoint_requester: tests/mrc_endpoint_requester.c $(MRC_ENDPOINT_SRC) $(MRC_ENDPOINT_HEADERS)
+	$(PKG_CONFIG) --exists libdpdk
+	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) -pthread $(LDFLAGS) -o $@ $(filter-out src/mrc_endpoint.c,$(filter %.c,$^)) $(DPDK_LIBS) $(LDLIBS)
+
+.PHONY: check-endpoint-requester
+check-endpoint-requester: tests/mrc_endpoint_requester
+	./tests/mrc_endpoint_requester
 
 .PHONY: check-endpoint-rtt
 check-endpoint-rtt: tests/mrc_endpoint_rtt
