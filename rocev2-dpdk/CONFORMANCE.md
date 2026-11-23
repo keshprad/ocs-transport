@@ -127,5 +127,11 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   Requester retries were 61, 73, and 147. The paired systemd invocation
   IDs for the median result are `9bf2eaf0c60b42f6814d0264ef5e5a41`
   and `5988fd39a3c9489b983a9bd35ed60a40`.
+- The dual-rail physical sweep reached 92.568 Gbit/s verified median
+  with 16 QPs and four mlx5 queue pairs per rail, matching the
+  92.340 Gbit/s native control. The median sample verified 16 GiB per
+  rail with zero retries. Its TX/RX invocation IDs are
+  `dbe800735ce0439e9a39e61b28d2a452` / `6b815e9187ce4f6198337dc254587319` and
+  `e6e831349cb1421794ab63636bed2388` / `bf95e952be92437d88b23f471e3b35a0`.
 - **§§4.1 and 4.7.** The verbs provider and user-space CM are useful references
   if we extend application compatibility after the wire milestone.

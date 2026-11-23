@@ -258,3 +258,13 @@ management link. The requester option `--start-gate PORT` synchronizes
 release across both sender processes on Spark-04. The aggregate metric
 uses 32 GiB over the interval from the first sender start to the last
 sender completion. The report records overlap and start skew.
+
+The `a2c307f` build verified 32 GiB in each of three concurrent runs
+on Spark-04 and Spark-02 at PMTU 1024 and Ethernet MTU 1500. Aggregate
+requester goodput was 92.566, 92.580, and 92.568 Gbit/s. The median
+of 92.568 Gbit/s matched the 92.340 Gbit/s native control. Each
+endpoint used about eight polling cores across the two functions.
+The sender windows overlapped by at least 99.97%, with at most
+0.099 ms start skew. Total requester retries across both rails were
+two, two, and zero. The last run verified exactly 16,777,216 data
+packets per rail with zero DPDK misses or packet errors.
