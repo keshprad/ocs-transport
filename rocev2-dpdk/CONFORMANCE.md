@@ -152,3 +152,18 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | Spark-04 → Spark-02 | `98f6e058ed304946878030553075fba2` | `c01f973e8ea8410faddbfb0d4687d891` |
 | Spark-02 → Spark-01 | `419e6d18fc8f491c805a8575978b11df` | `368182b74fa841babdcda9bfd1b598bb` |
 | Spark-01 → Spark-04 | `ed8a707852434029a2ada50c2b6720de` | `f95732fc56b840ba9aeece9c34743aa3` |
+
+## BURST service implementation
+
+| Reference | Component | Current evidence |
+| --- | --- | --- |
+| Figure 5(a), §4.1 | Separate application and DPDK worker processes | `make check-app` verifies an 8,195-byte WRITE and 3,145,764 bytes across four QPs and two workers. Each endpoint uses an application-owned shared buffer. The receiving application checks every byte before peer verification. |
+| Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins page-aligned ranges from the caller's own address space and exports a mapping descriptor. The module and runtime test build against both Spark kernels. Runtime validation, uverbs device discovery, libibverbs provider integration, and Generic Netlink export coordination are pending. |
+| Figure 5(b), §4.2, Appendix A.1 | WQE notification | Per-worker multi-producer doorbells and shared work and completion queues are pending. |
+| Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | Split-process mode uses the existing packet encoder and receiver placement. RX copies into the mapped application buffer before sending transport ACKs. TX DMA from application memory and TX descriptor lifetime tests are pending. |
+| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | The lab endpoint still uses its TCP setup protocol. The librdmacm backend, event channel, and in-band CM exchange are pending. |
+
+The first registration interface transfers a scoped FD over the Unix
+socket. A kernel registration notification can identify an authorized
+mapping so the service acquires it through the driver. This keeps
+the page checks and mapping lifetime in the kernel. [BURST design](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=6)

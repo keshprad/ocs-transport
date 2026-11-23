@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include <linux/anon_inodes.h>
+#include <linux/compat.h>
+#include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/overflow.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/signal.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+
+#include "roce_mr_uapi.h"
+
+struct roce_mr {
+	struct mm_struct *owner_mm;
+	struct page **pages;
+	unsigned long npages;
+	u32 access;
+};
+
+static long roce_mr_info(struct file *file, unsigned int command, unsigned long arg)
+{
+	const struct roce_mr *mr = file->private_data;
+	const struct roce_mr_info info = {
+		.length = (u64)mr->npages << PAGE_SHIFT,
+		.access = mr->access,
+		.abi_version = ROCE_MR_ABI_VERSION,
+	};
+
+	if (command != ROCE_MR_GET_INFO)
+		return -ENOTTY;
+	return copy_to_user((void __user *)arg, &info, sizeof(info)) ? -EFAULT : 0;
+}
+
+static vm_fault_t roce_mr_fault(struct vm_fault *vmf)
+{
+	struct roce_mr *mr = vmf->vma->vm_file->private_data;
+
+	if (vmf->pgoff >= mr->npages)
+		return VM_FAULT_SIGBUS;
+	return vmf_insert_pfn(vmf->vma, vmf->address,
+			      page_to_pfn(mr->pages[vmf->pgoff]));
+}
+
+static const struct vm_operations_struct roce_mr_vm_ops = {
+	.fault = roce_mr_fault,
+};
+
+static int roce_mr_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	const struct roce_mr *mr = file->private_data;
+	bool writable = mr->access & ROCE_MR_ACCESS_LOCAL_WRITE;
+
+	if (vma->vm_pgoff || vma_pages(vma) != mr->npages ||
+	    !(vma->vm_flags & VM_MAYSHARE))
+		return -EINVAL;
+	if ((vma->vm_flags & VM_EXEC) || (!writable && (vma->vm_flags & VM_WRITE)))
+		return -EACCES;
+
+	/*
+	 * The VMA's file reference keeps the GUP pins until it is unmapped.
+	 * Special PTEs alias anonymous folios without a second rmap entry.
+	 */
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTCOPY | VM_DONTEXPAND |
+		      VM_DONTDUMP);
+	vm_flags_clear(vma, VM_MAYEXEC | (writable ? 0 : VM_MAYWRITE));
+	vma->vm_ops = &roce_mr_vm_ops;
+	return 0;
+}
+
+static void roce_mr_destroy(struct roce_mr *mr, unsigned long pinned, bool dirty)
+{
+	if (pinned)
+		unpin_user_pages_dirty_lock(mr->pages, pinned, dirty);
+	atomic64_sub(mr->npages, &mr->owner_mm->pinned_vm);
+	mmdrop(mr->owner_mm);
+	kvfree(mr->pages);
+	kfree(mr);
+}
+
+static int roce_mr_release(struct inode *inode, struct file *file)
+{
+	struct roce_mr *mr = file->private_data;
+
+	roce_mr_destroy(mr, mr->npages, mr->access & ROCE_MR_ACCESS_LOCAL_WRITE);
+	return 0;
+}
+
+static const struct file_operations roce_mr_mapping_ops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = roce_mr_info,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = compat_ptr_ioctl,
+#endif
+	.mmap = roce_mr_mmap,
+	.release = roce_mr_release,
+};
+
+static long roce_mr_register(struct file *file, unsigned int command,
+			     unsigned long arg)
+{
+	struct roce_mr_register request;
+	struct mm_struct *mm = current->mm;
+	unsigned int gup_flags = FOLL_LONGTERM;
+	unsigned long address, length, end, npages, i;
+	struct roce_mr *mr;
+	int fd, pinned;
+
+	if (command != ROCE_MR_REGISTER)
+		return -ENOTTY;
+	if (copy_from_user(&request, (void __user *)arg, sizeof(request)))
+		return -EFAULT;
+
+	address = request.address;
+	length = request.length;
+	if (!mm || request.reserved ||
+	    (request.access & ~ROCE_MR_ACCESS_LOCAL_WRITE) ||
+	    request.address != address || request.length != length || !length ||
+	    !PAGE_ALIGNED(address) || !PAGE_ALIGNED(length) ||
+	    check_add_overflow(address, length, &end))
+		return -EINVAL;
+	if (!access_ok((void __user *)address, length))
+		return -EFAULT;
+
+	npages = length >> PAGE_SHIFT;
+	if (npages > INT_MAX)
+		return -E2BIG;
+	if (!can_do_mlock())
+		return -EPERM;
+
+	/* Match the per-mm long-term pin accounting used for standard MRs. */
+	if ((u64)atomic64_add_return(npages, &mm->pinned_vm) >
+			(rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT) &&
+	    !capable(CAP_IPC_LOCK)) {
+		fd = -ENOMEM;
+		goto uncharge;
+	}
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr) {
+		fd = -ENOMEM;
+		goto uncharge;
+	}
+	mr->pages = kvmalloc_array(npages, sizeof(*mr->pages), GFP_KERNEL);
+	if (!mr->pages) {
+		kfree(mr);
+		fd = -ENOMEM;
+		goto uncharge;
+	}
+	mmgrab(mm);
+	mr->owner_mm = mm;
+	mr->npages = npages;
+	mr->access = request.access;
+	if (mr->access & ROCE_MR_ACCESS_LOCAL_WRITE)
+		gup_flags |= FOLL_WRITE;
+
+	pinned = pin_user_pages_fast(address, (int)npages, gup_flags, mr->pages);
+	if (pinned != (int)npages) {
+		fd = pinned < 0 ? pinned : -EFAULT;
+		goto destroy;
+	}
+	/* Reject shared zero pages whose original VMA could replace them. */
+	for (i = 0; i < npages; ++i) {
+		if (is_zero_pfn(page_to_pfn(mr->pages[i]))) {
+			fd = -EFAULT;
+			goto destroy;
+		}
+	}
+	fd = anon_inode_getfd("[roce_mr]", &roce_mr_mapping_ops, mr,
+			     O_CLOEXEC | (mr->access ? O_RDWR : O_RDONLY));
+	if (fd >= 0)
+		return fd;
+destroy:
+	roce_mr_destroy(mr, max(pinned, 0), false);
+	return fd;
+uncharge:
+	atomic64_sub(npages, &mm->pinned_vm);
+	return fd;
+}
+
+static const struct file_operations roce_mr_control_ops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = roce_mr_register,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = compat_ptr_ioctl,
+#endif
+};
+
+static struct miscdevice roce_mr_device = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "roce_mr",
+	.fops = &roce_mr_control_ops,
+	.mode = 0600,
+};
+
+module_misc_device(roce_mr_device);
+
+MODULE_DESCRIPTION("Scoped host memory registration for RoCEv2 workers");
+MODULE_LICENSE("GPL");

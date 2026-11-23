@@ -1,3 +1,4 @@
+#include "roce_app.h"
 #include "roce_lab.h"
 #include "../../mrc-dpdk/src/dpdk_io.h"
 
@@ -32,6 +33,7 @@ struct datapath_options {
     uint32_t workers;
     uint32_t start_gate;
     unsigned int lcores[ROCE_LAB_MAX_QPS];
+    const char *app_socket;
     bool report_bandwidth;
 };
 
@@ -356,7 +358,7 @@ static bool wait_for_completion(int fd, struct write_worker *main_worker, uint64
     return false;
 }
 
-static bool verify_result(int fd, const struct write_worker *workers, uint64_t started,
+static bool verify_result(int fd, int application, const struct write_worker *workers, uint64_t started,
                           const uint8_t *buffer, uint64_t bytes, uint64_t qp_packets)
 {
     const struct write_run *run = workers[0].run;
@@ -389,7 +391,9 @@ static bool verify_result(int fd, const struct write_worker *workers, uint64_t s
         printf("WRITE complete: %" PRIu64 " bytes, %" PRIu64 " packets, %" PRIu64
                " retries, peer verified\n", bytes, packets, retries);
     } else {
-        if (!roce_lab_verify(buffer, (size_t)bytes) || !roce_lab_send(fd, 'V'))
+        bool verified = application < 0 ? roce_lab_verify(buffer, (size_t)bytes) :
+            roce_lab_send(application, 'D') && roce_lab_receive(application, 'V', false) == 1;
+        if (!verified || !roce_lab_send(fd, 'V'))
             return false;
         printf("WRITE verified: %" PRIu64 " bytes, %" PRIu64 " packets\n", bytes, packets);
     }
@@ -400,7 +404,7 @@ static bool verify_result(int fd, const struct write_worker *workers, uint64_t s
 
 static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
-               const struct roce_lab_options *lab, uint8_t *buffer, bool steer,
+               const struct roce_lab_options *lab, uint8_t *buffer, int application, bool steer,
                const struct datapath_options *options)
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
@@ -463,7 +467,7 @@ stop_workers:
     if (!result) {
         uint64_t bytes = local->region.size * options->writes * options->qps;
         uint64_t qp_packets = ((local->region.size - 1) / pmtu + 1) * options->writes;
-        result = !verify_result(fd, workers, started, buffer, bytes, qp_packets);
+        result = !verify_result(fd, application, workers, started, buffer, bytes, qp_packets);
     }
     if (result)
         fprintf(stderr, "WRITE or verification exchange did not complete\n");
@@ -516,6 +520,10 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             if (++i == argc ||
                 !roce_parse_uint(argv[i], UINT16_MAX, &options->start_gate) || !options->start_gate)
                 return false;
+        } else if (strcmp(argv[i], "--app-socket") == 0) {
+            if (++i == argc || !argv[i][0] || options->app_socket)
+                return false;
+            options->app_socket = argv[i];
         } else {
             return false;
         }
@@ -539,7 +547,7 @@ int main(int argc, char **argv)
         !parse_datapath_options(argc - 8, argv + 8, &datapath)) {
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
-                        " [--workers N] [--queue-window N] [--start-gate PORT]\n");
+                        " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -593,18 +601,27 @@ int main(int argc, char **argv)
 
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, options.workers, MBUF_CACHE_SIZE);
-    uint8_t *buffer = malloc((size_t)bytes);
-    if (!pool || !buffer) {
+    struct roce_app_memory application = { .socket = -1 };
+    uint8_t *buffer = datapath.app_socket ? NULL : malloc((size_t)bytes);
+    if (!pool || (!datapath.app_socket && !buffer)) {
         fprintf(stderr, "packet pool or host buffer allocation failed\n");
         goto cleanup_buffers;
     }
-    roce_lab_fill(buffer, (size_t)bytes, options.sender);
+    if (buffer)
+        roce_lab_fill(buffer, (size_t)bytes, options.sender);
 
     struct rte_ether_addr mac;
     int err = mrc_dpdk_open_port_queues(port, pool, &mac, mtu, (uint16_t)options.workers);
     if (err) {
         fprintf(stderr, "could not open DPDK port %u: %s\n", port, strerror(-err));
         goto cleanup_buffers;
+    }
+    if (datapath.app_socket) {
+        if (!roce_app_attach(datapath.app_socket, (size_t)bytes, options.sender, &application)) {
+            perror("application memory registration");
+            goto cleanup_port;
+        }
+        buffer = application.buffer;
     }
     struct rte_eth_stats initial_stats = {0};
     bool measure_stats = datapath.report_bandwidth && rte_eth_stats_get(port, &initial_stats) == 0;
@@ -632,10 +649,14 @@ int main(int argc, char **argv)
         goto cleanup_port;
     }
     if (roce_lab_exchange(fd, &options, &local, &peer)) {
-        result = run(fd, port, pool, &local, &peer, &options, buffer,
+        result = run(fd, port, pool, &local, &peer, &options, buffer, application.socket,
                      options.workers > 1 && !memif, &datapath);
     } else {
         fprintf(stderr, "control setup failed\n");
+    }
+    if (!result && application.socket >= 0 && !roce_lab_send(application.socket, 'C')) {
+        perror("application WRITE completion");
+        result = 1;
     }
     if (result || measure_stats) {
         struct rte_eth_stats stats;
@@ -657,7 +678,10 @@ int main(int argc, char **argv)
 cleanup_port:
     mrc_dpdk_close_port(port);
 cleanup_buffers:
-    free(buffer);
+    if (application.socket >= 0)
+        roce_app_detach(&application);
+    else
+        free(buffer);
     if (pool)
         rte_mempool_free(pool);
 cleanup_eal:

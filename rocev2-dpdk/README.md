@@ -15,6 +15,30 @@ test memory region to the peer and assumes both processes are cooperating.
 [CONFORMANCE.md](CONFORMANCE.md) records the specification mapping, verification
 commands, Spark hardware evidence, and implementation notes from BURST.
 
+## Application-owned buffers
+
+Append `--app-socket PATH` to the `roce_write` arguments on each
+endpoint to run the DPDK worker separately from the application. Use
+a socket path in a private directory owned by the endpoint UID. The
+worker prints `application listener ready` when it can accept the
+application. Start the client as the same UID.
+
+```sh
+./roce_app_write "$APP_SOCKET"
+make check-app
+```
+
+The application allocates and initializes its buffer, then sends a
+mapping descriptor to the worker over the Unix socket. The receiving
+application verifies the bytes in its own mapping before returning the
+verification response. `make check-app` exercises the four-process
+path over memif.
+
+With the registration module loaded and accessible to the client, use
+`./roce_app_write "$APP_SOCKET" --kernel-mr /dev/roce_mr` to register a
+page-aligned application allocation. The [kernel test](kernel/README.md)
+covers the descriptor and pin lifetime independently.
+
 ## Build and verify
 
 Build with a C compiler, pkg-config, DPDK with the desired PMD, and
