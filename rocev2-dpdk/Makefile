@@ -12,7 +12,7 @@ DPDK_LIBS = $(shell $(PKG_CONFIG) --libs libdpdk)
 VERBS_CFLAGS = $(shell $(PKG_CONFIG) --cflags libibverbs)
 VERBS_LIBS = $(shell $(PKG_CONFIG) --libs libibverbs)
 
-.PHONY: all check check-memif clean
+.PHONY: all check check-memif check-peer clean
 all: roce_write roce_verbs_write
 
 roce_write: src/roce_write.c $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADERS) $(DPDK_IO) ../mrc-dpdk/src/dpdk_io.h
@@ -34,6 +34,10 @@ check: tests/test_roce tests/roce_wire_cli
 
 check-memif: roce_write
 	python3 tests/check_memif.py
+
+check-peer: roce_write
+	$(MAKE) -C ../mrc-dpdk tests/mrc_memif_relay
+	python3 tests/check_peer.py
 
 clean:
 	$(RM) roce_write roce_verbs_write tests/test_roce tests/roce_wire_cli

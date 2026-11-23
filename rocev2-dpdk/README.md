@@ -25,6 +25,7 @@ libibverbs development files. For a non-system DPDK install, select its
 make
 make check
 make check-memif
+make check-peer
 ```
 
 `make check` needs only a C compiler and Python 3. It exercises the wire codec
@@ -32,6 +33,11 @@ against independently encoded frames and drives the RC state machine through
 loss, duplicate, access, timeout, and PSN-wrap cases. `make check-memif` needs
 DPDK's memif PMD and two accessible CPUs. It runs two copies of `roce_write`,
 using TCP on loopback and Ethernet frames over memif.
+`make check-peer` uses the same prerequisites. It runs the production
+endpoint against an independent Python RC peer, with the MRC memif relay
+carrying raw frames. It checks retry after a sequence NAK and a lost final
+ACK, rejects a corrupt iCRC, and verifies that a duplicate cannot overwrite
+completed data.
 
 ## Spark wire interoperability
 
