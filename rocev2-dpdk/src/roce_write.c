@@ -10,38 +10,92 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-enum { RX_BURST = 32, NS_PER_SEC = 1000000000, RETRY_NS = 10000000, CONTROL_POLL_NS = 1000000 };
+enum {
+    RX_BURST = 32, MAX_TX_BURST = 32, NS_PER_SEC = 1000000000,
+    RETRY_NS = 10000000, CONTROL_POLL_NS = 1000000,
+};
 
-static bool send_packet(uint16_t port, struct rte_mempool *pool,
-                        const struct roce_packet *packet)
+struct datapath_options {
+    uint32_t send_window;
+    uint32_t tx_burst;
+    bool report_bandwidth;
+};
+
+static struct rte_mbuf *encode_packet(struct rte_mempool *pool, const struct roce_packet *packet)
 {
     struct rte_mbuf *mbuf = rte_pktmbuf_alloc(pool);
     if (!mbuf)
-        return false;
+        return NULL;
     size_t length = roce_encode(rte_pktmbuf_mtod(mbuf, uint8_t *),
                                rte_pktmbuf_tailroom(mbuf), packet);
     if (!length || !rte_pktmbuf_append(mbuf, (uint16_t)length)) {
         rte_pktmbuf_free(mbuf);
-        return false;
+        return NULL;
     }
-    return mrc_dpdk_transmit(port, mbuf);
+    return mbuf;
+}
+
+static void send_requests(uint16_t port, struct rte_mempool *pool,
+                          struct roce_requester *requester, uint16_t max_burst, uint64_t now)
+{
+    struct rte_mbuf *packets[MAX_TX_BURST];
+    struct roce_packet packet;
+    uint16_t count = 0;
+    while (count < max_burst && roce_requester_next(requester, count, &packet)) {
+        packets[count] = encode_packet(pool, &packet);
+        if (!packets[count])
+            break;
+        ++count;
+    }
+    if (!count)
+        return;
+    uint16_t sent = rte_eth_tx_burst(port, 0, packets, count);
+    roce_requester_sent(requester, sent, now);
+    /* A short burst leaves the unsent PSNs eligible for the next poll. */
+    for (uint16_t i = sent; i < count; ++i)
+        rte_pktmbuf_free(packets[i]);
+}
+
+static uint64_t thread_cpu_ns(void)
+{
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * NS_PER_SEC + (uint64_t)ts.tv_nsec;
+}
+
+static void report_bandwidth(bool sender, uint32_t bytes, uint64_t elapsed, uint64_t cpu,
+                             const struct datapath_options *options)
+{
+    if (!elapsed)
+        return;
+    printf("BANDWIDTH role=%s payload_bytes=%u elapsed_ns=%" PRIu64
+           " thread_cpu_ns=%" PRIu64 " payload_gbps=%.3f poll_cores=%.3f",
+           sender ? "tx" : "rx", bytes, elapsed, cpu,
+           (double)bytes * 8.0 / (double)elapsed, (double)cpu / (double)elapsed);
+    if (sender)
+        printf(" send_window=%u tx_burst=%u", options->send_window, options->tx_burst);
+    putchar('\n');
 }
 
 static int run(int fd, uint16_t port, struct rte_mempool *pool, const struct roce_qp *qp,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
-               bool sender, uint8_t *buffer)
+               bool sender, uint8_t *buffer, const struct datapath_options *options)
 {
     struct roce_requester requester;
     struct roce_responder responder = {
         .qp = *qp, .region = local->region, .buffer = buffer, .expected = peer->psn,
     };
     if (sender && !roce_requester_init(&requester, qp, local->psn, peer->region,
-                                      buffer, ROCE_LAB_RETRIES))
+                                      buffer, ROCE_LAB_RETRIES, options->send_window))
         return 1;
 
     uint64_t now = roce_now_ns();
+    uint64_t started = now;
+    uint64_t cpu_started = options->report_bandwidth ? thread_cpu_ns() : 0;
+    uint64_t elapsed = 0, cpu = 0;
     uint64_t deadline = now + (uint64_t)ROCE_LAB_TIMEOUT * NS_PER_SEC;
     uint64_t control_poll = now;
     for (; now < deadline; now = roce_now_ns()) {
@@ -58,8 +112,11 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool, const struct roc
                     roce_requester_feedback(&requester, &packet, now);
                 } else {
                     struct roce_packet feedback;
-                    if (roce_responder_receive(&responder, &packet, &feedback))
-                        send_packet(port, pool, &feedback);
+                    if (roce_responder_receive(&responder, &packet, &feedback)) {
+                        struct rte_mbuf *ack = encode_packet(pool, &feedback);
+                        if (ack)
+                            mrc_dpdk_transmit(port, ack);
+                    }
                 }
             }
             rte_pktmbuf_free(received[i]);
@@ -73,19 +130,32 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool, const struct roc
                 return 1;
             }
             if (requester.acked == requester.total) {
+                if (options->report_bandwidth) {
+                    elapsed = roce_now_ns() - started;
+                    cpu = thread_cpu_ns() - cpu_started;
+                }
                 if (!roce_lab_send(fd, 'D') || roce_lab_receive(fd, 'V', false) != 1)
                     break;
                 printf("WRITE complete: %u bytes, %u packets, %u retries, peer verified\n",
                        local->region.size, requester.total, requester.retries);
+                if (options->report_bandwidth)
+                    report_bandwidth(true, local->region.size, elapsed, cpu, options);
                 return 0;
             }
-            struct roce_packet packet;
-            while (roce_requester_next(&requester, &packet) && send_packet(port, pool, &packet))
-                roce_requester_sent(&requester, now);
-        } else if (now >= control_poll || responder.failed) {
+            send_requests(port, pool, &requester, (uint16_t)options->tx_burst, now);
+        } else if (now >= control_poll || responder.failed ||
+                   (options->report_bandwidth && !elapsed && responder.msn == 1)) {
+            if (options->report_bandwidth && !elapsed && responder.msn == 1) {
+                elapsed = roce_now_ns() - started;
+                cpu = thread_cpu_ns() - cpu_started;
+            }
             if (responder.failed) {
                 fprintf(stderr, "WRITE failed responder validation at PSN %06x\n", responder.expected);
                 return 1;
+            }
+            if (now < control_poll) {
+                rte_pause();
+                continue;
             }
             control_poll = now + CONTROL_POLL_NS;
             int done = roce_lab_receive(fd, 'D', true);
@@ -96,6 +166,8 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool, const struct roc
                     !roce_lab_verify(buffer, local->region.size) || !roce_lab_send(fd, 'V'))
                     return 1;
                 printf("WRITE verified: %u bytes, %u packets\n", local->region.size, responder.accepted);
+                if (options->report_bandwidth)
+                    report_bandwidth(false, local->region.size, elapsed, cpu, options);
                 return 0;
             }
         }
@@ -103,6 +175,31 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool, const struct roc
     }
     fprintf(stderr, "WRITE or verification exchange did not complete\n");
     return 1;
+}
+
+static bool parse_datapath_options(int argc, char **argv, struct datapath_options *options)
+{
+    *options = (struct datapath_options) {
+        .send_window = ROCE_SEND_WINDOW_DEFAULT,
+        .tx_burst = MAX_TX_BURST,
+    };
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--report-bw") == 0) {
+            options->report_bandwidth = true;
+        } else if (strcmp(argv[i], "--tx-burst") == 0) {
+            if (++i == argc || !roce_parse_uint(argv[i], MAX_TX_BURST, &options->tx_burst) ||
+                !options->tx_burst)
+                return false;
+        } else if (strcmp(argv[i], "--send-window") == 0) {
+            if (++i == argc ||
+                !roce_parse_uint(argv[i], ROCE_SEND_WINDOW_MAX, &options->send_window) ||
+                !options->send_window)
+                return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -114,10 +211,13 @@ int main(int argc, char **argv)
     argv += consumed;
 
     struct roce_lab_options options;
+    struct datapath_options datapath;
     int result = 1;
     uint16_t port = RTE_MAX_ETHPORTS;
-    if (argc != 8 || !roce_lab_parse(argv, &options)) {
-        fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT\n");
+    if (argc < 8 || !roce_lab_parse(argv, &options) ||
+        !parse_datapath_options(argc - 8, argv + 8, &datapath)) {
+        fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
+                        " [--report-bw] [--tx-burst N] [--send-window N]\n");
         goto cleanup_eal;
     }
     uint32_t port_id;
@@ -188,7 +288,7 @@ int main(int argc, char **argv)
             .local = local.data, .peer = peer.data, .local_qpn = local.qpn,
             .peer_qpn = peer.qpn, .pmtu = local.pmtu < peer.pmtu ? local.pmtu : peer.pmtu,
         };
-        result = run(fd, port, pool, &qp, &local, &peer, options.sender, buffer);
+        result = run(fd, port, pool, &qp, &local, &peer, options.sender, buffer, &datapath);
     } else {
         fprintf(stderr, "control setup failed\n");
     }

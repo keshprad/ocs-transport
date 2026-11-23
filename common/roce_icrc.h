@@ -5,8 +5,23 @@
 #include <stdint.h>
 #include <string.h>
 
+#if defined(__AARCH64EL__) && defined(__ARM_FEATURE_CRC32) && !defined(OCS_ROCE_PORTABLE_CRC)
+#include <arm_acle.h>
+#endif
+
 static inline uint32_t roce_crc32_update(uint32_t crc, const uint8_t *bytes, size_t len)
 {
+#if defined(__AARCH64EL__) && defined(__ARM_FEATURE_CRC32) && !defined(OCS_ROCE_PORTABLE_CRC)
+    while (len >= sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, bytes, sizeof(word));
+        crc = __crc32d(crc, word);
+        bytes += sizeof(word);
+        len -= sizeof(word);
+    }
+    for (size_t i = 0; i < len; ++i)
+        crc = __crc32b(crc, bytes[i]);
+#else
     /* Four-bit table for the reflected IEEE polynomial 0xedb88320. */
     static const uint32_t table[] = {
         0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
@@ -20,6 +35,7 @@ static inline uint32_t roce_crc32_update(uint32_t crc, const uint8_t *bytes, siz
         crc = (crc >> 4) ^ table[crc & 0xf];
         crc = (crc >> 4) ^ table[crc & 0xf];
     }
+#endif
     return crc;
 }
 

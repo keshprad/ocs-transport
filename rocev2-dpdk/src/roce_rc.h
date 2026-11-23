@@ -3,6 +3,11 @@
 
 #include "roce_wire.h"
 
+enum {
+    ROCE_SEND_WINDOW_DEFAULT = 32,
+    ROCE_SEND_WINDOW_MAX = 512,
+};
+
 struct roce_qp {
     struct roce_address local;
     struct roce_address peer;
@@ -23,6 +28,7 @@ struct roce_requester {
     const uint8_t *source;
     uint32_t initial_psn;
     uint32_t total;
+    uint32_t window;
     uint32_t acked;
     uint32_t next;
     uint32_t sent;
@@ -49,9 +55,10 @@ struct roce_responder {
 bool roce_valid_pmtu(uint16_t pmtu);
 bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
                          uint32_t psn, struct roce_region remote,
-                         const uint8_t *source, unsigned int retry_limit);
-bool roce_requester_next(const struct roce_requester *r, struct roce_packet *packet);
-void roce_requester_sent(struct roce_requester *r, uint64_t now);
+                         const uint8_t *source, unsigned int retry_limit, uint32_t window);
+bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
+                         struct roce_packet *packet);
+void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now);
 void roce_requester_feedback(struct roce_requester *r,
                              const struct roce_packet *packet, uint64_t now);
 void roce_requester_poll_timer(struct roce_requester *r, uint64_t now, uint64_t timeout);

@@ -21,13 +21,13 @@ def command(cpu, directory, role, size, port, ip, pmtu):
     ]
 
 
-def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu):
+def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=()):
     with tempfile.TemporaryDirectory(prefix="roce-memif-") as directory:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
             port = unused.getsockname()[1]
         with subprocess.Popen(
-            command(rx_cpu, Path(directory), "rx", size, port, "192.0.2.2", rx_mtu),
+            command(rx_cpu, Path(directory), "rx", size, port, "192.0.2.2", rx_mtu) + list(options),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         ) as receiver:
             try:
@@ -37,7 +37,7 @@ def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu):
                 if marker != "control listener ready\n":
                     raise AssertionError(f"receiver startup: {marker!r}")
                 sender = subprocess.run(
-                    command(tx_cpu, Path(directory), "tx", size, port, "192.0.2.1", tx_mtu),
+                    command(tx_cpu, Path(directory), "tx", size, port, "192.0.2.1", tx_mtu) + list(options),
                     capture_output=True, text=True, timeout=15, check=False,
                 )
                 assert sender.returncode == 0, sender.stdout + sender.stderr
@@ -46,6 +46,10 @@ def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu):
                 assert receiver.returncode == 0, stdout + stderr
                 assert f"WRITE verified: {size} bytes" in stdout, stdout
                 print(sender.stdout.strip())
+                if "--report-bw" in options:
+                    for side, output in (("tx", sender.stdout), ("rx", stdout)):
+                        assert f"BANDWIDTH role={side} payload_bytes={size} " in output, output
+                    print(stdout.strip())
             except BaseException:
                 if receiver.poll() is None:
                     receiver.terminate()
@@ -58,8 +62,9 @@ def main():
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 2:
         raise RuntimeError("memif test needs two available CPUs")
-    for size, rx_mtu, tx_mtu in ((3, 1024, 1024), (1048579, 1024, 512)):
-        check(size, rx_mtu, tx_mtu, cpus[0], cpus[1])
+    check(3, 1024, 1024, cpus[0], cpus[1])
+    check(1048579, 1024, 512, cpus[0], cpus[1],
+          ("--report-bw", "--tx-burst", "16", "--send-window", "64"))
 
 
 if __name__ == "__main__":

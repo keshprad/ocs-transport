@@ -24,8 +24,8 @@ static struct roce_responder responder(uint8_t *destination, struct roce_region 
 static struct roce_packet transmit(struct roce_requester *tx, uint64_t now)
 {
     struct roce_packet packet;
-    assert(roce_requester_next(tx, &packet));
-    roce_requester_sent(tx, now);
+    assert(roce_requester_next(tx, 0, &packet));
+    roce_requester_sent(tx, 1, now);
     return packet;
 }
 
@@ -37,7 +37,7 @@ static void test_sequence_nak_and_lost_final_ack(void)
     const uint32_t psn = ROCE_PSN_MASK - 1;
     struct roce_region region = { .address = UINT64_C(0x100100000), .rkey = 0x21, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, psn, region, source, 3));
+    assert(roce_requester_init(&tx, &send_qp, psn, region, source, 3, ROCE_SEND_WINDOW_DEFAULT));
     struct roce_responder rx = responder(destination, region, psn);
     struct roce_packet first = transmit(&tx, 0), lost = transmit(&tx, 0);
     struct roce_packet third = transmit(&tx, 0), last = transmit(&tx, 0), ack;
@@ -78,7 +78,7 @@ static void test_window_timeout_and_address_validation(void)
     uint8_t source[33 * 256] = {1}, dest[sizeof(source)] = {0};
     struct roce_region region = { .address = UINT64_C(0xffffffff00000000), .rkey = 4, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, 6, region, source, 1));
+    assert(roce_requester_init(&tx, &send_qp, 6, region, source, 1, ROCE_SEND_WINDOW_DEFAULT));
     struct roce_responder rx = responder(dest, region, 6);
     struct roce_packet ack, packet;
     for (unsigned int i = 0; i < 32; ++i) {
@@ -86,7 +86,7 @@ static void test_window_timeout_and_address_validation(void)
         assert(packet.ack_requested == (i == 31));
         assert(roce_responder_receive(&rx, &packet, &ack) == (i == 31));
     }
-    assert(!roce_requester_next(&tx, &packet));
+    assert(!roce_requester_next(&tx, 0, &packet));
     struct roce_packet invalid = ack;
     invalid.qpn ^= 1;
     roce_requester_feedback(&tx, &invalid, 101);
@@ -118,7 +118,7 @@ static void test_single_packet_and_access_errors(void)
     struct roce_region region = { .address = 1000, .rkey = 77, .size = sizeof(destination) };
     struct roce_region remote = { .address = 1007, .rkey = 77, .size = sizeof(source) };
     struct roce_requester tx;
-    assert(roce_requester_init(&tx, &send_qp, 2, remote, source, 3));
+    assert(roce_requester_init(&tx, &send_qp, 2, remote, source, 3, ROCE_SEND_WINDOW_DEFAULT));
     struct roce_responder rx = responder(destination, region, 2);
     struct roce_packet packet = transmit(&tx, 0), ack;
     assert(packet.opcode == ROCE_WRITE_ONLY && packet.payload_length == sizeof(source));
@@ -148,11 +148,31 @@ static void test_single_packet_and_access_errors(void)
     assert(tx.failed && tx.acked == 0);
 }
 
+static void test_short_tx_burst(void)
+{
+    uint8_t source[80 * 256] = {0};
+    struct roce_region region = { .address = 1000, .rkey = 77, .size = sizeof(source) };
+    struct roce_requester tx;
+    assert(roce_requester_init(&tx, &send_qp, 5, region, source, 3, 64));
+    struct roce_packet packet;
+    assert(roce_requester_next(&tx, 31, &packet) && packet.ack_requested);
+    assert(roce_requester_next(&tx, 63, &packet) && packet.ack_requested);
+    assert(!roce_requester_next(&tx, 64, &packet));
+    assert(tx.next == 0 && tx.sent == 0);
+    roce_requester_sent(&tx, 16, 1);
+    assert(tx.next == 16 && tx.sent == 16);
+    assert(roce_requester_next(&tx, 0, &packet));
+    assert(packet.psn == 21 && packet.payload == source + 16 * 256);
+    roce_requester_sent(&tx, 0, 2);
+    assert(tx.next == 16 && tx.sent == 16 && tx.last_progress == 1);
+}
+
 int main(void)
 {
     test_sequence_nak_and_lost_final_ack();
     test_window_timeout_and_address_validation();
     test_single_packet_and_access_errors();
+    test_short_tx_burst();
     puts("RoCEv2 RC state tests passed");
     return 0;
 }

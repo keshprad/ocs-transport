@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-enum { SEND_WINDOW = 32, PSN_HALF_RANGE = (ROCE_PSN_MASK + 1) / 2 };
+enum { ACK_INTERVAL = 32, PSN_HALF_RANGE = (ROCE_PSN_MASK + 1) / 2 };
 
 bool roce_valid_pmtu(uint16_t pmtu)
 {
@@ -29,50 +29,56 @@ static bool for_qp(const struct roce_packet *packet, const struct roce_qp *qp)
 
 bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
                          uint32_t psn, struct roce_region remote,
-                         const uint8_t *source, unsigned int retry_limit)
+                         const uint8_t *source, unsigned int retry_limit, uint32_t window)
 {
     if (!roce_valid_pmtu(qp->pmtu) || psn > ROCE_PSN_MASK || !remote.size || !source ||
-        remote.size - 1 > UINT64_MAX - remote.address)
+        remote.size - 1 > UINT64_MAX - remote.address || !window || window > ROCE_SEND_WINDOW_MAX)
         return false;
     uint32_t packets = (remote.size - 1) / qp->pmtu + 1;
     if (packets >= PSN_HALF_RANGE)
         return false;
     *r = (struct roce_requester) {
         .qp = *qp, .remote = remote, .source = source, .initial_psn = psn,
-        .total = packets, .retry_limit = retry_limit, .retries_left = retry_limit,
+        .total = packets, .window = window, .retry_limit = retry_limit, .retries_left = retry_limit,
     };
     return true;
 }
 
-bool roce_requester_next(const struct roce_requester *r, struct roce_packet *packet)
+bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
+                         struct roce_packet *packet)
 {
-    if (r->failed || r->next == r->total || r->next - r->acked >= SEND_WINDOW)
+    if (r->failed || staged >= r->total - r->next)
+        return false;
+    uint32_t index = r->next + staged;
+    if (index - r->acked >= r->window)
         return false;
 
-    bool first = r->next == 0;
-    bool last = r->next + 1 == r->total;
+    bool first = index == 0;
+    bool last = index + 1 == r->total;
     enum roce_opcode opcode;
     if (first)
         opcode = last ? ROCE_WRITE_ONLY : ROCE_WRITE_FIRST;
     else
         opcode = last ? ROCE_WRITE_LAST : ROCE_WRITE_MIDDLE;
-    *packet = outgoing(&r->qp, opcode, r->initial_psn + r->next);
-    size_t offset = (size_t)r->next * r->qp.pmtu;
+    *packet = outgoing(&r->qp, opcode, r->initial_psn + index);
+    size_t offset = (size_t)index * r->qp.pmtu;
     packet->payload = r->source + offset;
     packet->payload_length = last ? r->remote.size - offset : r->qp.pmtu;
-    packet->ack_requested = last || (r->next + 1) % SEND_WINDOW == 0 ||
-                            r->next + 1 - r->acked == SEND_WINDOW;
+    packet->ack_requested = last || (index + 1) % ACK_INTERVAL == 0 ||
+                            index + 1 - r->acked == r->window;
     packet->remote_address = r->remote.address;
     packet->rkey = r->remote.rkey;
     packet->write_length = r->remote.size;
     return true;
 }
 
-void roce_requester_sent(struct roce_requester *r, uint64_t now)
+void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now)
 {
+    if (!count)
+        return;
     if (r->next == r->acked)
         r->last_progress = now;
-    ++r->next;
+    r->next += count;
     if (r->next > r->sent)
         r->sent = r->next;
 }
