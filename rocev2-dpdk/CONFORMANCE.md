@@ -29,7 +29,7 @@ to check implementation behavior and run independent interoperability tests.
 | §§9.7.1, 9.7.4–9.7.5, C9-105, C9-121–122 | PSN increments and wrap, gap NAK with expected PSN, duplicate ACK without replaying placement | **V** in `RC` and `PEER`. The live responder returns the missing PSN in its NAK and returns the same cumulative ACK and MSN for a duplicate after wrap. Byte verification detects any duplicate placement. |
 | §§9.7.2, 9.7.5.2, 9.7.6, 9.7.7.1, 9.9.2 | Cumulative ACK progress, MSN and error syndromes, timeout and bounded Go-Back-N retry | **P**. `RC` asserts cumulative progress, stale and unsent feedback rejection, MSN, access errors, and retry exhaustion. `PEER` confirms the live requester resumes from the missing PSN after a NAK, then retransmits from the same PSN when the final ACK is withheld. Only feedback applicable to plain WRITE with no receive credits is exercised. The first endpoint has a fixed 32-packet window and 10 ms local timeout. |
 | §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for the configured host region. `RC` checks incorrect keys, below-base and overrun addresses, and inconsistent message lengths with no memory modification on first-packet rejection. |
-| A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **H**. Native controls passed both ways. The privileged DPDK service opened the port, but the DPDK RX queue received zero packets in both mixed directions with native RoCE enabled on that function. |
+| A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **V** for the tested one-QP IPv4 host-memory WRITE. Two runs verified 8,195 bytes in each direction at PMTU 1024 with raw Ethernet on the DPDK function and native RoCE on the verbs peer. |
 
 Zero-length WRITE, WRITE with Immediate, SEND, READ, atomics, IPv6, RoCE
 congestion management, standard RDMA CM, and a DPDK-side verbs provider remain
@@ -43,9 +43,9 @@ open. No overall clause count is asserted.
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
 | MEMIF | `make check-memif` | Two production DPDK processes verified 3 bytes in one packet and 1,048,579 bytes in 2,049 packets with PMTU negotiated from 1024 and 512 |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
-| SPARK | [Spark wire interoperability](README.md#spark-wire-interoperability) | Native controls verified 8,195 bytes at PMTU 1024 in both directions. Both mixed tests reached the wire and exhausted retries with a zero DPDK RX count. |
+| SPARK | [Spark wire interoperability](README.md#spark-wire-interoperability) | Native controls passed both ways. Two mixed runs each verified all 8,195 bytes in both directions on ConnectX-7 at PMTU 1024. |
 
-### Spark hardware attempt
+### Spark hardware verification
 
 On November 23, 2026, the native control used Spark-04 (`spark-7e64`) and
 Spark-02 (`spark-4ed9`). The ConnectX-7 ports reported active MTU 1024 with
@@ -55,11 +55,9 @@ bytes in registered memory.
 
 DPDK 23.11.7 with mlx5 detected PCI function `0000:01:00.0` on Spark-04.
 DevX failed to create a TIS object (`errno=121 status=0x3 syndrome=0x6a6678`).
-The account requires sudo authentication for an elevated run. No RoCE port
-settings were changed. A scoped administrator-run endpoint is needed before
-checking UDP 4791 reception and repeating both mixed directions. See the
+The account required administrator-installed services before the mixed
+hardware tests could run. See the
 [mlx5 runtime requirements](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root).
-No throughput or latency samples were collected for the mixed path.
 
 A follow-up probe on Spark-04 reproduced the same TIS failure with both the
 Verbs and Direct Verbs steering modes (`dv_flow_en=0` and `dv_flow_en=1`).
@@ -88,6 +86,22 @@ RX counters both rose by 134 over the two directions. Neither port reported
 physical RX discards. These observations support mlx5 classifying inbound
 UDP 4791 as native RoCE ahead of the DPDK Ethernet queue. See
 [NVIDIA's mlx5 steering guidance](https://docs.nvidia.com/networking/display/bfswtroubleshooting/mlnx-dpdk.pdf).
+
+After setting `enable_roce=false` and applying `driver_reinit` to
+Spark-04's `0000:01:00.0` only, its Ethernet data link came back with
+`10.61.0.2/30`. Spark-02 kept native RoCE on `rocep1s0f1`, port 1,
+GID index 3, at `10.61.0.1`. TCP control used the separate rail.
+The installed binaries were built from `936d7d1`. The Spark-04 DPDK binary
+SHA-256 was `e5b8e6fcb94c9fa46a5dc62324b9820b8d091f378d305a944006136ab025085b`
+and the Spark-02 native peer SHA-256 was
+`4a440cd887a7ee90a6b7556a60d31d1e7313a79f7eeea9c0cf445278e397674b`.
+
+| Spark-04 role | Result in both runs | Spark-04 journal invocation IDs |
+| --- | --- | --- |
+| DPDK requester | Completed 8,195 bytes in nine packets with zero DPDK retries. The Spark-02 receiver verified every byte in native registered memory. | `395c843694684aba91374e5cdb2b3d12`, `a163e2bef65742fabd7e0ab3528e4763` |
+| DPDK responder | Verified 8,195 bytes in nine packets. The Spark-02 sender reported a successful native verbs WRITE completion and peer verification. | `2d54c3b6a2ce456eab8e80f51e576479`, `e200ded5d6ed46c38493e8e402acbde0` |
+
+Both services exited successfully and were inactive after the repeat.
 
 ## BURST implementation notes
 

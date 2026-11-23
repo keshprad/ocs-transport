@@ -51,7 +51,17 @@ Keep native RoCE enabled on the verbs peer. The commands use the current
 link MTU and require it to fit the requested RoCE PMTU.
 
 Example parameters for the Spark-04 to Spark-02 lab link at PMTU 1024.
-Start the receiver and wait for `control listener ready`.
+On Spark-04, with the dedicated data link idle, disable native RoCE on the
+DPDK function so UDP 4791 reaches its Ethernet RX queue. Reloading the
+function briefly interrupts that link.
+
+```sh
+sudo devlink dev param set pci/0000:01:00.0 name enable_roce value false cmode driverinit
+sudo devlink dev reload pci/0000:01:00.0 action driver_reinit
+```
+
+Confirm that `enp1s0f0np0` is back up with `10.61.0.2/30`. Start the
+receiver and wait for `control listener ready`.
 
 ```sh
 # Spark-02, native receiver
@@ -78,3 +88,6 @@ verification by the receiver. Repeat at 3 bytes for WRITE Only and 8195 bytes
 for an unaligned multi-packet WRITE. The DPDK endpoint reports port counters
 when a run fails after control setup. The native executable uses libibverbs
 directly, so it also serves as a native-to-native control.
+
+For a temporary test, restore the prior Spark-04 native RoCE setting by
+repeating the devlink commands with `value true` once the services are idle.
