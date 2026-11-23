@@ -42,7 +42,7 @@ check: tests/test_roce tests/roce_wire_cli tests/test_doorbell
 check-memif: roce_write
 	python3 tests/check_memif.py
 
-check-peer: roce_write
+check-peer: roce_write roce_app_write
 	$(MAKE) -C ../mrc-dpdk tests/mrc_memif_relay
 	python3 tests/check_peer.py
 

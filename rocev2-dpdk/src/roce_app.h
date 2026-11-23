@@ -16,7 +16,7 @@ struct roce_app_memory {
 };
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     struct roce_app_memory *memory);
+                     bool dma_writable, struct roce_app_memory *memory);
 void roce_app_detach(struct roce_app_memory *memory);
 bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32_t count, uint32_t writes);
 bool roce_app_write(const char *path, const char *registration_device);

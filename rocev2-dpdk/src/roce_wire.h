@@ -10,7 +10,9 @@ enum {
     ROCE_PKEY = 0xffff,
     ROCE_PSN_MASK = 0xffffff,
     ROCE_MAX_PMTU = 4096,
-    ROCE_MAX_FRAME = 14 + 20 + 8 + 12 + 16 + ROCE_MAX_PMTU + 4,
+    ROCE_MAX_HEADER = 14 + 20 + 8 + 12 + 16,
+    ROCE_MAX_TRAILER = 3 + 4,
+    ROCE_MAX_FRAME = ROCE_MAX_HEADER + ROCE_MAX_PMTU + 4,
     ROCE_MAC_LEN = 6,
 };
 
@@ -54,6 +56,10 @@ struct roce_packet {
 };
 
 size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *packet);
+/* The wire order is header, packet->payload, trailer. */
+bool roce_encode_split(uint8_t header[ROCE_MAX_HEADER], uint8_t trailer[ROCE_MAX_TRAILER],
+                       const struct roce_packet *packet, uint16_t *header_length,
+                       uint16_t *trailer_length);
 bool roce_decode(struct roce_packet *packet, const uint8_t *frame, size_t frame_length);
 
 #endif

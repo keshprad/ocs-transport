@@ -20,16 +20,16 @@ def checksum(header):
     return ~total & 0xFFFF
 
 
-def fixture(opcode, *, tos=0, ttl=64):
+def fixture(opcode, *, tos=0, ttl=64, payload=PAYLOAD):
     write = opcode != 0x11
-    data = PAYLOAD if write else b""
+    data = payload if write else b""
     pad = (-len(data)) % 4
     bth = struct.pack(
         "!BBHII", opcode, pad << 4, 0xFFFF, 0x123456, (int(write) << 31) | 0xABCDEF
     )
     ext = b""
     if opcode in (0x0A, 0x06):
-        ext = struct.pack("!QII", 0xFEDCBA9876543210, 0x10A0B0C0, 5)
+        ext = struct.pack("!QII", 0xFEDCBA9876543210, 0x10A0B0C0, len(data))
     elif opcode == 0x11:
         ext = struct.pack("!I", 0x60C0FFEE)
     tail = ext + data + bytes(pad)
@@ -57,6 +57,10 @@ def main():
         expected = fixture(opcode)
         result = subprocess.check_output([CLI, str(index)])
         assert result == expected, (hex(opcode), result.hex(), expected.hex())
+        gathered = subprocess.check_output([CLI, str(index), "split"])
+        assert gathered == expected, (hex(opcode), gathered.hex(), expected.hex())
+        jumbo = subprocess.check_output([CLI, str(index), "split-jumbo"])
+        assert jumbo == fixture(opcode, payload=bytes(range(256)) * 16), hex(opcode)
         header = (opcode, 0x123456, 0xABCDEF, int(opcode != 0x11))
         reth = (0xFEDCBA9876543210, 0x10A0B0C0, 5) if opcode in (0x0A, 0x06) else (0, 0, 0)
         aeth = (0x60, 0xC0FFEE, 0) if opcode == 0x11 else (0, 0, len(PAYLOAD))

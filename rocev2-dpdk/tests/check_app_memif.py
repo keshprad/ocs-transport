@@ -45,7 +45,7 @@ def expect_success(child, marker):
     print(stdout.strip())
 
 
-def check(cpus, size, writes, qps, workers, device):
+def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -62,8 +62,9 @@ def check(cpus, size, writes, qps, workers, device):
         expect_ready(rx, "control listener ready")
 
         tx_path = directory / "tx.sock"
+        tx_options = options + (["--scatter-gather"] if scatter_gather else [])
         tx = process(stack, command(cpus[workers:2 * workers], directory, "tx", size, port, "192.0.2.1", 1024)
-                     + options + ["--app-socket", str(tx_path)])
+                     + tx_options + ["--app-socket", str(tx_path)])
         expect_ready(tx, "application listener ready")
         tx_app = process(stack, [APPLICATION, str(tx_path), *app_options])
 
@@ -82,8 +83,10 @@ def main():
     if len(cpus) < 2:
         raise RuntimeError("application test needs two available CPUs")
     check(cpus, 8195, 1, 1, 1, args.kernel_mr)
+    check(cpus, 8195, 1, 1, 1, args.kernel_mr, scatter_gather=True)
     if len(cpus) >= 4:
         check(cpus, 262147, 3, 4, 2, args.kernel_mr)
+        check(cpus, 262147, 3, 4, 2, args.kernel_mr, scatter_gather=True)
 
 
 if __name__ == "__main__":

@@ -62,9 +62,16 @@ int mrc_dpdk_open_port_with_mtu(uint16_t port, struct rte_mempool *pool,
 int mrc_dpdk_open_port_queues(uint16_t port, struct rte_mempool *pool,
                              struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues)
 {
+    return mrc_dpdk_open_port_with_offloads(port, pool, mac, mtu, queues, 0);
+}
+
+int mrc_dpdk_open_port_with_offloads(uint16_t port, struct rte_mempool *pool,
+                                    struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues,
+                                    uint64_t tx_offloads)
+{
     if (!rte_eth_dev_is_valid_port(port))
         return -ENODEV;
-    struct rte_eth_conf config = { .rxmode.mtu = mtu };
+    struct rte_eth_conf config = { .rxmode.mtu = mtu, .txmode.offloads = tx_offloads };
     int result = rte_eth_dev_configure(port, queues, queues, &config);
     if (result)
         return result;

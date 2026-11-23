@@ -39,11 +39,13 @@ static inline uint32_t roce_crc32_update(uint32_t crc, const uint8_t *bytes, siz
     return crc;
 }
 
-static inline uint32_t roce_icrc(const uint8_t *ip, size_t ip_header_len, size_t protected_len)
+enum { ROCE_ICRC_UDP_LEN = 8, ROCE_ICRC_BTH_LEN = 12 };
+
+static inline uint32_t roce_icrc_seed(const uint8_t *ip, size_t ip_header_len)
 {
-    enum { IPV4_LEN = 20, IPV6_LEN = 40, UDP_LEN = 8, BTH_LEN = 12 };
-    uint8_t masked[IPV6_LEN + UDP_LEN + BTH_LEN];
-    size_t prefix_len = ip_header_len + UDP_LEN + BTH_LEN;
+    enum { IPV4_LEN = 20, IPV6_LEN = 40 };
+    uint8_t masked[IPV6_LEN + ROCE_ICRC_UDP_LEN + ROCE_ICRC_BTH_LEN];
+    size_t prefix_len = ip_header_len + ROCE_ICRC_UDP_LEN + ROCE_ICRC_BTH_LEN;
     memcpy(masked, ip, prefix_len);
     if (ip_header_len == IPV4_LEN) {
         masked[1] = 0xff;  /* IPv4 DSCP and ECN */
@@ -57,9 +59,15 @@ static inline uint32_t roce_icrc(const uint8_t *ip, size_t ip_header_len, size_t
     }
     masked[ip_header_len + 6] = 0xff; /* UDP checksum */
     masked[ip_header_len + 7] = 0xff;
-    masked[ip_header_len + UDP_LEN + 4] = 0xff; /* BTH variant reserved field */
+    masked[ip_header_len + ROCE_ICRC_UDP_LEN + 4] = 0xff; /* BTH variant reserved field */
     /* This seed includes the eight all-ones bytes of the masked IB LRH. */
-    uint32_t crc = roce_crc32_update(UINT32_C(0xdebb20e3), masked, prefix_len);
+    return roce_crc32_update(UINT32_C(0xdebb20e3), masked, prefix_len);
+}
+
+static inline uint32_t roce_icrc(const uint8_t *ip, size_t ip_header_len, size_t protected_len)
+{
+    size_t prefix_len = ip_header_len + ROCE_ICRC_UDP_LEN + ROCE_ICRC_BTH_LEN;
+    uint32_t crc = roce_icrc_seed(ip, ip_header_len);
     return ~roce_crc32_update(crc, ip + prefix_len, protected_len - prefix_len);
 }
 

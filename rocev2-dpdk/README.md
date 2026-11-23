@@ -45,6 +45,19 @@ With the registration module loaded and accessible to the client, use
 page-aligned application allocation. The [kernel test](kernel/README.md)
 covers the descriptor and pin lifetime independently.
 
+For scatter/gather transmit, add `--scatter-gather` to the application-backed
+requester. The worker builds the headers, padding and iCRC in its own buffers
+and references the application payload as a separate TX segment. The CPU still
+reads the payload to compute the iCRC. The receiving worker copies into the
+application mapping before acknowledging the WRITE.
+
+On a physical port this mode currently supports mlx5 in IOVA-as-VA mode
+with the default memfd registration. The mlx5 driver registers a writable
+service alias for DMA. The application must keep the submitted bytes stable
+until completion, which the worker reports after the peer verifies the
+WRITE and the local TX queues release their references. The kernel-pinned
+registration path still needs a DMA-capable export for physical scatter/gather.
+
 ## Build and verify
 
 Build with a C compiler, pkg-config, DPDK with the desired PMD, and

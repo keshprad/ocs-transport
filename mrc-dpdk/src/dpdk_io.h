@@ -20,6 +20,9 @@ int mrc_dpdk_open_port_with_mtu(uint16_t port, struct rte_mempool *pool,
                                struct rte_ether_addr *mac, uint16_t mtu);
 int mrc_dpdk_open_port_queues(uint16_t port, struct rte_mempool *pool,
                              struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues);
+int mrc_dpdk_open_port_with_offloads(uint16_t port, struct rte_mempool *pool,
+                                    struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues,
+                                    uint64_t tx_offloads);
 void mrc_dpdk_close_port(uint16_t port);
 
 /* Consumes the mbuf whether or not the driver accepts it. */

@@ -5,7 +5,7 @@
 
 int main(int argc, char **argv)
 {
-    const uint8_t payload[] = {0x24, 0x35, 0x46, 0x57, 0x68};
+    uint8_t payload[ROCE_MAX_PMTU] = {0x24, 0x35, 0x46, 0x57, 0x68};
     uint8_t frame[ROCE_MAX_FRAME + 1];
     if (argc == 2 && strcmp(argv[1], "decode") == 0) {
         size_t length = fread(frame, 1, sizeof(frame), stdin);
@@ -18,20 +18,36 @@ int main(int argc, char **argv)
                packet.syndrome, packet.msn, packet.payload_length);
         return 0;
     }
-    if (argc == 2 && argv[1][0] >= '0' && argv[1][0] <= '4' && !argv[1][1]) {
+    bool jumbo = argc == 3 && strcmp(argv[2], "split-jumbo") == 0;
+    bool split = jumbo || (argc == 3 && strcmp(argv[2], "split") == 0);
+    if ((argc == 2 || split) && argv[1][0] >= '0' && argv[1][0] <= '4' && !argv[1][1]) {
         enum roce_opcode opcodes[] = {
             ROCE_WRITE_ONLY, ROCE_WRITE_FIRST, ROCE_WRITE_MIDDLE, ROCE_WRITE_LAST, ROCE_ACK,
         };
         enum roce_opcode opcode = opcodes[argv[1][0] - '0'];
+        size_t payload_length = jumbo ? sizeof(payload) : 5;
+        if (jumbo)
+            for (size_t i = 0; i < payload_length; ++i)
+                payload[i] = (uint8_t)i;
         struct roce_packet packet = {
             .src = { .mac = {2, 0, 0, 0, 0, 1}, .ipv4 = 0xc0000201 },
             .dst = { .mac = {2, 0, 0, 0, 0, 2}, .ipv4 = 0xc0000202 },
             .udp_source = 0xc123, .pkey = ROCE_PKEY, .qpn = 0x123456, .psn = 0xabcdef,
             .opcode = opcode, .ack_requested = opcode != ROCE_ACK,
-            .remote_address = UINT64_C(0xfedcba9876543210), .rkey = 0x10a0b0c0, .write_length = 5,
+            .remote_address = UINT64_C(0xfedcba9876543210), .rkey = 0x10a0b0c0,
+            .write_length = (uint32_t)payload_length,
             .syndrome = ROCE_NAK_SEQUENCE, .msn = 0xc0ffee, .payload = payload,
-            .payload_length = opcode == ROCE_ACK ? 0 : sizeof(payload),
+            .payload_length = opcode == ROCE_ACK ? 0 : payload_length,
         };
+        if (split) {
+            uint8_t trailer[ROCE_MAX_TRAILER];
+            uint16_t header_length, trailer_length;
+            if (!roce_encode_split(frame, trailer, &packet, &header_length, &trailer_length))
+                return 1;
+            return fwrite(frame, 1, header_length, stdout) == header_length &&
+                   fwrite(payload, 1, packet.payload_length, stdout) == packet.payload_length &&
+                   fwrite(trailer, 1, trailer_length, stdout) == trailer_length ? 0 : 1;
+        }
         size_t length = roce_encode(frame, sizeof(frame), &packet);
         return length && fwrite(frame, 1, length, stdout) == length ? 0 : 1;
     }

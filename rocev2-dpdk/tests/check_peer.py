@@ -2,7 +2,7 @@
 """Exercise the production DPDK endpoint against an independent RC wire peer."""
 
 import os
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 import select
 import socket
@@ -140,7 +140,7 @@ class Peer:
         assert self.read(1) == b"V"
 
 
-def check(role, cpus):
+def check(role, cpus, *, scatter_gather=False):
     with tempfile.TemporaryDirectory(prefix="roce-peer-") as temporary:
         directory = Path(temporary)
         relay_path, fixture_path = directory / "relay", directory / "fixture"
@@ -166,7 +166,14 @@ def check(role, cpus):
                 args = eal_args(BINARY, "tx", cpus[1], directory, rail_count=1)
                 args += ["--", role, str(SIZE), "127.0.0.1", str(control_port),
                          "192.0.2.1", str(PMTU), "0"]
-                with process(args, directory) as endpoint:
+                app_socket = directory / "application.sock"
+                if scatter_gather:
+                    args += ["--scatter-gather", "--app-socket", str(app_socket)]
+                with process(args, directory) as endpoint, ExitStack() as clients:
+                    if scatter_gather:
+                        assert select.select([endpoint.stdout], [], [], 5)[0], "application listener timeout"
+                        assert endpoint.stdout.readline() == "application listener ready\n"
+                        app = clients.enter_context(process([BINARY.with_name("roce_app_write"), app_socket], directory))
                     if role == "tx":
                         control, _ = listener.accept()
                     else:
@@ -187,9 +194,13 @@ def check(role, cpus):
                     assert f"{marker}: {SIZE} bytes" in out, out
                     if role == "tx":
                         assert "2 retries" in out, out
+                    if scatter_gather:
+                        out, err = app.communicate(timeout=5)
+                        assert app.returncode == 0 and f"Application completed {SIZE} bytes" in out, out + err
                 out, err = relay.communicate(timeout=5)
                 assert relay.returncode == 0, out + err
-                print(f"independent RC peer verified {role} with {SIZE} bytes")
+                mode = " scatter/gather" if scatter_gather else ""
+                print(f"independent RC peer verified {role}{mode} with {SIZE} bytes")
 
 
 def main():
@@ -198,6 +209,7 @@ def main():
         raise RuntimeError("independent peer test needs two available CPUs")
     check("tx", cpus[:2])
     check("rx", cpus[:2])
+    check("tx", cpus[:2], scatter_gather=True)
 
 
 if __name__ == "__main__":

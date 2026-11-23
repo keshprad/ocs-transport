@@ -242,7 +242,7 @@ bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32
 }
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     struct roce_app_memory *memory)
+                     bool dma_writable, struct roce_app_memory *memory)
 {
     uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
     size_t length = mapping_length(bytes);
@@ -264,13 +264,19 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
     int fd = receive_mapping(socket, &kind);
     if (fd < 0)
         goto disconnect;
+    /* mlx5 verbs registers external memory with local write access. */
+    if (dma_writable && kind != APP_MEMFD) {
+        close(fd);
+        errno = EOPNOTSUPP;
+        goto disconnect;
+    }
     if (!valid_mapping(fd, kind, length, options->sender)) {
         close(fd);
         errno = EINVAL;
         goto disconnect;
     }
-    void *buffer = mmap(NULL, length, PROT_READ | (options->sender ? 0 : PROT_WRITE),
-                        MAP_SHARED, fd, 0);
+    int prot = PROT_READ | (!options->sender || dma_writable ? PROT_WRITE : 0);
+    void *buffer = mmap(NULL, length, prot, MAP_SHARED, fd, 0);
     close(fd);
     if (buffer == MAP_FAILED)
         goto disconnect;

@@ -3,12 +3,15 @@
 #include "roce_lab.h"
 #include "../../mrc-dpdk/src/dpdk_io.h"
 
+#include <rte_dev.h>
 #include <rte_eal.h>
+#include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_flow.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_memory.h>
 #include <rte_pause.h>
 
 #include <inttypes.h>
@@ -36,7 +39,12 @@ struct datapath_options {
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     const char *app_socket;
     bool report_bandwidth;
+    bool scatter_gather;
 };
+
+struct tx_memory_ref {
+    struct rte_mbuf_ext_shared_info shared;
+} __rte_cache_aligned;
 
 union write_qp {
     struct roce_requester requester;
@@ -49,6 +57,7 @@ struct write_run {
     const struct datapath_options *options;
     struct rte_mempool *pool;
     struct roce_doorbell *doorbells;
+    struct tx_memory_ref *tx_refs;
     uint16_t port;
     bool sender;
     atomic_int state;
@@ -86,6 +95,44 @@ static struct rte_mbuf *encode_packet(struct rte_mempool *pool, const struct roc
     return mbuf;
 }
 
+static void release_tx_reference(void *address, void *opaque)
+{
+    /* The transport retains a reference until every TX queue has stopped. */
+    (void)address;
+    (void)opaque;
+}
+
+static struct rte_mbuf *encode_gathered_packet(struct rte_mempool *pool,
+                                               struct rte_mbuf_ext_shared_info *shared,
+                                               const struct roce_packet *packet)
+{
+    struct rte_mbuf *segments[3];
+    if (rte_pktmbuf_alloc_bulk(pool, segments, RTE_DIM(segments)) != 0)
+        return NULL;
+    struct rte_mbuf *header = segments[0], *payload = segments[1], *trailer = segments[2];
+    uint16_t header_len, trailer_len;
+    if (!roce_encode_split(rte_pktmbuf_mtod(header, uint8_t *),
+                           rte_pktmbuf_mtod(trailer, uint8_t *), packet, &header_len, &trailer_len)) {
+        for (size_t i = 0; i < RTE_DIM(segments); ++i)
+            rte_pktmbuf_free(segments[i]);
+        return NULL;
+    }
+    uint16_t payload_len = (uint16_t)packet->payload_length;
+    rte_mbuf_ext_refcnt_update(shared, 1);
+    rte_pktmbuf_attach_extbuf(payload, (void *)packet->payload, (rte_iova_t)(uintptr_t)packet->payload,
+                             payload_len, shared);
+    payload->data_len = payload_len;
+    payload->pkt_len = payload_len;
+    trailer->data_len = trailer_len;
+    trailer->pkt_len = trailer_len;
+    header->data_len = header_len;
+    header->pkt_len = header_len + payload_len + trailer_len;
+    header->nb_segs = RTE_DIM(segments);
+    header->next = payload;
+    payload->next = trailer;
+    return header;
+}
+
 static bool send_requests(const struct write_worker *worker,
                           struct roce_requester *requester, uint32_t credit, uint64_t now)
 {
@@ -99,7 +146,10 @@ static bool send_requests(const struct write_worker *worker,
         /* A full queue window must still generate an ACK before another send. */
         if (run->options->queue_window && count + 1u == budget)
             packet.ack_requested = true;
-        packets[count] = encode_packet(run->pool, &packet);
+        if (run->tx_refs && packet.payload_length)
+            packets[count] = encode_gathered_packet(run->pool, &run->tx_refs[worker->queue].shared, &packet);
+        else
+            packets[count] = encode_packet(run->pool, &packet);
         if (!packets[count])
             break;
         ++count;
@@ -427,10 +477,11 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
                const struct roce_lab_options *lab, uint8_t *buffer,
                const struct roce_app_memory *application, bool steer,
-               const struct datapath_options *options)
+               const struct datapath_options *options, struct tx_memory_ref *tx_refs)
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
-                             .state = WRITE_WAITING, .doorbells = application->doorbells };
+                             .state = WRITE_WAITING, .doorbells = application->doorbells,
+                             .tx_refs = tx_refs };
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
     struct rte_flow *flows[ROCE_LAB_MAX_QPS] = {0};
     uint16_t pmtu = local->pmtu < peer->pmtu ? local->pmtu : peer->pmtu;
@@ -527,6 +578,8 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
     for (int i = 0; i < argc; ++i) {
         if (strcmp(argv[i], "--report-bw") == 0) {
             options->report_bandwidth = true;
+        } else if (strcmp(argv[i], "--scatter-gather") == 0) {
+            options->scatter_gather = true;
         } else if (strcmp(argv[i], "--tx-burst") == 0) {
             if (++i == argc || !roce_parse_uint(argv[i], MAX_TX_BURST, &options->tx_burst) ||
                 !options->tx_burst)
@@ -583,7 +636,8 @@ int main(int argc, char **argv)
         !parse_datapath_options(argc - 8, argv + 8, &datapath)) {
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
-                        " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]\n");
+                        " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
+                        " [--scatter-gather]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -626,6 +680,12 @@ int main(int argc, char **argv)
     uint16_t required_mtu = (uint16_t)(ROCE_MAX_FRAME - ROCE_MAX_PMTU + options.pmtu -
                                        RTE_ETHER_HDR_LEN);
     bool memif = strcmp(info.driver_name, "net_memif") == 0;
+    if (datapath.scatter_gather &&
+        (!options.sender || !datapath.app_socket || !(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
+         (!memif && (strcmp(info.driver_name, "mlx5_pci") != 0 || rte_eal_iova_mode() != RTE_IOVA_VA)))) {
+        fprintf(stderr, "scatter/gather requires an application-backed sender and memif or mlx5 with IOVA=VA\n");
+        goto cleanup_eal;
+    }
     if (mtu < required_mtu && !memif) {
         fprintf(stderr, "DPDK port MTU %u is below the required %u\n", mtu, required_mtu);
         goto cleanup_eal;
@@ -643,21 +703,47 @@ int main(int argc, char **argv)
         fprintf(stderr, "packet pool or host buffer allocation failed\n");
         goto cleanup_buffers;
     }
+    /* Each attached segment holds one 16-bit shared-info reference. */
+    if (datapath.scatter_gather && pool->size >= UINT16_MAX) {
+        fprintf(stderr, "packet pool is too large for scatter/gather buffer references\n");
+        goto cleanup_buffers;
+    }
     if (buffer)
         roce_lab_fill(buffer, (size_t)bytes, options.sender);
 
     struct rte_ether_addr mac;
-    int err = mrc_dpdk_open_port_queues(port, pool, &mac, mtu, (uint16_t)options.workers);
+    struct tx_memory_ref tx_refs[ROCE_LAB_MAX_QPS] = {0};
+    bool dma_registered = false, dma_mapped = false;
+    uint64_t offloads = datapath.scatter_gather ? RTE_ETH_TX_OFFLOAD_MULTI_SEGS : 0;
+    int err = mrc_dpdk_open_port_with_offloads(port, pool, &mac, mtu, (uint16_t)options.workers, offloads);
     if (err) {
         fprintf(stderr, "could not open DPDK port %u: %s\n", port, strerror(-err));
         goto cleanup_buffers;
     }
+    for (uint32_t i = 0; datapath.scatter_gather && i < options.workers; ++i) {
+        tx_refs[i].shared.free_cb = release_tx_reference;
+        rte_mbuf_ext_refcnt_set(&tx_refs[i].shared, 1);
+    }
     if (datapath.app_socket) {
-        if (!roce_app_attach(datapath.app_socket, &options, &application)) {
+        if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
         buffer = application.buffer;
+    }
+    if (datapath.scatter_gather && !memif) {
+        long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0 || rte_extmem_register(buffer, application.length, NULL, 0, (size_t)page_size)) {
+            fprintf(stderr, "external memory registration failed: %s\n", rte_strerror(rte_errno));
+            goto cleanup_port;
+        }
+        dma_registered = true;
+        if (rte_dev_dma_map(info.device, buffer, (uintptr_t)buffer, application.length)) {
+            fprintf(stderr, "mlx5 DMA mapping failed: %s\n", rte_strerror(rte_errno));
+            goto cleanup_port;
+        }
+        dma_mapped = true;
+        printf("Application DMA region mapped for scatter/gather TX (%zu bytes)\n", application.length);
     }
     struct rte_eth_stats initial_stats = {0};
     bool measure_stats = datapath.report_bandwidth && rte_eth_stats_get(port, &initial_stats) == 0;
@@ -686,13 +772,9 @@ int main(int argc, char **argv)
     }
     if (roce_lab_exchange(fd, &options, &local, &peer)) {
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
-                     options.workers > 1 && !memif, &datapath);
+                     options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL);
     } else {
         fprintf(stderr, "control setup failed\n");
-    }
-    if (!result && application.socket >= 0 && !roce_lab_send(application.socket, 'C')) {
-        perror("application WRITE completion");
-        result = 1;
     }
     if (result || measure_stats) {
         struct rte_eth_stats stats;
@@ -712,7 +794,38 @@ int main(int argc, char **argv)
     }
     close(fd);
 cleanup_port:
-    mrc_dpdk_close_port(port);
+    if (datapath.scatter_gather) {
+        err = rte_eth_dev_stop(port);
+        if (err) {
+            fprintf(stderr, "could not stop scatter/gather port: %s\n", rte_strerror(-err));
+            return 1;
+        }
+        for (uint32_t i = 0; i < options.workers; ++i) {
+            if (rte_mbuf_ext_refcnt_read(&tx_refs[i].shared) != 1) {
+                fprintf(stderr, "worker %u still has application buffers in its TX queue\n", i);
+                return 1;
+            }
+        }
+        if (dma_mapped && rte_dev_dma_unmap(info.device, buffer, (uintptr_t)buffer, application.length)) {
+            fprintf(stderr, "mlx5 DMA unmapping failed: %s\n", rte_strerror(rte_errno));
+            return 1;
+        }
+        if (dma_registered && rte_extmem_unregister(buffer, application.length)) {
+            fprintf(stderr, "external memory deregistration failed: %s\n", rte_strerror(rte_errno));
+            return 1;
+        }
+        err = rte_eth_dev_close(port);
+        if (err) {
+            fprintf(stderr, "could not close scatter/gather port: %s\n", rte_strerror(-err));
+            result = 1;
+        }
+    } else {
+        mrc_dpdk_close_port(port);
+    }
+    if (!result && application.socket >= 0 && !roce_lab_send(application.socket, 'C')) {
+        perror("application WRITE completion");
+        result = 1;
+    }
 cleanup_buffers:
     if (application.socket >= 0)
         roce_app_detach(&application);

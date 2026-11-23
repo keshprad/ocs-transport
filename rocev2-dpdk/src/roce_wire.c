@@ -50,20 +50,16 @@ static size_t extension_size(enum roce_opcode opcode)
     return SIZE_MAX;
 }
 
-size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *p)
+static bool valid_packet(const struct roce_packet *p)
 {
-    size_t extension = extension_size(p->opcode);
-    if (extension == SIZE_MAX || p->payload_length > ROCE_MAX_PMTU ||
-        (p->payload_length && !p->payload) || !p->udp_source ||
-        p->qpn > ROCE_PSN_MASK || p->psn > ROCE_PSN_MASK ||
-        p->msn > ROCE_PSN_MASK || (p->opcode == ROCE_ACK && p->payload_length))
-        return 0;
+    return p->payload_length <= ROCE_MAX_PMTU && (!p->payload_length || p->payload) &&
+           p->udp_source && p->qpn <= ROCE_PSN_MASK && p->psn <= ROCE_PSN_MASK &&
+           p->msn <= ROCE_PSN_MASK && (p->opcode != ROCE_ACK || !p->payload_length);
+}
 
-    size_t pad = (4 - p->payload_length % 4) % 4;
-    size_t length = ETH + IP + UDP + BTH + extension + p->payload_length + pad + ICRC;
-    if (capacity < length)
-        return 0;
-
+static void encode_header(uint8_t *frame, const struct roce_packet *p, size_t extension,
+                          size_t pad, size_t length)
+{
     memcpy(frame, p->dst.mac, ROCE_MAC_LEN);
     memcpy(frame + ROCE_MAC_LEN, p->src.mac, ROCE_MAC_LEN);
     write_be(frame + 12, 2, 0x0800);
@@ -101,13 +97,50 @@ size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *p)
         ext[0] = p->syndrome;
         write_be(ext + 1, 3, p->msn);
     }
-    if (p->payload_length)
-        memcpy(ext + extension, p->payload, p->payload_length);
-    memset(ext + extension + p->payload_length, 0, pad);
-    uint32_t crc = roce_icrc(ip, IP, length - ETH - ICRC);
+}
+
+static void encode_icrc(uint8_t *output, uint32_t crc)
+{
     for (size_t i = 0; i < ICRC; ++i)
-        frame[length - ICRC + i] = (uint8_t)(crc >> (8 * i));
+        output[i] = (uint8_t)(crc >> (8 * i));
+}
+
+size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *p)
+{
+    size_t extension = extension_size(p->opcode);
+    if (extension == SIZE_MAX || !valid_packet(p))
+        return 0;
+    size_t pad = (4 - p->payload_length % 4) % 4;
+    size_t header = ETH + IP + UDP + BTH + extension;
+    size_t length = header + p->payload_length + pad + ICRC;
+    if (capacity < length)
+        return 0;
+
+    encode_header(frame, p, extension, pad, length);
+    if (p->payload_length)
+        memcpy(frame + header, p->payload, p->payload_length);
+    memset(frame + length - ICRC - pad, 0, pad);
+    encode_icrc(frame + length - ICRC, roce_icrc(frame + ETH, IP, length - ETH - ICRC));
     return length;
+}
+
+bool roce_encode_split(uint8_t header[ROCE_MAX_HEADER], uint8_t trailer[ROCE_MAX_TRAILER],
+                       const struct roce_packet *p, uint16_t *header_length, uint16_t *trailer_length)
+{
+    size_t extension = extension_size(p->opcode);
+    if (extension == SIZE_MAX || !valid_packet(p))
+        return false;
+    size_t pad = (4 - p->payload_length % 4) % 4;
+    *header_length = ETH + IP + UDP + BTH + extension;
+    *trailer_length = (uint16_t)(pad + ICRC);
+    encode_header(header, p, extension, pad, *header_length + p->payload_length + *trailer_length);
+    memset(trailer, 0, pad);
+    uint32_t crc = roce_icrc_seed(header + ETH, IP);
+    crc = roce_crc32_update(crc, header + ETH + IP + UDP + BTH, extension);
+    if (p->payload_length)
+        crc = roce_crc32_update(crc, p->payload, p->payload_length);
+    encode_icrc(trailer + pad, ~roce_crc32_update(crc, trailer, pad));
+    return true;
 }
 
 bool roce_decode(struct roce_packet *packet, const uint8_t *frame, size_t frame_length)
