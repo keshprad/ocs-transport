@@ -132,7 +132,9 @@ last local queue completion. Reported CPU time sums the polling threads
 until each exits or observes endpoint completion.
 
 The requester accepts `--tx-burst N` (1–32, default 32) and
-`--send-window N` (1–512 packets, default 32). Use `--tx-burst 1`
+`--send-window N` (1–512 packets per QP, default 32).
+`--queue-window N` optionally caps the combined outstanding packet
+count across the QPs on each worker. Use `--tx-burst 1`
 for a single-packet TX submission comparison. A build with Arm CRC
 instructions enabled uses the hardware IEEE CRC32 operation for iCRC.
 Use `CPPFLAGS=-DOCS_ROCE_PORTABLE_CRC` for a clean build of the
@@ -208,3 +210,35 @@ The runner verifies the binary and service arguments on both hosts.
 It records the active link configuration, both endpoints' verified
 bandwidth and CPU time, the requester's retry count, and the systemd
 invocation logs.
+
+On November 23, 2026, the `3a6a1ca` build completed this sweep from
+Spark-04 to Spark-02 on the first 100 Gbit/s rail at Ethernet MTU 1500.
+The receiver verified all 16 GiB in every trial. Each worker used a
+3.9 GHz core.
+
+| QPs | Workers per endpoint | Median TX Gbit/s | Median RX Gbit/s | Median TX / RX polling cores | Requester retries per trial |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 29.189 | 29.190 | 1.000 / 1.000 | 0, 0, 0 |
+| 16 | 1 | 23.096 | 23.096 | 1.000 / 1.000 | 30,899, 32,424, 35,889 |
+| 16 | 2 | 42.205 | 42.195 | 2.000 / 2.000 | 39,942, 35,759, 34,747 |
+| 16 | 4 | 90.506 | 90.515 | 3.978 / 4.000 | 61, 73, 147 |
+
+### Physical dual-rail sweep
+
+The native runner accepts a local perftest 6.30 binary and checks the
+RoCEv2 GIDs and current Ethernet MTU on both Sparks. It measures each
+rail separately and both rails simultaneously, with separate one-QP
+and batched 16-QP controls.
+
+```sh
+python3 tests/check_spark_native_bandwidth.py --perftest "$PERFTEST_BIN"
+```
+
+With the pinned aggregate services installed and all four data
+functions in raw Ethernet mode, add `--aggregate` to the DPDK runner.
+Each rail uses 16 QPs and four polling cores per endpoint and verifies
+16 GiB. The lab TCP connections use loopback SSH forwards over the
+management link. The requester option `--start-gate PORT` synchronizes
+release across both sender processes on Spark-04. The aggregate metric
+uses 32 GiB over the interval from the first sender start to the last
+sender completion. The report records overlap and start skew.

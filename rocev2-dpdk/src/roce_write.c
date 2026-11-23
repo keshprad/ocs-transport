@@ -25,10 +25,12 @@ enum {
 
 struct datapath_options {
     uint32_t send_window;
+    uint32_t queue_window;
     uint32_t tx_burst;
     uint32_t writes;
     uint32_t qps;
     uint32_t workers;
+    uint32_t start_gate;
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     bool report_bandwidth;
 };
@@ -79,13 +81,18 @@ static struct rte_mbuf *encode_packet(struct rte_mempool *pool, const struct roc
 }
 
 static bool send_requests(const struct write_worker *worker,
-                          struct roce_requester *requester, uint64_t now)
+                          struct roce_requester *requester, uint32_t credit, uint64_t now)
 {
     const struct write_run *run = worker->run;
+    uint32_t budget = credit + (requester->sent - requester->next);
+    uint32_t limit = RTE_MIN(budget, run->options->tx_burst);
     struct rte_mbuf *packets[MAX_TX_BURST];
     struct roce_packet packet;
     uint16_t count = 0;
-    while (count < run->options->tx_burst && roce_requester_next(requester, count, &packet)) {
+    while (count < limit && roce_requester_next(requester, count, &packet)) {
+        /* A full queue window must still generate an ACK before another send. */
+        if (run->options->queue_window && count + 1u == budget)
+            packet.ack_requested = true;
         packets[count] = encode_packet(run->pool, &packet);
         if (!packets[count])
             break;
@@ -108,18 +115,21 @@ static uint64_t thread_cpu_ns(void)
     return (uint64_t)ts.tv_sec * NS_PER_SEC + (uint64_t)ts.tv_nsec;
 }
 
-static void report_bandwidth(bool sender, uint64_t bytes, uint64_t elapsed, uint64_t cpu,
+static void report_bandwidth(bool sender, uint64_t bytes, uint64_t started, uint64_t elapsed, uint64_t cpu,
                              const struct datapath_options *options)
 {
     if (!elapsed)
         return;
     printf("BANDWIDTH role=%s payload_bytes=%" PRIu64 " elapsed_ns=%" PRIu64
-           " thread_cpu_ns=%" PRIu64 " payload_gbps=%.3f poll_cores=%.3f writes=%u qps=%u workers=%u",
+           " thread_cpu_ns=%" PRIu64 " payload_gbps=%.3f poll_cores=%.3f writes=%u qps=%u workers=%u"
+           " start_ns=%" PRIu64,
            sender ? "tx" : "rx", bytes, elapsed, cpu,
            (double)bytes * 8.0 / (double)elapsed, (double)cpu / (double)elapsed,
-           options->writes, options->qps, options->workers);
+           options->writes, options->qps, options->workers, started);
     if (sender)
         printf(" send_window=%u tx_burst=%u", options->send_window, options->tx_burst);
+    if (sender && options->queue_window)
+        printf(" queue_window=%u", options->queue_window);
     putchar('\n');
 }
 
@@ -258,6 +268,7 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     if (!run->sender || worker->finished)
         return true;
 
+    uint32_t outstanding = 0;
     for (uint32_t i = 0; i < worker->qps; ++i) {
         struct roce_requester *requester = &worker->states[i].requester;
         roce_requester_poll_timer(requester, now, RETRY_NS);
@@ -266,12 +277,15 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
                     requester->qp.local_qpn, requester->retries, requester->acked, requester->total);
             return false;
         }
+        outstanding += requester->sent - requester->acked;
     }
+    uint32_t window = run->options->queue_window;
+    uint32_t credit = window ? window - RTE_MIN(window, outstanding) : run->options->tx_burst;
     for (uint32_t i = 0; i < worker->qps; ++i) {
         struct roce_requester *requester = &worker->states[worker->next].requester;
         if (++worker->next == worker->qps)
             worker->next = 0;
-        if (send_requests(worker, requester, now))
+        if (send_requests(worker, requester, credit, now))
             break;
     }
     return true;
@@ -380,15 +394,16 @@ static bool verify_result(int fd, const struct write_worker *workers, uint64_t s
         printf("WRITE verified: %" PRIu64 " bytes, %" PRIu64 " packets\n", bytes, packets);
     }
     if (options->report_bandwidth)
-        report_bandwidth(run->sender, bytes, finished - started, cpu, options);
+        report_bandwidth(run->sender, bytes, started, finished - started, cpu, options);
     return true;
 }
 
 static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
-               bool sender, uint8_t *buffer, bool steer, const struct datapath_options *options)
+               const struct roce_lab_options *lab, uint8_t *buffer, bool steer,
+               const struct datapath_options *options)
 {
-    struct write_run run = { .options = options, .pool = pool, .port = port, .sender = sender,
+    struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
                              .state = WRITE_WAITING };
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
     struct rte_flow *flows[ROCE_LAB_MAX_QPS] = {0};
@@ -425,14 +440,17 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
     }
 
     bool completed = false;
-    if (roce_lab_ready(fd)) {
+    bool ready = options->start_gate ?
+        roce_lab_ready_after_gate(fd, (uint16_t)options->start_gate, lab->control_port) :
+        roce_lab_ready(fd);
+    if (ready) {
         started = roce_now_ns();
         workers[0].cpu_started = options->report_bandwidth ? thread_cpu_ns() : 0;
         atomic_store_explicit(&run.state, WRITE_RUNNING, memory_order_release);
         completed = wait_for_completion(fd, &workers[0], started);
         sample_cpu(&workers[0]);
     } else {
-        fprintf(stderr, "control readiness exchange failed\n");
+        fprintf(stderr, "control readiness exchange%s failed\n", options->start_gate ? " or start gate" : "");
     }
     result = !completed;
 
@@ -478,6 +496,11 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
                 !roce_parse_uint(argv[i], ROCE_SEND_WINDOW_MAX, &options->send_window) ||
                 !options->send_window)
                 return false;
+        } else if (strcmp(argv[i], "--queue-window") == 0) {
+            if (++i == argc ||
+                !roce_parse_uint(argv[i], ROCE_LAB_MAX_QPS * ROCE_SEND_WINDOW_MAX, &options->queue_window) ||
+                !options->queue_window)
+                return false;
         } else if (strcmp(argv[i], "--writes") == 0) {
             if (++i == argc || !roce_parse_uint(argv[i], ROCE_PSN_MASK, &options->writes) ||
                 !options->writes)
@@ -488,6 +511,10 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
         } else if (strcmp(argv[i], "--workers") == 0) {
             if (++i == argc ||
                 !roce_parse_uint(argv[i], ROCE_LAB_MAX_QPS, &options->workers) || !options->workers)
+                return false;
+        } else if (strcmp(argv[i], "--start-gate") == 0) {
+            if (++i == argc ||
+                !roce_parse_uint(argv[i], UINT16_MAX, &options->start_gate) || !options->start_gate)
                 return false;
         } else {
             return false;
@@ -511,7 +538,12 @@ int main(int argc, char **argv)
     if (argc < 8 || !roce_lab_parse(argv, &options) ||
         !parse_datapath_options(argc - 8, argv + 8, &datapath)) {
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
-                        " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N] [--workers N]\n");
+                        " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
+                        " [--workers N] [--queue-window N] [--start-gate PORT]\n");
+        goto cleanup_eal;
+    }
+    if (datapath.start_gate && !options.sender) {
+        fprintf(stderr, "only a requester uses the start gate\n");
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -574,6 +606,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "could not open DPDK port %u: %s\n", port, strerror(-err));
         goto cleanup_buffers;
     }
+    struct rte_eth_stats initial_stats = {0};
+    bool measure_stats = datapath.report_bandwidth && rte_eth_stats_get(port, &initial_stats) == 0;
     /* Virtual PMDs can return a zero MAC. Give those lab endpoints a local MAC. */
     if (rte_is_zero_ether_addr(&mac))
         mac = (struct rte_ether_addr) { .addr_bytes = {
@@ -598,17 +632,26 @@ int main(int argc, char **argv)
         goto cleanup_port;
     }
     if (roce_lab_exchange(fd, &options, &local, &peer)) {
-        result = run(fd, port, pool, &local, &peer, options.sender, buffer,
+        result = run(fd, port, pool, &local, &peer, &options, buffer,
                      options.workers > 1 && !memif, &datapath);
     } else {
         fprintf(stderr, "control setup failed\n");
     }
-    if (result) {
+    if (result || measure_stats) {
         struct rte_eth_stats stats;
-        if (rte_eth_stats_get(port, &stats) == 0)
-            fprintf(stderr, "DPDK port %u RX=%" PRIu64 " TX=%" PRIu64
-                    " missed=%" PRIu64 " RX errors=%" PRIu64 " TX errors=%" PRIu64 "\n",
-                    port, stats.ipackets, stats.opackets, stats.imissed, stats.ierrors, stats.oerrors);
+        if (rte_eth_stats_get(port, &stats) == 0) {
+            if (measure_stats && !result)
+                printf("PORT_STATS rx_packets=%" PRIu64 " tx_packets=%" PRIu64
+                       " missed=%" PRIu64 " rx_errors=%" PRIu64 " tx_errors=%" PRIu64
+                       " rx_nombuf=%" PRIu64 "\n",
+                       stats.ipackets - initial_stats.ipackets, stats.opackets - initial_stats.opackets,
+                       stats.imissed - initial_stats.imissed, stats.ierrors - initial_stats.ierrors,
+                       stats.oerrors - initial_stats.oerrors, stats.rx_nombuf - initial_stats.rx_nombuf);
+            else
+                fprintf(stderr, "DPDK port %u RX=%" PRIu64 " TX=%" PRIu64
+                        " missed=%" PRIu64 " RX errors=%" PRIu64 " TX errors=%" PRIu64 "\n",
+                        port, stats.ipackets, stats.opackets, stats.imissed, stats.ierrors, stats.oerrors);
+        }
     }
     close(fd);
 cleanup_port:

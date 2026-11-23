@@ -2,6 +2,7 @@
 #include "roce_lab.h"
 
 #include <arpa/inet.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -187,6 +188,38 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
 bool roce_lab_ready(int fd)
 {
     return roce_lab_send(fd, 'R') && roce_lab_receive(fd, 'R', false) == 1;
+}
+
+bool roce_lab_ready_after_gate(int fd, uint16_t gate_port, uint16_t control_port)
+{
+    if (roce_lab_receive(fd, 'R', false) != 1)
+        return false;
+    const struct roce_lab_options options = {
+        .sender = true, .control_ip = htonl(INADDR_LOOPBACK), .control_port = gate_port,
+    };
+    int gate = roce_lab_open(&options);
+    if (gate < 0)
+        return false;
+    uint16_t identity = htons(control_port);
+    uint64_t release;
+    bool received = transfer(gate, &identity, sizeof(identity), true) &&
+                    transfer(gate, &release, sizeof(release), false);
+    close(gate);
+    if (!received)
+        return false;
+
+    /* The gate shares the sender's CLOCK_MONOTONIC time domain. */
+    release = be64toh(release);
+    const uint64_t ns_per_sec = UINT64_C(1000000000);
+    uint64_t now = roce_now_ns();
+    if (release < now || release - now > ROCE_LAB_TIMEOUT * ns_per_sec)
+        return false;
+    struct timespec target = { .tv_sec = release / ns_per_sec, .tv_nsec = release % ns_per_sec };
+    int error;
+    do {
+        error = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
+    } while (error == EINTR);
+    return !error && roce_lab_send(fd, 'R');
 }
 
 int roce_lab_receive(int fd, char expected, bool nonblocking)

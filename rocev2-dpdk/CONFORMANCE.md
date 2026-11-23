@@ -121,7 +121,11 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   throughput. BURST's single-QP result is about 121 Gbit/s in its x86/400G
   testbed. The DPDK test supports 16 QPs and independent RC state.
   The multi-queue memif test covers independent polling cores per
-  endpoint. Verification of ConnectX-7 steering and physical bandwidth
-  remains open.
+  endpoint. The physical first-rail sweep verified three 16 GiB runs
+  at 90.506 Gbit/s median with 16 QPs and four mlx5 queue pairs. Median
+  requester and responder CPU use was 3.978 and 4.000 polling cores.
+  Requester retries were 61, 73, and 147. The paired systemd invocation
+  IDs for the median result are `9bf2eaf0c60b42f6814d0264ef5e5a41`
+  and `5988fd39a3c9489b983a9bd35ed60a40`.
 - **§§4.1 and 4.7.** The verbs provider and user-space CM are useful references
   if we extend application compatibility after the wire milestone.
