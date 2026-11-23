@@ -133,5 +133,17 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   rail with zero retries. Its TX/RX invocation IDs are
   `dbe800735ce0439e9a39e61b28d2a452` / `6b815e9187ce4f6198337dc254587319` and
   `e6e831349cb1421794ab63636bed2388` / `bf95e952be92437d88b23f471e3b35a0`.
+- The concurrent three-Spark ring verified 16 GiB per edge in each of
+  three trials at PMTU 1024 with 16 QPs and four polling workers per
+  endpoint. Sender windows overlapped by at least 1.518 seconds.
+  See the [ring results](README.md#three-spark-ring-sweep). The
+  paired TX and RX invocation IDs for each median edge are recorded
+  below.
 - **§§4.1 and 4.7.** The verbs provider and user-space CM are useful references
   if we extend application compatibility after the wire milestone.
+
+| Ring edge | Median TX invocation | Receiver invocation |
+| --- | --- | --- |
+| Spark-04 → Spark-02 | `98f6e058ed304946878030553075fba2` | `c01f973e8ea8410faddbfb0d4687d891` |
+| Spark-02 → Spark-01 | `419e6d18fc8f491c805a8575978b11df` | `368182b74fa841babdcda9bfd1b598bb` |
+| Spark-01 → Spark-04 | `ed8a707852434029a2ada50c2b6720de` | `f95732fc56b840ba9aeece9c34743aa3` |

@@ -286,3 +286,21 @@ four polling cores per endpoint. The runner uses the management
 links for TCP setup and releases all three senders after every
 receiver is ready. It records each edge's rate, CPU and retries, and
 a lower bound on the interval when all three transfers were active.
+
+On November 23, 2026, the `a2c307f` build verified all 48 GiB in
+each of three trials. The three sender windows overlapped for at
+least 1.518 seconds in every trial. The six Ethernet interfaces
+reported 100 Gbit/s and MTU 1500. Requesters used 3.996–4.000 polling
+cores and responders used 4.000 each.
+
+| Edge | Median TX Gbit/s | Median RX Gbit/s | Requester retries per trial |
+| --- | --- | --- | --- |
+| Spark-04 → Spark-02 | 90.237 | 90.269 | 3, 0, 0 |
+| Spark-02 → Spark-01 | 47.829 | 47.844 | 1, 1, 0 |
+| Spark-01 → Spark-04 | 12.290 | 12.291 | 0, 0, 0 |
+
+One isolated 16 GiB check per slower edge used the same build, QP
+count, and CPU assignments. Spark-02 → Spark-01 verified 89.896 Gbit/s
+with 13 retries. Spark-01 → Spark-04 verified 12.934 Gbit/s with zero
+retries, RX misses, or packet errors. The cause of that path's lower
+throughput remains open.
