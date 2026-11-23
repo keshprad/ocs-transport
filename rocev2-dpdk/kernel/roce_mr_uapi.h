@@ -25,5 +25,7 @@ struct roce_mr_info {
 /* A successful registration returns a new close-on-exec mapping descriptor. */
 #define ROCE_MR_REGISTER _IOW(0xB7, 0, struct roce_mr_register)
 #define ROCE_MR_GET_INFO _IOR(0xB7, 1, struct roce_mr_info)
+/* Export the mapping descriptor's pinned pages as a new CLOEXEC DMA-BUF fd. */
+#define ROCE_MR_EXPORT_DMABUF _IO(0xB7, 2)
 
 #endif

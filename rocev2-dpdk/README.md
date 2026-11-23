@@ -56,7 +56,8 @@ with the default memfd registration. The mlx5 driver registers a writable
 service alias for DMA. The application must keep the submitted bytes stable
 until completion, which the worker reports after the peer verifies the
 WRITE and the local TX queues release their references. The kernel-pinned
-registration path still needs a DMA-capable export for physical scatter/gather.
+registration path has a DMA-BUF export and still needs mlx5 PMD
+integration for physical scatter/gather.
 
 ## Build and verify
 

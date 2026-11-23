@@ -19,16 +19,36 @@ access to the application account explicitly.
    the region is released. Read-only registrations cannot be upgraded
    to a writable mapping.
 
-The mapped alias supports CPU access to registered pages. Hardware
-scatter/gather needs a DMA-BUF export of the pinned pages and NIC
-registration against that export. The alias uses special PTEs to map
-anonymous folios. Linux GUP rejects that alias for a second pin.
-The descriptor handoff uses the Unix socket. Generic Netlink
-registration events and uverbs integration are follow-up milestones.
+The mapped alias uses special PTEs to give the worker CPU access to
+anonymous folios. Linux GUP rejects that alias for a second pin. The
+descriptor handoff uses the Unix socket. Generic Netlink registration
+events and uverbs integration are follow-up milestones.
 [Linux GUP design](https://docs.kernel.org/core-api/pin_user_pages.html)
+
+On kernels built with `CONFIG_DMA_SHARED_BUFFER`,
+`ioctl(mapping_fd, ROCE_MR_EXPORT_DMABUF, 0)` returns a close-on-exec
+DMA-BUF descriptor over the same pinned pages. The
+DMA-BUF descriptor and each importer retain the registration independently
+of the CPU alias. DMA mappings require a coherent device and direct access
+to the pages without bounce buffers. Read-only registrations allow only
+device reads (`DMA_TO_DEVICE`). The application and the device consumer must
+coordinate access and retain the registration through work completion.
+[Linux DMA-BUF API](https://docs.kernel.org/driver-api/dma-buf.html)
+
+Linux RDMA core requests bidirectional DMA for `ibv_reg_dmabuf_mr`.
+Register writable memory with `ROCE_MR_ACCESS_LOCAL_WRITE` for that path.
+The DPDK 23.11.7 mlx5 PMD still needs DMA-BUF import support to use these
+exports for packet scatter/gather.
+[Linux RDMA DMA-BUF importer](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/core/umem_dmabuf.c)
 
 Once the module is loaded and the device is available to the test
 account, run `make -C rocev2-dpdk/kernel check`. The test transfers
 a mapping descriptor between two processes, verifies visibility in
 both, and checks that closing the descriptor and releasing the
 application mapping leaves the worker mapping live.
+
+With `libibverbs` development files and access to an RDMA device, run
+`make -C rocev2-dpdk/kernel check-dma RDMA_DEVICE=rdmap1s0f0`.
+This test imports a writable export after releasing both the application
+VMA and CPU mapping descriptor, then verifies rejection of a read-only
+export by the bidirectional RDMA importer.
