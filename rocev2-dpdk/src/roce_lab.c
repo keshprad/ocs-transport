@@ -39,7 +39,7 @@ bool roce_lab_parse(char **argv, struct roce_lab_options *options)
         !roce_parse_uint(argv[6], UINT16_MAX, &pmtu) || !roce_valid_pmtu((uint16_t)pmtu))
         return false;
     *options = (struct roce_lab_options) {
-        .sender = sender, .size = size, .writes = 1, .control_ip = control.s_addr,
+        .sender = sender, .size = size, .writes = 1, .qps = 1, .control_ip = control.s_addr,
         .control_port = (uint16_t)port, .data_ip = ntohl(data.s_addr), .pmtu = (uint16_t)pmtu,
     };
     return true;
@@ -130,12 +130,22 @@ static bool transfer(int fd, void *value, size_t length, bool send_value)
     return true;
 }
 
+static bool exchange_count(int fd, uint32_t count)
+{
+    uint32_t value = htonl(count);
+    return transfer(fd, &value, sizeof(value), true) &&
+           transfer(fd, &value, sizeof(value), false) && ntohl(value) == count;
+}
+
 bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
                        const struct roce_lab_offer *local, struct roce_lab_offer *peer)
 {
     enum { MAGIC = 0x52435731, WORDS = 10 };
-    /* Keep the original record unchanged for the one-WR native peer. */
-    uint32_t extension = options->writes > 1 ? UINT32_C(0x80000000) : 0;
+    /* Keep the original record unchanged for the single-QP, single-WR peer. */
+    const uint32_t more_writes = UINT32_C(0x80000000);
+    const uint32_t more_qps = UINT32_C(0x40000000);
+    uint32_t extension = (options->writes > 1 ? more_writes : 0) |
+                         (options->qps > 1 ? more_qps : 0);
     uint32_t values[WORDS] = {
         htonl(MAGIC), htonl(options->size), htonl(local->data.ipv4),
         htonl(local->qpn), htonl(local->psn), htonl(local->pmtu),
@@ -152,19 +162,16 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
     for (size_t i = 0; i < WORDS; ++i)
         values[i] = ntohl(values[i]);
     uint64_t address = (uint64_t)values[7] << 32 | values[8];
-    uint64_t bytes = (uint64_t)options->size * options->writes;
+    uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
     if (values[0] != MAGIC || values[1] != options->size || !values[2] ||
-        values[2] == local->data.ipv4 || values[3] < 2 || values[3] >= ROCE_PSN_MASK ||
+        values[2] == local->data.ipv4 || values[3] < 2 || values[3] > ROCE_PSN_MASK - options->qps ||
         values[4] > ROCE_PSN_MASK || values[5] > ROCE_MAX_PMTU ||
         !roce_valid_pmtu((uint16_t)values[5]) || bytes - 1 > UINT64_MAX - address ||
         values[9] != (extension | (uint32_t)!options->sender) || (record[sizeof(values)] & 1))
         return false;
-    if (extension) {
-        uint32_t count = htonl(options->writes);
-        if (!transfer(fd, &count, sizeof(count), true) ||
-            !transfer(fd, &count, sizeof(count), false) || ntohl(count) != options->writes)
-            return false;
-    }
+    if (((extension & more_writes) && !exchange_count(fd, options->writes)) ||
+        ((extension & more_qps) && !exchange_count(fd, options->qps)))
+        return false;
     *peer = (struct roce_lab_offer) {
         .data.ipv4 = values[2], .qpn = values[3], .psn = values[4], .pmtu = (uint16_t)values[5],
         .region = { .address = address, .rkey = values[6], .size = values[1] },

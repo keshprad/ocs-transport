@@ -2,12 +2,12 @@
 
 `roce_write` originates and responds to host-memory IPv4 RoCEv2 Reliable
 Connected WRITEs on one DPDK Ethernet port. `roce_verbs_write` exercises the
-same test with a native verbs QP. By default each process transfers one message. The
-sender reports success after its transport completion and the receiver's
-byte-for-byte verification.
+same test with a native verbs QP. By default each process transfers one
+message on one QP. The sender reports success after its transport completion
+and the receiver's byte-for-byte verification.
 
 The test uses one directly connected Ethernet path, the default P_Key, an
-untagged IPv4 data path, and one nonempty plain RDMA WRITE. Both peers exchange
+untagged IPv4 data path, and nonempty plain RDMA WRITEs. Both peers exchange
 QP numbers, initial PSNs, PMTU, and buffer attributes over a private TCP
 connection. Run it on a trusted test network. The control protocol exposes the
 test memory region to the peer and assumes both processes are cooperating.
@@ -92,7 +92,7 @@ directly, so it also serves as a native-to-native control.
 For a temporary test, restore the prior Spark-04 native RoCE setting by
 repeating the devlink commands with `value true` once the services are idle.
 
-## Single-QP bandwidth probes
+## Bandwidth probes
 
 For an initial DPDK-to-DPDK comparison, run `roce_write` at both ends with
 the same message size and `--report-bw`. Both data functions need to
@@ -112,6 +112,14 @@ QP, and the receiver verifies every byte across all destination regions
 after the transfer. For example, use `BYTES=1048576` and `--writes 4096`
 to send 4 GiB in 1 MiB WRITEs. The transfer has one setup exchange and
 one timed interval.
+
+Add `--qps N` at both DPDK endpoints for 1–16 independent QPs. Each QP
+uses its own PSNs, retry state, and slice of the buffer. The total
+verified payload is `BYTES × writes × qps`. For example, compare 1 GiB
+over one QP using `--writes 1024` with the same payload over 16 QPs
+using `--writes 64 --qps 16`, both with `BYTES=1048576`.
+The endpoint rotates TX bursts across QPs on one DPDK queue and one
+polling core. `--tx-burst` counts packets per PMD submission.
 
 The requester accepts `--tx-burst N` (1–32, default 32) and
 `--send-window N` (1–512 packets, default 32). Use `--tx-burst 1`
@@ -144,6 +152,12 @@ at PMTU 1024, with zero retries and approximately one polling core per
 endpoint. A separate PMTU 256 stress run verified 4,097 WRITEs and
 16,781,312 packets with zero retries, exercising both offsets above
 4 GiB and a full cycle of 24-bit PSNs.
+
+In three matched 1 GiB memif trials per configuration, the median
+requester rate was 19.17 Gbit/s on one QP and 18.85 Gbit/s on 16 QPs.
+Both used PMTU 1024, 1 MiB WRITEs, 16 packets per TX burst, a
+256-packet window per QP, and one polling core at each end. All six
+trials verified the entire buffer with zero retries.
 
 The memif timings compare datapath changes on one host. Measure the
 physical DPDK link before selecting a default window or burst size. For

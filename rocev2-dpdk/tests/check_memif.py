@@ -21,10 +21,12 @@ def command(cpu, directory, role, size, port, ip, pmtu):
     ]
 
 
-def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=(), writes=1):
-    total = size * writes
+def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=(), writes=1, qps=1):
+    total = size * writes * qps
     if writes != 1:
         options = (*options, "--writes", str(writes))
+    if qps != 1:
+        options = (*options, "--qps", str(qps))
     with tempfile.TemporaryDirectory(prefix="roce-memif-") as directory:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -52,6 +54,7 @@ def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=(), writes=1):
                 if "--report-bw" in options:
                     for side, output in (("tx", sender.stdout), ("rx", stdout)):
                         assert f"BANDWIDTH role={side} payload_bytes={total} " in output, output
+                        assert f" writes={writes} qps={qps}" in output, output
                     print(stdout.strip())
             except BaseException:
                 if receiver.poll() is None:
@@ -70,6 +73,9 @@ def main():
           ("--report-bw", "--tx-burst", "16", "--send-window", "64"))
     check(8195, 1024, 1024, cpus[0], cpus[1],
           ("--report-bw", "--send-window", "256"), writes=65)
+    check(3, 1024, 1024, cpus[0], cpus[1], ("--report-bw",), qps=16)
+    check(1048579, 1024, 1024, cpus[0], cpus[1],
+          ("--report-bw", "--tx-burst", "16", "--send-window", "256"), writes=3, qps=16)
 
 
 if __name__ == "__main__":

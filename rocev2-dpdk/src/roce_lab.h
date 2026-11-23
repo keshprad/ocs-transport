@@ -3,12 +3,13 @@
 
 #include "roce_rc.h"
 
-enum { ROCE_LAB_TIMEOUT = 30, ROCE_LAB_RETRIES = 7 };
+enum { ROCE_LAB_TIMEOUT = 30, ROCE_LAB_RETRIES = 7, ROCE_LAB_MAX_QPS = 16 };
 
 struct roce_lab_options {
     bool sender;
     uint32_t size;
     uint32_t writes;
+    uint32_t qps;
     uint32_t control_ip;
     uint16_t control_port;
     uint32_t data_ip;

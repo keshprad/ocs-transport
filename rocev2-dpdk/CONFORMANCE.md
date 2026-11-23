@@ -41,7 +41,7 @@ open. No overall clause count is asserted.
 | --- | --- | --- |
 | WIRE | `make check` → `tests/check_wire.py` | Independent BTH/RETH/AETH and iCRC vectors for five opcodes, plus negative decode cases |
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
-| MEMIF | `make check-memif` | Two production DPDK processes verified 3 bytes in one packet, 1,048,579 bytes in 2,049 packets with PMTU negotiated from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP |
+| MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
 | SPARK | [Spark wire interoperability](README.md#spark-wire-interoperability) | Native controls passed both ways. Two mixed runs each verified all 8,195 bytes in both directions on ConnectX-7 at PMTU 1024. |
 
@@ -117,7 +117,9 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   buffer chaining, CRC acceleration, or a receive-copy offload.
 - **§5.1 and Appendix A.7.** Report QP count, batch size, and core usage with
   throughput. BURST's single-QP result is about 121 Gbit/s in its x86/400G
-  testbed. Establish the Spark single-QP baseline before considering
-  multi-QP scaling.
+  testbed. The DPDK test supports 16 QPs and independent RC state. The
+  first multi-QP probe shares one polling core and one PMD queue per
+  endpoint. Spark physical bandwidth and scaling across cores remain
+  open.
 - **§§4.1 and 4.7.** The verbs provider and user-space CM are useful references
   if we extend application compatibility after the wire milestone.
