@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "roce_app.h"
+#include "roce_doorbell.h"
 #include "roce_lab.h"
 #include "../kernel/roce_mr_uapi.h"
 
@@ -7,6 +8,7 @@
 #include <fcntl.h>
 #include <linux/magic.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -18,9 +20,10 @@
 #include <unistd.h>
 
 enum {
-    APP_VERSION = 1,
+    APP_VERSION = 2,
     APP_MEMFD = 1,
     APP_PINNED = 2,
+    APP_DOORBELL = 3,
     APP_SEALS = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL,
 };
 
@@ -28,7 +31,13 @@ struct app_workload {
     uint64_t bytes;
     uint32_t version;
     uint32_t sender;
+    uint32_t qps;
+    uint32_t workers;
+    uint32_t writes;
+    uint32_t reserved;
 };
+
+static const size_t doorbell_bytes = ROCE_LAB_MAX_QPS * sizeof(struct roce_doorbell);
 
 static size_t mapping_length(uint64_t bytes)
 {
@@ -181,8 +190,61 @@ static bool valid_mapping(int fd, uint8_t kind, size_t length, bool sender)
     return false;
 }
 
-bool roce_app_attach(const char *path, size_t bytes, bool sender, struct roce_app_memory *memory)
+static int create_shared_file(const char *name, size_t length)
 {
+    int fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0)
+        return -1;
+    if (ftruncate(fd, (off_t)length) == 0 && fcntl(fd, F_ADD_SEALS, APP_SEALS) >= 0)
+        return fd;
+    int error = errno;
+    close(fd);
+    errno = error;
+    return -1;
+}
+
+static struct roce_doorbell *offer_doorbells(int socket, uint32_t workers)
+{
+    int fd = create_shared_file("roce-doorbells", doorbell_bytes);
+    if (fd < 0)
+        return NULL;
+    struct roce_doorbell *queues = mmap(NULL, doorbell_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    bool valid = queues != MAP_FAILED;
+    for (uint32_t i = 0; valid && i < workers; ++i)
+        valid = roce_doorbell_init(&queues[i]);
+    if (queues != MAP_FAILED && !valid)
+        errno = ENOTSUP;
+    bool sent = valid && send_mapping(socket, fd, APP_DOORBELL);
+    int error = errno;
+    close(fd);
+    if (sent && roce_lab_receive(socket, 'P', false) == 1)
+        return queues;
+    if (queues != MAP_FAILED)
+        munmap(queues, doorbell_bytes);
+    errno = sent ? EPROTO : error;
+    return NULL;
+}
+
+bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32_t count, uint32_t writes)
+{
+    uint32_t cursor = 0, submitted = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t item = roce_doorbell_take(doorbell, &cursor);
+        uint32_t qp = (uint32_t)(item >> 32);
+        if (qp <= first || qp - first > count || (uint32_t)item != writes)
+            return false;
+        uint32_t bit = UINT32_C(1) << (qp - first - 1);
+        if (submitted & bit)
+            return false;
+        submitted |= bit;
+    }
+    return roce_doorbell_take(doorbell, &cursor) == 0;
+}
+
+bool roce_app_attach(const char *path, const struct roce_lab_options *options,
+                     struct roce_app_memory *memory)
+{
+    uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
     size_t length = mapping_length(bytes);
     if (!length) {
         errno = EINVAL;
@@ -191,7 +253,10 @@ bool roce_app_attach(const char *path, size_t bytes, bool sender, struct roce_ap
     int socket = accept_client(path);
     if (socket < 0)
         return false;
-    const struct app_workload workload = { .bytes = bytes, .version = APP_VERSION, .sender = sender };
+    const struct app_workload workload = {
+        .bytes = bytes, .version = APP_VERSION, .sender = options->sender,
+        .qps = options->qps, .workers = options->workers, .writes = options->writes,
+    };
     if (!configure_peer(socket) || send(socket, &workload, sizeof(workload), MSG_NOSIGNAL) != sizeof(workload))
         goto disconnect;
 
@@ -199,16 +264,29 @@ bool roce_app_attach(const char *path, size_t bytes, bool sender, struct roce_ap
     int fd = receive_mapping(socket, &kind);
     if (fd < 0)
         goto disconnect;
-    if (!valid_mapping(fd, kind, length, sender)) {
+    if (!valid_mapping(fd, kind, length, options->sender)) {
         close(fd);
         errno = EINVAL;
         goto disconnect;
     }
-    void *buffer = mmap(NULL, length, PROT_READ | (sender ? 0 : PROT_WRITE), MAP_SHARED, fd, 0);
+    void *buffer = mmap(NULL, length, PROT_READ | (options->sender ? 0 : PROT_WRITE),
+                        MAP_SHARED, fd, 0);
     close(fd);
     if (buffer == MAP_FAILED)
         goto disconnect;
-    *memory = (struct roce_app_memory) { .socket = socket, .buffer = buffer, .length = length };
+    struct roce_doorbell *doorbells = NULL;
+    if (options->sender) {
+        doorbells = offer_doorbells(socket, options->workers);
+        if (!doorbells) {
+            int error = errno;
+            munmap(buffer, length);
+            errno = error;
+            goto disconnect;
+        }
+    }
+    *memory = (struct roce_app_memory) {
+        .socket = socket, .buffer = buffer, .length = length, .doorbells = doorbells,
+    };
     return true;
 
 disconnect:
@@ -223,6 +301,8 @@ disconnect:
 void roce_app_detach(struct roce_app_memory *memory)
 {
     if (memory->socket >= 0) {
+        if (memory->doorbells)
+            munmap(memory->doorbells, doorbell_bytes);
         munmap(memory->buffer, memory->length);
         close(memory->socket);
         memory->socket = -1;
@@ -245,6 +325,53 @@ static int pin_mapping(const char *device, void *buffer, size_t length, bool sen
     return fd;
 }
 
+struct producer {
+    struct roce_doorbell *queue;
+    uint64_t item;
+    bool posted;
+};
+
+static void *publish_work(void *opaque)
+{
+    struct producer *producer = opaque;
+    producer->posted = roce_doorbell_publish(producer->queue, producer->item);
+    return NULL;
+}
+
+static bool post_writes(int socket, const struct app_workload *workload)
+{
+    uint8_t kind;
+    int fd = receive_mapping(socket, &kind);
+    if (fd < 0)
+        return false;
+    struct roce_doorbell *queues = MAP_FAILED;
+    if (kind == APP_DOORBELL && valid_mapping(fd, APP_MEMFD, doorbell_bytes, false))
+        queues = mmap(NULL, doorbell_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (queues == MAP_FAILED)
+        return false;
+
+    struct producer producers[ROCE_LAB_MAX_QPS];
+    pthread_t threads[ROCE_LAB_MAX_QPS];
+    uint32_t created = 0;
+    for (; created < workload->qps; ++created) {
+        uint32_t qp = created + 1;
+        uint32_t worker = (qp * workload->workers - 1) / workload->qps;
+        producers[created] = (struct producer) {
+            .queue = &queues[worker], .item = (uint64_t)qp << 32 | workload->writes,
+        };
+        if (pthread_create(&threads[created], NULL, publish_work, &producers[created]) != 0)
+            break;
+    }
+    bool posted = created == workload->qps;
+    for (uint32_t i = 0; i < created; ++i) {
+        pthread_join(threads[i], NULL);
+        posted = posted && producers[i].posted;
+    }
+    munmap(queues, doorbell_bytes);
+    return posted && roce_lab_send(socket, 'P');
+}
+
 bool roce_app_write(const char *path, const char *registration_device)
 {
     int socket = open_socket(path, false);
@@ -255,7 +382,9 @@ bool roce_app_write(const char *path, const char *registration_device)
     struct app_workload workload;
     if (!configure_peer(socket) ||
         recv(socket, &workload, sizeof(workload), MSG_TRUNC) != sizeof(workload) ||
-        workload.version != APP_VERSION || workload.sender > 1) {
+        workload.version != APP_VERSION || workload.sender > 1 || workload.reserved ||
+        !workload.qps || workload.qps > ROCE_LAB_MAX_QPS || !workload.workers ||
+        workload.workers > workload.qps || !workload.writes || workload.writes > ROCE_PSN_MASK) {
         errno = EPROTO;
         goto disconnect;
     }
@@ -268,9 +397,8 @@ bool roce_app_write(const char *path, const char *registration_device)
     if (registration_device) {
         flags |= MAP_ANONYMOUS;
     } else {
-        region = memfd_create("roce-app-mr", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (region < 0 || ftruncate(region, (off_t)length) != 0 ||
-            fcntl(region, F_ADD_SEALS, APP_SEALS) < 0)
+        region = create_shared_file("roce-app-mr", length);
+        if (region < 0)
             goto disconnect;
     }
     uint8_t *buffer = mmap(NULL, length, PROT_READ | PROT_WRITE, flags, region, 0);
@@ -281,9 +409,10 @@ bool roce_app_write(const char *path, const char *registration_device)
     if (registration_device)
         region = pin_mapping(registration_device, buffer, length, workload.sender);
     if (region >= 0 && send_mapping(socket, region, registration_device ? APP_PINNED : APP_MEMFD)) {
-        if (workload.sender ||
-            (roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
-             roce_lab_send(socket, 'V'))) {
+        bool posted = workload.sender ? post_writes(socket, &workload) :
+            roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
+            roce_lab_send(socket, 'V');
+        if (posted) {
             success = roce_lab_receive(socket, 'C', false) == 1;
             if (success)
                 printf("Application %s %zu bytes\n", workload.sender ? "completed" : "verified", bytes);

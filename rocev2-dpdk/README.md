@@ -34,6 +34,12 @@ application verifies the bytes in its own mapping before returning the
 verification response. `make check-app` exercises the four-process
 path over memif.
 
+The requester application posts each QP's configured WRITE batch to
+its worker's process-shared doorbell queue. Application threads can
+publish concurrently. Each DPDK worker admits its own QPs before data
+transfer starts. An application producer publishes the notification
+atomically, so an exit before publication leaves the slot available.
+
 With the registration module loaded and accessible to the client, use
 `./roce_app_write "$APP_SOCKET" --kernel-mr /dev/roce_mr` to register a
 page-aligned application allocation. The [kernel test](kernel/README.md)

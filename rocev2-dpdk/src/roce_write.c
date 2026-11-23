@@ -1,4 +1,5 @@
 #include "roce_app.h"
+#include "roce_doorbell.h"
 #include "roce_lab.h"
 #include "../../mrc-dpdk/src/dpdk_io.h"
 
@@ -47,10 +48,12 @@ enum run_state { WRITE_WAITING, WRITE_RUNNING, WRITE_STOPPED };
 struct write_run {
     const struct datapath_options *options;
     struct rte_mempool *pool;
+    struct roce_doorbell *doorbells;
     uint16_t port;
     bool sender;
     atomic_int state;
     atomic_uint finished_workers;
+    atomic_uint ready_workers;
     atomic_bool failed;
 };
 
@@ -58,6 +61,7 @@ struct write_worker {
     struct write_run *run;
     uint16_t queue;
     uint32_t base_qpn;
+    uint32_t first_qp;
     uint32_t qps;
     uint32_t completed;
     uint32_t next;
@@ -304,10 +308,27 @@ static void sample_cpu(struct write_worker *worker)
         worker->cpu_ns = thread_cpu_ns() - worker->cpu_started;
 }
 
+static bool claim_work(const struct write_worker *worker)
+{
+    const struct write_run *run = worker->run;
+    if (roce_app_take_writes(&run->doorbells[worker->queue], worker->first_qp,
+                             worker->qps, run->options->writes))
+        return true;
+    fprintf(stderr, "invalid application work for worker %u\n", worker->queue);
+    return false;
+}
+
 static int run_worker(void *arg)
 {
     struct write_worker *worker = arg;
     struct write_run *run = worker->run;
+    if (run->doorbells) {
+        if (!claim_work(worker)) {
+            atomic_store_explicit(&run->failed, true, memory_order_release);
+            return 1;
+        }
+        atomic_fetch_add_explicit(&run->ready_workers, 1, memory_order_release);
+    }
     int state;
     while ((state = atomic_load_explicit(&run->state, memory_order_acquire)) == WRITE_WAITING)
         rte_pause();
@@ -404,11 +425,12 @@ static bool verify_result(int fd, int application, const struct write_worker *wo
 
 static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
-               const struct roce_lab_options *lab, uint8_t *buffer, int application, bool steer,
+               const struct roce_lab_options *lab, uint8_t *buffer,
+               const struct roce_app_memory *application, bool steer,
                const struct datapath_options *options)
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
-                             .state = WRITE_WAITING };
+                             .state = WRITE_WAITING, .doorbells = application->doorbells };
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
     struct rte_flow *flows[ROCE_LAB_MAX_QPS] = {0};
     uint16_t pmtu = local->pmtu < peer->pmtu ? local->pmtu : peer->pmtu;
@@ -422,6 +444,7 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
         worker->run = &run;
         worker->queue = queue;
         worker->base_qpn = local->qpn + first;
+        worker->first_qp = first;
         worker->qps = end - first;
         if (!init_qps(worker, first, pmtu, local, peer, buffer)) {
             fprintf(stderr, "WRITE sequence exceeds the requester range\n");
@@ -441,6 +464,19 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
             goto stop_workers;
         }
         ++launched;
+    }
+
+    if (run.doorbells) {
+        if (!claim_work(&workers[0]))
+            goto stop_workers;
+        uint64_t deadline = roce_now_ns() + (uint64_t)ROCE_LAB_TIMEOUT * NS_PER_SEC;
+        while (atomic_load_explicit(&run.ready_workers, memory_order_acquire) != launched) {
+            if (atomic_load_explicit(&run.failed, memory_order_acquire) || roce_now_ns() >= deadline) {
+                fprintf(stderr, "application work admission failed\n");
+                goto stop_workers;
+            }
+            rte_pause();
+        }
     }
 
     bool completed = false;
@@ -467,7 +503,7 @@ stop_workers:
     if (!result) {
         uint64_t bytes = local->region.size * options->writes * options->qps;
         uint64_t qp_packets = ((local->region.size - 1) / pmtu + 1) * options->writes;
-        result = !verify_result(fd, application, workers, started, buffer, bytes, qp_packets);
+        result = !verify_result(fd, application->socket, workers, started, buffer, bytes, qp_packets);
     }
     if (result)
         fprintf(stderr, "WRITE or verification exchange did not complete\n");
@@ -617,7 +653,7 @@ int main(int argc, char **argv)
         goto cleanup_buffers;
     }
     if (datapath.app_socket) {
-        if (!roce_app_attach(datapath.app_socket, (size_t)bytes, options.sender, &application)) {
+        if (!roce_app_attach(datapath.app_socket, &options, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
@@ -649,7 +685,7 @@ int main(int argc, char **argv)
         goto cleanup_port;
     }
     if (roce_lab_exchange(fd, &options, &local, &peer)) {
-        result = run(fd, port, pool, &local, &peer, &options, buffer, application.socket,
+        result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
                      options.workers > 1 && !memif, &datapath);
     } else {
         fprintf(stderr, "control setup failed\n");
