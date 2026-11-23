@@ -65,6 +65,17 @@ A follow-up probe on Spark-04 reproduced the same TIS failure with both the
 Verbs and Direct Verbs steering modes (`dv_flow_en=0` and `dv_flow_en=1`).
 Both probes stopped before Ethernet port setup and sent no test traffic.
 
+The installed MRC smoke services provide a separate physical DPDK baseline.
+Using the root-owned snapshot for `32d67ee5464821c0ad19fbc8e35caa1a5bd3927f`,
+Spark-04 → Spark-02 → Spark-01 → Spark-04 each completed and verified a
+256 MiB WRITE on UDP 4971 across both rails. The three receivers counted
+131,396 / 130,748, 131,052 / 131,092, and 131,356 / 130,788 segments
+respectively. This confirmed the lab links and mlx5 initialization under the
+existing service capabilities. The prepared RoCEv2 services use the same
+capabilities and runtime on Spark-04, with a separate binary and UDP 4791.
+The pinned native-verbs test binary subsequently passed the 8,195-byte
+control at PMTU 1024 in both directions between Spark-04 and Spark-02.
+
 ## BURST implementation notes
 
 Shen et al., [*BURST* (NSDI 2026)](https://www.usenix.org/system/files/nsdi26-shen.pdf),
