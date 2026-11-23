@@ -189,3 +189,22 @@ the near-line-rate target, compare sustained software payload rate with
 the matched native payload rate on the same paths and MTU. Use 95% of
 the native control as the initial gate. Report single-QP and batched
 multi-QP rates separately, following [BURST §5.1 and Appendix A.7](https://www.usenix.org/system/files/nsdi26-shen.pdf).
+
+### Physical single-rail sweep
+
+Run the first-rail sweep from Spark-04 after the pinned services are
+installed on Spark-04 and Spark-02 and both data functions are in raw
+Ethernet mode. TCP setup uses the second rail. Each sample transfers
+16 GiB in 1 MiB WRITEs at PMTU 1024. The four profiles use one QP or
+16 QPs with one, two, or four workers. Each profile runs three samples
+by default.
+
+```sh
+python3 tests/check_spark_bandwidth.py \
+  --destination "/opt/ocs-roce-bw/$REVISION" --sha256 "$BINARY_SHA256"
+```
+
+The runner verifies the binary and service arguments on both hosts.
+It records the active link configuration, both endpoints' verified
+bandwidth and CPU time, the requester's retry count, and the systemd
+invocation logs.
