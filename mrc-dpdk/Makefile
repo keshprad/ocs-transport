@@ -21,7 +21,8 @@ mrc_bench: src/mrc_bench.c src/dpdk_io.c src/dpdk_io.h
 MRC_ENDPOINT_SRC = src/mrc_endpoint.c src/dpdk_io.c src/mrc_qp.c src/mrc_wire.c src/mrc_cc.c src/mrc_wr.c \
                    src/mrc_ev.c src/mrc_ev_event_io.c src/mrc_mpr.c src/mrc_provider.c \
                    src/mrc_provider_qp.c src/mrc_ctl_store.c src/mrc_port_netlink.c
-MRC_ENDPOINT_HEADERS = src/mrc_endpoint.h src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h \
+ROCE_ICRC_HEADER = ../common/roce_icrc.h
+MRC_ENDPOINT_HEADERS = $(ROCE_ICRC_HEADER) src/mrc_endpoint.h src/dpdk_io.h src/mrc_qp.h src/mrc_wire.h src/mrc_cc.h src/mrc_wr.h \
                        src/mrc_ev.h src/mrc_ev_event_io.h src/mrc_mpr.h src/mrc_provider.h src/mrc_ctl_store.h \
                        src/mrc_port_netlink.h
 
@@ -40,11 +41,11 @@ mrc_bench mrc_write tests/mrc_memif_relay tests/mrc_endpoint_application:
 	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(LDLIBS)
 
 tests/test_mrc_qp: tests/test_mrc_qp.c src/mrc_qp.c src/mrc_qp.h
-tests/test_mrc_wire: tests/test_mrc_wire.c src/mrc_wire.c src/mrc_wire.h
+tests/test_mrc_wire: tests/test_mrc_wire.c src/mrc_wire.c src/mrc_wire.h $(ROCE_ICRC_HEADER)
 
 tests/test_mrc_cc: tests/test_mrc_cc.c src/mrc_cc.c src/mrc_cc.h
 tests/test_mrc_wr: tests/test_mrc_wr.c src/mrc_wr.c src/mrc_wire.c src/mrc_qp.c \
-                   src/mrc_provider.c src/mrc_provider_qp.c src/mrc_wr.h src/mrc_wire.h src/mrc_qp.h src/mrc_provider.h
+                   src/mrc_provider.c src/mrc_provider_qp.c src/mrc_wr.h src/mrc_wire.h src/mrc_qp.h src/mrc_provider.h $(ROCE_ICRC_HEADER)
 
 tests/test_mrc_connect: tests/test_mrc_connect.c src/mrc_connect.c src/mrc_connect.h src/mrc_qp.h src/mrc_wire.h
 tests/test_mrc_ev: tests/test_mrc_ev.c src/mrc_ev.c src/mrc_ev.h
@@ -130,7 +131,7 @@ tests/mrc_write_ready: tests/mrc_write_ready.c src/mrc_write.c src/mrc_connect.c
 	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) $(LDFLAGS) -Wl,--wrap=mrc_requester_create -Wl,--wrap=mrc_responder_create -Wl,--wrap=mrc_dpdk_close_port -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(LDLIBS)
 
 # Independent Linux NEXT-CSID forwarding of production-encoded envelopes.
-tests/mrc_srv6_encode: tests/mrc_srv6_encode.c src/mrc_wire.c src/mrc_wire.h
+tests/mrc_srv6_encode: tests/mrc_srv6_encode.c src/mrc_wire.c src/mrc_wire.h $(ROCE_ICRC_HEADER)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 .PHONY: check-srv6-csid

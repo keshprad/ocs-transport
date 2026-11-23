@@ -1,0 +1,4 @@
+/roce_write
+/roce_verbs_write
+/tests/test_roce
+/tests/roce_wire_cli

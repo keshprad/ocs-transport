@@ -1,0 +1,173 @@
+#include "roce_wire.h"
+
+#include "../../common/roce_icrc.h"
+
+enum { ETH = 14, IP = 20, UDP = 8, BTH = 12, RETH = 16, AETH = 4, ICRC = 4 };
+
+static uint32_t read_be(const uint8_t *bytes, size_t width)
+{
+    uint32_t value = 0;
+    for (size_t i = 0; i < width; ++i)
+        value = (value << 8) | bytes[i];
+    return value;
+}
+
+static void write_be(uint8_t *bytes, size_t width, uint32_t value)
+{
+    while (width) {
+        bytes[--width] = (uint8_t)value;
+        value >>= 8;
+    }
+}
+
+static uint16_t internet_checksum(const uint8_t *bytes, size_t length,
+                                  uint32_t sum)
+{
+    while (length >= 2) {
+        sum += read_be(bytes, 2);
+        bytes += 2;
+        length -= 2;
+    }
+    if (length)
+        sum += (uint32_t)*bytes << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static size_t extension_size(enum roce_opcode opcode)
+{
+    switch (opcode) {
+    case ROCE_WRITE_FIRST:
+    case ROCE_WRITE_ONLY:
+        return RETH;
+    case ROCE_WRITE_MIDDLE:
+    case ROCE_WRITE_LAST:
+        return 0;
+    case ROCE_ACK:
+        return AETH;
+    }
+    return SIZE_MAX;
+}
+
+size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *p)
+{
+    size_t extension = extension_size(p->opcode);
+    if (extension == SIZE_MAX || p->payload_length > ROCE_MAX_PMTU ||
+        (p->payload_length && !p->payload) || !p->udp_source ||
+        p->qpn > ROCE_PSN_MASK || p->psn > ROCE_PSN_MASK ||
+        p->msn > ROCE_PSN_MASK || (p->opcode == ROCE_ACK && p->payload_length))
+        return 0;
+
+    size_t pad = (4 - p->payload_length % 4) % 4;
+    size_t length = ETH + IP + UDP + BTH + extension + p->payload_length + pad + ICRC;
+    if (capacity < length)
+        return 0;
+
+    memcpy(frame, p->dst.mac, ROCE_MAC_LEN);
+    memcpy(frame + ROCE_MAC_LEN, p->src.mac, ROCE_MAC_LEN);
+    write_be(frame + 12, 2, 0x0800);
+    uint8_t *ip = frame + ETH;
+    memset(ip, 0, IP + UDP + BTH);
+    ip[0] = 0x45;
+    write_be(ip + 2, 2, (uint32_t)(length - ETH));
+    ip[6] = 0x40;
+    ip[8] = 64;
+    ip[9] = 17;
+    write_be(ip + 12, 4, p->src.ipv4);
+    write_be(ip + 16, 4, p->dst.ipv4);
+    write_be(ip + 10, 2, internet_checksum(ip, IP, 0));
+
+    uint8_t *udp = ip + IP;
+    write_be(udp, 2, p->udp_source);
+    write_be(udp + 2, 2, ROCE_UDP_PORT);
+    write_be(udp + 4, 2, (uint32_t)(length - ETH - IP));
+
+    uint8_t *bth = udp + UDP;
+    bth[0] = (uint8_t)p->opcode;
+    bth[1] = (uint8_t)(pad << 4);
+    write_be(bth + 2, 2, p->pkey);
+    write_be(bth + 5, 3, p->qpn);
+    bth[8] = p->ack_requested ? 0x80 : 0;
+    write_be(bth + 9, 3, p->psn);
+
+    uint8_t *ext = bth + BTH;
+    if (extension == RETH) {
+        write_be(ext, 4, (uint32_t)(p->remote_address >> 32));
+        write_be(ext + 4, 4, (uint32_t)p->remote_address);
+        write_be(ext + 8, 4, p->rkey);
+        write_be(ext + 12, 4, p->write_length);
+    } else if (extension == AETH) {
+        ext[0] = p->syndrome;
+        write_be(ext + 1, 3, p->msn);
+    }
+    if (p->payload_length)
+        memcpy(ext + extension, p->payload, p->payload_length);
+    memset(ext + extension + p->payload_length, 0, pad);
+    uint32_t crc = roce_icrc(ip, IP, length - ETH - ICRC);
+    for (size_t i = 0; i < ICRC; ++i)
+        frame[length - ICRC + i] = (uint8_t)(crc >> (8 * i));
+    return length;
+}
+
+bool roce_decode(struct roce_packet *packet, const uint8_t *frame, size_t frame_length)
+{
+    if (frame_length < ETH + IP + UDP + BTH + ICRC || read_be(frame + 12, 2) != 0x0800)
+        return false;
+    const uint8_t *ip = frame + ETH;
+    size_t ip_length = read_be(ip + 2, 2);
+    if (ip[0] != 0x45 || ip[9] != 17 || (read_be(ip + 6, 2) & 0xbfff) ||
+        ip_length < IP + UDP + BTH + ICRC || ip_length > frame_length - ETH ||
+        ip_length > ROCE_MAX_FRAME - ETH || internet_checksum(ip, IP, 0))
+        return false;
+
+    const uint8_t *udp = ip + IP;
+    if (read_be(udp + 2, 2) != ROCE_UDP_PORT || read_be(udp + 4, 2) != ip_length - IP)
+        return false;
+    if (read_be(udp + 6, 2)) {
+        uint32_t pseudo = read_be(ip + 12, 2) + read_be(ip + 14, 2) +
+                          read_be(ip + 16, 2) + read_be(ip + 18, 2) +
+                          17 + (uint32_t)(ip_length - IP);
+        if (internet_checksum(udp, ip_length - IP, pseudo))
+            return false;
+    }
+
+    const uint8_t *bth = udp + UDP;
+    enum roce_opcode opcode = (enum roce_opcode)bth[0];
+    size_t extension = extension_size(opcode);
+    size_t pad = (bth[1] >> 4) & 3;
+    size_t body = ip_length - (IP + UDP + BTH + ICRC);
+    if ((body & 3) || (bth[1] & 0x0f) || extension == SIZE_MAX || extension + pad > body)
+        return false;
+    size_t payload_length = body - extension - pad;
+    if (payload_length > ROCE_MAX_PMTU || (opcode == ROCE_ACK && (payload_length || pad)))
+        return false;
+
+    const uint8_t *crc_bytes = ip + ip_length - ICRC;
+    uint32_t crc = 0;
+    for (size_t i = 0; i < ICRC; ++i)
+        crc |= (uint32_t)crc_bytes[i] << (8 * i);
+    if (crc != roce_icrc(ip, IP, ip_length - ICRC))
+        return false;
+
+    struct roce_packet p = {
+        .src.ipv4 = read_be(ip + 12, 4), .dst.ipv4 = read_be(ip + 16, 4),
+        .udp_source = (uint16_t)read_be(udp, 2), .pkey = (uint16_t)read_be(bth + 2, 2),
+        .qpn = read_be(bth + 5, 3), .psn = read_be(bth + 9, 3), .opcode = opcode,
+        .ack_requested = (bth[8] & 0x80) != 0,
+        .payload = bth + BTH + extension, .payload_length = payload_length,
+    };
+    memcpy(p.dst.mac, frame, ROCE_MAC_LEN);
+    memcpy(p.src.mac, frame + ROCE_MAC_LEN, ROCE_MAC_LEN);
+    const uint8_t *ext = bth + BTH;
+    if (extension == RETH) {
+        p.remote_address = (uint64_t)read_be(ext, 4) << 32 | read_be(ext + 4, 4);
+        p.rkey = read_be(ext + 8, 4);
+        p.write_length = read_be(ext + 12, 4);
+    } else if (extension == AETH) {
+        p.syndrome = ext[0];
+        p.msn = read_be(ext + 1, 3);
+    }
+    *packet = p;
+    return true;
+}
