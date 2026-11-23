@@ -118,8 +118,18 @@ uses its own PSNs, retry state, and slice of the buffer. The total
 verified payload is `BYTES × writes × qps`. For example, compare 1 GiB
 over one QP using `--writes 1024` with the same payload over 16 QPs
 using `--writes 64 --qps 16`, both with `BYTES=1048576`.
-The endpoint rotates TX bursts across QPs on one DPDK queue and one
-polling core. `--tx-burst` counts packets per PMD submission.
+By default one polling core rotates TX bursts across QPs.
+`--tx-burst` counts packets per PMD submission. Use `--workers N` on
+both DPDK endpoints and enable at least N EAL lcores, including the
+main lcore. For example, use `-l 5,6,7,8` before the EAL separator and
+`--qps 16 --workers 4` after it. Each worker owns one RX/TX queue pair
+and a disjoint range of QPs. Memif connects matching queue indices. On
+physical devices, DPDK flow rules steer each QP by its peer IP addresses
+and UDP ports, so the PMD must support that pattern and queue action.
+
+The multi-worker rate uses aggregate verified bytes and ends at the
+last local queue completion. Reported CPU time sums the polling threads
+until each exits or observes endpoint completion.
 
 The requester accepts `--tx-burst N` (1–32, default 32) and
 `--send-window N` (1–512 packets, default 32). Use `--tx-burst 1`
@@ -161,6 +171,17 @@ on one QP and 43.54 Gbit/s on 16 QPs. Both experiments pinned RX to CPU 5
 and TX to CPU 9 on Spark-04 and used PMTU 1024, 1 MiB WRITEs, 16 packets
 per TX burst, and a 256-packet window per QP. Every transfer verified with
 zero retries and used approximately one polling core per endpoint.
+
+Three further 4 GiB memif trials per configuration used 16 QPs and
+256 WRITEs per QP with the same PMTU, burst, and window. RX used the
+first N CPUs of 5, 6, 15, and 16 on Spark-04. TX used the first N of
+9, 8, 19, and 18. All nine transfers verified with zero retries.
+
+| Polling workers per endpoint | Median requester payload Gbit/s | Median requester polling cores used |
+| --- | --- | --- |
+| 1 | 45.40 | 1.00 |
+| 2 | 73.11 | 2.00 |
+| 4 | 134.99 | 3.85 |
 
 The memif timings compare datapath changes on one host. Measure the
 physical DPDK link before selecting a default window or burst size. For

@@ -16,7 +16,8 @@ static struct roce_packet outgoing(const struct roce_qp *qp, enum roce_opcode op
         .src = qp->local, .dst = qp->peer, .opcode = opcode,
         .qpn = qp->peer_qpn, .psn = psn & ROCE_PSN_MASK,
         .pkey = ROCE_PKEY,
-        .udp_source = (uint16_t)(0xc000 | ((qp->local_qpn ^ qp->peer_qpn) & 0x3fff)),
+        .udp_source = qp->udp_source ? qp->udp_source :
+            (uint16_t)(0xc000 | ((qp->local_qpn ^ qp->peer_qpn) & 0x3fff)),
     };
 }
 

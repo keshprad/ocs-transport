@@ -22,7 +22,7 @@ to check implementation behavior and run independent interoperability tests.
 
 | Source | Scoped behavior | Status and evidence |
 | --- | --- | --- |
-| A17.3.1–A17.3.2, CA17-20–21 | IPv4 UDP encapsulation, destination 4791, length including iCRC, stable source port per QP | **V**. `WIRE` compares complete IPv4 frames against an independent encoder. Source port derives solely from the local and remote QPN. |
+| A17.3.1–A17.3.2, CA17-20–21 | IPv4 UDP encapsulation, destination 4791, length including iCRC, stable source port per QP | **V**. `WIRE` compares complete IPv4 frames against an independent encoder. The single-worker profile derives the source port from the local and remote QPN. The multi-worker profile uses the local QPN so each peer can steer its incoming QPs to the intended queues. |
 | A17.3.3–A17.3.4 | Compute the invariant CRC and drop bad frames | **V** for the supported packet shapes. `WIRE` checks independent CRCs for WRITE and ACK encodings, tolerates changes to masked IPv4 fields and rejects truncation and corruption. `PEER` checks that a corrupted WRITE does not advance the live responder. |
 | A17.4.1–A17.4.4, §9.6 | Match IPv4 address/QP/partition and use the IPv4-mapped GID on the verbs peer | **P**. `RC` checks wrong peer IP, QPN, and P_Key on feedback. Native control verifies setup for the active IPv4 GID. Broader routing, VLAN, and IPv6 coverage is open. |
 | §§5.2, 9.2, 9.4.3, C9-18–20 | RC WRITE Only and First/Middle/Last segmentation, RETH placement, AETH response, and padding | **V** for nonempty plain WRITE. `WIRE` compares all five packet layouts. `RC` checks first, middle and unaligned last geometry and `MEMIF` verifies reassembly at the negotiated PMTU. |
@@ -41,7 +41,7 @@ open. No overall clause count is asserted.
 | --- | --- | --- |
 | WIRE | `make check` → `tests/check_wire.py` | Independent BTH/RETH/AETH and iCRC vectors for five opcodes, plus negative decode cases |
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
-| MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. |
+| MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. With four available CPUs, a two-queue test verifies WRITEs on three QPs. |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
 | SPARK | [Spark wire interoperability](README.md#spark-wire-interoperability) | Native controls passed both ways. Two mixed runs each verified all 8,195 bytes in both directions on ConnectX-7 at PMTU 1024. |
 
@@ -119,9 +119,9 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   open.
 - **§5.1 and Appendix A.7.** Report QP count, batch size, and core usage with
   throughput. BURST's single-QP result is about 121 Gbit/s in its x86/400G
-  testbed. The DPDK test supports 16 QPs and independent RC state. The
-  first multi-QP probe shares one polling core and one PMD queue per
-  endpoint. Spark physical bandwidth and scaling across cores remain
-  open.
+  testbed. The DPDK test supports 16 QPs and independent RC state.
+  The multi-queue memif test covers independent polling cores per
+  endpoint. Verification of ConnectX-7 steering and physical bandwidth
+  remains open.
 - **§§4.1 and 4.7.** The verbs provider and user-space CM are useful references
   if we extend application compatibility after the wire milestone.

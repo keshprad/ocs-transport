@@ -10,6 +10,7 @@ struct roce_lab_options {
     uint32_t size;
     uint32_t writes;
     uint32_t qps;
+    uint32_t workers;
     uint32_t control_ip;
     uint16_t control_port;
     uint32_t data_ip;

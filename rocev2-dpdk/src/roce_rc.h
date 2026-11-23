@@ -14,6 +14,7 @@ struct roce_qp {
     uint32_t local_qpn;
     uint32_t peer_qpn;
     uint16_t pmtu;
+    uint16_t udp_source;
 };
 
 struct roce_region {

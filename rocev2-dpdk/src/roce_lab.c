@@ -39,7 +39,8 @@ bool roce_lab_parse(char **argv, struct roce_lab_options *options)
         !roce_parse_uint(argv[6], UINT16_MAX, &pmtu) || !roce_valid_pmtu((uint16_t)pmtu))
         return false;
     *options = (struct roce_lab_options) {
-        .sender = sender, .size = size, .writes = 1, .qps = 1, .control_ip = control.s_addr,
+        .sender = sender, .size = size, .writes = 1, .qps = 1, .workers = 1,
+        .control_ip = control.s_addr,
         .control_port = (uint16_t)port, .data_ip = ntohl(data.s_addr), .pmtu = (uint16_t)pmtu,
     };
     return true;
@@ -144,8 +145,10 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
     /* Keep the original record unchanged for the single-QP, single-WR peer. */
     const uint32_t more_writes = UINT32_C(0x80000000);
     const uint32_t more_qps = UINT32_C(0x40000000);
+    const uint32_t more_workers = UINT32_C(0x20000000);
     uint32_t extension = (options->writes > 1 ? more_writes : 0) |
-                         (options->qps > 1 ? more_qps : 0);
+                         (options->qps > 1 ? more_qps : 0) |
+                         (options->workers > 1 ? more_workers : 0);
     uint32_t values[WORDS] = {
         htonl(MAGIC), htonl(options->size), htonl(local->data.ipv4),
         htonl(local->qpn), htonl(local->psn), htonl(local->pmtu),
@@ -170,7 +173,8 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
         values[9] != (extension | (uint32_t)!options->sender) || (record[sizeof(values)] & 1))
         return false;
     if (((extension & more_writes) && !exchange_count(fd, options->writes)) ||
-        ((extension & more_qps) && !exchange_count(fd, options->qps)))
+        ((extension & more_qps) && !exchange_count(fd, options->qps)) ||
+        ((extension & more_workers) && !exchange_count(fd, options->workers)))
         return false;
     *peer = (struct roce_lab_offer) {
         .data.ipv4 = values[2], .qpn = values[3], .psn = values[4], .pmtu = (uint16_t)values[5],

@@ -13,20 +13,24 @@ BINARY = Path(__file__).resolve().parents[1] / "roce_write"
 
 def command(cpu, directory, role, size, port, ip, pmtu):
     driver_role = "server" if role == "rx" else "client"
+    cpus = (cpu,) if isinstance(cpu, int) else cpu
+    lcores = ",".join(f"{index}@{core}" for index, core in enumerate(cpus))
     return [
-        str(BINARY), f"--lcores=0@{cpu}", "--no-huge", "--no-pci", "--no-telemetry",
+        str(BINARY), f"--lcores={lcores}", "--no-huge", "--no-pci", "--no-telemetry",
         f"--file-prefix=roce-{directory.name}-{role}",
         f"--vdev=net_memif0,role={driver_role},socket={directory / 'link'},socket-abstract=no",
         "--", role, str(size), "127.0.0.1", str(port), ip, str(pmtu), "net_memif0",
     ]
 
 
-def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=(), writes=1, qps=1):
+def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=(), writes=1, qps=1, workers=1):
     total = size * writes * qps
     if writes != 1:
         options = (*options, "--writes", str(writes))
     if qps != 1:
         options = (*options, "--qps", str(qps))
+    if workers != 1:
+        options = (*options, "--workers", str(workers))
     with tempfile.TemporaryDirectory(prefix="roce-memif-") as directory:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -54,7 +58,7 @@ def check(size, rx_mtu, tx_mtu, rx_cpu, tx_cpu, options=(), writes=1, qps=1):
                 if "--report-bw" in options:
                     for side, output in (("tx", sender.stdout), ("rx", stdout)):
                         assert f"BANDWIDTH role={side} payload_bytes={total} " in output, output
-                        assert f" writes={writes} qps={qps}" in output, output
+                        assert f" writes={writes} qps={qps} workers={workers}" in output, output
                     print(stdout.strip())
             except BaseException:
                 if receiver.poll() is None:
@@ -76,6 +80,9 @@ def main():
     check(3, 1024, 1024, cpus[0], cpus[1], ("--report-bw",), qps=16)
     check(1048579, 1024, 1024, cpus[0], cpus[1],
           ("--report-bw", "--tx-burst", "16", "--send-window", "256"), writes=3, qps=16)
+    if len(cpus) >= 4:
+        check(1048579, 1024, 1024, cpus[:2], cpus[2:4],
+              ("--report-bw", "--tx-burst", "16", "--send-window", "256"), writes=3, qps=3, workers=2)
 
 
 if __name__ == "__main__":
