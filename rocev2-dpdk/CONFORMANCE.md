@@ -61,6 +61,10 @@ checking UDP 4791 reception and repeating both mixed directions. See the
 [mlx5 runtime requirements](https://doc.dpdk.org/guides-23.11/platform/mlx5.html#run-as-non-root).
 No throughput or latency samples were collected for the mixed path.
 
+A follow-up probe on Spark-04 reproduced the same TIS failure with both the
+Verbs and Direct Verbs steering modes (`dv_flow_en=0` and `dv_flow_en=1`).
+Both probes stopped before Ethernet port setup and sent no test traffic.
+
 ## BURST implementation notes
 
 Shen et al., [*BURST* (NSDI 2026)](https://www.usenix.org/system/files/nsdi26-shen.pdf),
