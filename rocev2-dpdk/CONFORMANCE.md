@@ -430,6 +430,34 @@ PMTU 1024. Both runs used required Generic Netlink handoff and had zero
 RC retries. The worker retires scatter/gather WRITEs in QP order after
 the RC ACK and release of that slot's PMD references.
 
+Version 3 appends an array of second source descriptors after the
+version 2 send queue layout. Both SGEs must use the configured MR. The
+worker snapshots both addresses and lengths after validation and uses
+the same snapshot on retransmission.
+The wire tests compare two-span packet bytes, padding and iCRC against
+the contiguous encoder. The provider test rejects the wrong descriptor
+size, an invalid second lkey and an out-of-range second address. It also
+polls ordered completions for a two-SGE WRITE followed by a one-SGE WRITE.
+
+On the exact Spark-04 kernel, one-QP Netlink-backed copy and scatter/gather
+CM runs each verified 24,585 bytes and three completions at PMTU 1024.
+The gather trace showed four mbuf segments for a packet that crossed
+the boundary with one byte from the first SGE and 1,023 from the second.
+Dropping that packet triggered one RC retry and the same verified payload.
+A four-QP, two-worker gather run verified 98,340 bytes and 12 ordered
+completions with zero RC retries in two guest runs. At PMTU 4096, a
+two-SGE scatter/gather WRITE from the DPDK requester verified 8,195
+bytes against stock Linux RXE over TAP.
+The updated worker and app also passed the CM retransmission fixture
+with the older ABI-34 provider using the default version 2 queue.
+In a separate local memif comparison at PMTU 1024, each trial verified
+256 MiB across four QPs with one worker per endpoint. Two batches of nine
+alternating trials per build put median goodput for the default
+contiguous-payload path at 36.187 and 35.945 Gbit/s after the change.
+The corresponding `e7bcf99` medians were 38.490 and 35.417 Gbit/s.
+Both builds used the same application binary. The difference varied by batch.
+[libibverbs scatter/gather posting](https://github.com/linux-rdma/rdma-core/blob/v50.0/libibverbs/man/ibv_post_send.3)
+
 The native worker skips the doorbell ring when its publication counter
 has stayed idle. A full ring triggers immediate send-queue recovery.
 A 1 ms periodic scan covers the gap between publishing an SQ head and
@@ -595,6 +623,30 @@ reported 98.015 Gbit/s at the requester, verified 16 GiB, and recorded
 zero requester retries and zero NIC errors. The sender and receiver
 invocation IDs are `38171ad1580f4308a5d4b250f64848db` and
 `615a5a2eb0834f60b4526a60261c28be`.
+
+### Spark-04 to Spark-02 application bandwidth rerun
+
+On November 24, 2026, the installed `8c5058a` services ran three more
+trials at each MTU with four DPDK workers and 16 QPs per endpoint. Each
+trial completed and verified 16 GiB of 1 MiB WRITEs using prefaulted
+memfd scatter/gather. The MTU 4200 profile used 2 MiB packet-pool pages.
+Both endpoints reported 100,000 Mb/s before each sweep and returned to
+Ethernet MTU 1500 at the end.
+
+| Ethernet MTU | Requester trials (Gbit/s) | Requester median (Gbit/s) | Responder median (Gbit/s) |
+| --- | --- | ---: | ---: |
+| 1500 | 84.282, 84.104, 84.694 | 84.282 | 84.284 |
+| 4200 | 98.027, 98.021, 98.019 | 98.021 | 98.028 |
+
+The MTU 1500 median was 91.3% of the matched 92.320 Gbit/s hardware
+control. One MTU 1500 trial recorded 49 retries and 1,805 responder RX
+misses. The other five trials recorded zero retries and misses. No
+trial recorded a NIC packet error. The median sender and receiver
+journal invocation IDs were `1306c7dad52440eb8b033dcfb0b96ce7` and
+`f302f1205e984d719f1bbf9faa411612` at MTU 1500, and
+`de66015e6789499f8cf1ff8d232b2230` and
+`6a989d33966f42718b8e2bb1dcf26885` at MTU 4200. Both Spark hosts still
+required enrollment of the module-signing key for kernel-backed MR runs.
 
 ### Additional datapath measurements
 

@@ -261,10 +261,15 @@ static uint8_t pattern(uint64_t offset)
     return (uint8_t)((low >> 24) ^ (high * 157));
 }
 
-void roce_lab_fill(uint8_t *buffer, size_t size, bool sender)
+void roce_lab_fill_range(uint8_t *buffer, size_t size, size_t offset, bool sender)
 {
     for (size_t i = 0; i < size; ++i)
-        buffer[i] = sender ? pattern(i) : (uint8_t)~pattern(i);
+        buffer[i] = sender ? pattern(offset + i) : (uint8_t)~pattern(offset + i);
+}
+
+void roce_lab_fill(uint8_t *buffer, size_t size, bool sender)
+{
+    roce_lab_fill_range(buffer, size, 0, sender);
 }
 
 bool roce_lab_verify(const uint8_t *buffer, size_t size)

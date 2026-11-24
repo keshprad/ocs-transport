@@ -54,7 +54,7 @@ static enum ibv_mtu verbs_mtu(uint32_t pmtu)
 
 static bool valid_config(const struct roce_native_queue_config *config, bool receiver)
 {
-    if (config->version != ROCE_NATIVE_QUEUE_VERSION || !config->qps ||
+    if (!config->qps ||
         config->qps > ROCE_LAB_MAX_QPS || !config->workers || config->workers > config->qps ||
         !config->writes || config->writes > ROCE_PSN_MASK || !config->write_size ||
         config->flags != (receiver ? ROCE_NATIVE_QUEUE_RECEIVE_ONLY : 0) || !verbs_mtu(config->pmtu) ||
@@ -80,16 +80,17 @@ const struct roce_native_work *roce_native_map_work(int fd, bool receiver,
     if (seals < 0 || fstat(fd, &status))
         return MAP_FAILED;
     if ((seals & required_seals) != required_seals || !S_ISREG(status.st_mode) ||
-        status.st_size != (off_t)sizeof(struct roce_native_work)) {
+        !roce_native_valid_work_size(status.st_size)) {
         errno = EPROTO;
         return MAP_FAILED;
     }
 
-    const struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ, MAP_SHARED, fd, 0);
+    size_t length = (size_t)status.st_size;
+    const struct roce_native_work *work = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, 0);
     if (work == MAP_FAILED)
         return MAP_FAILED;
     *config = work->config;
-    if (valid_config(config, receiver)) {
+    if (roce_native_work_size(config->version) == length && valid_config(config, receiver)) {
         uint32_t i = 0;
         for (; i < config->qps; ++i) {
             const struct roce_native_sq *sq = &work->qps[i];
@@ -102,7 +103,7 @@ const struct roce_native_work *roce_native_map_work(int fd, bool receiver,
         if (i == config->qps)
             return work;
     }
-    munmap((void *)work, sizeof(*work));
+    munmap((void *)work, length);
     errno = EPROTO;
     return MAP_FAILED;
 }
@@ -170,7 +171,7 @@ int roce_native_configure_qp(struct ibv_qp *qp, int queue_fd, bool receiver)
     const struct roce_native_work *work = roce_native_map_work(queue_fd, receiver, &config);
     if (work == MAP_FAILED)
         return errno;
-    if (munmap((void *)work, sizeof(*work)))
+    if (munmap((void *)work, roce_native_work_size(config.version)))
         return errno;
     if (config.qps != 1 || qp->qp_num != config.local_qpn)
         return EPROTO;

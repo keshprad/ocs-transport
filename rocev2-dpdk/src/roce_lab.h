@@ -38,6 +38,7 @@ bool roce_lab_ready_after_gate(int fd, uint16_t gate_port, uint16_t control_port
 int roce_lab_receive(int fd, char expected, bool nonblocking);
 bool roce_lab_send(int fd, char message);
 void roce_lab_fill(uint8_t *buffer, size_t size, bool sender);
+void roce_lab_fill_range(uint8_t *buffer, size_t size, size_t offset, bool sender);
 bool roce_lab_verify(const uint8_t *buffer, size_t size);
 uint64_t roce_now_ns(void);
 

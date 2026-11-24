@@ -27,6 +27,7 @@ struct roce_app_memory {
     uint32_t qpn;
     struct roce_app_work *work;
     struct roce_native_work *native;
+    uint32_t native_version;
     struct roce_mr_lease mr;
 };
 
@@ -37,6 +38,7 @@ struct roce_app_config {
     bool in_band_cm;
     bool scatter_gather;
     bool native_queues;
+    bool two_sge_writes;
     bool rdmacm;
 };
 

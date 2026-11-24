@@ -138,7 +138,7 @@ static uint64_t event_deadline(void)
 
 bool roce_app_rdmacm_connect(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
                              struct ibv_pd *pd, struct roce_app_native_qp *resources,
-                             bool sender, int (*prepare_qp)(void *), void *context)
+                             bool sender, uint32_t send_sges, int (*prepare_qp)(void *), void *context)
 {
     bool owned = !prepare_qp;
     if (!cm || !address || !address->local_ipv4 || !address->peer_ipv4 || !address->service_port ||
@@ -168,7 +168,7 @@ bool roce_app_rdmacm_connect(struct roce_app_rdmacm *cm, const struct roce_cma_l
     if (owned) {
         struct ibv_qp_init_attr init = {
             .send_cq = resources->cq, .recv_cq = resources->cq, .qp_type = IBV_QPT_RC,
-            .cap = { .max_send_wr = (uint32_t)resources->cq->cqe, .max_send_sge = 1 },
+            .cap = { .max_send_wr = (uint32_t)resources->cq->cqe, .max_send_sge = send_sges },
         };
         if (rdma_create_qp(cm->id, pd, &init))
             return false;

@@ -90,7 +90,7 @@ operations. The lab client binds the worker queue mapping to the
 provider and submits WRITEs with `ibv_post_send()`. In the TCP lab setup,
 it creates the CQ and RC QP for each lane after negotiation. It retrieves
 individual WR IDs and statuses with `ibv_poll_cq()`. The current lab
-shape supports up to 256 outstanding signaled one-SGE WRITEs per QP and
+shape supports up to 256 outstanding signaled WRITEs per QP and
 uses a distinct completion queue per QP. The provider also supports
 [shared polling CQs](provider/README.md). The worker checks the registered source
 range and receiving QP's slice before packet submission. A native WRITE can
@@ -100,6 +100,14 @@ addresses, lengths, and packet-number ranges for retransmission. The app polls
 completions to reuse slots during longer runs. With scatter/gather it
 refills as credits arrive and drains the final completions after the
 worker retires the last TX descriptors.
+
+Add `--two-sge-writes` on a native requester to exercise two nonempty
+source spans in the same registered MR. The application posts the spans
+through libibverbs and the receiver sees their concatenation as one
+WRITE. At a packet that crosses the span boundary, scatter/gather TX
+uses separate DMA segments for both spans and a single iCRC. The default
+uses the version 2 queue layout for single-SGE WRITEs. Two-SGE mode
+requires a worker, application and provider that support version 3.
 
 Each native worker checks a shared notification counter before draining its
 doorbell ring. It scans the posted send-queue heads on overflow and
@@ -598,11 +606,12 @@ MTUs 1500 and 4200 used PMTUs 1024 and 4096 respectively.
 | `8b075bb` separate processes, memfd scatter/gather | 16 | 2 | 37.165 | Failed | 92.320 | 40.3% |
 | `8b075bb` separate processes, memfd scatter/gather | 16 | 4 | 84.577 | Failed | 92.320 | 91.6% |
 | `3a6a1ca` standalone DPDK | 16 | 4 | 90.506 | — | 92.320 | 98.0% |
-| `8c5058a` separate processes, prefaulted memfd scatter/gather | 16 | 4 | 84.272 | 98.012 | 92.320 | 91.3% |
+| `8c5058a` separate processes, prefaulted memfd scatter/gather | 16 | 4 | 84.282 | 98.021 | 92.320 | 91.3% |
 
 The rates are three-trial medians. Rows marked failed stopped after the
 first unsuccessful trial for that MTU. The `8c5058a` jumbo result used
 2 MiB packet-pool backing. The matched hardware control used MTU 1500.
+[Application bandwidth trial details](CONFORMANCE.md#spark-04-to-spark-02-application-bandwidth-rerun)
 The fastest four-worker `8b075bb` trial reached 85.795 Gbit/s. The earlier
 134.99 Gbit/s result used local memif on Spark-04.
 
@@ -614,10 +623,13 @@ hardware tests. The hardware control reached 92.340 Gbit/s. On
 November 24, 2026, `ethtool` and sysfs again reported 100,000 Mb/s at
 both endpoints of the app benchmark (`enp1s0f0np0` on Spark-04 and
 `enp1s0f1np1` on Spark-02). Both interfaces advertised 200 Gbit/s modes
-with auto-negotiation enabled. The measurements establish the reported
-speed of that connection at test time. The reason it came up at
-100 Gbit/s remains unverified. A DPDK sweep with the link reporting
-200 Gbit/s is pending in both one-way and bidirectional modes.
+with auto-negotiation enabled. The earlier 200 Gbit/s runs used
+Spark-01 as Spark-04's peer and Spark-03 as Spark-02's peer. Both used
+`f1np1` on Spark-04 and Spark-02, while the current benchmark uses
+`f0np0` on Spark-04. The matched hardware control on the current pair
+also reported 100 Gbit/s with hardware RoCE enabled. The reason this
+connection comes up at 100 Gbit/s remains unverified. A DPDK sweep
+at an active 200 Gbit/s is pending in both one-way and bidirectional modes.
 [Physical dual-rail sweep](#physical-dual-rail-sweep)
 
 In single-sample prefault runs at MTU 1500, four workers reached

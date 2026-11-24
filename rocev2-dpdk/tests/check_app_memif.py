@@ -48,7 +48,8 @@ def expect_success(child, *markers):
 
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
-          provider=None, post_batch=None, native_queues=False, rdmacm=False, external_qp=False):
+          provider=None, post_batch=None, native_queues=False, rdmacm=False, external_qp=False,
+          two_sge_writes=False):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -82,6 +83,8 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
             tx_options += ["--app-post-batch", str(post_batch)]
         if native_queues:
             tx_options.append("--verbs-queues")
+        if two_sge_writes:
+            tx_options.append("--two-sge-writes")
         tx = process(stack, command(cpus[workers:2 * workers], directory, "tx", size, port, "192.0.2.1", 1024, mac=tx_mac)
                      + tx_options + tx_cm + tx_mr + tx_cma + ["--app-socket", str(tx_path)])
         expect_ready(tx, "application listener ready")
@@ -138,6 +141,9 @@ def main():
         for gather in (False, True):
             check(cpus, 8195, 521, 1, 1, None, scatter_gather=gather, cm=True,
                   provider=args.verbs_provider, post_batch=31, native_queues=True, rdmacm=True)
+            check(cpus, 8195, 3, 1, 1, None, scatter_gather=gather, cm=True,
+                  provider=args.verbs_provider, post_batch=1, native_queues=True, rdmacm=True,
+                  two_sge_writes=True)
         if len(cpus) >= 4:
             check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=1, native_queues=True)
         return

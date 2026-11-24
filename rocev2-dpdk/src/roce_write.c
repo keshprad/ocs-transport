@@ -57,6 +57,7 @@ struct datapath_options {
     bool report_bandwidth;
     bool scatter_gather;
     bool native_queues;
+    bool two_sge_writes;
     bool prefault_app;
 };
 
@@ -77,10 +78,12 @@ enum run_state { WRITE_WAITING, WRITE_RUNNING, WRITE_STOPPED };
 
 struct native_write {
     const uint8_t *source;
+    const uint8_t *second;
     uint64_t remote;
     uint32_t first_packet;
     uint32_t end_packet;
     uint32_t length;
+    uint32_t first_length;
 };
 
 struct write_run {
@@ -156,34 +159,47 @@ static void release_tx_reference(void *address, void *opaque)
     (void)opaque;
 }
 
+static void attach_payload(struct rte_mbuf *mbuf, struct rte_mbuf_ext_shared_info *shared,
+                           const uint8_t *data, uint16_t length)
+{
+    rte_pktmbuf_attach_extbuf(mbuf, (void *)data, (rte_iova_t)(uintptr_t)data, length, shared);
+    mbuf->data_len = length;
+    mbuf->pkt_len = length;
+}
+
 static struct rte_mbuf *encode_gathered_packet(struct rte_mempool *pool,
                                                struct rte_mbuf_ext_shared_info *shared,
                                                const struct roce_packet *packet)
 {
-    struct rte_mbuf *segments[3];
-    if (rte_pktmbuf_alloc_bulk(pool, segments, RTE_DIM(segments)) != 0)
+    struct rte_mbuf *segments[4];
+    uint16_t count = 3 + (packet->payload_tail_length != 0);
+    if (rte_pktmbuf_alloc_bulk(pool, segments, count) != 0)
         return NULL;
-    struct rte_mbuf *header = segments[0], *payload = segments[1], *trailer = segments[2];
+    struct rte_mbuf *header = segments[0], *payload = segments[1], *trailer = segments[count - 1];
     uint16_t header_len, trailer_len;
     if (!roce_encode_split(rte_pktmbuf_mtod(header, uint8_t *),
                            rte_pktmbuf_mtod(trailer, uint8_t *), packet, &header_len, &trailer_len)) {
-        for (size_t i = 0; i < RTE_DIM(segments); ++i)
+        for (uint16_t i = 0; i < count; ++i)
             rte_pktmbuf_free(segments[i]);
         return NULL;
     }
     uint16_t payload_len = (uint16_t)packet->payload_length;
-    rte_mbuf_ext_refcnt_update(shared, 1);
-    rte_pktmbuf_attach_extbuf(payload, (void *)packet->payload, (rte_iova_t)(uintptr_t)packet->payload,
-                             payload_len, shared);
-    payload->data_len = payload_len;
-    payload->pkt_len = payload_len;
+    uint16_t tail_len = packet->payload_tail_length;
+    rte_mbuf_ext_refcnt_update(shared, count - 2);
+    attach_payload(payload, shared, packet->payload, payload_len - tail_len);
+    payload->next = trailer;
+    if (tail_len) {
+        struct rte_mbuf *tail = segments[2];
+        attach_payload(tail, shared, packet->payload_tail, tail_len);
+        payload->next = tail;
+        tail->next = trailer;
+    }
     trailer->data_len = trailer_len;
     trailer->pkt_len = trailer_len;
     header->data_len = header_len;
     header->pkt_len = header_len + payload_len + trailer_len;
-    header->nb_segs = RTE_DIM(segments);
+    header->nb_segs = count;
     header->next = payload;
-    payload->next = trailer;
     return header;
 }
 
@@ -212,8 +228,15 @@ static uint32_t stage_native_write(struct write_worker *worker, uint32_t index, 
         ++sequence;
     worker->next_write[index] = sequence;
     const struct native_write *write = &writes[sequence % ROCE_NATIVE_QUEUE_DEPTH];
-    roce_requester_write_packet(requester, packet_index, packet_index - write->first_packet,
-                                write->source, write->remote, write->length, packet);
+    uint32_t segment = packet_index - write->first_packet;
+    uint32_t offset = segment * requester->qp.pmtu;
+    const uint8_t *payload = offset < write->first_length ? write->source + offset :
+        write->second + (offset - write->first_length);
+    roce_requester_write_packet(requester, packet_index, segment, payload, write->remote, write->length, packet);
+    if (offset < write->first_length && packet->payload_length > write->first_length - offset) {
+        packet->payload_tail = write->second;
+        packet->payload_tail_length = (uint16_t)(packet->payload_length - (write->first_length - offset));
+    }
     return sequence;
 }
 
@@ -493,15 +516,18 @@ static bool admit_writes(struct write_worker *worker)
 }
 
 static enum roce_native_wc_status validate_native_write(const struct write_worker *worker, uint32_t index,
-                                                        const struct roce_native_write *wqe)
+                                                        const struct roce_native_write *wqe,
+                                                        const struct roce_native_sge *second)
 {
     const struct write_run *run = worker->run;
     const struct roce_requester *requester = &worker->states[index].requester;
     uint64_t bytes = wqe->length;
-    if (!bytes || bytes > ROCE_NATIVE_MAX_WRITE)
+    if (!bytes || bytes > ROCE_NATIVE_MAX_WRITE || second->length >= bytes)
         return ROCE_NATIVE_WC_LOCAL_LENGTH;
     if (wqe->lkey != run->local_lkey ||
-        !roce_native_contains(run->local_iova, run->local_length, wqe->local_address, bytes))
+        !roce_native_contains(run->local_iova, run->local_length, wqe->local_address, bytes - second->length) ||
+        (second->length && (second->lkey != run->local_lkey ||
+         !roce_native_contains(run->local_iova, run->local_length, second->address, second->length))))
         return ROCE_NATIVE_WC_LOCAL_PROTECTION;
     if (wqe->rkey != requester->remote.rkey ||
         !roce_native_contains(requester->remote.address, requester->remote.size * run->options->writes,
@@ -515,6 +541,8 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
     const struct write_run *run = worker->run;
     uint32_t qp = worker->first_qp + index;
     struct roce_native_sq *sq = &run->native->qps[qp];
+    const struct roce_native_sge *second = run->options->two_sge_writes ?
+        ((const struct roce_native_sge_work *)run->native)->second[qp] : NULL;
     struct roce_requester *requester = &worker->states[index].requester;
     uint32_t head = atomic_load_explicit(&sq->posted, memory_order_acquire);
     uint32_t sequence = worker->posted[index];
@@ -529,7 +557,8 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
     for (; sequence < head; ++sequence) {
         uint32_t slot = sequence % ROCE_NATIVE_QUEUE_DEPTH;
         const struct roce_native_write wqe = sq->entries[slot];
-        enum roce_native_wc_status result = validate_native_write(worker, index, &wqe);
+        const struct roce_native_sge tail = second ? second[slot] : (struct roce_native_sge){0};
+        enum roce_native_wc_status result = validate_native_write(worker, index, &wqe, &tail);
         if (result != ROCE_NATIVE_WC_SUCCESS) {
             sq->status[slot] = result;
             return false;
@@ -544,7 +573,9 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
         /* Keep both PSN bounds even when the preceding slot has been reused. */
         run->native_writes[qp][slot] = (struct native_write) {
             .source = run->local_buffer + (wqe.local_address - run->local_iova),
+            .second = tail.length ? run->local_buffer + (tail.address - run->local_iova) : NULL,
             .remote = wqe.remote_address, .length = wqe.length,
+            .first_length = wqe.length - tail.length,
             .first_packet = packets, .end_packet = packets + count,
         };
         packets += count;
@@ -972,6 +1003,8 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             options->scatter_gather = true;
         } else if (strcmp(argv[i], "--verbs-queues") == 0) {
             options->native_queues = true;
+        } else if (strcmp(argv[i], "--two-sge-writes") == 0) {
+            options->two_sge_writes = true;
         } else if (strcmp(argv[i], "--tap-mtu") == 0) {
             if (++i == argc || options->tap_mtu ||
                 !roce_parse_uint(argv[i], UINT16_MAX - RTE_ETHER_HDR_LEN, &options->tap_mtu) || !options->tap_mtu)
@@ -1064,7 +1097,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--prefault-app]"
+                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--two-sge-writes] [--prefault-app]"
                         " [--scatter-gather] [--tap-mtu N] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
     }
@@ -1091,6 +1124,10 @@ int main(int argc, char **argv)
     }
     if (datapath.native_queues && (!datapath.mr_socket || !options.sender)) {
         fprintf(stderr, "native requester queues require a requester MR socket\n");
+        goto cleanup_eal;
+    }
+    if (datapath.two_sge_writes && (!datapath.native_queues || options.size < 2)) {
+        fprintf(stderr, "two-SGE WRITEs require a native requester and at least two bytes per WRITE\n");
         goto cleanup_eal;
     }
     if (datapath.rdmacm_socket &&
@@ -1150,6 +1187,12 @@ int main(int argc, char **argv)
         (!options.sender || !datapath.app_socket || !(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
          (!memif && !tap && !mlx5) || (dma_gather && rte_eal_iova_mode() != RTE_IOVA_VA))) {
         fprintf(stderr, "scatter/gather requires an application-backed sender and memif, TAP, or mlx5 with IOVA=VA\n");
+        goto cleanup_eal;
+    }
+    if (datapath.two_sge_writes && dma_gather &&
+        ((info.tx_desc_lim.nb_seg_max && info.tx_desc_lim.nb_seg_max < 4) ||
+         (info.tx_desc_lim.nb_mtu_seg_max && info.tx_desc_lim.nb_mtu_seg_max < 4))) {
+        fprintf(stderr, "two-SGE scatter/gather WRITEs require four TX segments\n");
         goto cleanup_eal;
     }
     if (mtu < required_mtu && !memif) {
@@ -1263,7 +1306,8 @@ int main(int argc, char **argv)
             .post_batch = post_batch,
             .dma_writable = dma_gather,
             .in_band_cm = in_band, .scatter_gather = datapath.scatter_gather,
-            .native_queues = datapath.native_queues, .rdmacm = cma != NULL,
+            .native_queues = datapath.native_queues, .two_sge_writes = datapath.two_sge_writes,
+            .rdmacm = cma != NULL,
         };
         uint64_t attached = datapath.report_bandwidth ? roce_now_ns() : 0;
         if (!roce_app_attach(datapath.app_socket, &options, &configuration, &application)) {

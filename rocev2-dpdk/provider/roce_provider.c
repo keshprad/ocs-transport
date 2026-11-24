@@ -86,7 +86,7 @@ static uint64_t native_queue_bytes(const struct roce_native_queue_config *config
 
 static bool valid_queue_config(const struct roce_native_queue_config *config)
 {
-    if (config->version != ROCE_NATIVE_QUEUE_VERSION || (config->flags & ~ROCE_NATIVE_QUEUE_RECEIVE_ONLY) ||
+    if ((config->flags & ~ROCE_NATIVE_QUEUE_RECEIVE_ONLY) ||
         !config->qps || config->qps > ROCE_LAB_MAX_QPS || !config->workers || config->workers > config->qps ||
         !config->writes || config->writes > ROCE_PSN_MASK || !config->write_size ||
         config->local_qpn <= 1 || config->local_qpn >= ROCE_PSN_MASK ||
@@ -120,7 +120,7 @@ static struct roce_verbs_mr *queue_mr(const struct roce_verbs_pd *pd,
 static void unmap_queue_work(struct roce_verbs_context *context)
 {
     if (context->work)
-        munmap(context->work, sizeof(*context->work));
+        munmap(context->work, roce_native_work_size(context->config.version));
     context->work = NULL;
     context->next_qp = 0;
 }
@@ -144,6 +144,8 @@ static int bind_queue_work(struct roce_verbs_context *context, struct roce_nativ
     struct ibv_qp *ibv = &qp->verbs.qp;
     if (config->qps != 1 || config->local_qpn != ibv->qp_num)
         return EINVAL;
+    if (qp->init.cap.max_send_sge > roce_native_send_sges(config->version))
+        return EOPNOTSUPP;
     struct roce_verbs_pd *pd = container_of(ibv->pd, struct roce_verbs_pd, ibv);
     struct roce_verbs_mr *mr = queue_mr(pd, config);
     if (!mr)
@@ -175,15 +177,16 @@ int roce_dpdk_bind_queues(struct ibv_context *ibv, int fd)
     struct stat information;
     if (fstat(fd, &information) < 0)
         return errno;
-    if (!S_ISREG(information.st_mode) || information.st_size != (off_t)sizeof(struct roce_native_work))
+    if (!S_ISREG(information.st_mode) || !roce_native_valid_work_size(information.st_size))
         return EINVAL;
 
-    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    size_t length = (size_t)information.st_size;
+    struct roce_native_work *work = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (work == MAP_FAILED)
         return errno;
     struct roce_native_queue_config config = work->config;
     int error = EINVAL;
-    if (!valid_queue_config(&config))
+    if (roce_native_work_size(config.version) != length || !valid_queue_config(&config))
         goto unmap;
     error = EOPNOTSUPP;
     if (!atomic_is_lock_free(&work->qps[0].posted) || !atomic_is_lock_free(&work->doorbells[0].slots[0]))
@@ -206,7 +209,7 @@ unlock:
         return 0;
 
 unmap:
-    munmap(work, sizeof(*work));
+    munmap(work, length);
     return error;
 }
 
@@ -231,7 +234,8 @@ static int query_device(struct ibv_context *context, const struct ibv_query_devi
         attributes->orig_attr.max_cq = 2 * attributes->orig_attr.max_qp;
         attributes->orig_attr.max_qp_wr = ROCE_NATIVE_QUEUE_DEPTH;
         attributes->orig_attr.max_cqe = attributes->orig_attr.max_qp * ROCE_NATIVE_QUEUE_DEPTH;
-        attributes->orig_attr.max_sge = 1;
+        attributes->orig_attr.max_sge = provider->work ? roce_native_send_sges(provider->config.version) :
+                                        ROCE_NATIVE_MAX_SEND_SGES;
     }
     pthread_mutex_unlock(&context->mutex);
     return 0;
@@ -537,6 +541,8 @@ static int attach_qp(struct roce_verbs_qp *qp, struct ibv_pd *ibv_pd,
     pthread_mutex_lock(&ibv->mutex);
     if (!context->work && !context->mr_socket) {
         error = EOPNOTSUPP;
+    } else if (context->work && qp->init.cap.max_send_sge > roce_native_send_sges(context->config.version)) {
+        error = EOPNOTSUPP;
     } else if (context->early_qp || (context->work && context->next_qp == context->config.qps)) {
         error = ENOSPC;
     } else {
@@ -581,7 +587,8 @@ static struct ibv_qp *create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr
         errno = EINVAL;
         return NULL;
     }
-    if (attr->qp_type != IBV_QPT_RC || attr->srq || attr->cap.max_send_sge != 1 ||
+    if (attr->qp_type != IBV_QPT_RC || attr->srq || !attr->cap.max_send_sge ||
+        attr->cap.max_send_sge > ROCE_NATIVE_MAX_SEND_SGES ||
         attr->cap.max_recv_wr || attr->cap.max_recv_sge || attr->cap.max_inline_data) {
         errno = EOPNOTSUPP;
         return NULL;
@@ -799,28 +806,42 @@ static int query_qp(struct ibv_qp *ibv, struct ibv_qp_attr *attr, int mask, stru
     return 0;
 }
 
-static int prepare_native_write(struct roce_native_write *entry, const struct ibv_send_wr *wr,
+static int prepare_native_write(struct roce_native_write *entry, struct roce_native_sge *second,
+                                const struct ibv_send_wr *wr,
                                 const struct roce_verbs_qp *qp)
 {
     const struct roce_native_queue_config *config = &provider_context(qp->verbs.qp.context)->config;
     if (wr->opcode != IBV_WR_RDMA_WRITE || (wr->send_flags & ~IBV_SEND_SIGNALED))
         return EOPNOTSUPP;
-    if (wr->num_sge != 1 || !wr->sg_list)
+    if (wr->num_sge < 1 || (uint32_t)wr->num_sge > qp->init.cap.max_send_sge || !wr->sg_list ||
+        (wr->num_sge > 1 && !second))
         return EINVAL;
 
-    const struct ibv_sge *sge = wr->sg_list;
+    uint64_t bytes = 0;
+    for (int i = 0; i < wr->num_sge; ++i) {
+        const struct ibv_sge *sge = &wr->sg_list[i];
+        if (!sge->length || sge->lkey != config->local_lkey ||
+            !roce_native_contains(config->local_address, native_queue_bytes(config), sge->addr, sge->length))
+            return EINVAL;
+        bytes += sge->length;
+    }
     uint64_t qp_bytes = (uint64_t)config->writes * config->write_size;
     uint64_t remote_base = config->remote_address + qp->index * qp_bytes;
-    if (!sge->length || sge->length > ROCE_NATIVE_MAX_WRITE || sge->lkey != config->local_lkey ||
-        wr->wr.rdma.rkey != config->remote_rkey ||
-        !roce_native_contains(config->local_address, native_queue_bytes(config), sge->addr, sge->length) ||
-        !roce_native_contains(remote_base, qp_bytes, wr->wr.rdma.remote_addr, sge->length))
+    if (bytes > ROCE_NATIVE_MAX_WRITE || wr->wr.rdma.rkey != config->remote_rkey ||
+        !roce_native_contains(remote_base, qp_bytes, wr->wr.rdma.remote_addr, bytes))
         return EINVAL;
 
     *entry = (struct roce_native_write) {
-        .wr_id = wr->wr_id, .local_address = sge->addr, .remote_address = wr->wr.rdma.remote_addr,
-        .length = sge->length, .lkey = sge->lkey, .rkey = wr->wr.rdma.rkey,
+        .wr_id = wr->wr_id, .local_address = wr->sg_list[0].addr, .remote_address = wr->wr.rdma.remote_addr,
+        .length = (uint32_t)bytes, .lkey = config->local_lkey, .rkey = wr->wr.rdma.rkey,
     };
+    if (second) {
+        *second = (struct roce_native_sge) {0};
+        if (wr->num_sge == 2) {
+            const struct ibv_sge *tail = &wr->sg_list[1];
+            *second = (struct roce_native_sge) {.address = tail->addr, .length = tail->length, .lkey = tail->lkey};
+        }
+    }
     return 0;
 }
 
@@ -854,6 +875,8 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
     }
 
     uint32_t available = (uint32_t)cq->ibv.cqe - cq->outstanding;
+    struct roce_native_sge *second = config->version == ROCE_NATIVE_SGE_QUEUE_VERSION ?
+        ((struct roce_native_sge_work *)context->work)->second[qp->index] : NULL;
     uint32_t posted = first;
     for (; next; next = next->next) {
         if (posted >= config->writes || posted - qp->reaped >= qp->init.cap.max_send_wr ||
@@ -862,7 +885,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
             break;
         }
         uint32_t slot = posted % ROCE_NATIVE_QUEUE_DEPTH;
-        error = prepare_native_write(&sq->entries[slot], next, qp);
+        error = prepare_native_write(&sq->entries[slot], second ? &second[slot] : NULL, next, qp);
         if (error)
             break;
         sq->status[slot] = ROCE_NATIVE_WC_SUCCESS;

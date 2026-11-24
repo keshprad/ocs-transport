@@ -6,6 +6,8 @@
 
 enum {
     ROCE_NATIVE_QUEUE_VERSION = 2,
+    ROCE_NATIVE_SGE_QUEUE_VERSION = 3,
+    ROCE_NATIVE_MAX_SEND_SGES = 2,
     ROCE_NATIVE_QUEUE_DEPTH = 256,
     ROCE_NATIVE_MAX_WRITE = INT32_MAX,
     ROCE_NATIVE_QUEUE_FD = 4,
@@ -69,6 +71,37 @@ struct roce_native_work {
     struct roce_doorbell doorbells[ROCE_LAB_MAX_QPS];
     struct roce_native_sq qps[ROCE_LAB_MAX_QPS];
 };
+
+/* Version 3 appends second SGEs. The base WRITE length is the sum of both spans. */
+struct roce_native_sge {
+    uint64_t address;
+    uint32_t length;
+    uint32_t lkey;
+};
+
+struct roce_native_sge_work {
+    struct roce_native_work base;
+    struct roce_native_sge second[ROCE_LAB_MAX_QPS][ROCE_NATIVE_QUEUE_DEPTH];
+};
+
+static inline size_t roce_native_work_size(uint32_t version)
+{
+    if (version == ROCE_NATIVE_QUEUE_VERSION)
+        return sizeof(struct roce_native_work);
+    if (version == ROCE_NATIVE_SGE_QUEUE_VERSION)
+        return sizeof(struct roce_native_sge_work);
+    return 0;
+}
+
+static inline bool roce_native_valid_work_size(uint64_t length)
+{
+    return length == sizeof(struct roce_native_work) || length == sizeof(struct roce_native_sge_work);
+}
+
+static inline uint32_t roce_native_send_sges(uint32_t version)
+{
+    return version == ROCE_NATIVE_SGE_QUEUE_VERSION ? ROCE_NATIVE_MAX_SEND_SGES : 1;
+}
 
 static inline uint32_t roce_native_posted_count(uint32_t posted)
 {

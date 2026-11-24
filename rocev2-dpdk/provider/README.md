@@ -9,8 +9,8 @@ context can create CQs and one RC QP before connection negotiation. The
 provider retains the QP's PD and CQs at creation and takes its MR
 reference when binding the worker's queue mapping. The lab requester
 enables native posting with `--verbs-queues`.
-The provider supports RC QP setup and query, one-SGE
-RDMA WRITE posting and CQ polling. The supplied PD must own the source
+The provider supports RC QP setup and query, RDMA WRITE posting, and
+CQ polling. The supplied PD must own the source
 MR for the lane. The QP retains both that MR and its CQs until destroy.
 With a matching worker, a native WRITE can use any source offset within
 the configured local MR and destination offset within the receiving
@@ -18,6 +18,13 @@ QP's slice. The worker snapshots the validated addresses when admitting
 each WR and reuses them for retransmission. Individual WRITEs can have
 different nonzero lengths. The lab still negotiates a WRITE count and a
 total byte budget per QP.
+
+Use `--two-sge-writes` on the lab requester to bind a version 3 queue
+descriptor and request `max_send_sge=2`. The QP then accepts one or two
+nonempty SGEs from the same registered MR. The provider checks both
+source ranges and the combined remote range before posting. The worker
+validates both spans before forming packets. Version 2 descriptors
+support one SGE and are used by default.
 
 Multiple bound QPs can share one polling CQ. Completions carry the
 originating QPN and remain ordered within each send queue. The CQ reserves
@@ -68,7 +75,9 @@ unaligned ranges and deregistration while a lease is active. The same test
 uses a simulated worker to check shared CQ capacity, completion identity
 and teardown with more than one attached QP. It also checks selective
 signaling, zero-result polls that reclaim retired entries, and error CQEs
-for unsignaled WRs.
+for unsignaled WRs. It checks the version 3 size requirement, second-SGE
+key and range validation, and ordered completions for mixed one- and
+two-SGE requests.
 Set `ROCE_DPDK_MR_REQUIRE_NETLINK=1` to require the kernel's ticket
 handoff in these checks.
 
@@ -85,7 +94,9 @@ and external QP flows. The application checks peer addresses, private
 data, and both negotiated QPNs, polls every WRITE completion, and
 observes disconnect. The CM-owned runs post 521 WRITEs per QP to
 verify queue reuse after two full laps. With four available CPUs it
-also runs four QPs across two workers using the TCP lab setup.
+also runs four QPs across two workers using the TCP lab setup. The
+two-SGE cases verify byte order across packet boundaries in both copy
+and scatter/gather modes.
 [librdmacm adapter](../README.md#in-band-connection-setup)
 
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

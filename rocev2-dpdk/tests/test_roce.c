@@ -281,7 +281,7 @@ static void test_variable_write_packets(void)
             struct roce_packet packet, ack;
             uint32_t index = tx.next;
             assert(roce_requester_can_stage(&tx, 0));
-            roce_requester_write_packet(&tx, index, segment, source + offset,
+            roce_requester_write_packet(&tx, index, segment, source + offset + segment * send_qp.pmtu,
                                         region.address + offset, lengths[wr], &packet);
             assert(packet.opcode == opcodes[index] && packet.psn == ((start + index) & ROCE_PSN_MASK));
             assert(packet.write_length == lengths[wr] && packet.remote_address == region.address + offset);
@@ -297,8 +297,49 @@ static void test_variable_write_packets(void)
     assert(rx.msn == 3 && memcmp(source, destination, sizeof(source)) == 0);
 }
 
+static void test_two_payload_spans(void)
+{
+    uint8_t first[27], second[232], contiguous[sizeof(first) + sizeof(second)];
+    for (size_t i = 0; i < sizeof(first); ++i)
+        first[i] = (uint8_t)(i * 17);
+    for (size_t i = 0; i < sizeof(second); ++i)
+        second[i] = (uint8_t)(255 - i);
+    memcpy(contiguous, first, sizeof(first));
+    memcpy(contiguous + sizeof(first), second, sizeof(second));
+    struct roce_packet packet = {
+        .src = send_qp.local, .dst = send_qp.peer, .qpn = send_qp.peer_qpn, .psn = 123,
+        .opcode = ROCE_WRITE_ONLY, .pkey = ROCE_PKEY, .udp_source = 0xc321, .ack_requested = true,
+        .remote_address = 0x100000, .rkey = 0x1234, .write_length = sizeof(contiguous),
+        .payload = contiguous, .payload_length = sizeof(contiguous),
+    };
+    uint8_t reference[ROCE_MAX_FRAME], encoded[ROCE_MAX_FRAME];
+    size_t length = roce_encode(reference, sizeof(reference), &packet);
+    assert(length > sizeof(contiguous));
+
+    packet.payload = first;
+    packet.payload_tail = second;
+    packet.payload_tail_length = sizeof(second);
+    assert(roce_encode(encoded, sizeof(encoded), &packet) == length && !memcmp(encoded, reference, length));
+
+    uint16_t header, trailer;
+    uint8_t footer[ROCE_MAX_TRAILER];
+    assert(roce_encode_split(encoded, footer, &packet, &header, &trailer));
+    assert(trailer == 5 && header + sizeof(contiguous) + trailer == length);
+    memcpy(encoded + header, first, sizeof(first));
+    memcpy(encoded + header + sizeof(first), second, sizeof(second));
+    memcpy(encoded + length - trailer, footer, trailer);
+    assert(!memcmp(encoded, reference, length));
+
+    packet.payload_tail_length = sizeof(contiguous);
+    assert(!roce_encode_split(encoded, footer, &packet, &header, &trailer));
+    packet.payload_tail_length = sizeof(second);
+    packet.payload_tail = NULL;
+    assert(!roce_encode(encoded, sizeof(encoded), &packet));
+}
+
 int main(void)
 {
+    test_two_payload_spans();
     test_sequence_nak_and_lost_final_ack();
     test_window_timeout_and_address_validation();
     test_single_packet_and_access_errors();

@@ -53,8 +53,10 @@ struct roce_packet {
     uint32_t rkey;
     uint32_t write_length;
     uint8_t syndrome;
+    uint16_t payload_tail_length; /* Included in payload_length. Zero for a contiguous payload. */
     uint32_t msn;
     const uint8_t *payload;
+    const uint8_t *payload_tail;
     size_t payload_length;
 };
 
@@ -68,10 +70,11 @@ struct roce_cm_frame {
 };
 
 size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *packet);
-/* The wire order is header, packet->payload, trailer. */
+/* The wire order is header, payload spans in order, trailer. */
 bool roce_encode_split(uint8_t header[ROCE_MAX_HEADER], uint8_t trailer[ROCE_MAX_TRAILER],
                        const struct roce_packet *packet, uint16_t *header_length,
                        uint16_t *trailer_length);
+/* The decoded payload always borrows a contiguous span from the input frame. */
 bool roce_decode(struct roce_packet *packet, const uint8_t *frame, size_t frame_length);
 
 /* QP1 UD SEND_ONLY with one MAD. Encode uses separate input and output buffers.

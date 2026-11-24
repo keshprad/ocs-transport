@@ -54,7 +54,7 @@ int roce_app_destroy_native_qp(struct roce_app_native_qp *resources)
     return 0;
 }
 
-int roce_app_create_native_qp(struct ibv_pd *pd, uint32_t depth, bool receiver,
+int roce_app_create_native_qp(struct ibv_pd *pd, uint32_t depth, uint32_t send_sges, bool receiver,
                               struct roce_app_native_qp *resources)
 {
     if (!pd || !pd->context || !resources || !depth || depth > ROCE_NATIVE_QUEUE_DEPTH)
@@ -66,7 +66,7 @@ int roce_app_create_native_qp(struct ibv_pd *pd, uint32_t depth, bool receiver,
         return errno ? errno : EIO;
     struct ibv_qp_init_attr init = {
         .send_cq = resources->cq, .recv_cq = resources->cq, .qp_type = IBV_QPT_RC,
-        .cap = { .max_send_wr = depth, .max_send_sge = 1 },
+        .cap = { .max_send_wr = depth, .max_send_sge = send_sges },
     };
     resources->qp = ibv_create_qp(pd, &init);
     int error = resources->qp ? roce_native_init_qp(resources->qp, receiver) : (errno ? errno : EIO);
@@ -90,17 +90,26 @@ static int post_batch(struct native_qp *state, uint32_t first, uint32_t count)
 {
     const struct roce_native_queue_config *config = &state->run->config;
     struct ibv_send_wr writes[ROCE_NATIVE_QUEUE_DEPTH];
-    struct ibv_sge segments[ROCE_NATIVE_QUEUE_DEPTH];
+    struct ibv_sge segments[ROCE_NATIVE_QUEUE_DEPTH][ROCE_NATIVE_MAX_SEND_SGES];
+    const bool two_sges = config->version == ROCE_NATIVE_SGE_QUEUE_VERSION;
     uint64_t offset = ((uint64_t)state->index * config->writes + first) * config->write_size;
     for (uint32_t i = 0; i < count; ++i, offset += config->write_size) {
-        segments[i] = (struct ibv_sge) {
+        segments[i][0] = (struct ibv_sge) {
             .addr = config->local_address + offset, .length = config->write_size,
             .lkey = config->local_lkey,
         };
+        if (two_sges) {
+            uint32_t first_length = roce_app_first_sge_length(config->write_size);
+            uint32_t second_length = config->write_size - first_length;
+            segments[i][1] = segments[i][0];
+            segments[i][1].length = second_length;
+            segments[i][0].addr += second_length;
+            segments[i][0].length = first_length;
+        }
         writes[i] = (struct ibv_send_wr) {
             .wr_id = write_id(state, first + i),
             .next = i + 1 < count ? &writes[i + 1] : NULL,
-            .sg_list = &segments[i], .num_sge = 1,
+            .sg_list = segments[i], .num_sge = two_sges ? 2 : 1,
             .opcode = IBV_WR_RDMA_WRITE, .send_flags = IBV_SEND_SIGNALED,
             .wr.rdma = { .remote_addr = config->remote_address + offset, .rkey = config->remote_rkey },
         };
@@ -305,14 +314,16 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
             struct ibv_qp_attr attr;
             struct ibv_qp_init_attr init;
             error = ibv_query_qp(early_qp->qp, &attr, IBV_QP_CAP, &init);
-            if (!error && init.cap.max_send_wr < need)
+            if (!error && (init.cap.max_send_wr < need ||
+                init.cap.max_send_sge < roce_native_send_sges(run.config.version)))
                 error = EINVAL;
         }
     } else {
         error = roce_native_bind_work(pd->context, queue_fd);
         for (uint32_t i = 0; !error && i < run.config.qps; ++i) {
             queues[i] = (struct native_qp) { .run = &run, .shared = &work->qps[i], .index = i };
-            error = roce_app_create_native_qp(pd, run.capacity, false, &queues[i].resources);
+            error = roce_app_create_native_qp(pd, run.capacity, roce_native_send_sges(run.config.version),
+                                              false, &queues[i].resources);
             if (!error)
                 error = roce_native_connect_qp(queues[i].resources.qp, &run.config, i);
         }
@@ -332,7 +343,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
         cleanup = release_queues(queues, run.config.qps, error != 0);
     else if (error)
         abort_native_qp(&queues[0], roce_now_ns() + UINT64_C(1000000000));
-    if (munmap((void *)work, sizeof(*work)) && !cleanup)
+    if (munmap((void *)work, roce_native_work_size(run.config.version)) && !cleanup)
         cleanup = errno;
     if (error || cleanup) {
         if (!error)

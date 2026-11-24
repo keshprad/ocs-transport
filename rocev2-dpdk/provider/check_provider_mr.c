@@ -131,14 +131,77 @@ static void check_wc(const struct ibv_wc *wc, const struct ibv_qp *qp, uint64_t 
 
 static struct roce_native_work *map_test_work(const struct roce_native_queue_config *config, int *fd)
 {
+    size_t size = roce_native_work_size(config->version);
     *fd = memfd_create("roce-provider-work", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    assert(*fd >= 0 && !ftruncate(*fd, sizeof(struct roce_native_work)));
-    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0);
+    assert(*fd >= 0 && size && !ftruncate(*fd, (off_t)size));
+    struct roce_native_work *work = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0);
     assert(work != MAP_FAILED);
     work->config = *config;
     assert(roce_doorbell_init(&work->doorbells[0]));
     assert(!fcntl(*fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL));
     return work;
+}
+
+static void check_two_sge_queue(struct ibv_pd *pd, const struct ibv_mr *mr, uint64_t iova)
+{
+    struct ibv_context *context = pd->context;
+    const struct roce_native_queue_config config = {
+        .version = ROCE_NATIVE_SGE_QUEUE_VERSION, .qps = 1, .workers = 1, .writes = 2,
+        .write_size = 32, .local_qpn = 3100, .peer_qpn = 4200, .local_psn = 5001, .peer_psn = 6001,
+        .pmtu = 1024, .local_lkey = mr->lkey, .remote_rkey = 42,
+        .local_ipv4 = 0xc0000201, .peer_ipv4 = 0xc0000202, .local_address = iova, .remote_address = 0x100000,
+    };
+    int fd;
+    struct roce_native_work *work = map_test_work(&config, &fd);
+    work->config.version = ROCE_NATIVE_QUEUE_VERSION;
+    assert(roce_native_bind_work(context, fd) == EINVAL);
+    work->config.version = config.version;
+    assert(!roce_native_bind_work(context, fd));
+
+    struct ibv_device_attr limits;
+    assert(!ibv_query_device(context, &limits) && limits.max_sge == ROCE_NATIVE_MAX_SEND_SGES);
+    struct ibv_cq *cq = ibv_create_cq(context, 2, NULL, NULL, 0);
+    assert(cq);
+    struct ibv_qp_init_attr init = {
+        .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = 2, .max_send_sge = ROCE_NATIVE_MAX_SEND_SGES + 1 },
+    };
+    assert(!ibv_create_qp(pd, &init) && errno == EOPNOTSUPP);
+    init.cap.max_send_sge = ROCE_NATIVE_MAX_SEND_SGES;
+    struct ibv_qp *qp = ibv_create_qp(pd, &init);
+    assert(qp && !roce_native_init_qp(qp, false) && !roce_native_connect_qp(qp, &config, 0));
+    struct ibv_sge segments[] = {
+        {.addr = iova + 40, .length = 13, .lkey = mr->lkey},
+        {.addr = iova + 1, .length = 19, .lkey = mr->lkey},
+        {.addr = iova + 16, .length = 32, .lkey = mr->lkey},
+    };
+    struct ibv_send_wr writes[] = {
+        {.wr_id = 1, .sg_list = segments, .num_sge = 2, .opcode = IBV_WR_RDMA_WRITE,
+         .send_flags = IBV_SEND_SIGNALED, .wr.rdma = { .remote_addr = config.remote_address, .rkey = 42 }},
+        {.wr_id = 2, .sg_list = &segments[2], .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+         .send_flags = IBV_SEND_SIGNALED, .wr.rdma = { .remote_addr = config.remote_address + 32, .rkey = 42 }},
+    };
+    struct ibv_send_wr *bad;
+    segments[1].lkey ^= 1;
+    assert(ibv_post_send(qp, writes, &bad) == EINVAL && bad == writes);
+    segments[1].lkey = mr->lkey;
+    segments[1].addr = iova + 64;
+    assert(ibv_post_send(qp, writes, &bad) == EINVAL && bad == writes);
+    assert(!atomic_load(&work->qps[0].posted));
+    segments[1].addr = iova + 1;
+    writes[0].next = &writes[1];
+    assert(!ibv_post_send(qp, writes, &bad) && !bad);
+    const struct roce_native_sge *tail = ((struct roce_native_sge_work *)work)->second[0];
+    assert(tail[0].address == segments[1].addr && tail[0].length == segments[1].length && tail[0].lkey == mr->lkey);
+    assert(!tail[1].length && work->qps[0].entries[0].length == 32 && work->qps[0].entries[1].length == 32);
+    struct ibv_wc wc[2];
+    assert(!ibv_poll_cq(cq, 2, wc));
+    atomic_store_explicit(&work->qps[0].retired, 2, memory_order_release);
+    assert(ibv_poll_cq(cq, 2, wc) == 2);
+    check_wc(&wc[0], qp, 1, IBV_WC_SUCCESS);
+    check_wc(&wc[1], qp, 2, IBV_WC_SUCCESS);
+    assert(!ibv_destroy_qp(qp) && !ibv_destroy_cq(cq));
+    assert(!munmap(work, roce_native_work_size(config.version)) && !close(fd));
 }
 
 static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
@@ -324,6 +387,7 @@ static void client(int fd)
     assert(mr && mr->addr == buffer && mr->lkey && mr->rkey && mr->lkey != mr->rkey);
     check_early_qp(pd, mr, iova);
     check_early_qp(pd, mr, iova);
+    check_two_sge_queue(pd, mr, iova);
     share_keys(fd, mr, iova);
 
     expect(fd, 'B');

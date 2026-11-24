@@ -60,6 +60,7 @@ static size_t extension_size(enum roce_opcode opcode, bool cm)
 static bool valid_packet(const struct roce_packet *p)
 {
     return p->payload_length <= ROCE_MAX_PMTU && (!p->payload_length || p->payload) &&
+           (!p->payload_tail_length || (p->payload_tail && p->payload_tail_length < p->payload_length)) &&
            p->udp_source && p->qpn <= ROCE_PSN_MASK && p->psn <= ROCE_PSN_MASK &&
            p->msn <= ROCE_PSN_MASK && (p->opcode != ROCE_ACK || !p->payload_length);
 }
@@ -127,8 +128,12 @@ static size_t encode_packet(uint8_t *frame, size_t capacity, const struct roce_p
         return 0;
 
     encode_header(frame, p, extension, pad, length);
-    if (p->payload_length)
-        memcpy(frame + header, p->payload, p->payload_length);
+    if (p->payload_length) {
+        size_t first = p->payload_length - p->payload_tail_length;
+        memcpy(frame + header, p->payload, first);
+        if (p->payload_tail_length)
+            memcpy(frame + header + first, p->payload_tail, p->payload_tail_length);
+    }
     memset(frame + length - ICRC - pad, 0, pad);
     encode_icrc(frame + length - ICRC, roce_icrc(frame + ETH, IP, length - ETH - ICRC));
     return length;
@@ -153,7 +158,9 @@ bool roce_encode_split(uint8_t header[ROCE_MAX_HEADER], uint8_t trailer[ROCE_MAX
     uint32_t crc = roce_icrc_seed(header + ETH, IP);
     crc = roce_crc32_update(crc, header + ETH + IP + UDP + BTH, extension);
     if (p->payload_length)
-        crc = roce_crc32_update(crc, p->payload, p->payload_length);
+        crc = roce_crc32_update(crc, p->payload, p->payload_length - p->payload_tail_length);
+    if (p->payload_tail_length)
+        crc = roce_crc32_update(crc, p->payload_tail, p->payload_tail_length);
     encode_icrc(trailer + pad, ~roce_crc32_update(crc, trailer, pad));
     return true;
 }

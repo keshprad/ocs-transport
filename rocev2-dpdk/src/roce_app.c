@@ -39,6 +39,7 @@ enum {
     APP_SCATTER_GATHER = 1u << 3,
     APP_NATIVE_QUEUES = 1u << 4,
     APP_RDMACM = 1u << 5,
+    APP_TWO_SGE_WRITES = 1u << 6,
     APP_CONNECT = 'A',
     APP_LISTEN = 'L',
     APP_ESTABLISHED = 'E',
@@ -285,7 +286,10 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
     int socket = accept_client(path);
     if (socket < 0)
         return false;
-    struct roce_app_memory attached = { .socket = socket };
+    struct roce_app_memory attached = {
+        .socket = socket, .native_version = config->two_sge_writes ? ROCE_NATIVE_SGE_QUEUE_VERSION :
+                                           ROCE_NATIVE_QUEUE_VERSION,
+    };
     struct roce_mr_server *registrations = config->registrations;
     pid_t pid;
     const struct app_workload workload = {
@@ -294,7 +298,8 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         .flags = (config->in_band_cm ? APP_USE_CM : 0) | (registrations ? APP_USE_VERBS_MR : 0) |
                  (registrations && config->dma_writable ? APP_WRITE_DMA_ALIAS : 0) |
                  (config->scatter_gather ? APP_SCATTER_GATHER : 0) |
-                 (config->native_queues ? APP_NATIVE_QUEUES : 0) | (config->rdmacm ? APP_RDMACM : 0),
+                 (config->native_queues ? APP_NATIVE_QUEUES : 0) | (config->rdmacm ? APP_RDMACM : 0) |
+                 (config->two_sge_writes ? APP_TWO_SGE_WRITES : 0),
         .post_batch = config->post_batch,
     };
     if (!configure_peer(socket, &pid) || !send_app_message(socket, &workload, sizeof(workload)))
@@ -356,7 +361,7 @@ bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab
     if (queue_fd)
         *queue_fd = -1;
     const struct roce_native_queue_config config = {
-        .version = ROCE_NATIVE_QUEUE_VERSION,
+        .version = memory->native_version,
         .qps = options->qps, .workers = options->workers, .writes = options->writes,
         .write_size = options->size,
         .local_qpn = local->qpn, .peer_qpn = peer->qpn,
@@ -367,10 +372,11 @@ bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab
         .flags = options->sender ? 0 : ROCE_NATIVE_QUEUE_RECEIVE_ONLY,
         .local_address = local->region.address, .remote_address = peer->region.address,
     };
-    int fd = create_shared_file("roce-native-queues", sizeof(struct roce_native_work));
+    size_t length = roce_native_work_size(config.version);
+    int fd = create_shared_file("roce-native-queues", length);
     if (fd < 0)
         return false;
-    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    struct roce_native_work *work = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     bool valid = work != MAP_FAILED;
     if (valid)
         work->config = config;
@@ -398,7 +404,7 @@ bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab
         return true;
     }
     if (work != MAP_FAILED)
-        munmap(work, sizeof(*work));
+        munmap(work, length);
     errno = error;
     return false;
 }
@@ -480,7 +486,7 @@ void roce_app_detach(struct roce_app_memory *memory)
         if (memory->work)
             munmap(memory->work, sizeof(*memory->work));
         if (memory->native)
-            munmap(memory->native, sizeof(*memory->native));
+            munmap(memory->native, roce_native_work_size(memory->native_version));
         if (memory->mr.server)
             roce_mr_release(&memory->mr);
         else if (memory->buffer)
@@ -689,7 +695,7 @@ bool roce_app_write(const char *path, const char *registration_device)
         goto disconnect;
     if (workload.version != APP_VERSION || workload.sender > 1 ||
         (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS | APP_SCATTER_GATHER |
-                             APP_NATIVE_QUEUES | APP_RDMACM)) ||
+                             APP_NATIVE_QUEUES | APP_RDMACM | APP_TWO_SGE_WRITES)) ||
         workload.reserved || !workload.post_batch || workload.post_batch > workload.writes ||
         !workload.qps || workload.qps > ROCE_LAB_MAX_QPS || !workload.workers ||
         workload.workers > workload.qps || !workload.writes || workload.writes > ROCE_PSN_MASK) {
@@ -700,9 +706,15 @@ bool roce_app_write(const char *path, const char *registration_device)
     bool verbs_mr = (workload.flags & APP_USE_VERBS_MR) != 0;
     bool native_queues = (workload.flags & APP_NATIVE_QUEUES) != 0;
     bool rdmacm = (workload.flags & APP_RDMACM) != 0;
+    bool two_sge_writes = (workload.flags & APP_TWO_SGE_WRITES) != 0;
+    uint32_t send_sges = two_sge_writes ? ROCE_NATIVE_MAX_SEND_SGES : 1;
+    uint64_t write_count = (uint64_t)workload.qps * workload.writes;
+    uint64_t write_size = workload.bytes / write_count;
     const char *external_qp = secure_getenv("ROCE_DPDK_CM_EXTERNAL_QP");
     bool owned_qp = rdmacm && (!external_qp || strcmp(external_qp, "1"));
     if ((verbs_mr && registration_device) ||
+        (two_sge_writes && (!native_queues || write_size < 2 || write_size > ROCE_NATIVE_MAX_WRITE ||
+                            workload.bytes % write_count)) ||
         (native_queues && (!verbs_mr || !workload.sender ||
                            workload.post_batch > roce_native_queue_capacity(workload.writes))) ||
         (rdmacm && (!in_band_cm || !verbs_mr || workload.qps != 1 ||
@@ -729,7 +741,17 @@ bool roce_app_write(const char *path, const char *registration_device)
     if (buffer == MAP_FAILED)
         goto disconnect;
     size_t bytes = (size_t)workload.bytes;
-    roce_lab_fill(buffer, bytes, workload.sender);
+    if (two_sge_writes) {
+        size_t first = roce_app_first_sge_length((uint32_t)write_size);
+        size_t second = (size_t)write_size - first;
+        /* Reverse the spans in local memory to exercise ordered, noncontiguous gathers. */
+        for (size_t offset = 0; offset < bytes; offset += (size_t)write_size) {
+            roce_lab_fill_range(buffer + offset, second, offset + first, true);
+            roce_lab_fill_range(buffer + offset + second, first, offset, true);
+        }
+    } else {
+        roce_lab_fill(buffer, bytes, workload.sender);
+    }
     struct app_verbs verbs = {0};
     struct app_cm_queue queue = { .socket = socket, .fd = -1, .receiver = !workload.sender };
     bool offered;
@@ -742,7 +764,7 @@ bool roce_app_write(const char *path, const char *registration_device)
                 queue.resources.cq = ibv_create_cq(verbs.context, (int)depth, NULL, NULL, 0);
                 offered = queue.resources.cq != NULL;
             } else {
-                int error = roce_app_create_native_qp(verbs.pd, depth, queue.receiver, &queue.resources);
+                int error = roce_app_create_native_qp(verbs.pd, depth, send_sges, queue.receiver, &queue.resources);
                 if (error)
                     errno = error;
                 else
@@ -769,7 +791,8 @@ bool roce_app_write(const char *path, const char *registration_device)
             struct roce_cma_lab_address addresses;
             connected = receive_app_message(socket, &addresses, sizeof(addresses)) &&
                         roce_app_rdmacm_connect(&cma, &addresses, verbs.pd, &queue.resources,
-                                                workload.sender, owned_qp ? NULL : prepare_cm_queue, &queue);
+                                                workload.sender, send_sges,
+                                                owned_qp ? NULL : prepare_cm_queue, &queue);
             if (connected && owned_qp && workload.sender) {
                 int error = receive_cm_queue(&queue);
                 if (error)

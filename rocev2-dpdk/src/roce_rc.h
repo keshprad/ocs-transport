@@ -73,9 +73,9 @@ static inline bool roce_requester_can_stage(const struct roce_requester *r, uint
     return !r->failure && staged < r->total - r->next &&
            r->next + staged - r->acked < r->window;
 }
-/* The caller supplies a validated segment within an admitted WRITE. */
+/* Payload points to the first byte of a validated segment within an admitted WRITE. */
 void roce_requester_write_packet(const struct roce_requester *r, uint32_t index,
-                                 uint32_t segment, const uint8_t *source,
+                                 uint32_t segment, const uint8_t *payload,
                                  uint64_t remote_address, uint32_t length,
                                  struct roce_packet *packet);
 /* Returns the zero-based WRITE index, or UINT32_MAX if no packet is sendable. */
