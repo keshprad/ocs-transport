@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the production DPDK endpoint against an independent RC wire peer."""
 
+import argparse
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -34,8 +35,8 @@ OPCODES = (0x06, 0x07, 0x08)
 
 
 @contextmanager
-def process(args, directory):
-    env = {**os.environ, "XDG_RUNTIME_DIR": str(directory)}
+def process(args, directory, *, environment=None):
+    env = {**os.environ, "XDG_RUNTIME_DIR": str(directory), **(environment or {})}
     child = subprocess.Popen(args, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         yield child
@@ -120,6 +121,7 @@ class Peer:
         # Model loss of the final ACK. The timer must retry from the remaining gap.
         self.expect_write(1)
         self.expect_write(2)
+        assert not select.select([self.control], [], [], 0)[0], "requester signaled completion before final ACK"
         self.send(0x11, self.psn + 2, struct.pack("!I", 0x1F000001))
         assert self.read(1) == b"D"
         self.control.sendall(b"V")
@@ -140,7 +142,7 @@ class Peer:
         assert self.read(1) == b"V"
 
 
-def check(role, cpus, *, scatter_gather=False):
+def check(role, cpus, *, scatter_gather=False, provider=None):
     with tempfile.TemporaryDirectory(prefix="roce-peer-") as temporary:
         directory = Path(temporary)
         relay_path, fixture_path = directory / "relay", directory / "fixture"
@@ -169,11 +171,18 @@ def check(role, cpus, *, scatter_gather=False):
                 app_socket = directory / "application.sock"
                 if scatter_gather:
                     args += ["--scatter-gather", "--app-socket", str(app_socket)]
+                app_env = {}
+                if provider:
+                    mr_socket = directory / "registration.sock"
+                    args += ["--mr-socket", str(mr_socket), "--verbs-queues"]
+                    app_env = {"ROCE_DPDK_MR_SOCKET": str(mr_socket), "RDMAV_DRIVERS": provider,
+                               "ROCE_DPDK_MR_REQUIRE_NETLINK": "1"}
                 with process(args, directory) as endpoint, ExitStack() as clients:
                     if scatter_gather:
                         assert select.select([endpoint.stdout], [], [], 5)[0], "application listener timeout"
                         assert endpoint.stdout.readline() == "application listener ready\n"
-                        app = clients.enter_context(process([BINARY.with_name("roce_app_write"), app_socket], directory))
+                        app = clients.enter_context(process([BINARY.with_name("roce_app_write"), app_socket],
+                                                            directory, environment=app_env))
                     if role == "tx":
                         control, _ = listener.accept()
                     else:
@@ -193,23 +202,34 @@ def check(role, cpus, *, scatter_gather=False):
                     marker = "WRITE complete" if role == "tx" else "WRITE verified"
                     assert f"{marker}: {SIZE} bytes" in out, out
                     if role == "tx":
-                        assert "2 retries" in out, out
+                        completion = f"WRITE complete: {SIZE} bytes, 3 packets, 2 retries, peer verified"
+                        assert completion in out.splitlines(), out
                     if scatter_gather:
                         out, err = app.communicate(timeout=5)
                         assert app.returncode == 0 and f"Application completed {SIZE} bytes" in out, out + err
+                        if provider:
+                            assert "Application observed 1 WRITE completions per QP via libibverbs" in out, out + err
                 out, err = relay.communicate(timeout=5)
                 assert relay.returncode == 0, out + err
                 mode = " scatter/gather" if scatter_gather else ""
+                if provider:
+                    mode += " using a native verbs queue"
                 print(f"independent RC peer verified {role}{mode} with {SIZE} bytes")
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verbs-provider", metavar="PREFIX", type=lambda path: str(Path(path).resolve()),
+                        help="add the Netlink-backed verbs retry test using this provider prefix")
+    args = parser.parse_args()
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 2:
         raise RuntimeError("independent peer test needs two available CPUs")
     check("tx", cpus[:2])
     check("rx", cpus[:2])
     check("tx", cpus[:2], scatter_gather=True)
+    if args.verbs_provider:
+        check("tx", cpus[:2], scatter_gather=True, provider=args.verbs_provider)
 
 
 if __name__ == "__main__":

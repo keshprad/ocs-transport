@@ -187,6 +187,15 @@ carrying raw frames. It checks retry after a sequence NAK and a lost final
 ACK, rejects a corrupt iCRC, and verifies that a duplicate cannot overwrite
 completed data.
 
+With the MR modules loaded and the provider available, run the same
+independent peer with a native libibverbs scatter/gather requester.
+The added case requires Generic Netlink and checks successful WRITE
+completion after the sequence NAK and ACK timeout.
+
+```sh
+python3 tests/check_peer.py --verbs-provider "$PROVIDER_DIR/libroce_dpdk"
+```
+
 ## Spark wire interoperability
 
 Use a dedicated data function and a separate IP path for TCP setup. The

@@ -31,9 +31,9 @@ to check implementation behavior and run independent interoperability tests.
 | §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for the configured host region. `RC` checks incorrect keys, below-base and overrun addresses, and inconsistent message lengths with no memory modification on first-packet rejection. |
 | A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **V** for the tested one-QP IPv4 host-memory WRITE. Two runs verified 8,195 bytes in each direction at PMTU 1024 with raw Ethernet on the DPDK function and native RoCE on the verbs peer. |
 
-Zero-length WRITE, WRITE with Immediate, SEND, READ, atomics, IPv6, RoCE
-congestion management, standard RDMA CM, and a DPDK-side verbs provider remain
-open. No overall clause count is asserted.
+Zero-length WRITE, WRITE with Immediate, SEND, READ, atomics, IPv6 and
+RoCE congestion management remain open. The BURST evidence below covers
+the supported RDMA CM and DPDK-side verbs provider profiles.
 
 ## Reproducible evidence
 
@@ -43,6 +43,7 @@ open. No overall clause count is asserted.
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
 | MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. With four available CPUs, a two-queue test verifies WRITEs on three QPs. |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
+| PEER-VERBS | `python3 tests/check_peer.py --verbs-provider "$PROVIDER_DIR/libroce_dpdk"` | On the exact Spark-04 kernel in QEMU, the independent peer sent a sequence NAK and withheld the final ACK. It verified both retransmissions from a native scatter/gather requester and checked the payload. The application received one libibverbs completion. Netlink handoff was required. |
 | SPARK | [Spark wire interoperability](README.md#spark-wire-interoperability) | Native controls passed both ways. Two mixed runs each verified all 8,195 bytes in both directions on ConnectX-7 at PMTU 1024. |
 
 ### Spark hardware verification
@@ -115,8 +116,8 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
   BURST uses DPDK scatter/gather for transmit and Intel DSA for receive copies.
   The Spark CPU-copy baseline uses Arm CRC instructions and a per-core
   mbuf cache. See [bandwidth probes](README.md#bandwidth-probes) for the
-  measurements. Transmit buffer chaining and receive-copy offload remain
-  open.
+  measurements. The native gather path chains worker-owned headers and
+  iCRC with the application payload. Spark RX placement uses CPU memcpy.
 - **§5.1 and Appendix A.7.** Report QP count, batch size, and core usage with
   throughput. BURST's single-QP result is about 121 Gbit/s in its x86/400G
   testbed. The DPDK test supports 16 QPs and independent RC state.
@@ -159,7 +160,7 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | --- | --- | --- |
 | Figure 5(a), §4.1 | Separate application and DPDK worker processes | `make check-app` verifies an 8,195-byte WRITE and 3,145,764 bytes across four QPs and two workers. Each endpoint uses an application-owned shared buffer. The receiving application checks every byte before peer verification. |
 | Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins caller pages and sends a single-use Generic Netlink ticket bound to the worker. The worker imports a CPU mapping and can export its lease as a DMA-BUF. The exact Spark-04 kernel guest verified process authorization, retry after FD exhaustion, duplicate import rejection, cancellation, and expiry. The provider lifecycle and both copy and scatter/gather WRITE tests passed with Netlink required. The same binaries passed on the older kernel module using SCM_RIGHTS. |
-| Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. The CM applications create CQs and RC QPs before setup. Provider checks cover unmatched QPN and wrong-PD rejection, successful rebinding after a rejected configuration, and `EBUSY` for referenced MR, PD and CQ resources. |
+| Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. The CM applications use libibverbs polling CQs and RC QPs. Provider checks cover unmatched QPN and wrong-PD rejection, successful rebinding after a rejected configuration, and `EBUSY` for referenced MR, PD and CQ resources. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification and completion | Worker queues consume shared WQEs from native `ibv_post_send()` and publish individual results for `ibv_poll_cq()`. The provider fixture verifies partial linked-list posting, CQ capacity, queue closure and error WC mapping. With Netlink required, the exact Spark-04-kernel guest verified native copy and scatter/gather on one QP and native copy on four QPs across two workers. Each QP posted one WRITE at a time and returned all three signaled completions. |
 | Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The requester chains worker-owned headers and trailer around the application payload. Independent wire vectors cover PMTU 4096. The RC peer verifies sequence NAK and timeout retries. With standard verbs registration on both ends, a four-process memif test verified 24,585 bytes in both copy and scatter/gather modes before deregistration. RX copies into the MR before acknowledging. The DPDK 23.11.7 mlx5 patch builds, and the worker resolves its DMA-BUF map/unmap APIs. Physical ConnectX-7 DMA from native MRs remains unverified. |
 | Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs, DREP replay, and the REP and RTU gates. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. CM-owned QPs use `rdma_create_qp()` with a provider PD and polling CQs. The worker hands back the queue FD, waits for QP readiness, and sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. The exact Spark-04 kernel guest exercised CM-owned and external QPs. TCP carries the lab's WRITE completion and verification. Stock librdmacm verified WRITE and disconnect in both directions with Linux RXE and physical ConnectX-7 at MTUs 1500 and 4200. |
@@ -206,6 +207,15 @@ trace contained only WRITE completion and verification bytes. DREP
 replays are capped by the CM retry count. The lab uses that retry horizon
 for TIMEWAIT. The IBTA timer uses path lifetime and peer ACK delay.
 [IBTA Volume 1 §§12.9.7–12.9.8](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
+
+Two further exact-kernel trials exercised RC loss with CM-owned QPs,
+Netlink-backed native MRs and scatter/gather TX. Dropping a three-segment
+WRITE MIDDLE mbuf provoked a sequence NAK for that PSN. Dropping the final
+positive ACK provoked a timeout, a duplicate final WRITE and a replay of
+the cumulative ACK. Each run needed one retry and verified 24,585 bytes.
+The requester had acknowledged and retired two of three WRITEs before
+processing the final ACK. Each run returned three ordered successful
+libibverbs completions after their covering ACKs.
 
 On November 24, 2026, the Spark-04 requester mapped a 12,288-byte
 application memfd buffer for mlx5 scatter/gather DMA. The Spark-02
