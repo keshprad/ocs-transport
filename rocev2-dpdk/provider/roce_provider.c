@@ -52,8 +52,13 @@ struct roce_verbs_mr {
 
 struct roce_verbs_cq {
     struct ibv_cq ibv;
-    struct roce_verbs_qp *sender;
-    bool attached;
+    /* The CQ mutex protects senders, polling order and unpolled WR credits. */
+    struct roce_verbs_qp *senders[ROCE_LAB_MAX_QPS];
+    uint32_t sender_count;
+    uint32_t next_sender;
+    uint32_t outstanding;
+    /* The context mutex protects association counts for both CQ roles. */
+    uint32_t attachments;
 };
 
 struct roce_verbs_qp {
@@ -210,7 +215,7 @@ static int query_device(struct ibv_context *context, const struct ibv_query_devi
         attributes->orig_attr.max_qp = provider->work ? provider->config.qps : 1;
         attributes->orig_attr.max_cq = 2 * attributes->orig_attr.max_qp;
         attributes->orig_attr.max_qp_wr = ROCE_NATIVE_QUEUE_DEPTH;
-        attributes->orig_attr.max_cqe = ROCE_NATIVE_QUEUE_DEPTH;
+        attributes->orig_attr.max_cqe = attributes->orig_attr.max_qp * ROCE_NATIVE_QUEUE_DEPTH;
         attributes->orig_attr.max_sge = 1;
     }
     pthread_mutex_unlock(&context->mutex);
@@ -472,7 +477,7 @@ static struct ibv_cq *create_cq(struct ibv_context *ibv, int cqe, struct ibv_com
     int error = 0;
     if ((!context->work && !context->mr_socket) || channel || comp_vector)
         error = EOPNOTSUPP;
-    else if (cqe <= 0 || cqe > ROCE_NATIVE_QUEUE_DEPTH)
+    else if (cqe <= 0 || (uint32_t)cqe > qp_capacity * ROCE_NATIVE_QUEUE_DEPTH)
         error = EINVAL;
     else if (context->cq_count == 2 * qp_capacity)
         error = ENOSPC;
@@ -494,7 +499,7 @@ static int destroy_cq(struct ibv_cq *ibv)
     struct roce_verbs_cq *cq = container_of(ibv, struct roce_verbs_cq, ibv);
     struct ibv_context *context = ibv->context;
     pthread_mutex_lock(&context->mutex);
-    bool attached = cq->attached;
+    bool attached = cq->attachments != 0;
     if (!attached)
         --provider_context(context)->cq_count;
     pthread_mutex_unlock(&context->mutex);
@@ -519,8 +524,6 @@ static int attach_qp(struct roce_verbs_qp *qp, struct ibv_pd *ibv_pd,
         error = EOPNOTSUPP;
     } else if (context->early_qp || (context->work && context->next_qp == context->config.qps)) {
         error = ENOSPC;
-    } else if (send_cq->attached || recv_cq->attached) {
-        error = EBUSY;
     } else {
         if (context->work) {
             qp->region = queue_mr(pd, &context->config);
@@ -541,8 +544,10 @@ static int attach_qp(struct roce_verbs_qp *qp, struct ibv_pd *ibv_pd,
             context->early_qp = qp;
         }
         pthread_mutex_lock(&send_cq->ibv.mutex);
-        send_cq->sender = qp;
-        send_cq->attached = recv_cq->attached = true;
+        send_cq->senders[send_cq->sender_count++] = qp;
+        ++send_cq->attachments;
+        if (recv_cq != send_cq)
+            ++recv_cq->attachments;
         atomic_fetch_add_explicit(&pd->references, 1, memory_order_relaxed);
         pthread_mutex_unlock(&send_cq->ibv.mutex);
     }
@@ -621,8 +626,17 @@ static int destroy_qp(struct ibv_qp *ibv)
     bool pending = sq &&
         roce_native_posted_count(atomic_load_explicit(&sq->posted, memory_order_relaxed)) != qp->polled;
     if (!pending) {
-        send_cq->sender = NULL;
-        send_cq->attached = recv_cq->attached = false;
+        uint32_t sender = 0;
+        while (send_cq->senders[sender] != qp)
+            ++sender;
+        uint32_t last = --send_cq->sender_count;
+        send_cq->senders[sender] = send_cq->senders[last];
+        send_cq->senders[last] = NULL;
+        if (send_cq->next_sender >= last)
+            send_cq->next_sender = 0;
+        --send_cq->attachments;
+        if (recv_cq != send_cq)
+            --recv_cq->attachments;
         if (qp->region)
             --qp->region->qp_refs;
         else
@@ -769,6 +783,7 @@ static int prepare_native_write(struct roce_native_write *entry, const struct ib
 static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send_wr **bad_wr)
 {
     struct roce_verbs_qp *qp = container_of(ibv, struct roce_verbs_qp, verbs.qp);
+    struct roce_verbs_cq *cq = container_of(ibv->send_cq, struct roce_verbs_cq, ibv);
     struct roce_verbs_context *context = provider_context(ibv->context);
     const struct roce_native_queue_config *config = &context->config;
     struct ibv_send_wr *next = wr;
@@ -794,12 +809,11 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
         goto unlock;
     }
 
-    uint32_t limit = qp->init.cap.max_send_wr;
-    if (limit > (uint32_t)ibv->send_cq->cqe)
-        limit = (uint32_t)ibv->send_cq->cqe;
+    uint32_t available = (uint32_t)cq->ibv.cqe - cq->outstanding;
     uint32_t posted = first;
     for (; next; next = next->next) {
-        if (posted >= config->writes || posted - qp->polled >= limit) {
+        if (posted >= config->writes || posted - qp->polled >= qp->init.cap.max_send_wr ||
+            posted - first >= available) {
             error = ENOMEM;
             break;
         }
@@ -816,6 +830,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
             error = ESHUTDOWN;
             next = wr;
         } else {
+            cq->outstanding += posted - first;
             uint32_t worker = ((qp->index + 1) * config->workers - 1) / config->qps;
             uint64_t item = (uint64_t)(qp->index + 1) << 32 | posted;
             roce_native_notify(&context->work->doorbells[worker], item);
@@ -852,6 +867,28 @@ static enum ibv_wc_status completion_status(uint8_t status)
     }
 }
 
+static int poll_sender(struct roce_verbs_qp *qp, int count, struct ibv_wc *wc)
+{
+    const struct roce_native_sq *sq = qp_sq(qp);
+    if (!sq)
+        return 0;
+    uint32_t retired = atomic_load_explicit(&sq->retired, memory_order_acquire);
+    uint32_t posted = roce_native_posted_count(atomic_load_explicit(&sq->posted, memory_order_relaxed));
+    if (retired < qp->polled || retired > posted)
+        return -EIO;
+
+    int done = 0;
+    while (done < count && qp->polled < retired) {
+        size_t index = qp->polled++ % ROCE_NATIVE_QUEUE_DEPTH;
+        enum ibv_wc_status status = completion_status(sq->status[index]);
+        wc[done++] = (struct ibv_wc) {
+            .wr_id = sq->entries[index].wr_id, .status = status, .opcode = IBV_WC_RDMA_WRITE,
+            .qp_num = qp->verbs.qp.qp_num, .byte_len = status == IBV_WC_SUCCESS ? sq->entries[index].length : 0,
+        };
+    }
+    return done;
+}
+
 static int poll_cq(struct ibv_cq *ibv, int count, struct ibv_wc *wc)
 {
     if (count < 0 || (count && !wc))
@@ -861,27 +898,21 @@ static int poll_cq(struct ibv_cq *ibv, int count, struct ibv_wc *wc)
     struct roce_verbs_cq *cq = container_of(ibv, struct roce_verbs_cq, ibv);
 
     pthread_mutex_lock(&ibv->mutex);
-    struct roce_verbs_qp *qp = cq->sender;
-    const struct roce_native_sq *sq = qp ? qp_sq(qp) : NULL;
-    int done = 0;
-    if (sq) {
-        uint32_t retired = atomic_load_explicit(&sq->retired, memory_order_acquire);
-        uint32_t posted = roce_native_posted_count(atomic_load_explicit(&sq->posted, memory_order_relaxed));
-        if (retired < qp->polled || retired > posted) {
-            done = -EIO;
-        } else {
-            while (done < count && qp->polled < retired) {
-                size_t index = qp->polled++ % ROCE_NATIVE_QUEUE_DEPTH;
-                enum ibv_wc_status status = completion_status(sq->status[index]);
-                wc[done++] = (struct ibv_wc) {
-                    .wr_id = sq->entries[index].wr_id, .status = status, .opcode = IBV_WC_RDMA_WRITE,
-                    .qp_num = qp->verbs.qp.qp_num, .byte_len = status == IBV_WC_SUCCESS ? sq->entries[index].length : 0,
-                };
-            }
+    int done = 0, error = 0;
+    /* Rotate between send queues while preserving each queue's WR order. */
+    for (uint32_t i = 0; i < cq->sender_count && done < count; ++i) {
+        int polled = poll_sender(cq->senders[cq->next_sender], count - done, wc + done);
+        if (polled < 0) {
+            error = polled;
+            break;
         }
+        done += polled;
+        if (++cq->next_sender == cq->sender_count)
+            cq->next_sender = 0;
     }
+    cq->outstanding -= (uint32_t)done;
     pthread_mutex_unlock(&ibv->mutex);
-    return done;
+    return done ? done : error;
 }
 
 static void free_context(struct ibv_context *ibv)

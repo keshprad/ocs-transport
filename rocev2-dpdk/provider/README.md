@@ -13,6 +13,13 @@ The provider supports RC QP setup and query, signaled one-SGE
 RDMA WRITE posting and CQ polling. The supplied PD must own the source
 MR for the lane. The QP retains both that MR and its CQs until destroy.
 
+Multiple bound QPs can share one polling CQ. Completions carry the
+originating QPN and remain ordered within each send queue. The CQ reserves
+space for all accepted signaled WRs across its QPs and returns the space
+when the application polls their completions. When all slots are reserved,
+posting returns `ENOMEM` with `bad_wr` pointing to the first unaccepted WR.
+The provider releases a CQ only after its last associated QP is destroyed.
+
 The provider uses libibverbs private ABI 34, the ABI of rdma-core v50
 on both tested Sparks. Build the `ibverbs` target from the official
 rdma-core v50.0 source to generate the private headers. The provider
@@ -37,7 +44,9 @@ make -C rocev2-dpdk/provider RDMA_CORE_BUILD="$RDMA_CORE_BUILD" check
 The discovery probe checks the device without a worker connection.
 With both kernel modules loaded, run the separate MR lifecycle check.
 It starts a worker-side registration listener and checks MR permissions,
-unaligned ranges and deregistration while a lease is active.
+unaligned ranges and deregistration while a lease is active. The same test
+uses a simulated worker to check shared CQ capacity, completion identity
+and teardown with more than one attached QP.
 Set `ROCE_DPDK_MR_REQUIRE_NETLINK=1` to require the kernel's ticket
 handoff in these checks.
 

@@ -25,6 +25,7 @@ check_provider: check_provider.c
 check_provider_mr: check_provider_mr.c ../src/roce_mr_server.c ../src/roce_mr_server.h \
                    ../src/roce_mr_ipc.c ../src/roce_mr_ipc.h ../src/roce_fd.h \
                    ../src/roce_mr_netlink.c ../src/roce_mr_netlink.h ../kernel/roce_mr_uapi.h \
+                   ../src/roce_native_connection.c ../src/roce_native_connection.h \
                    $(QUEUE_HEADERS)
 	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CFLAGS) $(WARNINGS) -std=gnu11 -pthread $(LDFLAGS) \
 		-o $@ $(filter %.c,$^) $(VERBS_LIBS) -ldl $(LDLIBS)

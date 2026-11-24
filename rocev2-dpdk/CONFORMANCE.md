@@ -171,6 +171,22 @@ ticket to that worker's process and namespaces. The ticket identifies
 the mapping while the exporter holds the kernel file descriptor.
 [BURST design](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=6)
 
+The stock libibverbs provider fixture on the Spark-04 kernel checks
+two QPs sharing a four-entry polling CQ. It verifies aggregate posting
+credits, partial posting with `bad_wr`, completion identity for duplicate
+WR IDs on different QPs, ordered success and error completions within each
+QP, and continued polling after one QP is destroyed. The CQ stays busy
+until the last QP detaches. The signaled WRITE path reserves CQ capacity
+at posting time. Asynchronous CQ notifications and overrun events remain
+outside the polling profile. [IBTA Volume 1 §§10.2.6, 10.8.5](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
+
+A separate four-QP scatter/gather application used one CQ with the
+production DPDK worker on that kernel. It posted 129 WRITEs per QP
+before polling, verified all 516 completions in order within each QP,
+and verified 4,228,620 bytes at the receiver. The transfer had one RC
+retry. Both applications released their MRs and PDs, and the requester
+destroyed all four QPs before releasing the shared CQ.
+
 The CM wire tests cover fixed 256-byte MADs in Volume 1 Chapter 12
 and the QP1 transport described in
 Annex A17 §A17.6.1.1. They check the UD opcode, destination and source QPs,
