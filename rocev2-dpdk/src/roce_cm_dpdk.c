@@ -1,5 +1,4 @@
 #include "roce_cm_dpdk.h"
-#include "roce_cm_session.h"
 
 #include <arpa/inet.h>
 
@@ -88,7 +87,8 @@ static void transmit_cm(uint16_t port, struct rte_mempool *pool, struct roce_cm_
 
 bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
                           const struct roce_lab_options *options, const struct roce_lab_offer *local,
-                          const struct roce_address *destination, struct roce_lab_offer *peer)
+                          const struct roce_address *destination, struct roce_lab_offer *peer,
+                          struct roce_cm_session *session)
 {
     uint32_t comm_id, nonce[2];
     if (!roce_lab_random(&comm_id) || !roce_lab_random(&nonce[0]) || !roce_lab_random(&nonce[1]))
@@ -111,29 +111,61 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
         .mtu = mtu_code(local->pmtu), .private_data = (const uint8_t *)private_data,
         .private_length = sizeof(private_data), .retry_ns = UINT64_C(250000000), .max_retries = 7,
     };
-    struct roce_cm_session session;
-    if (!roce_cm_session_init(&session, &config))
+    if (!roce_cm_session_init(session, &config))
         return false;
 
     uint64_t deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
     bool valid_peer = false;
     for (uint64_t now = roce_now_ns(); now < deadline; now = roce_now_ns()) {
-        receive_cm(port, &session, now);
-        if (session.peer_private_length && !valid_peer) {
-            if (!peer_offer(&session, options, destination, peer))
+        receive_cm(port, session, now);
+        if (session->peer_private_length && !valid_peer) {
+            if (!peer_offer(session, options, destination, peer))
                 return false;
             valid_peer = true;
         }
-        transmit_cm(port, pool, &session, now);
-        if (session.phase == ROCE_CM_FAILED)
+        transmit_cm(port, pool, session, now);
+        if (session->phase == ROCE_CM_FAILED)
             return false;
-        if (session.phase == ROCE_CM_ESTABLISHED) {
+        if (session->phase == ROCE_CM_ESTABLISHED) {
             /* Keep polling for duplicate REP until the lab peer confirms receipt of RTU. */
             if (!options->sender)
                 return roce_lab_send(control, 'C');
             int ready = roce_lab_receive(control, 'C', true);
             if (ready)
                 return ready == 1;
+        }
+        rte_pause();
+    }
+    return false;
+}
+
+bool roce_cm_lab_close(uint16_t port, struct rte_mempool *pool, int control,
+                      struct roce_cm_session *session)
+{
+    bool initiator = session->config.initiator;
+    if (initiator) {
+        uint32_t nonce[2];
+        if (!roce_lab_random(&nonce[0]) || !roce_lab_random(&nonce[1]))
+            return false;
+        uint64_t tid = ((uint64_t)nonce[0] << 32 | nonce[1]) | 1;
+        if (!roce_cm_session_disconnect(session, tid))
+            return false;
+    }
+    uint64_t deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
+    for (uint64_t now = roce_now_ns(); now < deadline; now = roce_now_ns()) {
+        receive_cm(port, session, now);
+        transmit_cm(port, pool, session, now);
+        if (session->phase == ROCE_CM_DISCONNECTED) {
+            if (session->disconnect_error)
+                return false;
+            if (initiator)
+                return roce_lab_send(control, 'Q');
+            /* Keep replaying DREP until the lab requester confirms receipt. */
+            int closed = roce_lab_receive(control, 'Q', true);
+            if (closed)
+                return closed == 1;
+            if (!roce_cm_session_in_timewait(session, now))
+                return false;
         }
         rte_pause();
     }

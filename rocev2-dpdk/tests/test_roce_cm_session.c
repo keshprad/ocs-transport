@@ -1,6 +1,7 @@
 #include "roce_cm_session.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -231,11 +232,133 @@ static void check_retry_limit(void)
     assert(!roce_cm_session_init(&pair.passive, &passive));
 }
 
+static void establish_pair(struct test_pair *pair, bool deliver_rtu)
+{
+    init_pair(pair);
+    assert(!roce_cm_session_disconnect(&pair->active, 1));
+    send_at(&pair->active, 0, pair->req);
+    assert(receive_at(&pair->passive, 0, pair->req));
+    send_at(&pair->passive, 0, pair->rep);
+    assert(receive_at(&pair->active, 0, pair->rep));
+    send_at(&pair->active, 0, pair->rtu);
+    if (deliver_rtu)
+        assert(receive_at(&pair->passive, 0, pair->rtu));
+}
+
+static void check_disconnect_replay(void)
+{
+    struct test_pair pair;
+    struct roce_cm_frame outer;
+    uint8_t dreq[ROCE_CM_FRAME_SIZE], drep[ROCE_CM_FRAME_SIZE], wrong[ROCE_CM_FRAME_SIZE];
+    establish_pair(&pair, false);
+
+    assert(roce_cm_session_disconnect(&pair.active, 0x12345678));
+    assert(roce_cm_session_disconnect(&pair.active, 2));
+    send_at(&pair.active, 0, dreq);
+    struct roce_cm_message message = unpack(dreq, &outer);
+    assert(message.type == ROCE_CM_DREQ && message.tid == 0x12345678);
+    assert(message.local_comm_id == 0x12345678 && message.remote_comm_id == 0x96325874);
+    assert(message.dreq.remote_qpn == 0x80402);
+    ++message.dreq.remote_qpn;
+    pack(wrong, outer, &message);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    --message.dreq.remote_qpn;
+    ++message.remote_comm_id;
+    pack(wrong, outer, &message);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    assert(pair.passive.phase == ROCE_CM_PENDING);
+    assert(receive_at(&pair.passive, 0, dreq));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+    assert(!receive_at(&pair.passive, 0, pair.rtu));
+    assert(receive_at(&pair.passive, 0, dreq));
+    assert(roce_cm_session_prepare(&pair.passive, 0, drep, sizeof(drep)) == sizeof(drep));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+
+    /* Drop the first DREP and confirm the next duplicate DREQ receives a reply. */
+    roce_cm_session_sent(&pair.passive, 0);
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTED && !pair.passive.disconnect_error);
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS - 1, dreq, sizeof(dreq)));
+    send_at(&pair.active, RETRY_NS, dreq);
+    assert(receive_at(&pair.passive, RETRY_NS, dreq));
+    send_at(&pair.passive, RETRY_NS, drep);
+    message = unpack(drep, &outer);
+    assert(message.type == ROCE_CM_DREP && message.tid == 0x12345678);
+    assert(message.local_comm_id == 0x96325874 && message.remote_comm_id == 0x12345678);
+    ++message.tid;
+    pack(wrong, outer, &message);
+    assert(!receive_at(&pair.active, RETRY_NS, wrong));
+    assert(pair.active.phase == ROCE_CM_DISCONNECTING);
+    assert(receive_at(&pair.active, RETRY_NS, drep));
+    assert(pair.active.phase == ROCE_CM_DISCONNECTED && !pair.active.disconnect_error);
+    assert(receive_at(&pair.active, RETRY_NS, drep));
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, wrong, sizeof(wrong)));
+
+    assert(roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS - 1));
+    assert(!roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS));
+    assert(!receive_at(&pair.passive, 5 * RETRY_NS, dreq));
+    assert(!roce_cm_session_prepare(&pair.passive, 5 * RETRY_NS, wrong, sizeof(wrong)));
+}
+
+static void check_simultaneous_disconnect(bool reordered)
+{
+    struct test_pair pair;
+    struct roce_cm_frame outer;
+    uint8_t passive_dreq[ROCE_CM_FRAME_SIZE];
+    establish_pair(&pair, true);
+    assert(roce_cm_session_disconnect(&pair.active, pair.active.tid));
+    assert(roce_cm_session_disconnect(&pair.passive, 0x87654321));
+    send_at(&pair.active, 0, pair.req);
+    send_at(&pair.passive, 0, passive_dreq);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    if (!reordered)
+        assert(receive_at(&pair.active, 0, passive_dreq));
+
+    send_at(&pair.passive, 0, pair.rep);
+    struct roce_cm_message message = unpack(pair.rep, &outer);
+    assert(message.type == ROCE_CM_DREP && message.tid == pair.active.tid);
+    assert(receive_at(&pair.active, 0, pair.rep));
+    if (reordered) {
+        assert(pair.active.phase == ROCE_CM_DISCONNECTED);
+        assert(receive_at(&pair.active, 0, passive_dreq));
+    } else {
+        assert(pair.active.phase == ROCE_CM_DISCONNECTING);
+    }
+
+    send_at(&pair.active, 0, pair.rtu);
+    message = unpack(pair.rtu, &outer);
+    assert(message.type == ROCE_CM_DREP && message.tid == 0x87654321);
+    assert(receive_at(&pair.passive, 0, pair.rtu));
+    assert(pair.active.phase == ROCE_CM_DISCONNECTED && !pair.active.disconnect_error);
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTED && !pair.passive.disconnect_error);
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, pair.req, sizeof(pair.req)));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS, pair.rep, sizeof(pair.rep)));
+}
+
+static void check_disconnect_timeout(void)
+{
+    struct test_pair pair;
+    establish_pair(&pair, true);
+    assert(roce_cm_session_disconnect(&pair.passive, 7));
+    for (uint64_t retry = 0; retry <= 4; ++retry) {
+        send_at(&pair.passive, retry * RETRY_NS, pair.req);
+        assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+    }
+    assert(!roce_cm_session_prepare(&pair.passive, 5 * RETRY_NS - 1, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+    assert(!roce_cm_session_prepare(&pair.passive, 5 * RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTED && pair.passive.disconnect_error == ETIMEDOUT);
+    assert(roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS));
+}
+
 int main(void)
 {
     check_loss();
     check_identity();
     check_retry_limit();
+    check_disconnect_replay();
+    check_simultaneous_disconnect(false);
+    check_simultaneous_disconnect(true);
+    check_disconnect_timeout();
     puts("RoCEv2 CM session tests passed");
     return 0;
 }

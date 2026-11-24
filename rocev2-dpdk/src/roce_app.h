@@ -2,29 +2,37 @@
 #define ROCE_APP_H
 
 #include "roce_mr_server.h"
+#include "roce_doorbell.h"
+#include "roce_lab.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-struct roce_doorbell;
-struct roce_lab_options;
+struct roce_app_qp_progress {
+    _Alignas(64) _Atomic uint32_t admitted;
+    _Atomic uint32_t completed;
+};
+
+struct roce_app_work {
+    struct roce_doorbell doorbells[ROCE_LAB_MAX_QPS];
+    struct roce_app_qp_progress qps[ROCE_LAB_MAX_QPS];
+};
 
 struct roce_app_memory {
     int socket;
     uint8_t *buffer;
     size_t length;
-    struct roce_doorbell *doorbells;
+    struct roce_app_work *work;
     struct roce_mr_lease mr;
 };
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     bool dma_writable, bool in_band_cm, struct roce_mr_server *registrations,
-                     struct roce_app_memory *memory);
+                     bool dma_writable, bool in_band_cm, bool scatter_gather, uint32_t post_batch,
+                     struct roce_mr_server *registrations, struct roce_app_memory *memory);
 bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_options *options);
-bool roce_app_complete(struct roce_app_memory *memory);
+bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_detach(struct roce_app_memory *memory);
-bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32_t count, uint32_t writes);
 bool roce_app_write(const char *path, const char *registration_device);
 
 #endif

@@ -7,6 +7,8 @@ enum roce_cm_phase {
     ROCE_CM_PENDING,
     ROCE_CM_ESTABLISHED,
     ROCE_CM_FAILED,
+    ROCE_CM_DISCONNECTING,
+    ROCE_CM_DISCONNECTED,
 };
 
 struct roce_cm_session_config {
@@ -24,7 +26,7 @@ struct roce_cm_session_config {
     const uint8_t *private_data;
     size_t private_length;
     uint64_t retry_ns;
-    uint8_t max_retries; /* Additional REQ or REP sends, 0 through 15. */
+    uint8_t max_retries; /* Additional REQ, REP or DREQ sends, 0 through 15. */
 };
 
 struct roce_cm_session {
@@ -35,21 +37,36 @@ struct roce_cm_session {
     /* Received fixed-width user area, including its zero-fill. */
     uint8_t peer_private_data[ROCE_CM_REP_PRIVATE_SIZE];
     size_t peer_private_length;
+    int disconnect_error; /* Positive ETIMEDOUT if a local DREQ exhausts retries. */
 
     struct roce_cm_session_config config;
     uint8_t local_private_data[ROCE_CM_REP_PRIVATE_SIZE];
     uint32_t peer_comm_id;
     uint64_t tid;
     uint64_t last_sent;
+    uint64_t disconnect_tid;
+    uint64_t peer_dreq_tid;
+    uint64_t disconnected_at;
     uint32_t gsi_psn;
     unsigned sends;
     enum roce_cm_type prepared;
     bool received_peer;
     bool send_pending;
+    bool local_disconnect;
+    bool peer_dreq_received;
+    bool drep_pending;
 };
 
 bool roce_cm_session_init(struct roce_cm_session *session,
                           const struct roce_cm_session_config *config);
+
+/* Queue a DREQ on an established session. Closing and closed sessions succeed
+ * without starting another transaction. A received DREQ queues its own DREP. */
+bool roce_cm_session_disconnect(struct roce_cm_session *session, uint64_t tid);
+
+/* Keep the disconnected session available for duplicate DREQs for
+ * (max_retries + 1) retry intervals after entering ROCE_CM_DISCONNECTED. */
+bool roce_cm_session_in_timewait(const struct roce_cm_session *session, uint64_t now);
 
 /* Pass monotonic nanoseconds for now. Report sent only after TX accepts the
  * frame from prepare. A zero length means there is no frame ready to send. */

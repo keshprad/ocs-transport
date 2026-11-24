@@ -23,13 +23,14 @@
 #include <unistd.h>
 
 enum {
-    APP_VERSION = 2,
+    APP_VERSION = 3,
     APP_MEMFD = 1,
     APP_PINNED = 2,
     APP_DOORBELL = 3,
     APP_USE_CM = 1u << 0,
     APP_USE_VERBS_MR = 1u << 1,
     APP_WRITE_DMA_ALIAS = 1u << 2,
+    APP_SCATTER_GATHER = 1u << 3,
     APP_CONNECT = 'A',
     APP_LISTEN = 'L',
     APP_ESTABLISHED = 'E',
@@ -45,9 +46,9 @@ struct app_workload {
     uint32_t workers;
     uint32_t writes;
     uint32_t flags;
+    uint32_t post_batch;
+    uint32_t reserved;
 };
-
-static const size_t doorbell_bytes = ROCE_LAB_MAX_QPS * sizeof(struct roce_doorbell);
 
 static size_t mapping_length(uint64_t bytes)
 {
@@ -171,42 +172,32 @@ static int create_shared_file(const char *name, size_t length)
     return -1;
 }
 
-static struct roce_doorbell *offer_doorbells(int socket, uint32_t workers)
+static struct roce_app_work *offer_work(int socket, const struct roce_lab_options *options)
 {
-    int fd = create_shared_file("roce-doorbells", doorbell_bytes);
+    int fd = create_shared_file("roce-work", sizeof(struct roce_app_work));
     if (fd < 0)
         return NULL;
-    struct roce_doorbell *queues = mmap(NULL, doorbell_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    bool valid = queues != MAP_FAILED;
-    for (uint32_t i = 0; valid && i < workers; ++i)
-        valid = roce_doorbell_init(&queues[i]);
-    if (queues != MAP_FAILED && !valid)
+    struct roce_app_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    bool valid = work != MAP_FAILED;
+    for (uint32_t i = 0; valid && i < options->workers; ++i)
+        valid = roce_doorbell_init(&work->doorbells[i]);
+    for (uint32_t i = 0; valid && i < options->qps; ++i) {
+        atomic_init(&work->qps[i].admitted, 0);
+        atomic_init(&work->qps[i].completed, 0);
+        valid = atomic_is_lock_free(&work->qps[i].admitted) &&
+                atomic_is_lock_free(&work->qps[i].completed);
+    }
+    if (work != MAP_FAILED && !valid)
         errno = ENOTSUP;
     bool sent = valid && send_mapping(socket, fd, APP_DOORBELL);
     int error = errno;
     close(fd);
-    if (sent && roce_lab_receive(socket, 'P', false) == 1)
-        return queues;
-    if (queues != MAP_FAILED)
-        munmap(queues, doorbell_bytes);
-    errno = sent ? EPROTO : error;
+    if (sent)
+        return work;
+    if (work != MAP_FAILED)
+        munmap(work, sizeof(*work));
+    errno = error;
     return NULL;
-}
-
-bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32_t count, uint32_t writes)
-{
-    uint32_t cursor = 0, submitted = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        uint64_t item = roce_doorbell_take(doorbell, &cursor);
-        uint32_t qp = (uint32_t)(item >> 32);
-        if (qp <= first || qp - first > count || (uint32_t)item != writes)
-            return false;
-        uint32_t bit = UINT32_C(1) << (qp - first - 1);
-        if (submitted & bit)
-            return false;
-        submitted |= bit;
-    }
-    return roce_doorbell_take(doorbell, &cursor) == 0;
 }
 
 static bool receive_local_memory(struct roce_app_memory *memory, size_t length,
@@ -261,8 +252,8 @@ static bool receive_verbs_memory(struct roce_app_memory *memory, struct roce_mr_
 }
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     bool dma_writable, bool in_band_cm, struct roce_mr_server *registrations,
-                     struct roce_app_memory *memory)
+                     bool dma_writable, bool in_band_cm, bool scatter_gather, uint32_t post_batch,
+                     struct roce_mr_server *registrations, struct roce_app_memory *memory)
 {
     uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
     size_t length = mapping_length(bytes);
@@ -279,7 +270,9 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         .bytes = bytes, .version = APP_VERSION, .sender = options->sender,
         .qps = options->qps, .workers = options->workers, .writes = options->writes,
         .flags = (in_band_cm ? APP_USE_CM : 0) | (registrations ? APP_USE_VERBS_MR : 0) |
-                 (registrations && dma_writable ? APP_WRITE_DMA_ALIAS : 0),
+                 (registrations && dma_writable ? APP_WRITE_DMA_ALIAS : 0) |
+                 (scatter_gather ? APP_SCATTER_GATHER : 0),
+        .post_batch = post_batch,
     };
     if (!configure_peer(socket, &pid) ||
         send(socket, &workload, sizeof(workload), MSG_NOSIGNAL) != sizeof(workload))
@@ -299,8 +292,8 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
     if (!received)
         goto disconnect;
     if (options->sender && !in_band_cm) {
-        attached.doorbells = offer_doorbells(socket, options->workers);
-        if (!attached.doorbells)
+        attached.work = offer_work(socket, options);
+        if (!attached.work)
             goto disconnect;
     }
     *memory = attached;
@@ -321,12 +314,16 @@ bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_op
         return false;
     if (!options->sender)
         return true;
-    memory->doorbells = offer_doorbells(memory->socket, options->workers);
-    return memory->doorbells != NULL;
+    memory->work = offer_work(memory->socket, options);
+    return memory->work != NULL;
 }
 
-bool roce_app_complete(struct roce_app_memory *memory)
+bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options)
 {
+    /* The worker has verified every WRITE and released its PMD references. */
+    if (memory->work)
+        for (uint32_t i = 0; i < options->qps; ++i)
+            atomic_store_explicit(&memory->work->qps[i].completed, options->writes, memory_order_release);
     bool verbs = memory->mr.server != NULL;
     if (verbs) {
         roce_mr_release(&memory->mr);
@@ -344,8 +341,8 @@ bool roce_app_complete(struct roce_app_memory *memory)
 void roce_app_detach(struct roce_app_memory *memory)
 {
     if (memory->socket >= 0) {
-        if (memory->doorbells)
-            munmap(memory->doorbells, doorbell_bytes);
+        if (memory->work)
+            munmap(memory->work, sizeof(*memory->work));
         if (memory->mr.server)
             roce_mr_release(&memory->mr);
         else if (memory->buffer)
@@ -373,14 +370,44 @@ static int pin_mapping(const char *device, void *buffer, size_t length, bool sen
 
 struct producer {
     struct roce_doorbell *queue;
-    uint64_t item;
+    const _Atomic uint32_t *progress;
+    uint32_t qp;
+    uint32_t writes;
+    uint32_t post_batch;
+    int socket;
     bool posted;
 };
+
+static bool wait_to_post(int socket, uint64_t deadline)
+{
+    if (roce_now_ns() >= deadline)
+        return false;
+    struct pollfd peer = { .fd = socket, .events = POLLRDHUP };
+    int ready = poll(&peer, 1, 1);
+    return ready == 0 || (ready < 0 && errno == EINTR);
+}
 
 static void *publish_work(void *opaque)
 {
     struct producer *producer = opaque;
-    producer->posted = roce_doorbell_publish(producer->queue, producer->item);
+    uint64_t deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
+    for (uint32_t posted = 0; posted < producer->writes;) {
+        uint32_t count = producer->writes - posted;
+        if (count > producer->post_batch)
+            count = producer->post_batch;
+        uint64_t item = (uint64_t)producer->qp << 32 | count;
+        while (!roce_doorbell_publish(producer->queue, item))
+            if (!wait_to_post(producer->socket, deadline))
+                return NULL;
+        posted += count;
+        /* Copy TX can reuse a range when it completes. Scatter/gather may
+         * retain TX references until queue stop, so it gates on admission. */
+        while (posted < producer->writes &&
+               atomic_load_explicit(producer->progress, memory_order_acquire) < posted)
+            if (!wait_to_post(producer->socket, deadline))
+                return NULL;
+    }
+    producer->posted = true;
     return NULL;
 }
 
@@ -390,11 +417,11 @@ static bool post_writes(int socket, const struct app_workload *workload)
     int fd = receive_mapping(socket, &kind);
     if (fd < 0)
         return false;
-    struct roce_doorbell *queues = MAP_FAILED;
-    if (kind == APP_DOORBELL && valid_mapping(fd, APP_MEMFD, doorbell_bytes, false))
-        queues = mmap(NULL, doorbell_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    struct roce_app_work *work = MAP_FAILED;
+    if (kind == APP_DOORBELL && valid_mapping(fd, APP_MEMFD, sizeof(*work), false))
+        work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (queues == MAP_FAILED)
+    if (work == MAP_FAILED)
         return false;
 
     struct producer producers[ROCE_LAB_MAX_QPS];
@@ -403,8 +430,11 @@ static bool post_writes(int socket, const struct app_workload *workload)
     for (; created < workload->qps; ++created) {
         uint32_t qp = created + 1;
         uint32_t worker = (qp * workload->workers - 1) / workload->qps;
+        const struct roce_app_qp_progress *progress = &work->qps[created];
         producers[created] = (struct producer) {
-            .queue = &queues[worker], .item = (uint64_t)qp << 32 | workload->writes,
+            .queue = &work->doorbells[worker], .qp = qp, .writes = workload->writes,
+            .post_batch = workload->post_batch, .socket = socket,
+            .progress = workload->flags & APP_SCATTER_GATHER ? &progress->admitted : &progress->completed,
         };
         if (pthread_create(&threads[created], NULL, publish_work, &producers[created]) != 0)
             break;
@@ -414,8 +444,13 @@ static bool post_writes(int socket, const struct app_workload *workload)
         pthread_join(threads[i], NULL);
         posted = posted && producers[i].posted;
     }
-    munmap(queues, doorbell_bytes);
-    return posted && roce_lab_send(socket, 'P');
+    bool completed = posted && roce_lab_receive(socket, 'C', false) == 1;
+    for (uint32_t i = 0; completed && i < workload->qps; ++i)
+        completed = atomic_load_explicit(&work->qps[i].completed, memory_order_acquire) == workload->writes;
+    munmap(work, sizeof(*work));
+    if (completed)
+        printf("Application observed %u WRITE completions per QP\n", workload->writes);
+    return completed;
 }
 
 struct app_verbs {
@@ -474,7 +509,8 @@ bool roce_app_write(const char *path, const char *registration_device)
     if (!configure_peer(socket, NULL) ||
         recv(socket, &workload, sizeof(workload), MSG_TRUNC) != sizeof(workload) ||
         workload.version != APP_VERSION || workload.sender > 1 ||
-        (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS)) ||
+        (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS | APP_SCATTER_GATHER)) ||
+        workload.reserved || !workload.post_batch || workload.post_batch > workload.writes ||
         !workload.qps || workload.qps > ROCE_LAB_MAX_QPS || !workload.workers ||
         workload.workers > workload.qps || !workload.writes || workload.writes > ROCE_PSN_MASK) {
         errno = EPROTO;
@@ -521,10 +557,9 @@ bool roce_app_write(const char *path, const char *registration_device)
         bool connected = !in_band_cm || roce_lab_receive(socket, APP_ESTABLISHED, false) == 1;
         if (connected && in_band_cm)
             puts("Application CM established");
-        bool done = connected && (workload.sender ? post_writes(socket, &workload) :
+        success = connected && (workload.sender ? post_writes(socket, &workload) :
             roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
-            roce_lab_send(socket, 'V'));
-        success = done && roce_lab_receive(socket, 'C', false) == 1;
+            roce_lab_send(socket, 'V') && roce_lab_receive(socket, 'C', false) == 1);
         if (!success)
             errno = EPROTO;
     }

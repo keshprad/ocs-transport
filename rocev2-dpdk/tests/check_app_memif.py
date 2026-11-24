@@ -45,7 +45,8 @@ def expect_success(child, *markers):
     print(stdout.strip())
 
 
-def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False, provider=None):
+def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
+          provider=None, post_batch=None):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -70,6 +71,8 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
 
         tx_path = directory / "tx.sock"
         tx_options = options + (["--scatter-gather"] if scatter_gather else [])
+        if post_batch:
+            tx_options += ["--app-post-batch", str(post_batch)]
         tx = process(stack, command(cpus[workers:2 * workers], directory, "tx", size, port, "192.0.2.1", 1024, mac=tx_mac)
                      + tx_options + tx_cm + tx_mr + ["--app-socket", str(tx_path)])
         expect_ready(tx, "application listener ready")
@@ -77,11 +80,12 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         tx_app = process(stack, [APPLICATION, str(tx_path), *app_options], env=tx_env)
 
         total = size * writes * qps
-        cm_marker = ("RoCEv2 CM established",) if cm else ()
+        cm_marker = ("RoCEv2 CM established", "RoCEv2 CM disconnected") if cm else ()
         expect_success(tx, f"WRITE complete: {total} bytes", *cm_marker)
         expect_success(rx, f"WRITE verified: {total} bytes", *cm_marker)
         app_marker = ("Application CM established",) if cm else ()
-        expect_success(tx_app, f"Application completed {total} bytes", *app_marker)
+        expect_success(tx_app, f"Application completed {total} bytes",
+                       f"Application observed {writes} WRITE completions per QP", *app_marker)
         expect_success(rx_app, f"Application verified {total} bytes", *app_marker)
 
 
@@ -96,15 +100,16 @@ def main():
     if len(cpus) < 2:
         raise RuntimeError("application test needs two available CPUs")
     if args.verbs_provider:
-        check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider)
-        check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider)
+        check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider, post_batch=1)
+        check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
+              post_batch=1)
         return
     check(cpus, 8195, 1, 1, 1, args.kernel_mr)
     check(cpus, 8195, 1, 1, 1, args.kernel_mr, scatter_gather=True)
-    check(cpus, 8195, 3, 1, 1, args.kernel_mr, scatter_gather=True, cm=True)
+    check(cpus, 8195, 3, 1, 1, args.kernel_mr, scatter_gather=True, cm=True, post_batch=1)
     if len(cpus) >= 4:
-        check(cpus, 262147, 3, 4, 2, args.kernel_mr)
-        check(cpus, 262147, 3, 4, 2, args.kernel_mr, scatter_gather=True)
+        check(cpus, 262147, 3, 4, 2, args.kernel_mr, post_batch=1)
+        check(cpus, 262147, 3, 4, 2, args.kernel_mr, scatter_gather=True, post_batch=1)
 
 
 if __name__ == "__main__":

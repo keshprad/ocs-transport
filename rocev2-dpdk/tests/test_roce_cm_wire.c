@@ -48,6 +48,23 @@ static const uint8_t rtu_fixture[256] = {
     [32] = 0x06, 0xce,
 };
 
+static const uint8_t dreq_fixture[256] = {
+    [0] = 0x01, 0x07, 0x02, 0x03,
+    [8] = 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0, 0xf0,
+    [16] = 0x00, 0x15,
+    [24] = 0x80, 0x70, 0x60, 0x50, 0x10, 0x20, 0x30, 0x40,
+    [32] = 0x11, 0x23, 0x45,
+    [36] = 0xaa, 0xcd,
+};
+
+static const uint8_t drep_fixture[256] = {
+    [0] = 0x01, 0x07, 0x02, 0x03,
+    [8] = 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe0, 0xf0,
+    [16] = 0x00, 0x16,
+    [24] = 0x10, 0x20, 0x30, 0x40, 0x80, 0x70, 0x60, 0x50,
+    [32] = 0x89, 0x01,
+};
+
 static void check_fixture(const struct roce_cm_message *message, const uint8_t *fixture,
                           size_t offset, size_t private_size)
 {
@@ -172,7 +189,7 @@ static void check_rep_rtu(void)
 
 static void check_lengths(void)
 {
-    const uint8_t *fixtures[] = {req_fixture, rep_fixture, rtu_fixture};
+    const uint8_t *fixtures[] = {req_fixture, rep_fixture, rtu_fixture, dreq_fixture, drep_fixture};
     uint8_t data[225];
     uint8_t mad[257];
 
@@ -196,6 +213,37 @@ static void check_lengths(void)
         assert(!roce_cm_decode(&message, mad, 255));
         assert(!roce_cm_decode(&message, mad, 257));
     }
+}
+
+static void check_disconnect(void)
+{
+    const uint8_t request_data[] = {0xaa, 0xcd};
+    const uint8_t reply_data[] = {0x89, 0x01};
+    struct roce_cm_message request = {
+        .type = ROCE_CM_DREQ,
+        .tid = UINT64_C(0x20406080a0c0e0f0),
+        .local_comm_id = 0x80706050,
+        .remote_comm_id = 0x10203040,
+        .dreq.remote_qpn = 0x112345,
+        .private_data = request_data,
+        .private_length = sizeof(request_data),
+    };
+    const struct roce_cm_message reply = {
+        .type = ROCE_CM_DREP,
+        .tid = request.tid,
+        .local_comm_id = request.remote_comm_id,
+        .remote_comm_id = request.local_comm_id,
+        .private_data = reply_data,
+        .private_length = sizeof(reply_data),
+    };
+    uint8_t mad[256];
+
+    check_fixture(&request, dreq_fixture, 36, 220);
+    check_fixture(&reply, drep_fixture, 32, 224);
+    assert(roce_cm_decode(&request, dreq_fixture, sizeof(mad)));
+    assert(request.dreq.remote_qpn == 0x112345);
+    request.dreq.remote_qpn = 0x1000000;
+    assert(!roce_cm_encode(mad, sizeof(mad), &request));
 }
 
 static void check_invalid_fields(void)
@@ -340,6 +388,7 @@ int main(void)
     check_req();
     check_rep_rtu();
     check_lengths();
+    check_disconnect();
     check_invalid_fields();
     check_cm_frame();
     puts("RoCEv2 CM MAD wire tests passed");

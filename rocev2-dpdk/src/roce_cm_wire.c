@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-/* IBTA Volume 1, sections 12.6.5, 12.6.8 and 12.6.9. Body offsets
+/* IBTA Volume 1, sections 12.6.5 and 12.6.8 through 12.6.11. Body offsets
  * start after the common MAD header, as in Linux ibta_vol1_c12.h. */
 enum {
     MAD_HEADER_SIZE = 24,
@@ -13,6 +13,8 @@ enum {
     REQ_PRIVATE_OFFSET = 140,
     REP_PRIVATE_OFFSET = 36,
     RTU_PRIVATE_OFFSET = 8,
+    DREQ_QPN_OFFSET = 8,
+    DREQ_PRIVATE_OFFSET = 12,
     REQ_TRANSPORT_TYPE_MASK = 0x06,
     REQ_RDC_EXISTS = 0x08,
     QPN_MASK = 0xffffff,
@@ -162,7 +164,10 @@ static size_t private_offset(enum roce_cm_type type)
     case ROCE_CM_REP:
         return MAD_HEADER_SIZE + REP_PRIVATE_OFFSET;
     case ROCE_CM_RTU:
+    case ROCE_CM_DREP:
         return MAD_HEADER_SIZE + RTU_PRIVATE_OFFSET;
+    case ROCE_CM_DREQ:
+        return MAD_HEADER_SIZE + DREQ_PRIVATE_OFFSET;
     }
     return 0;
 }
@@ -175,7 +180,10 @@ static bool valid_fields(const struct roce_cm_message *message)
     case ROCE_CM_REP:
         return valid_connection(&message->connection) && valid_rep(message);
     case ROCE_CM_RTU:
+    case ROCE_CM_DREP:
         return true;
+    case ROCE_CM_DREQ:
+        return message->dreq.remote_qpn > 1 && message->dreq.remote_qpn < QPN_MASK;
     }
     return false;
 }
@@ -206,12 +214,14 @@ size_t roce_cm_encode(uint8_t *mad, size_t capacity, const struct roce_cm_messag
     write_be(body, 4, message->local_comm_id);
     if (message->type != ROCE_CM_REQ)
         write_be(body + 4, 4, message->remote_comm_id);
-    if (message->type != ROCE_CM_RTU)
+    if (message->type == ROCE_CM_REQ || message->type == ROCE_CM_REP)
         write_be(mad + 20, 4, message->connection.ece_attr_mod);
     if (message->type == ROCE_CM_REQ)
         encode_req(body, message);
     else if (message->type == ROCE_CM_REP)
         encode_rep(body, message);
+    else if (message->type == ROCE_CM_DREQ)
+        write_be(body + DREQ_QPN_OFFSET, 3, message->dreq.remote_qpn);
     return ROCE_CM_MAD_SIZE;
 }
 
@@ -234,7 +244,7 @@ bool roce_cm_decode(struct roce_cm_message *message, const uint8_t *mad, size_t 
     decoded.local_comm_id = (uint32_t)read_be(body, 4);
     if (decoded.type != ROCE_CM_REQ)
         decoded.remote_comm_id = (uint32_t)read_be(body + 4, 4);
-    if (decoded.type != ROCE_CM_RTU)
+    if (decoded.type == ROCE_CM_REQ || decoded.type == ROCE_CM_REP)
         decoded.connection.ece_attr_mod = (uint32_t)read_be(mad + 20, 4);
     if (decoded.type == ROCE_CM_REQ) {
         if ((body[43] & REQ_TRANSPORT_TYPE_MASK) || (body[50] & REQ_RDC_EXISTS))
@@ -242,6 +252,8 @@ bool roce_cm_decode(struct roce_cm_message *message, const uint8_t *mad, size_t 
         decode_req(&decoded, body);
     } else if (decoded.type == ROCE_CM_REP) {
         decode_rep(&decoded, body);
+    } else if (decoded.type == ROCE_CM_DREQ) {
+        decoded.dreq.remote_qpn = (uint32_t)read_be(body + DREQ_QPN_OFFSET, 3);
     }
     if (!valid_fields(&decoded))
         return false;

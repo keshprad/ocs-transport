@@ -1,5 +1,6 @@
 #include "roce_cm_session.h"
 
+#include <errno.h>
 #include <string.h>
 
 static uint8_t timeout_code(uint64_t ns)
@@ -55,23 +56,65 @@ bool roce_cm_session_init(struct roce_cm_session *session,
     return true;
 }
 
+bool roce_cm_session_disconnect(struct roce_cm_session *session, uint64_t tid)
+{
+    if (!session)
+        return false;
+    if (session->phase == ROCE_CM_DISCONNECTING || session->phase == ROCE_CM_DISCONNECTED)
+        return true;
+    if (session->phase != ROCE_CM_ESTABLISHED)
+        return false;
+
+    session->phase = ROCE_CM_DISCONNECTING;
+    session->disconnect_tid = tid;
+    session->local_disconnect = true;
+    session->sends = 0;
+    session->prepared = 0;
+    session->send_pending = false;
+    return true;
+}
+
+bool roce_cm_session_in_timewait(const struct roce_cm_session *session, uint64_t now)
+{
+    return session && session->phase == ROCE_CM_DISCONNECTED &&
+           (now - session->disconnected_at) / session->config.retry_ns <= session->config.max_retries;
+}
+
+static void disconnect_complete(struct roce_cm_session *session, uint64_t now, int error)
+{
+    session->phase = ROCE_CM_DISCONNECTED;
+    session->disconnected_at = now;
+    session->disconnect_error = error;
+    session->prepared = 0;
+}
+
 static bool retry_due(const struct roce_cm_session *session, uint64_t now)
 {
     return session->sends && now - session->last_sent >= session->config.retry_ns;
 }
 
-static bool failed(struct roce_cm_session *session, uint64_t now)
+static void update_timeouts(struct roce_cm_session *session, uint64_t now)
 {
-    if (session->phase == ROCE_CM_PENDING && !(session->config.initiator && session->received_peer) &&
-        session->sends > session->config.max_retries && retry_due(session, now))
-        session->phase = ROCE_CM_FAILED;
-    return session->phase == ROCE_CM_FAILED;
+    if (session->sends > session->config.max_retries && retry_due(session, now)) {
+        if (session->phase == ROCE_CM_PENDING && !(session->config.initiator && session->received_peer))
+            session->phase = ROCE_CM_FAILED;
+        else if (session->phase == ROCE_CM_DISCONNECTING && !session->peer_dreq_received)
+            disconnect_complete(session, now, ETIMEDOUT);
+    }
 }
 
 static enum roce_cm_type next_message(struct roce_cm_session *session, uint64_t now)
 {
-    if (failed(session, now))
+    update_timeouts(session, now);
+    if (session->phase == ROCE_CM_FAILED)
         return 0;
+    if (session->phase == ROCE_CM_DISCONNECTED)
+        return session->drep_pending && roce_cm_session_in_timewait(session, now) ? ROCE_CM_DREP : 0;
+    if (session->phase == ROCE_CM_DISCONNECTING) {
+        if (session->drep_pending)
+            return ROCE_CM_DREP;
+        return !session->sends || retry_due(session, now) ? ROCE_CM_DREQ : 0;
+    }
     if (session->config.initiator && session->received_peer)
         return session->send_pending ? ROCE_CM_RTU : 0;
     if (session->phase == ROCE_CM_ESTABLISHED ||
@@ -138,6 +181,11 @@ size_t roce_cm_session_prepare(struct roce_cm_session *session, uint64_t now,
         message.rep.failover_accepted = 1;
         message.private_data = session->local_private_data;
         message.private_length = config->private_length;
+    } else if (type == ROCE_CM_DREQ) {
+        message.tid = session->disconnect_tid;
+        message.dreq.remote_qpn = session->peer_qpn;
+    } else if (type == ROCE_CM_DREP) {
+        message.tid = session->peer_dreq_tid;
     }
 
     uint8_t mad[ROCE_CM_MAD_SIZE];
@@ -164,6 +212,10 @@ void roce_cm_session_sent(struct roce_cm_session *session, uint64_t now)
 
     if (session->prepared == ROCE_CM_RTU) {
         session->phase = ROCE_CM_ESTABLISHED;
+    } else if (session->prepared == ROCE_CM_DREP) {
+        session->drep_pending = false;
+        if (session->phase == ROCE_CM_DISCONNECTING)
+            disconnect_complete(session, now, 0);
     } else {
         ++session->sends;
         session->last_sent = now;
@@ -251,15 +303,56 @@ static bool receive_rep(struct roce_cm_session *session, const struct roce_cm_me
     return true;
 }
 
+static bool receive_disconnect(struct roce_cm_session *session, uint64_t now,
+                               const struct roce_cm_message *message)
+{
+    if (!session->received_peer || message->local_comm_id != session->peer_comm_id ||
+        message->remote_comm_id != session->config.local_comm_id ||
+        (session->phase == ROCE_CM_DISCONNECTED && !roce_cm_session_in_timewait(session, now)))
+        return false;
+
+    if (message->type == ROCE_CM_DREP) {
+        if (!session->local_disconnect || !session->sends || message->tid != session->disconnect_tid)
+            return false;
+        if (session->phase == ROCE_CM_DISCONNECTING && !session->drep_pending)
+            disconnect_complete(session, now, 0);
+        return true;
+    }
+
+    /* A passive peer can receive DREQ while its transmitted REP awaits RTU. */
+    if ((session->phase == ROCE_CM_PENDING && (session->config.initiator || !session->sends)) ||
+        message->dreq.remote_qpn != session->config.connection.local_qpn ||
+        (session->peer_dreq_received && message->tid != session->peer_dreq_tid))
+        return false;
+
+    if (session->phase != ROCE_CM_DISCONNECTED)
+        session->phase = ROCE_CM_DISCONNECTING;
+    session->peer_dreq_tid = message->tid;
+    session->peer_dreq_received = true;
+    session->drep_pending = true;
+    session->prepared = 0;
+    session->send_pending = false;
+    return true;
+}
+
 bool roce_cm_session_receive(struct roce_cm_session *session, uint64_t now,
                              const uint8_t *frame, size_t length)
 {
+    if (!session)
+        return false;
+    update_timeouts(session, now);
+
     struct roce_cm_frame cm;
     struct roce_cm_message message;
-    if (!session || failed(session, now) || !roce_cm_frame_decode(&cm, frame, length) ||
+    if (session->phase == ROCE_CM_FAILED || !roce_cm_frame_decode(&cm, frame, length) ||
         cm.pkey != session->config.pkey || !address_matches(&session->config.local, &cm.dst) ||
         !address_matches(&session->config.peer, &cm.src) ||
         !roce_cm_decode(&message, cm.mad, ROCE_CM_MAD_SIZE))
+        return false;
+
+    if (message.type == ROCE_CM_DREQ || message.type == ROCE_CM_DREP)
+        return receive_disconnect(session, now, &message);
+    if (session->phase == ROCE_CM_DISCONNECTING || session->phase == ROCE_CM_DISCONNECTED)
         return false;
 
     if (session->config.initiator)

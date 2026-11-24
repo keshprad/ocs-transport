@@ -34,11 +34,14 @@ application verifies the bytes in its own mapping before returning the
 verification response. `make check-app` exercises the four-process
 path over memif.
 
-The requester application posts each QP's configured WRITE batch to
-its worker's process-shared doorbell queue. Application threads can
-publish concurrently. Each DPDK worker admits its own QPs before data
-transfer starts. An application producer publishes the notification
-atomically, so an exit before publication leaves the slot available.
+The requester application posts batches through a process-shared
+multi-producer doorbell queue per worker. Workers admit each batch
+while polling the data path and publish cumulative completions per QP.
+Use `--app-post-batch N` on the requester to exercise smaller live
+posts. Copy TX can wait for each batch's acknowledgement before the next
+post. Scatter/gather can admit later batches while TX descriptors still
+refer to earlier application buffers. The worker publishes those pending
+completions after returning the TX references.
 
 With the registration module loaded and accessible to the client, use
 `./roce_app_write "$APP_SOCKET" --kernel-mr /dev/roce_mr` to register a
@@ -84,7 +87,8 @@ DMA-BUF import. The sender MR has no remote-write key.
 
 For a single-QP DPDK-to-DPDK lab run, pass `--cm-peer IPV4 MAC` to each
 worker with the other endpoint's data-plane addresses. The worker sends
-standard REQ, REP and RTU messages over DPDK. The sender's path MTU
+standard REQ, REP and RTU messages over DPDK to establish the QP and
+exchanges DREQ and DREP after the transfer. The sender's path MTU
 must fit the receiver's configured path MTU. The lab's CM private data
 carries the WRITE buffer address, key and workload. The existing TCP
 socket synchronizes the test and returns the verification result.

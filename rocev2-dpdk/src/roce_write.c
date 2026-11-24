@@ -19,6 +19,7 @@
 #include <rte_pause.h>
 
 #include <inttypes.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,7 @@ struct datapath_options {
     uint32_t qps;
     uint32_t workers;
     uint32_t start_gate;
+    uint32_t app_post_batch;
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     const char *app_socket;
     const char *mr_socket;
@@ -65,13 +67,13 @@ enum run_state { WRITE_WAITING, WRITE_RUNNING, WRITE_STOPPED };
 struct write_run {
     const struct datapath_options *options;
     struct rte_mempool *pool;
-    struct roce_doorbell *doorbells;
+    struct roce_app_work *work;
     struct tx_memory_ref *tx_refs;
     uint16_t port;
+    int application_socket;
     bool sender;
     atomic_int state;
     atomic_uint finished_workers;
-    atomic_uint ready_workers;
     atomic_bool failed;
 };
 
@@ -83,6 +85,10 @@ struct write_worker {
     uint32_t qps;
     uint32_t completed;
     uint32_t next;
+    uint32_t doorbell_cursor;
+    uint32_t fully_posted;
+    uint32_t posted[ROCE_LAB_MAX_QPS];
+    uint32_t completions[ROCE_LAB_MAX_QPS];
     bool finished;
     uint64_t cpu_started;
     uint64_t cpu_ns;
@@ -143,10 +149,12 @@ static struct rte_mbuf *encode_gathered_packet(struct rte_mempool *pool,
 }
 
 static bool send_requests(const struct write_worker *worker,
-                          struct roce_requester *requester, uint32_t credit, uint64_t now)
+                          struct roce_requester *requester, uint32_t posted_packets,
+                          uint32_t credit, uint64_t now)
 {
     const struct write_run *run = worker->run;
-    uint32_t budget = credit + (requester->sent - requester->next);
+    uint32_t budget = RTE_MIN(posted_packets - requester->next,
+                              credit + (requester->sent - requester->next));
     uint32_t limit = RTE_MIN(budget, run->options->tx_burst);
     struct rte_mbuf *packets[MAX_TX_BURST];
     struct roce_packet packet;
@@ -317,13 +325,54 @@ static bool receive_packets(struct write_worker *worker, uint64_t now)
     return true;
 }
 
+static bool admit_writes(struct write_worker *worker)
+{
+    const struct write_run *run = worker->run;
+    if (!run->work || worker->fully_posted == worker->qps)
+        return true;
+    struct roce_doorbell *doorbell = &run->work->doorbells[worker->queue];
+    for (unsigned i = 0; i < ROCE_DOORBELL_SLOTS; ++i) {
+        uint64_t item = roce_doorbell_take(doorbell, &worker->doorbell_cursor);
+        if (!item)
+            break;
+        uint32_t qp = (uint32_t)(item >> 32);
+        uint32_t count = (uint32_t)item;
+        uint32_t index = qp - worker->first_qp - 1;
+        if (index >= worker->qps || !count || count > run->options->writes - worker->posted[index]) {
+            fprintf(stderr, "invalid application work for worker %u\n", worker->queue);
+            return false;
+        }
+        worker->posted[index] += count;
+        worker->fully_posted += worker->posted[index] == run->options->writes;
+        atomic_store_explicit(&run->work->qps[qp - 1].admitted, worker->posted[index], memory_order_release);
+    }
+    return true;
+}
+
+static void publish_completions(struct write_worker *worker)
+{
+    const struct write_run *run = worker->run;
+    if (!run->work || (run->tx_refs && rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) != 1))
+        return;
+    for (uint32_t i = 0; i < worker->qps; ++i) {
+        const struct roce_requester *requester = &worker->states[i].requester;
+        uint32_t completed = requester->acked / requester->packets_per_write;
+        if (completed != worker->completions[i]) {
+            worker->completions[i] = completed;
+            atomic_store_explicit(&run->work->qps[worker->first_qp + i].completed, completed,
+                                  memory_order_release);
+        }
+    }
+}
+
 static bool poll_worker(struct write_worker *worker, uint64_t now)
 {
     struct write_run *run = worker->run;
     if (run->sender && worker->finished)
         return true;
-    if (!receive_packets(worker, now))
+    if (!admit_writes(worker) || !receive_packets(worker, now))
         return false;
+    publish_completions(worker);
     if (worker->completed == worker->qps && !worker->finished) {
         worker->finished = true;
         if (run->options->report_bandwidth)
@@ -347,10 +396,12 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     uint32_t window = run->options->queue_window;
     uint32_t credit = window ? window - RTE_MIN(window, outstanding) : run->options->tx_burst;
     for (uint32_t i = 0; i < worker->qps; ++i) {
-        struct roce_requester *requester = &worker->states[worker->next].requester;
+        uint32_t next = worker->next;
+        struct roce_requester *requester = &worker->states[next].requester;
+        uint32_t posted_packets = run->work ? worker->posted[next] * requester->packets_per_write : requester->total;
         if (++worker->next == worker->qps)
             worker->next = 0;
-        if (send_requests(worker, requester, credit, now))
+        if (send_requests(worker, requester, posted_packets, credit, now))
             break;
     }
     return true;
@@ -367,27 +418,10 @@ static void sample_cpu(struct write_worker *worker)
         worker->cpu_ns = thread_cpu_ns() - worker->cpu_started;
 }
 
-static bool claim_work(const struct write_worker *worker)
-{
-    const struct write_run *run = worker->run;
-    if (roce_app_take_writes(&run->doorbells[worker->queue], worker->first_qp,
-                             worker->qps, run->options->writes))
-        return true;
-    fprintf(stderr, "invalid application work for worker %u\n", worker->queue);
-    return false;
-}
-
 static int run_worker(void *arg)
 {
     struct write_worker *worker = arg;
     struct write_run *run = worker->run;
-    if (run->doorbells) {
-        if (!claim_work(worker)) {
-            atomic_store_explicit(&run->failed, true, memory_order_release);
-            return 1;
-        }
-        atomic_fetch_add_explicit(&run->ready_workers, 1, memory_order_release);
-    }
     int state;
     while ((state = atomic_load_explicit(&run->state, memory_order_acquire)) == WRITE_WAITING)
         rte_pause();
@@ -420,18 +454,25 @@ static bool wait_for_completion(int fd, struct write_worker *main_worker, uint64
         if (!poll_worker(main_worker, now) ||
             atomic_load_explicit(&run->failed, memory_order_relaxed))
             return false;
+        if (now >= control_poll) {
+            control_poll = now + CONTROL_POLL_NS;
+            if (run->application_socket >= 0) {
+                struct pollfd peer = { .fd = run->application_socket };
+                if (poll(&peer, 1, 0) > 0 && peer.revents & (POLLERR | POLLHUP | POLLNVAL))
+                    return false;
+            }
+            if (!run->sender) {
+                int done = roce_lab_receive(fd, 'D', true);
+                if (done)
+                    return done == 1;
+            }
+        }
         if (run->sender) {
             if (all_workers_finished(run))
                 return true;
         } else {
             if (main_worker->finished && all_workers_finished(run))
                 sample_cpu(main_worker);
-            if (now >= control_poll) {
-                control_poll = now + CONTROL_POLL_NS;
-                int done = roce_lab_receive(fd, 'D', true);
-                if (done)
-                    return done == 1;
-            }
         }
         rte_pause();
     }
@@ -489,7 +530,8 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct datapath_options *options, struct tx_memory_ref *tx_refs)
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
-                             .state = WRITE_WAITING, .doorbells = application->doorbells,
+                             .state = WRITE_WAITING, .work = application->work,
+                             .application_socket = application->socket,
                              .tx_refs = tx_refs };
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
     struct rte_flow *flows[ROCE_LAB_MAX_QPS] = {0};
@@ -524,19 +566,6 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
             goto stop_workers;
         }
         ++launched;
-    }
-
-    if (run.doorbells) {
-        if (!claim_work(&workers[0]))
-            goto stop_workers;
-        uint64_t deadline = roce_now_ns() + (uint64_t)ROCE_LAB_TIMEOUT * NS_PER_SEC;
-        while (atomic_load_explicit(&run.ready_workers, memory_order_acquire) != launched) {
-            if (atomic_load_explicit(&run.failed, memory_order_acquire) || roce_now_ns() >= deadline) {
-                fprintf(stderr, "application work admission failed\n");
-                goto stop_workers;
-            }
-            rte_pause();
-        }
     }
 
     bool completed = false;
@@ -632,6 +661,10 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             if (++i == argc || !argv[i][0] || options->app_socket)
                 return false;
             options->app_socket = argv[i];
+        } else if (strcmp(argv[i], "--app-post-batch") == 0) {
+            if (++i == argc || !roce_parse_uint(argv[i], ROCE_PSN_MASK, &options->app_post_batch) ||
+                !options->app_post_batch)
+                return false;
         } else if (strcmp(argv[i], "--mr-socket") == 0) {
             if (++i == argc || !argv[i][0] || options->mr_socket)
                 return false;
@@ -660,7 +693,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--mr-socket PATH] [--scatter-gather] [--cm-peer IPV4 MAC]\n");
+                        " [--mr-socket PATH] [--app-post-batch N] [--scatter-gather] [--cm-peer IPV4 MAC]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -674,6 +707,10 @@ int main(int argc, char **argv)
     if (datapath.mr_socket &&
         (!datapath.app_socket || strcmp(datapath.app_socket, datapath.mr_socket) == 0)) {
         fprintf(stderr, "verbs memory registration requires separate application and MR socket paths\n");
+        goto cleanup_eal;
+    }
+    if (datapath.app_post_batch && (!options.sender || !datapath.app_socket)) {
+        fprintf(stderr, "an application-backed requester uses the application post batch\n");
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -783,8 +820,10 @@ int main(int argc, char **argv)
         }
     }
     if (datapath.app_socket) {
+        uint32_t post_batch = datapath.app_post_batch ? RTE_MIN(datapath.app_post_batch, options.writes) :
+            options.writes;
         if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif,
-                             in_band, registrations, &application)) {
+                             in_band, datapath.scatter_gather, post_batch, registrations, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
@@ -848,8 +887,9 @@ int main(int argc, char **argv)
         perror("control socket");
         goto cleanup_port;
     }
+    struct roce_cm_session cm;
     bool connected = in_band ?
-        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer) :
+        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer, &cm) :
         roce_lab_exchange(fd, &options, &local, &peer);
     if (!connected) {
         fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
@@ -860,6 +900,14 @@ int main(int argc, char **argv)
             printf("RoCEv2 CM established local_qpn=%06x peer_qpn=%06x\n", local.qpn, peer.qpn);
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
                      options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL);
+        if (!result && in_band) {
+            if (roce_cm_lab_close(port, pool, fd, &cm)) {
+                puts("RoCEv2 CM disconnected");
+            } else {
+                fprintf(stderr, "RoCEv2 CM disconnect failed\n");
+                result = 1;
+            }
+        }
     }
     if (result || measure_stats) {
         struct rte_eth_stats stats;
@@ -912,7 +960,7 @@ cleanup_port:
     } else {
         mrc_dpdk_close_port(port);
     }
-    if (!result && application.socket >= 0 && !roce_app_complete(&application)) {
+    if (!result && application.socket >= 0 && !roce_app_complete(&application, &options)) {
         perror("application WRITE completion");
         result = 1;
     }
