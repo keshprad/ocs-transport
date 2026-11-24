@@ -99,9 +99,12 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         if rdmacm:
             app_marker = ("Application librdmacm established", "Application librdmacm disconnected")
         completion_suffix = " via libibverbs" if native_queues else ""
+        serial_marker = (f"APP_SERIAL_COMPLETIONS writes_per_qp={writes}",) if (
+            native_queues and scatter_gather and post_batch == 1
+        ) else ()
         tx_app_log = expect_success(tx_app, f"Application completed {total} bytes",
                                     f"Application observed {writes} WRITE completions per QP{completion_suffix}",
-                                    *app_marker)
+                                    *app_marker, *serial_marker)
         rx_app_log = expect_success(rx_app, f"Application verified {total} bytes", *app_marker)
         if rdmacm:
             pattern = r"RoCEv2 CM established local_qpn=([0-9a-f]{6}) peer_qpn=([0-9a-f]{6})"
@@ -130,6 +133,8 @@ def main():
               post_batch=1, native_queues=True, rdmacm=True, external_qp=True)
         check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
               post_batch=1, native_queues=True, rdmacm=True, external_qp=True)
+        check(cpus, 1024, 4, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
+              post_batch=1, native_queues=True, rdmacm=True)
         for gather in (False, True):
             check(cpus, 8195, 521, 1, 1, None, scatter_gather=gather, cm=True,
                   provider=args.verbs_provider, post_batch=31, native_queues=True, rdmacm=True)

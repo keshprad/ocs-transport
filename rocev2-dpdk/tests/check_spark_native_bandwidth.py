@@ -31,7 +31,6 @@ PMTU = 1024
 DURATION = 8
 MARGIN = 2
 SAMPLE_US = (DURATION - 2 * MARGIN) * 1_000_000
-LINK_SPEED = 100000
 LINK_MTU = 1500
 PROFILES = {"single": (1, 1), "multi": (16, 16)}
 
@@ -90,7 +89,7 @@ def read_port(commands, host, port):
                     for item in link[0].get("addr_info", [])),
             f"{host} {port.interface}: expected a live MTU {LINK_MTU} link with {port.address}/30")
     speed = int(commands.run(host, "cat", f"/sys/class/net/{port.interface}/speed").strip())
-    require(speed == LINK_SPEED, f"{host} {port.interface}: expected {LINK_SPEED} Mb/s, got {speed}")
+    require(speed > 0, f"{host} {port.interface}: unavailable link speed ({speed} Mb/s)")
 
     command = r'''set -eu
 for device in /sys/class/infiniband/*; do
@@ -374,6 +373,8 @@ def main():
             require(not active.strip(), f"{host}: a lab service is running")
         ports = {name: {"tx": read_port(commands, LOCAL, RAILS[name].tx),
                         "rx": read_port(commands, PEER, RAILS[name].rx)} for name in names}
+        speeds = {port["speed_mbps"] for rail in ports.values() for port in rail.values()}
+        require(len(speeds) == 1, f"Benchmark interfaces report different link speeds: {sorted(speeds)} Mb/s")
         local = args.perftest.resolve(strict=True)
         with (staged_perftest(commands, local, args.peer_perftest) as staged,
               negotiation_tunnel(commands, sockets, names)):

@@ -22,7 +22,7 @@ struct native_run {
     uint32_t post_batch;
     uint32_t capacity;
     int socket;
-    bool scatter_gather;
+    bool pipelined;
     _Atomic bool stopped;
 };
 
@@ -164,7 +164,7 @@ static int produce_batches(struct native_qp *state)
         if (count > run->post_batch)
             count = run->post_batch;
         int error;
-        if (run->scatter_gather) {
+        if (run->pipelined) {
             if (posted - state->completed == run->capacity) {
                 error = poll_completions(state, posted, false);
                 if (error)
@@ -179,7 +179,7 @@ static int produce_batches(struct native_qp *state)
         if (error)
             return error;
         posted += count;
-        if (!run->scatter_gather) {
+        if (!run->pipelined) {
             error = poll_completions(state, posted, true);
             if (error)
                 return error;
@@ -279,7 +279,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
         return false;
     }
     struct native_run run = { .socket = app_socket, .post_batch = post_batch,
-                              .scatter_gather = scatter_gather };
+                              .pipelined = scatter_gather && post_batch > 1 };
     atomic_init(&run.stopped, false);
     const struct roce_native_work *work = roce_native_map_work(queue_fd, false, &run.config);
     if (work == MAP_FAILED) {
@@ -295,7 +295,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     if (!post_batch || post_batch > run.capacity) {
         error = EPROTO;
     } else if (early_qp) {
-        uint32_t need = scatter_gather ? run.capacity : post_batch;
+        uint32_t need = run.pipelined ? run.capacity : post_batch;
         if (run.config.qps != 1 || !valid_native_qp(early_qp) || early_qp->qp->pd != pd ||
             early_qp->qp->state != IBV_QPS_RTS || early_qp->qp->qp_num != run.config.local_qpn ||
             early_qp->cq->cqe < (int)need) {
@@ -341,5 +341,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
         return false;
     }
     printf("Application observed %u WRITE completions per QP via libibverbs\n", run.config.writes);
+    if (scatter_gather && post_batch == 1)
+        printf("APP_SERIAL_COMPLETIONS writes_per_qp=%u\n", run.config.writes);
     return true;
 }

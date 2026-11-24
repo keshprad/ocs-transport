@@ -250,6 +250,38 @@ The requester had acknowledged and retired two of three WRITEs before
 processing the final ACK. Each run returned three ordered successful
 libibverbs completions after their covering ACKs.
 
+The pinned mlx5 PMD normally requests a TX CQE after a threshold of
+32 mbufs. A sender that posts one short gathered WRITE and waits for its
+WC can leave the last payload reference behind that threshold. Reading TX
+descriptor status consumes CQEs the NIC has already produced. The native
+requester now opts its TX queues into signaling the last WQE of each
+productive doorbell, and the PMD checks CQ space before accepting a burst.
+The worker waits for final WRITE retirement before it ends a successful
+transfer. Retirement requires both a covering RoCE ACK and release of
+the last DPDK reference to the WRITE payload.
+
+The patched shared-ibverbs mlx5 PMDs built on Spark-04 and exported the
+queue configuration API. A driver-level check exercised default short
+bursts, the opt-in signal and accepted-mbuf count, and CQ counter wrap with
+inline TX. In the Spark-04-kernel guest, a partial burst accepted one
+packet, followed by a zero-acceptance burst. The requester resumed at the
+first unsent PSN, completed three WRITEs in order, and verified 24,585 bytes
+without RC retries. In a separate run, a fault shim retained the final
+WRITE's external payload reference for 20 ms after the peer ACK. The
+worker kept that WRITE pending until the shim released the reference,
+then retired it before port shutdown.
+
+The short native application profile posted four 1,024-byte WRITEs at
+PMTU 1024 over memif and two 4,096-byte WRITEs at PMTU 4096 over stock
+TAP. Both Spark-04-kernel guest runs required Netlink registration and
+used a single CM-owned QP. The verbs trace records each WC before the
+next call to post a WRITE. All WR IDs matched, both peers verified the
+payloads with zero retries, and the jumbo trace captured two 4,170-byte
+WRITE_ONLY Ethernet frames. Resource teardown and module unloads passed.
+The Spark hardware profiles check the same posting pattern and require
+the mlx5 queue configuration and DMA-BUF registration. Physical CQ
+generation from these queues still requires verification.
+
 Two exact Spark-04-kernel guest trials verified terminal error status and
 teardown with native scatter/gather queues. A cumulative remote-access
 NAK for the second WRITE produced `SUCCESS`, `REM_ACCESS_ERR` and
@@ -409,6 +441,13 @@ fell from 4,194,308 in the default median trial to six in that run.
 Prefaulting the receiver alias took 337 ms. The prefaulted single-worker
 16-QP trial completed at 25.373 Gbit/s with 2,765,156 receiver misses
 and 33,583 retries. These two prefaulted rates are individual samples.
+
+A smaller sender-only pool for gather mbufs passed the stock TAP jumbo
+test with 2,084 ordered WRITE completions. At PMTU 1024 over local memif,
+nine alternating 128 MiB samples per variant yielded 34.744 Gbit/s with
+the shared pool and 34.362 Gbit/s with the compact pool. Both variants used
+one polling worker per endpoint and completed all trials without retries,
+drops, or reported packet errors. The implementation uses the shared pool.
 
 Two matched 8 MiB runs on the exact Spark-04 kernel in QEMU put one
 read per application MR page before transport setup. Prefaulting

@@ -1,4 +1,4 @@
-Subject: [PATCH] net/mlx5: map external DMA-BUF memory in the port PD
+Subject: [PATCH] net/mlx5: support DMA-BUF scatter/gather with prompt completions
 
 Based on the DPDK 23.11.7 release tarball.
 https://fast.dpdk.org/rel/dpdk-23.11.7.tar.xz
@@ -15,18 +15,10 @@ Meson -Dibverbs_link=shared and link both mlx5 PMD libraries from that
 build. The dlopen configuration keeps the existing mlx5 glue ABI and
 its DMA-BUF map entry point reports ENOTSUP.
 
----
- drivers/common/mlx5/linux/meson.build         |   2 +
- drivers/common/mlx5/linux/mlx5_common_verbs.c |  38 +++++
- drivers/common/mlx5/mlx5_common.c             | 193 +++++++++++++++++++-------
- drivers/common/mlx5/mlx5_common.h             |   9 ++
- drivers/common/mlx5/mlx5_common_mr.c          |  48 +++++--
- drivers/common/mlx5/mlx5_common_mr.h          |   8 ++
- drivers/common/mlx5/version.map               |   2 +
- drivers/net/mlx5/mlx5.c                       |  42 ++++++
- drivers/net/mlx5/rte_pmd_mlx5.h               |  48 +++++++
- drivers/net/mlx5/version.map                  |   2 +
- 10 files changed, 331 insertions(+), 61 deletions(-)
+Let the requester opt each TX queue into signaling the last WQE of
+every productive doorbell. Check completion credits before accepting
+a burst so the existing CQ can handle the higher CQE rate.
+
 diff --git a/drivers/common/mlx5/linux/meson.build b/drivers/common/mlx5/linux/meson.build
 index b3a6454..0176c37 100644
 --- a/drivers/common/mlx5/linux/meson.build
@@ -473,10 +465,10 @@ index ca734dc..5c0d997 100644
  	mlx5_os_interrupt_handler_create; # WINDOWS_NO_EXPORT
  	mlx5_os_interrupt_handler_destroy; # WINDOWS_NO_EXPORT
 diff --git a/drivers/net/mlx5/mlx5.c b/drivers/net/mlx5/mlx5.c
-index 5974760..cb4376e 100644
+index 5974760..0f29e46 100644
 --- a/drivers/net/mlx5/mlx5.c
 +++ b/drivers/net/mlx5/mlx5.c
-@@ -2431,6 +2431,48 @@ mlx5_dev_close(struct rte_eth_dev *dev)
+@@ -2431,6 +2431,74 @@ mlx5_dev_close(struct rte_eth_dev *dev)
  	return 0;
  }
  
@@ -520,13 +512,72 @@ index 5974760..cb4376e 100644
 +		return -rte_errno;
 +	return mlx5_common_dev_dmabuf_unmap(dev, addr, len);
 +}
++
++int
++rte_pmd_mlx5_enable_tx_burst_completion(uint16_t port_id, uint16_t queue_id)
++{
++	struct rte_eth_dev *dev;
++	struct mlx5_priv *priv;
++	struct mlx5_txq_data *txq;
++
++	if (!rte_eth_dev_is_valid_port(port_id))
++		return -ENODEV;
++	dev = &rte_eth_devices[port_id];
++	if (dev->dev_ops != &mlx5_dev_ops ||
++	    rte_eal_process_type() != RTE_PROC_PRIMARY)
++		return -ENOTSUP;
++	if (queue_id >= dev->data->nb_tx_queues ||
++	    dev->data->tx_queue_state[queue_id] != RTE_ETH_QUEUE_STATE_STARTED)
++		return -EINVAL;
++	priv = dev->data->dev_private;
++	txq = (*priv->txqs)[queue_id];
++	if (txq == NULL)
++		return -EINVAL;
++	if (txq->offloads & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP)
++		return -ENOTSUP;
++	txq->burst_completion = 1;
++	return 0;
++}
 +#endif
 +
  const struct eth_dev_ops mlx5_dev_ops = {
  	.dev_configure = mlx5_dev_configure,
  	.dev_start = mlx5_dev_start,
+diff --git a/drivers/net/mlx5/mlx5_tx.h b/drivers/net/mlx5/mlx5_tx.h
+index 4655942..2dc9e9a 100644
+--- a/drivers/net/mlx5/mlx5_tx.h
++++ b/drivers/net/mlx5/mlx5_tx.h
+@@ -144,6 +144,7 @@ struct mlx5_txq_data {
+ 	uint16_t rt_timestamp:1; /* Realtime timestamp format. */
+ 	uint16_t wait_on_time:1; /* WQE with timestamp is supported. */
+ 	uint16_t fast_free:1; /* mbuf fast free on Tx is enabled. */
++	uint16_t burst_completion:1; /* Request a CQE for each doorbell. */
+ 	uint16_t inlen_send; /* Ordinary send data inline size. */
+ 	uint16_t inlen_empw; /* eMPW max packet size to inline. */
+ 	uint16_t inlen_mode; /* Minimal data length to inline. */
+@@ -745,7 +746,8 @@ mlx5_tx_request_completion(struct mlx5_txq_data *__rte_restrict txq,
+ 	part = MLX5_TXOFF_CONFIG(INLINE) ?
+ 	       0 : loc->pkts_sent - loc->pkts_copy;
+ 	head += part;
+-	if ((uint16_t)(head - txq->elts_comp) >= MLX5_TX_COMP_THRESH ||
++	if (unlikely(txq->burst_completion) ||
++	    (uint16_t)(head - txq->elts_comp) >= MLX5_TX_COMP_THRESH ||
+ 	     (MLX5_TXOFF_CONFIG(INLINE) &&
+ 	     (uint16_t)(txq->wqe_ci - txq->wqe_comp) >= txq->wqe_thres)) {
+ 		volatile struct mlx5_wqe *last = loc->wqe_last;
+@@ -3576,6 +3578,10 @@ mlx5_tx_burst_tmpl(struct mlx5_txq_data *__rte_restrict txq,
+ 	 */
+ 	rte_prefetch0(*(pkts + loc.pkts_sent));
+ 	mlx5_tx_handle_completion(txq, olx);
++	/* Each productive iteration consumes one CQ slot. Leave a spare. */
++	if (unlikely(txq->burst_completion &&
++		     (uint16_t)(txq->cq_pi - txq->cq_ci) >= txq->cqe_s - 1))
++		goto burst_exit;
+ 	/*
+ 	 * Calculate the number of available resources - elts and WQEs.
+ 	 * There are two possible different scenarios:
 diff --git a/drivers/net/mlx5/rte_pmd_mlx5.h b/drivers/net/mlx5/rte_pmd_mlx5.h
-index ee5c4a0..4de3619 100644
+index ee5c4a0..623f9e6 100644
 --- a/drivers/net/mlx5/rte_pmd_mlx5.h
 +++ b/drivers/net/mlx5/rte_pmd_mlx5.h
 @@ -5,6 +5,7 @@
@@ -537,7 +588,7 @@ index ee5c4a0..4de3619 100644
  #include <stdint.h>
  
  #include <rte_byteorder.h>
-@@ -250,6 +251,53 @@ int rte_pmd_mlx5_flow_engine_set_mode(enum rte_pmd_mlx5_flow_engine_mode mode, u
+@@ -250,6 +251,71 @@ int rte_pmd_mlx5_flow_engine_set_mode(enum rte_pmd_mlx5_flow_engine_mode mode, u
  __rte_experimental
  int rte_pmd_mlx5_external_sq_disable(uint16_t port_id, uint32_t sq_num);
  
@@ -586,19 +637,38 @@ index ee5c4a0..4de3619 100644
 + */
 +__rte_experimental
 +int rte_pmd_mlx5_dmabuf_unmap(uint16_t port_id, void *addr, size_t len);
++
++/**
++ * Request a send CQE on the last WQE of each productive TX doorbell.
++ *
++ * Call from the primary process after starting an ordinary TX queue and
++ * before its first TX burst. The queue and port must not be in use while
++ * configuring it. The queue continues to use the configured CQ capacity.
++ * A full CQ applies TX backpressure until polling drains it.
++ *
++ * @param port_id
++ *   Ethernet port identifier.
++ * @param queue_id
++ *   Started TX queue identifier.
++ * @return
++ *   Zero on success or a negative errno value.
++ */
++__rte_experimental
++int rte_pmd_mlx5_enable_tx_burst_completion(uint16_t port_id, uint16_t queue_id);
 +#endif
 +
  #ifdef __cplusplus
  }
  #endif
 diff --git a/drivers/net/mlx5/version.map b/drivers/net/mlx5/version.map
-index 3561a1d..e710316 100644
+index 3561a1d..5151e26 100644
 --- a/drivers/net/mlx5/version.map
 +++ b/drivers/net/mlx5/version.map
-@@ -18,4 +18,6 @@ EXPERIMENTAL {
+@@ -18,4 +18,7 @@ EXPERIMENTAL {
  	# added in 23.03
  	rte_pmd_mlx5_flow_engine_set_mode;
  	rte_pmd_mlx5_external_sq_disable;
 +	rte_pmd_mlx5_dmabuf_map; # WINDOWS_NO_EXPORT
 +	rte_pmd_mlx5_dmabuf_unmap; # WINDOWS_NO_EXPORT
++	rte_pmd_mlx5_enable_tx_burst_completion; # WINDOWS_NO_EXPORT
  };

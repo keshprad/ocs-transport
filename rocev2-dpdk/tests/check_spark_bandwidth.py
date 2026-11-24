@@ -30,6 +30,7 @@ CONTROL_IP = "10.61.0.13"
 DESTINATION_ROOT = Path("/opt/ocs-roce-bw")
 APP_DESTINATION_ROOT = Path("/opt/ocs-roce-app-bw")
 APP_FILES = ("roce_write", "roce_app_write", "run_app", "provider/libroce_dpdk-rdmav34.so")
+APP_MLX5_FILES = ("lib/librte_common_mlx5.so.24", "lib/librte_net_mlx5.so.24")
 APP_HUGEPAGE_HELPER = "manage_hugepages"
 APP_HUGEPAGE_DIR = "/dev/hugepages/ocs-roce-app-bw"
 APP_HUGEPAGES_RELEASED = "DPDK_HUGEPAGES restored=0 page_kib=2048"
@@ -62,14 +63,16 @@ class Profile:
     app_mode: str | None = None
     prefault_app: bool = False
     hugepages: bool = False
+    write_bytes: int = WRITE_BYTES
+    post_batch: int = APP_POST_BATCH
 
     @property
     def writes(self):
-        return self.payload // (self.qps * WRITE_BYTES)
+        return self.payload // (self.qps * self.write_bytes)
 
     @property
     def packets(self):
-        return self.qps * self.writes * ((WRITE_BYTES + self.pmtu - 1) // self.pmtu)
+        return self.qps * self.writes * ((self.write_bytes + self.pmtu - 1) // self.pmtu)
 
     @property
     def uses_tunnel(self):
@@ -128,7 +131,15 @@ HUGEPAGE_PROFILES = {
     f"{name}-hugepages": replace(profile, port=profile.port + 2 * len(APP_PROFILES), hugepages=True)
     for name, profile in (APP_PROFILES | PREFAULT_PROFILES).items() if profile.ethernet_mtu == 4200
 }
-ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES | PREFAULT_PROFILES | HUGEPAGE_PROFILES
+SHORT_WRITE_PROFILES = {
+    f"app-mr-gather-mtu-{mtu}-short": Profile(
+        port, 1, 1, pmtu=pmtu, ethernet_mtu=mtu, payload=payload, app_mode="mr-gather",
+        write_bytes=pmtu, post_batch=1,
+    )
+    for mtu, pmtu, port, payload in ((1500, 1024, 29020, 4096), (4200, 4096, 29021, 8192))
+}
+ALL_PROFILES = (PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES |
+                PREFAULT_PROFILES | HUGEPAGE_PROFILES | SHORT_WRITE_PROFILES)
 
 
 @dataclass(frozen=True)
@@ -173,7 +184,7 @@ def unit_argv(endpoint, destination, runtime):
         "--no-telemetry", f"--file-prefix=ocs-roce-bw-{endpoint.profile}",
         "-d", str(runtime / "librte_mempool_ring.so.24"),
         "-d", str(runtime / "librte_net_mlx5.so.24"), "-a", device,
-        "--", endpoint.role, str(WRITE_BYTES), control_ip, str(profile.port), data_ip, str(profile.pmtu),
+        "--", endpoint.role, str(profile.write_bytes), control_ip, str(profile.port), data_ip, str(profile.pmtu),
         pci, "--report-bw", "--tx-burst", str(TX_BURST), "--send-window", str(SEND_WINDOW),
         "--writes", str(profile.writes), "--qps", str(profile.qps), "--workers", str(profile.workers),
     ]
@@ -184,7 +195,7 @@ def unit_argv(endpoint, destination, runtime):
     if profile.prefault_app:
         argv.append("--prefault-app")
     if profile.app_mode and endpoint.role == "tx":
-        argv += ["--app-post-batch", str(APP_POST_BATCH)]
+        argv += ["--app-post-batch", str(profile.post_batch)]
         if profile.native_mr:
             argv.append("--verbs-queues")
         if profile.scatter_gather:
@@ -266,9 +277,10 @@ def require_idle(commands, host):
 
 def app_digests(bundle):
     digests = {}
+    supported = (*APP_FILES, *APP_MLX5_FILES, APP_HUGEPAGE_HELPER)
     for line in (bundle / "APP_SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([a-f0-9]{64})  (\S+)", line)
-        require(match and match[2] in (*APP_FILES, APP_HUGEPAGE_HELPER) and match[2] not in digests,
+        require(match and match[2] in supported and match[2] not in digests,
                 "unexpected application bundle digest entry")
         digests[match[2]] = match[1]
     require(set(APP_FILES) <= digests.keys(), "incomplete application bundle manifest")
@@ -288,6 +300,8 @@ def preflight(commands, profiles, destination, digests):
     aggregate = settings[0].aggregate
     app_mode = settings[0].app_mode
     native_mr = any(profile.native_mr for profile in settings)
+    if any(name in SHORT_WRITE_PROFILES for name in profiles):
+        require(set(APP_MLX5_FILES) <= digests.keys(), "short WRITE profiles require pinned mlx5 libraries")
     if any(profile.hugepages for profile in settings):
         require(APP_HUGEPAGE_HELPER in digests, "application bundle lacks the hugepage helper")
     links = {name: {} for name in profiles} if aggregate else {}
@@ -531,6 +545,12 @@ def parse_result(endpoint, messages):
                 kind = "DMA-BUF" if profile.native_mr else "DMA"
                 require(messages.count(f"Application {kind} region mapped for scatter/gather TX ({payload} bytes)") == 1,
                         f"{endpoint.label}: missing {kind} registration for scatter/gather")
+            if endpoint.profile in SHORT_WRITE_PROFILES:
+                require(messages.count(f"APP_SERIAL_COMPLETIONS writes_per_qp={profile.writes}") == 1,
+                        f"{endpoint.label}: missing serial WRITE completions")
+                require(messages.count(f"DPDK_TX_BURST_COMPLETION queues={profile.workers}") == 1,
+                        f"{endpoint.label}: missing mlx5 burst completion setup")
+                fields["serial_completions"] = profile.writes
     counters = [line for line in messages if line.startswith("PORT_STATS ")]
     if counters:
         require(len(counters) == 1, f"{endpoint.label}: expected one port counter result")
@@ -685,8 +705,8 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
             profile_result.update(ethernet_mtu=config.ethernet_mtu, pmtu=config.pmtu)
         if config.app_mode:
             profile_result.update(app_mode=config.app_mode, payload_bytes=config.payload,
-                                  app_post_batch=min(APP_POST_BATCH, config.writes), prefault_app=config.prefault_app,
-                                  hugepages=config.hugepages)
+                                  write_bytes=config.write_bytes, app_post_batch=min(config.post_batch, config.writes),
+                                  prefault_app=config.prefault_app, hugepages=config.hugepages)
         report["profiles"][profile] = profile_result
         for sample in range(1, samples + 1):
             try:
@@ -719,7 +739,7 @@ def main():
     parser.add_argument("--app-bundle", type=Path, help="staged application bundle containing APP_SHA256SUMS")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--aggregate", action="store_true",
-                           help="run four-worker 16-QP transfers concurrently on both 100 Gbit/s rails")
+                           help="run four-worker 16-QP transfers concurrently on both logical paths")
     selection.add_argument("--burst-style-bench", action="store_true",
                            help="compare the same WRITE profiles at Ethernet MTUs 1500 and 4200")
     selection.add_argument("--app-bench", action="append", choices=APP_MODES,
@@ -731,8 +751,8 @@ def main():
                              help="run the prefaulting application profiles alone")
     parser.add_argument("--compare-hugepages", action="store_true",
                         help="compare default and 2 MiB packet-pool backing at MTU 4200")
-    parser.add_argument("--profile", action="append", choices=APP_SHAPES,
-                        help="repeat to select profiles; smoke is an 8 MiB application check")
+    parser.add_argument("--profile", action="append", choices=(*APP_SHAPES, "short"),
+                        help="repeat to select profiles; short checks individual native gather completions")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
                         help="limit a paired-MTU benchmark to this Ethernet MTU")
     parser.add_argument("--samples", type=int, default=3, help="trials per profile (default 3)")
@@ -759,6 +779,9 @@ def main():
     selected = tuple(dict.fromkeys(args.profile or PROFILES))
     if "smoke" in selected and not args.app_bench:
         parser.error("--profile smoke requires --app-bench")
+    if "short" in selected and (set(args.app_bench or ()) != {"mr-gather"} or
+                                args.compare_prefault or args.prefault_only or args.compare_hugepages):
+        parser.error("--profile short requires --app-bench mr-gather without memory backing comparisons")
     if args.compare_prefault and not args.app_bench:
         parser.error("--compare-prefault requires --app-bench")
     if args.prefault_only and not args.app_bench:

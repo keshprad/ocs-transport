@@ -65,6 +65,7 @@ struct tx_memory_ref {
 
 typedef int (*mlx5_dmabuf_map_fn)(uint16_t, void *, size_t, int, uint64_t);
 typedef int (*mlx5_dmabuf_unmap_fn)(uint16_t, void *, size_t);
+typedef int (*mlx5_tx_burst_completion_fn)(uint16_t, uint16_t);
 
 union write_qp {
     struct roce_requester requester;
@@ -584,6 +585,15 @@ static void record_requester_failure(const struct write_worker *worker, uint32_t
     sq->status[write % ROCE_NATIVE_QUEUE_DEPTH] = status[requester->failure];
 }
 
+static bool all_native_writes_retired(const struct write_worker *worker)
+{
+    if (worker->run->native)
+        for (uint32_t i = 0; i < worker->qps; ++i)
+            if (worker->completions[i] != worker->run->options->writes)
+                return false;
+    return true;
+}
+
 static bool poll_worker(struct write_worker *worker, uint64_t now)
 {
     struct write_run *run = worker->run;
@@ -595,7 +605,7 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     }
     bool received = receive_packets(worker, now);
     publish_completions(worker);
-    if (received && worker->completed == worker->qps && !worker->finished) {
+    if (received && worker->completed == worker->qps && !worker->finished && all_native_writes_retired(worker)) {
         worker->finished = true;
         if (run->options->report_bandwidth)
             worker->finished_ns = roce_now_ns();
@@ -1120,6 +1130,24 @@ int main(int argc, char **argv)
         if (!dmabuf_map || !dmabuf_unmap) {
             fprintf(stderr, "physical scatter/gather from verbs memory requires the mlx5 DMA-BUF patch\n");
             goto cleanup_port;
+        }
+        if (datapath.native_queues) {
+            mlx5_tx_burst_completion_fn enable_completion =
+                (mlx5_tx_burst_completion_fn)dlsym(mlx5_pmd, "rte_pmd_mlx5_enable_tx_burst_completion");
+            if (!enable_completion) {
+                fprintf(stderr, "native scatter/gather requires mlx5 TX burst completion support\n");
+                goto cleanup_port;
+            }
+            for (uint16_t queue = 0; queue < options.workers; ++queue) {
+                err = enable_completion(port, queue);
+                if (err) {
+                    fprintf(stderr, "could not enable TX burst completions on queue %u: %s\n",
+                            queue, rte_strerror(-err));
+                    goto cleanup_port;
+                }
+            }
+            if (datapath.report_bandwidth)
+                fprintf(stderr, "DPDK_TX_BURST_COMPLETION queues=%u\n", options.workers);
         }
     }
     if (datapath.mr_socket) {

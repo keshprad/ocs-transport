@@ -42,6 +42,8 @@ posts. Copy TX can wait for each batch's acknowledgement before the next
 post. Scatter/gather producers post batches as long as there is room in
 the doorbell ring or native send queue. The worker publishes completions
 after returning the TX references.
+With native scatter/gather and `--app-post-batch 1`, each producer waits
+for its verbs WC before posting its next WRITE.
 
 With the registration module loaded and accessible to the client, use
 `./roce_app_write "$APP_SOCKET" --kernel-mr /dev/roce_mr` to register a
@@ -114,6 +116,10 @@ The worker resolves the import APIs from its loaded net PMD and uses
 the same protection domain as that port. The provider requests local
 write permission on the sender MR for the kernel's bidirectional
 DMA-BUF import. The sender MR has no remote-write key.
+The native WRITE sender enables a NIC completion on the last WQE of
+each productive TX doorbell, so a short WRITE can retire while the send
+queue is idle. The application WC still waits for the covering RoCE
+ACK and for the PMD to release every payload reference for that WRITE.
 
 ### In-band connection setup
 
@@ -511,7 +517,15 @@ python3 tests/check_spark_bandwidth.py --app-bench memfd-gather --profile smoke 
   --destination "/opt/ocs-roce-app-bw/$REVISION" --app-bundle "$bundle"
 python3 tests/check_spark_bandwidth.py --app-bench mr-copy --app-bench mr-gather \
   --destination "/opt/ocs-roce-app-bw/$REVISION" --app-bundle "$bundle"
+python3 tests/check_spark_bandwidth.py --app-bench mr-gather --profile short --samples 1 \
+  --destination "/opt/ocs-roce-app-bw/$REVISION" --app-bundle "$bundle"
 ```
+
+The short profile uses one QP and one DPDK worker at each endpoint.
+It posts four 1,024-byte single-packet WRITEs at MTU 1500 and two
+4,096-byte single-packet WRITEs at MTU 4200. The requester must observe
+each verbs WC before it posts the following WRITE on the same open QP.
+The runner verifies the mlx5 queue configuration and DMA-BUF mapping.
 
 Each recorded sample requires distinct application and worker processes,
 application completions and byte verification. The native modes require
@@ -550,11 +564,14 @@ The earlier hardware benchmarks measured about 92.6 Gbit/s per path,
 across both paths and both directions. These are the 1 MiB results from
 `spark-7e64` with `spark-28a3` and `spark-4ed9` with `spark-016e`.
 Each path used one QP at Ethernet MTU 1500 and RoCE PMTU 1024.
-[Earlier two-path hardware benchmarks](../summary.md)
+Both pairs reported 200 Gbit/s link speed.
+[Earlier two-path hardware benchmarks](../summary.md),
+[first pair link metadata](../results/20261110T021852Z-4cacd141-client/endpoints.json),
+[second pair link metadata](../results/20261112T023026Z-7a1c5c7f-client/endpoints.json)
 
 The table uses requester payload rates from Spark-04 to Spark-02 on
-their first 100 Gbit/s path. Each successful DPDK trial verified 16 GiB
-of 1 MiB WRITEs. The ConnectX-7 control used the same WRITE size and
+their first path, which reported 100 Gbit/s. Each successful DPDK trial
+verified 16 GiB of 1 MiB WRITEs. The ConnectX-7 control used the same WRITE size and
 perftest 6.30 with four-second measurement windows as described below.
 MTUs 1500 and 4200 used PMTUs 1024 and 4096 respectively.
 
@@ -571,10 +588,16 @@ first unsuccessful trial for that MTU. The fastest four-worker `8b075bb`
 trial reached 85.795 Gbit/s. The earlier 134.99 Gbit/s result used
 local memif on Spark-04.
 
-The [two-path DPDK run](#physical-dual-rail-sweep) reached 92.568 Gbit/s
-in one direction on Spark-04 → Spark-02, where the matched hardware
-control reached 92.340 Gbit/s. The two-path bidirectional DPDK measurement
-for comparison with the earlier 370.16 Gbit/s result is pending.
+The standalone DPDK run reached 92.568 Gbit/s with both logical paths
+active in one direction on Spark-04 → Spark-02. The two paths use the
+left QSFP port on Spark-04 and the right QSFP port on Spark-02. All four
+interfaces reported 100,000 Mb/s in sysfs during the DPDK and matched
+hardware tests. The hardware control reached 92.340 Gbit/s. On a
+follow-up, `ethtool` reported 100,000 Mb/s and auto-negotiation on
+while both ends advertised 200 Gbit/s modes. The cause of the reported
+speed difference remains unverified. A DPDK sweep at a reported
+200 Gbit/s is pending in both one-way and bidirectional modes.
+[Physical dual-rail sweep](#physical-dual-rail-sweep)
 
 In single-sample prefault runs at MTU 1500, four workers reached
 84.899 Gbit/s with zero retries and misses. The 16-QP single-worker
@@ -586,9 +609,11 @@ the diagnostic counters.
 ### Physical dual-rail sweep
 
 The native runner accepts a local perftest 6.30 binary and checks the
-RoCEv2 GIDs and current Ethernet MTU on both Sparks. It measures each
-rail separately and both rails simultaneously, with separate one-QP
-and batched 16-QP controls.
+RoCEv2 GIDs and current Ethernet MTU on both Sparks. It records the
+link speed reported by each interface and requires the speeds to
+agree among the selected endpoints. It measures each rail separately
+and both rails simultaneously, with separate one-QP and batched
+16-QP controls.
 
 ```sh
 python3 tests/check_spark_native_bandwidth.py --perftest "$PERFTEST_BIN"

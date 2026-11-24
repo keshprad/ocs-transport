@@ -10,8 +10,8 @@ import shutil
 import tempfile
 
 from check_spark_bandwidth import (
-    APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER, APP_PROFILES, HUGEPAGE_PROFILES,
-    PREFAULT_PROFILES, Endpoint, unit_argv, unit_environment,
+    APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER, APP_MLX5_FILES, APP_PROFILES, HUGEPAGE_PROFILES,
+    PREFAULT_PROFILES, SHORT_WRITE_PROFILES, Endpoint, unit_argv, unit_environment,
 )
 from stage_spark_cm import APP_LAUNCHER
 
@@ -25,7 +25,7 @@ INPUT_APPS = {
     "roce_app_write": "bin/roce_app_write",
     "provider/libroce_dpdk-rdmav34.so": "provider/libroce_dpdk-rdmav34.so",
 }
-REQUIRED_LIBS = {f"lib/librte_{name}.so.24" for name in ("eal", "mempool_ring", "common_mlx5", "net_mlx5")}
+REQUIRED_LIBS = {"lib/librte_eal.so.24", "lib/librte_mempool_ring.so.24", *APP_MLX5_FILES}
 
 
 def digest(path):
@@ -264,6 +264,8 @@ def stage(revision, inputs, profiles):
         if tx != rx:
             raise ValueError("The pinned application artifacts differ between Spark hosts")
         app_files = APP_FILES
+        if any(name in SHORT_WRITE_PROFILES for name in profiles):
+            app_files += APP_MLX5_FILES
         if any(name in HUGEPAGE_PROFILES for name in profiles):
             app_files += (APP_HUGEPAGE_HELPER,)
         (bundle / "APP_SHA256SUMS").write_text(manifest_text(bundle / "spark-04", app_files))
@@ -277,7 +279,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("revision", help="revision of the pinned RoCEv2 application and worker")
     parser.add_argument("--inputs", type=Path, required=True, help="directory with spark-02 and spark-04 inputs")
-    parser.add_argument("--profile", action="append", choices=APP_PROFILES | PREFAULT_PROFILES,
+    parser.add_argument("--profile", action="append", choices=APP_PROFILES | PREFAULT_PROFILES | SHORT_WRITE_PROFILES,
                         help="profile to stage (default: all profiles without prefaulting)")
     parser.add_argument("--include-prefault", action="store_true",
                         help="also stage prefault variants of the selected profiles")
@@ -286,7 +288,7 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{7,40}", args.revision):
         parser.error("revision must be a 7- to 40-character Git commit ID")
-    profiles = tuple(args.profile or APP_PROFILES)
+    profiles = tuple(args.profile or (APP_PROFILES | SHORT_WRITE_PROFILES))
     if args.include_prefault:
         profiles += tuple(f"{name}-prefault" for name in profiles if name in APP_PROFILES)
     if args.include_hugepages:
