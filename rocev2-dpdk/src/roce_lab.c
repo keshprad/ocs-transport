@@ -269,11 +269,26 @@ void roce_lab_fill(uint8_t *buffer, size_t size, bool sender)
 
 bool roce_lab_verify(const uint8_t *buffer, size_t size)
 {
-    for (size_t i = 0; i < size; ++i) {
-        if (buffer[i] != pattern(i)) {
-            fprintf(stderr, "payload mismatch at byte %zu\n", i);
+    enum { VERIFY_BLOCK_BYTES = 4096 };
+    for (size_t offset = 0; offset < size;) {
+        size_t length = size - offset;
+        if (length > VERIFY_BLOCK_BYTES)
+            length = VERIFY_BLOCK_BYTES;
+
+        /* Reduce every byte so the compiler can vectorize the successful path. */
+        uint8_t difference = 0;
+        for (size_t i = 0; i < length; ++i)
+            difference |= buffer[offset + i] ^ pattern(offset + i);
+        if (difference) {
+            for (size_t i = 0; i < length; ++i) {
+                if (buffer[offset + i] != pattern(offset + i)) {
+                    fprintf(stderr, "payload mismatch at byte %zu\n", offset + i);
+                    break;
+                }
+            }
             return false;
         }
+        offset += length;
     }
     return true;
 }

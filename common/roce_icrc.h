@@ -84,6 +84,18 @@ enum { ROCE_ICRC_UDP_LEN = 8, ROCE_ICRC_BTH_LEN = 12 };
 static inline uint32_t roce_icrc_seed(const uint8_t *ip, size_t ip_header_len)
 {
     enum { IPV4_LEN = 20, IPV6_LEN = 40 };
+    /* This seed includes the eight all-ones bytes of the masked IB LRH. */
+    uint32_t crc = UINT32_C(0xdebb20e3);
+#if defined(__AARCH64EL__) && defined(__ARM_FEATURE_CRC32) && !defined(OCS_ROCE_PORTABLE_CRC)
+    if (ip_header_len == IPV4_LEN) {
+        /* Mask variant fields in the five little-endian IPv4/UDP/BTH words. */
+        crc = __crc32d(crc, roce_crc_load_word(ip) | UINT64_C(0xff00));       /* DSCP and ECN */
+        crc = __crc32d(crc, roce_crc_load_word(ip + 8) | UINT64_C(0xffff00ff)); /* TTL and IPv4 checksum */
+        crc = __crc32d(crc, roce_crc_load_word(ip + 16));
+        crc = __crc32d(crc, roce_crc_load_word(ip + 24) | UINT64_C(0xffff0000)); /* UDP checksum */
+        return __crc32d(crc, roce_crc_load_word(ip + 32) | UINT64_C(0xff));  /* BTH variant reserved byte */
+    }
+#endif
     uint8_t masked[IPV6_LEN + ROCE_ICRC_UDP_LEN + ROCE_ICRC_BTH_LEN];
     size_t prefix_len = ip_header_len + ROCE_ICRC_UDP_LEN + ROCE_ICRC_BTH_LEN;
     memcpy(masked, ip, prefix_len);
@@ -100,8 +112,7 @@ static inline uint32_t roce_icrc_seed(const uint8_t *ip, size_t ip_header_len)
     masked[ip_header_len + 6] = 0xff; /* UDP checksum */
     masked[ip_header_len + 7] = 0xff;
     masked[ip_header_len + ROCE_ICRC_UDP_LEN + 4] = 0xff; /* BTH variant reserved field */
-    /* This seed includes the eight all-ones bytes of the masked IB LRH. */
-    return roce_crc32_update(UINT32_C(0xdebb20e3), masked, prefix_len);
+    return roce_crc32_update(crc, masked, prefix_len);
 }
 
 static inline uint32_t roce_icrc(const uint8_t *ip, size_t ip_header_len, size_t protected_len)

@@ -627,6 +627,19 @@ successful WRITEs per run and no retries. The same builds emitted no
 timing records when disabled. During in-band CM the responder's application
 elapsed time includes the disconnect replay wait before worker completion.
 
+The lab verifier now compares each byte in blocks so the compiler can
+vectorize the comparison. It scans a failing block for the first
+mismatched offset. An isolated 16 GiB Spark-04 verification took 6.74 s
+of thread CPU time on the Cortex-A725 used for the receiver application,
+compared with 16.60 s before the change. The Cortex-X925 took 2.33 s
+compared with 7.09 s. Both builds detected the same corrupt byte at the
+start, on either side of the 4 KiB boundary, and above the 4 GiB offset.
+This measures full-buffer verification after the datapath interval.
+In three alternating 2 GiB memif trials per build with the same workers,
+the receiver application took 2.076 → 0.842 s of median CPU time and
+3.816 → 2.586 s of elapsed time. The worker medians were 63.121 and
+62.950 Gbit/s for that two-worker, 16-QP test.
+
 Scatter/gather application producers now wait for ring space or native
 SQ completion credit when needed. They can post successive batches without
 waiting for the worker to acknowledge admission of each batch. In five
@@ -663,6 +676,19 @@ copy and scatter/gather with Netlink-backed MRs. It verified
 4,269,595 bytes in each single-QP CM run and 17,078,380 bytes in each
 four-QP run, with 521 ordered completions per QP. The scalar and
 portable builds passed the same independent jumbo wire vectors.
+
+The Arm IPv4 iCRC prefix now masks the fields as it loads the five words
+needed for CRC32. The isolated Cortex-X925 packet benchmark measured
+scatter/gather encode time of 49.78 → 44.65 ns at PMTU 1024 and
+139.59 → 134.59 ns at PMTU 4096. Both builds used PMULL. The resulting
+IPv4 and IPv6 CRCs matched the portable implementation on 12,000
+varied packet lengths and alignments. At PMTU 1024, seven alternating
+256 MiB memif trials per build with four QPs and one worker per endpoint
+measured 35.373 Gbit/s before the prefix change and 35.403 Gbit/s after.
+Bulk receive-buffer recycling measured 34.718 Gbit/s in the same test.
+All successful trials verified every byte with zero retries. The memif
+PMD reported a 1,518-byte frame limit, so the jumbo numbers come from
+the isolated packet benchmark.
 
 The RC requester now returns the WRITE index it used to build each
 packet. The scatter/gather worker uses that same index to hold the
