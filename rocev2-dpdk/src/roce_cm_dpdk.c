@@ -246,6 +246,8 @@ bool roce_cm_lab_close(uint16_t port, struct rte_mempool *pool,
                 if (cma && !roce_cma_service_event(cma, ROCE_CMA_DISCONNECTED, 0, NULL, 0))
                     return false;
                 notified = true;
+                /* A transmitted DREP can enter TIMEWAIT after the poll timestamp. */
+                now = roce_now_ns();
             }
             /* The DREP sender keeps QP1 available to replay a lost reply. */
             if (!session->peer_dreq_received || !roce_cm_session_in_timewait(session, now))

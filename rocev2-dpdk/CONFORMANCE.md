@@ -261,7 +261,8 @@ matches the transaction and peer before deferring retries. Duplicate
 MRAs leave the current wait unchanged. An accepted retransmission starts
 the regular retry interval again. The worker timestamps CM sends after
 DPDK accepts the packet and rechecks the exchange deadline after waiting
-on the application.
+on the application. The disconnect loop refreshes its clock when it
+enters TIMEWAIT so it preserves the DREP replay window.
 [IBTA Volume 1 §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
 
 In the exact Spark-04 kernel guest, a memif TX test shim delayed REP
