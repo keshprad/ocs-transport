@@ -101,8 +101,9 @@ worker with the other endpoint's data-plane addresses. The worker sends
 standard REQ, REP and RTU messages over DPDK to establish the QP and
 exchanges DREQ and DREP after the transfer. The sender's path MTU
 must fit the receiver's configured path MTU. The lab's CM private data
-carries the WRITE buffer address, key and workload. The existing TCP
-socket synchronizes the test and returns the verification result.
+carries the WRITE buffer address, key and workload. The TCP test socket
+reports transfer completion and payload verification. CM establishment,
+start of data polling, and disconnect use the in-band connection state.
 
 With `--app-socket`, the application issues its connect or listen request
 over the local Unix socket. The requester gets its doorbell queue after
@@ -118,11 +119,14 @@ libibverbs and moves it to INIT before setup. Each passes its local QPN
 to the worker and to librdmacm. The applications bind the negotiated queue
 mapping to the same QPs and move them to RTR and RTS before accepting the
 connection on the passive side or calling `rdma_establish()` on the active
-side. The passive application receives `ESTABLISHED` when RTU arrives.
+side. The passive application receives `ESTABLISHED` on RTU or when the
+first validated WRITE confirms the connection. The worker preserves RC
+packets that share the RX burst with establishment.
 The worker authenticates the CM socket against the application process
 and sends the CM packets on DPDK queue 0. The requester asks the worker
 to disconnect after posting its last WRITE. The worker sends DREQ after
-the transfer and delivers `DISCONNECTED` after the DREP exchange.
+the transfer. Each side delivers `DISCONNECTED` after its local DREP
+step. The reply sender keeps polling QP1 during the bounded replay window.
 
 This profile supports a single IPv4 RC QP and up to 23 bytes of application
 private data in the lab REQ and REP. The receiver QP accepts plain RDMA

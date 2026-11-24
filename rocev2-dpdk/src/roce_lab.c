@@ -190,10 +190,8 @@ bool roce_lab_ready(int fd)
     return roce_lab_send(fd, 'R') && roce_lab_receive(fd, 'R', false) == 1;
 }
 
-bool roce_lab_ready_after_gate(int fd, uint16_t gate_port, uint16_t control_port)
+bool roce_lab_wait_start_gate(uint16_t gate_port, uint16_t control_port)
 {
-    if (roce_lab_receive(fd, 'R', false) != 1)
-        return false;
     const struct roce_lab_options options = {
         .sender = true, .control_ip = htonl(INADDR_LOOPBACK), .control_port = gate_port,
     };
@@ -219,7 +217,13 @@ bool roce_lab_ready_after_gate(int fd, uint16_t gate_port, uint16_t control_port
     do {
         error = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
     } while (error == EINTR);
-    return !error && roce_lab_send(fd, 'R');
+    return !error;
+}
+
+bool roce_lab_ready_after_gate(int fd, uint16_t gate_port, uint16_t control_port)
+{
+    return roce_lab_receive(fd, 'R', false) == 1 && roce_lab_wait_start_gate(gate_port, control_port) &&
+           roce_lab_send(fd, 'R');
 }
 
 int roce_lab_receive(int fd, char expected, bool nonblocking)

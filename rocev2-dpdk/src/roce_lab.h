@@ -32,6 +32,7 @@ int roce_lab_open(const struct roce_lab_options *options);
 bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
                        const struct roce_lab_offer *local, struct roce_lab_offer *peer);
 bool roce_lab_ready(int fd);
+bool roce_lab_wait_start_gate(uint16_t gate_port, uint16_t control_port);
 bool roce_lab_ready_after_gate(int fd, uint16_t gate_port, uint16_t control_port);
 int roce_lab_receive(int fd, char expected, bool nonblocking);
 bool roce_lab_send(int fd, char message);

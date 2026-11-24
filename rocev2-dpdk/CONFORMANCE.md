@@ -162,7 +162,7 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. The CM applications create CQs and RC QPs before setup. Provider checks cover unmatched QPN and wrong-PD rejection, successful rebinding after a rejected configuration, and `EBUSY` for referenced MR, PD and CQ resources. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification and completion | Worker queues consume shared WQEs from native `ibv_post_send()` and publish individual results for `ibv_poll_cq()`. The provider fixture verifies partial linked-list posting, CQ capacity, queue closure and error WC mapping. With Netlink required, the exact Spark-04-kernel guest verified native copy and scatter/gather on one QP and native copy on four QPs across two workers. Each QP posted one WRITE at a time and returned all three signaled completions. |
 | Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The requester chains worker-owned headers and trailer around the application payload. Independent wire vectors cover PMTU 4096. The RC peer verifies sequence NAK and timeout retries. With standard verbs registration on both ends, a four-process memif test verified 24,585 bytes in both copy and scatter/gather modes before deregistration. RX copies into the MR before acknowledging. The DPDK 23.11.7 mlx5 patch builds, and the worker resolves its DMA-BUF map/unmap APIs. Physical ConnectX-7 DMA from native MRs remains unverified. |
-| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It also verifies that duplicate REP cannot send RTU before `rdma_establish()` authorizes it. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. The lab uses application-created external QPs, a private MR offer and TCP test synchronization and verification. CM-managed verbs QPs and native CM interoperability remain pending. |
+| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It verifies that duplicate REP waits for `rdma_establish()` before sending RTU. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. TCP carries the lab's WRITE completion and verification. CM-managed verbs QPs and native CM interoperability remain pending. |
 
 The registration socket carries the request, the correlation cookie
 and the assigned keys. The kernel resolves the Unix peer and binds the
@@ -191,6 +191,25 @@ QP and passing that QPN into CM. The same QPs moved to RTR and RTS before
 `DISCONNECTED`. A separate four-QP, two-worker run verified
 98,340 bytes and three completions per QP using TCP lab setup. All
 endpoints exited successfully and both kernel modules unloaded.
+
+Packet-loss injection at the DPDK memif burst interface separately
+dropped the first RTU, the first DREP, and both. The initial validated
+RC WRITE confirmed the passive connection after RTU loss. A duplicate
+DREQ elicited the same DREP transaction after DREP loss. Each trial
+verified 24,585 bytes with zero RC retries and three native CQEs. The TCP
+trace contained only WRITE completion and verification bytes. DREP
+replays are capped by the CM retry count. The lab uses that retry horizon
+for TIMEWAIT. The IBTA timer uses path lifetime and peer ACK delay.
+[IBTA Volume 1 §§12.9.7–12.9.8](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
+
+On November 24, 2026, the Spark-04 requester mapped a 12,288-byte
+application memfd buffer for mlx5 scatter/gather DMA. The Spark-02
+application verified the 8,195-byte WRITE over nine packets at PMTU 1024.
+The requester reported zero retries and both ports reported zero errors.
+These were the `ocs-roce-gather-smoke.service` invocations
+`aa9d8d665c6e4d438fe9a5ba77aa02bc` on Spark-04 and
+`60b8327c324149768abfe95a88113e3f` on Spark-02. The smoke test used the
+memfd backend and the TCP lab setup.
 
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
 memif port teardown. Backtraces located that diagnostic in

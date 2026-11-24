@@ -149,6 +149,33 @@ static bool respond(const struct roce_responder *r, struct roce_packet *packet,
     return true;
 }
 
+static bool starts_write(const struct roce_packet *packet)
+{
+    return packet->opcode == ROCE_WRITE_FIRST || packet->opcode == ROCE_WRITE_ONLY;
+}
+
+static bool valid_segment(const struct roce_responder *r, const struct roce_packet *packet,
+                          bool first, uint32_t remaining)
+{
+    bool last = packet->opcode == ROCE_WRITE_LAST || packet->opcode == ROCE_WRITE_ONLY;
+    return first == (r->remaining == 0) && remaining && last == (remaining <= r->qp.pmtu) &&
+           packet->payload_length == (last ? remaining : r->qp.pmtu);
+}
+
+static bool valid_region(const struct roce_region *region, const struct roce_packet *packet)
+{
+    uint64_t offset = packet->remote_address - region->address;
+    return packet->rkey == region->rkey && packet->remote_address >= region->address &&
+           offset <= region->size && packet->write_length <= region->size - offset;
+}
+
+bool roce_responder_can_establish(const struct roce_responder *r, const struct roce_packet *packet)
+{
+    return !r->failed && !r->accepted && packet->psn == r->expected && for_qp(packet, &r->qp) &&
+           starts_write(packet) && valid_segment(r, packet, true, packet->write_length) &&
+           valid_region(&r->region, packet);
+}
+
 bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *packet,
                             struct roce_packet *feedback)
 {
@@ -169,27 +196,23 @@ bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *
         return respond(r, feedback, ROCE_NAK_SEQUENCE, r->expected);
     }
 
-    bool first = packet->opcode == ROCE_WRITE_FIRST || packet->opcode == ROCE_WRITE_ONLY;
+    bool first = starts_write(packet);
     bool last = packet->opcode == ROCE_WRITE_LAST || packet->opcode == ROCE_WRITE_ONLY;
     uint32_t remaining = first ? packet->write_length : r->remaining;
-    size_t expected_length = last ? remaining : r->qp.pmtu;
-    bool in_progress = r->remaining != 0;
-    if (first == in_progress || remaining == 0 ||
-        last != (remaining <= r->qp.pmtu) || packet->payload_length != expected_length) {
+    if (!valid_segment(r, packet, first, remaining)) {
         r->failed = true;
         return respond(r, feedback, ROCE_NAK_INVALID, r->expected);
     }
 
     if (first) {
-        uint64_t offset = packet->remote_address - r->region.address;
-        if (packet->rkey != r->region.rkey || packet->remote_address < r->region.address ||
-            offset > r->region.size || remaining > r->region.size - offset) {
+        if (!valid_region(&r->region, packet)) {
             r->failed = true;
             return respond(r, feedback, ROCE_NAK_ACCESS, r->expected);
         }
-        r->offset = offset;
+        r->offset = packet->remote_address - r->region.address;
     }
 
+    size_t expected_length = packet->payload_length;
     memcpy(r->buffer + r->offset, packet->payload, expected_length);
     r->offset += (uint32_t)expected_length;
     r->remaining = remaining - (uint32_t)expected_length;

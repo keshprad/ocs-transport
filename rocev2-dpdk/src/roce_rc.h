@@ -65,6 +65,7 @@ void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now)
 void roce_requester_feedback(struct roce_requester *r,
                              const struct roce_packet *packet, uint64_t now);
 void roce_requester_poll_timer(struct roce_requester *r, uint64_t now, uint64_t timeout);
+bool roce_responder_can_establish(const struct roce_responder *r, const struct roce_packet *packet);
 bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *packet,
                             struct roce_packet *feedback);
 

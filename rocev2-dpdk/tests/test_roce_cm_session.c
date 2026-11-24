@@ -318,6 +318,12 @@ static void check_disconnect_replay(void)
     assert(receive_at(&pair.active, RETRY_NS, drep));
     assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, wrong, sizeof(wrong)));
 
+    for (unsigned i = 2; i <= pair.passive.config.max_retries; ++i) {
+        assert(receive_at(&pair.passive, RETRY_NS + 1, dreq));
+        send_at(&pair.passive, RETRY_NS + 1, drep);
+    }
+    assert(receive_at(&pair.passive, RETRY_NS + 1, dreq));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS + 1, wrong, sizeof(wrong)));
     assert(roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS - 1));
     assert(!roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS));
     assert(!receive_at(&pair.passive, 5 * RETRY_NS, dreq));

@@ -41,6 +41,18 @@ static void test_sequence_nak_and_lost_final_ack(void)
     struct roce_responder rx = responder(destination, region, psn);
     struct roce_packet first = transmit(&tx, 0), lost = transmit(&tx, 0);
     struct roce_packet third = transmit(&tx, 0), last = transmit(&tx, 0), ack;
+    assert(roce_responder_can_establish(&rx, &first));
+    assert(!roce_responder_can_establish(&rx, &lost));
+    struct roce_packet invalid = first;
+    ++invalid.rkey;
+    assert(!roce_responder_can_establish(&rx, &invalid));
+    invalid = first;
+    ++invalid.psn;
+    assert(!roce_responder_can_establish(&rx, &invalid));
+    invalid = first;
+    --invalid.payload_length;
+    assert(!roce_responder_can_establish(&rx, &invalid));
+    assert(!rx.accepted && destination[0] == 0);
     assert(first.opcode == ROCE_WRITE_FIRST && first.psn == psn && !first.ack_requested);
     assert(lost.opcode == ROCE_WRITE_MIDDLE && lost.psn == ROCE_PSN_MASK);
     assert(third.opcode == ROCE_WRITE_MIDDLE && third.psn == 0);

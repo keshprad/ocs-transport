@@ -33,6 +33,8 @@ enum {
     MBUF_CACHE_SIZE = 256,
 };
 
+_Static_assert((int)ROCE_CM_RX_BURST <= (int)RX_BURST, "the data burst can hold prefetched CM packets");
+
 struct datapath_options {
     uint32_t send_window;
     uint32_t queue_window;
@@ -71,6 +73,7 @@ struct write_run {
     struct rte_mempool *pool;
     struct roce_app_work *work;
     struct roce_native_work *native;
+    struct roce_cm_port *cm;
     uint64_t local_iova;
     uint32_t local_lkey;
     struct tx_memory_ref *tx_refs;
@@ -289,7 +292,14 @@ static bool receive_packets(struct write_worker *worker, uint64_t now)
     const struct write_run *run = worker->run;
     uint32_t writes = run->options->writes;
     struct rte_mbuf *received[RX_BURST];
-    uint16_t count = rte_eth_rx_burst(run->port, worker->queue, received, RX_BURST);
+    uint16_t count;
+    if (run->cm && run->cm->early_count) {
+        count = run->cm->early_count;
+        memcpy(received, run->cm->early, count * sizeof(*received));
+        run->cm->early_count = 0;
+    } else {
+        count = rte_eth_rx_burst(run->port, worker->queue, received, RX_BURST);
+    }
     for (uint16_t i = 0; i < count; ++i) {
         uint8_t storage[ROCE_MAX_FRAME];
         uint32_t length = rte_pktmbuf_pkt_len(received[i]);
@@ -323,8 +333,22 @@ static bool receive_packets(struct write_worker *worker, uint64_t now)
                     worker->completed += pending && responder->msn == writes;
                 }
             }
+        } else if (run->cm && frame && length == ROCE_CM_FRAME_SIZE) {
+            struct roce_cm_session *session = &run->cm->session;
+            if (roce_cm_session_receive(session, now, frame, length) && session->phase != ROCE_CM_ESTABLISHED) {
+                for (; i < count; ++i)
+                    rte_pktmbuf_free(received[i]);
+                break;
+            }
         }
         rte_pktmbuf_free(received[i]);
+    }
+    if (run->cm) {
+        struct roce_cm_session *session = &run->cm->session;
+        if (session->send_pending || session->drep_pending)
+            roce_cm_transmit(run->port, run->pool, session, now);
+        if (session->phase != ROCE_CM_ESTABLISHED)
+            return false;
     }
     return true;
 }
@@ -609,14 +633,14 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
                const struct roce_lab_options *lab, uint8_t *buffer,
                const struct roce_app_memory *application, bool steer,
-               const struct datapath_options *options, struct tx_memory_ref *tx_refs)
+               const struct datapath_options *options, struct tx_memory_ref *tx_refs, struct roce_cm_port *cm)
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
                              .state = WRITE_WAITING, .work = application->work,
                              .native = lab->sender ? application->native : NULL, .local_iova = local->region.address,
                              .local_lkey = application->mr.lkey,
                              .application_socket = application->socket,
-                             .tx_refs = tx_refs };
+                             .tx_refs = tx_refs, .cm = cm };
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
     struct rte_flow *flows[ROCE_LAB_MAX_QPS] = {0};
     uint16_t pmtu = local->pmtu < peer->pmtu ? local->pmtu : peer->pmtu;
@@ -653,9 +677,13 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
     }
 
     bool completed = false;
-    bool ready = options->start_gate ?
-        roce_lab_ready_after_gate(fd, (uint16_t)options->start_gate, lab->control_port) :
-        roce_lab_ready(fd);
+    bool ready;
+    if (cm)
+        ready = !options->start_gate || roce_lab_wait_start_gate((uint16_t)options->start_gate, lab->control_port);
+    else if (options->start_gate)
+        ready = roce_lab_ready_after_gate(fd, (uint16_t)options->start_gate, lab->control_port);
+    else
+        ready = roce_lab_ready(fd);
     if (ready) {
         started = roce_now_ns();
         workers[0].cpu_started = options->report_bandwidth ? thread_cpu_ns() : 0;
@@ -882,6 +910,7 @@ int main(int argc, char **argv)
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, options.workers, MBUF_CACHE_SIZE);
     struct roce_app_memory application = { .socket = -1 };
+    struct roce_cm_port cm = {0};
     struct roce_cma_service cm_service = { .listener = -1, .socket = -1 };
     struct roce_cma_service *cma = datapath.rdmacm_socket ? &cm_service : NULL;
     struct roce_mr_server *registrations = NULL;
@@ -1023,30 +1052,30 @@ int main(int argc, char **argv)
         perror("control socket");
         goto cleanup_port;
     }
-    struct roce_cm_session cm = {0};
     bool connected = in_band ?
-        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer, &cm, cma, &application) :
+        roce_cm_lab_exchange(port, pool, &options, &local, &datapath.cm_peer, &peer, &cm, cma, &application) :
         roce_lab_exchange(fd, &options, &local, &peer);
     if (!connected) {
         fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
         if (cma)
             roce_cma_service_event(cma, ROCE_CMA_CONNECT_ERROR,
-                                   cm.phase == ROCE_CM_FAILED ? ETIMEDOUT : EPROTO, NULL, 0);
+                                   cm.session.phase == ROCE_CM_FAILED ? ETIMEDOUT : EPROTO, NULL, 0);
     } else if (application.socket >= 0 && !connect_application(&application, &options, &datapath, &local, &peer)) {
         perror("application establishment");
     } else {
         if (in_band)
             printf("RoCEv2 CM established local_qpn=%06x peer_qpn=%06x\n", local.qpn, peer.qpn);
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
-                     options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL);
+                     options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL,
+                     in_band ? &cm : NULL);
         if (!result && in_band) {
-            if (roce_cm_lab_close(port, pool, fd, &cm, cma)) {
+            if (roce_cm_lab_close(port, pool, &cm, cma)) {
                 puts("RoCEv2 CM disconnected");
             } else {
                 fprintf(stderr, "RoCEv2 CM disconnect failed\n");
                 if (cma)
                     roce_cma_service_event(cma, ROCE_CMA_DISCONNECTED,
-                                           cm.disconnect_error ? cm.disconnect_error : EPROTO, NULL, 0);
+                                           cm.session.disconnect_error ? cm.session.disconnect_error : EPROTO, NULL, 0);
                 result = 1;
             }
         }
@@ -1069,6 +1098,8 @@ int main(int argc, char **argv)
     }
     close(fd);
 cleanup_port:
+    for (uint16_t i = 0; i < cm.early_count; ++i)
+        rte_pktmbuf_free(cm.early[i]);
     if (datapath.scatter_gather) {
         err = rte_eth_dev_stop(port);
         if (err) {

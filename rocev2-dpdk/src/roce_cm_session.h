@@ -50,6 +50,7 @@ struct roce_cm_session {
     uint64_t disconnected_at;
     uint32_t gsi_psn;
     unsigned sends;
+    unsigned dreps_sent;
     enum roce_cm_type prepared;
     bool received_peer;
     bool rtu_allowed;
@@ -64,6 +65,9 @@ bool roce_cm_session_init(struct roce_cm_session *session,
 
 /* Authorize RTU after a valid REP on an initiator awaiting application approval. */
 bool roce_cm_session_establish(struct roce_cm_session *session);
+
+/* A validated first RC packet can confirm communication after a passive REP. */
+bool roce_cm_session_peer_ready(struct roce_cm_session *session);
 
 /* Queue a DREQ on an established session. Closing and closed sessions succeed
  * without starting another transaction. A received DREQ queues its own DREP. */

@@ -68,6 +68,16 @@ bool roce_cm_session_establish(struct roce_cm_session *session)
     return true;
 }
 
+bool roce_cm_session_peer_ready(struct roce_cm_session *session)
+{
+    if (!session || session->phase != ROCE_CM_PENDING || session->config.initiator ||
+        !session->received_peer || !session->sends)
+        return false;
+    session->phase = ROCE_CM_ESTABLISHED;
+    session->send_pending = false;
+    return true;
+}
+
 bool roce_cm_session_disconnect(struct roce_cm_session *session, uint64_t tid)
 {
     if (!session)
@@ -225,6 +235,7 @@ void roce_cm_session_sent(struct roce_cm_session *session, uint64_t now)
     if (session->prepared == ROCE_CM_RTU) {
         session->phase = ROCE_CM_ESTABLISHED;
     } else if (session->prepared == ROCE_CM_DREP) {
+        ++session->dreps_sent;
         session->drep_pending = false;
         if (session->phase == ROCE_CM_DISCONNECTING)
             disconnect_complete(session, now, 0);
@@ -341,7 +352,7 @@ static bool receive_disconnect(struct roce_cm_session *session, uint64_t now,
         session->phase = ROCE_CM_DISCONNECTING;
     session->peer_dreq_tid = message->tid;
     session->peer_dreq_received = true;
-    session->drep_pending = true;
+    session->drep_pending = session->dreps_sent <= session->config.max_retries;
     session->prepared = 0;
     session->send_pending = false;
     return true;
@@ -376,7 +387,5 @@ bool roce_cm_session_receive(struct roce_cm_session *session, uint64_t now,
         message.remote_comm_id != session->config.local_comm_id)
         return false;
 
-    session->phase = ROCE_CM_ESTABLISHED;
-    session->send_pending = false;
-    return true;
+    return session->phase == ROCE_CM_ESTABLISHED || roce_cm_session_peer_ready(session);
 }

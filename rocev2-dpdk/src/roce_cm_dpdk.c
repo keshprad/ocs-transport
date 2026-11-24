@@ -7,7 +7,7 @@
 #include <rte_mbuf.h>
 #include <rte_pause.h>
 
-enum { CM_RX_BURST = 16, CM_LAB_WORDS = 8, CM_LAB_MAGIC = 0x52434d31 };
+enum { CM_LAB_WORDS = 8, CM_LAB_MAGIC = 0x52434d31 };
 enum { CM_LAB_OFFER_SIZE = CM_LAB_WORDS * sizeof(uint32_t) };
 _Static_assert(CM_LAB_OFFER_SIZE + 1 + ROCE_CMA_PRIVATE_MAX <= ROCE_CM_REQ_PRIVATE_SIZE - ROCE_CMA_IPV4_SIZE,
                "lab offer and application private data fit in a CM REQ");
@@ -71,21 +71,43 @@ static bool peer_offer(const struct roce_cm_session *session, const struct roce_
     return true;
 }
 
-static void receive_cm(uint16_t port, struct roce_cm_session *session, uint64_t now)
+static bool first_write(struct rte_mbuf *mbuf, const struct roce_responder *responder)
 {
-    struct rte_mbuf *received[CM_RX_BURST];
+    uint8_t storage[ROCE_MAX_FRAME];
+    uint32_t length = rte_pktmbuf_pkt_len(mbuf);
+    const void *frame = length <= sizeof(storage) ? rte_pktmbuf_read(mbuf, 0, length, storage) : NULL;
+    struct roce_packet packet;
+    return frame && roce_decode(&packet, frame, length) && roce_responder_can_establish(responder, &packet);
+}
+
+static void receive_cm(uint16_t port, struct roce_cm_port *cm, const struct roce_responder *responder,
+                        uint64_t now)
+{
+    struct roce_cm_session *session = &cm->session;
+    struct rte_mbuf *received[ROCE_CM_RX_BURST];
     uint16_t count = rte_eth_rx_burst(port, 0, received, RTE_DIM(received));
     uint8_t storage[ROCE_CM_FRAME_SIZE];
     for (uint16_t i = 0; i < count; ++i) {
-        const uint8_t *frame = rte_pktmbuf_read(received[i], 0, sizeof(storage), storage);
-        if (frame)
-            roce_cm_session_receive(session, now, frame, sizeof(storage));
-        rte_pktmbuf_free(received[i]);
+        struct rte_mbuf *mbuf = received[i];
+        const uint8_t *frame = rte_pktmbuf_pkt_len(mbuf) == sizeof(storage) ?
+            rte_pktmbuf_read(mbuf, 0, sizeof(storage), storage) : NULL;
+        if (frame && roce_cm_session_receive(session, now, frame, sizeof(storage))) {
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+        if (responder && session->phase == ROCE_CM_PENDING && first_write(mbuf, responder) &&
+            roce_cm_session_peer_ready(session))
+            puts("RoCEv2 CM confirmed by first RC WRITE");
+        /* RTU and the first RC packets may share this RX burst. */
+        if (responder && session->phase == ROCE_CM_ESTABLISHED)
+            cm->early[cm->early_count++] = mbuf;
+        else
+            rte_pktmbuf_free(mbuf);
     }
 }
 
-static void transmit_cm(uint16_t port, struct rte_mempool *pool, struct roce_cm_session *session,
-                        uint64_t now)
+void roce_cm_transmit(uint16_t port, struct rte_mempool *pool, struct roce_cm_session *session,
+                      uint64_t now)
 {
     uint8_t storage[ROCE_CM_FRAME_SIZE];
     size_t length = roce_cm_session_prepare(session, now, storage, sizeof(storage));
@@ -105,12 +127,13 @@ static void transmit_cm(uint16_t port, struct rte_mempool *pool, struct roce_cm_
     rte_pktmbuf_free(mbuf);
 }
 
-bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
+bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                           const struct roce_lab_options *options, const struct roce_lab_offer *local,
                           const struct roce_address *destination, struct roce_lab_offer *peer,
-                          struct roce_cm_session *session, struct roce_cma_service *cma,
+                          struct roce_cm_port *cm, struct roce_cma_service *cma,
                           struct roce_app_memory *application)
 {
+    struct roce_cm_session *session = &cm->session;
     uint32_t comm_id, nonce[2];
     if (!roce_lab_random(&comm_id) || !roce_lab_random(&nonce[0]) || !roce_lab_random(&nonce[1]))
         return false;
@@ -143,13 +166,23 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
 
     uint64_t deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
     bool valid_peer = false;
+    struct roce_responder responder;
     uint8_t cma_private_length = 0;
     const uint8_t *cma_private = session->peer_private_data + CM_LAB_OFFER_SIZE + 1;
     for (uint64_t now = roce_now_ns(); now < deadline; now = roce_now_ns()) {
-        receive_cm(port, session, now);
+        receive_cm(port, cm, valid_peer && !options->sender ? &responder : NULL, now);
         if (session->peer_private_length && !valid_peer) {
             if (!peer_offer(session, options, destination, peer))
                 return false;
+            if (!options->sender) {
+                responder = (struct roce_responder) {
+                    .qp = { .local = local->data, .peer = peer->data, .local_qpn = local->qpn,
+                            .pmtu = RTE_MIN(local->pmtu, peer->pmtu) },
+                    .region = { .address = local->region.address, .rkey = local->region.rkey,
+                                .size = (uint64_t)options->size * options->writes },
+                    .expected = peer->psn,
+                };
+            }
             if (cma && !load_cma_private(session, &cma_private_length))
                 return false;
             if (cma) {
@@ -171,26 +204,20 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
             }
             valid_peer = true;
         }
-        transmit_cm(port, pool, session, now);
-        if (session->phase == ROCE_CM_FAILED)
+        roce_cm_transmit(port, pool, session, now);
+        if (session->phase == ROCE_CM_ESTABLISHED)
+            return options->sender || !cma || roce_cma_service_event(cma, ROCE_CMA_ESTABLISHED, 0, NULL, 0);
+        if (session->phase != ROCE_CM_PENDING)
             return false;
-        if (session->phase == ROCE_CM_ESTABLISHED) {
-            /* Keep polling for duplicate REP until the lab peer confirms receipt of RTU. */
-            if (!options->sender)
-                return (!cma || roce_cma_service_event(cma, ROCE_CMA_ESTABLISHED, 0, NULL, 0)) &&
-                       roce_lab_send(control, 'C');
-            int ready = roce_lab_receive(control, 'C', true);
-            if (ready)
-                return ready == 1;
-        }
         rte_pause();
     }
     return false;
 }
 
-bool roce_cm_lab_close(uint16_t port, struct rte_mempool *pool, int control,
-                      struct roce_cm_session *session, struct roce_cma_service *cma)
+bool roce_cm_lab_close(uint16_t port, struct rte_mempool *pool,
+                      struct roce_cm_port *cm, struct roce_cma_service *cma)
 {
+    struct roce_cm_session *session = &cm->session;
     if (cma && !roce_cma_service_wait_disconnect(cma))
         return false;
     bool initiator = session->config.initiator;
@@ -202,22 +229,22 @@ bool roce_cm_lab_close(uint16_t port, struct rte_mempool *pool, int control,
         if (!roce_cm_session_disconnect(session, tid))
             return false;
     }
+    bool notified = false;
     uint64_t deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
     for (uint64_t now = roce_now_ns(); now < deadline; now = roce_now_ns()) {
-        receive_cm(port, session, now);
-        transmit_cm(port, pool, session, now);
+        receive_cm(port, cm, NULL, now);
+        roce_cm_transmit(port, pool, session, now);
         if (session->phase == ROCE_CM_DISCONNECTED) {
             if (session->disconnect_error)
                 return false;
-            if (initiator)
-                return roce_lab_send(control, 'Q') &&
-                       (!cma || roce_cma_service_event(cma, ROCE_CMA_DISCONNECTED, 0, NULL, 0));
-            /* Keep replaying DREP until the lab requester confirms receipt. */
-            int closed = roce_lab_receive(control, 'Q', true);
-            if (closed)
-                return closed == 1 && (!cma || roce_cma_service_event(cma, ROCE_CMA_DISCONNECTED, 0, NULL, 0));
-            if (!roce_cm_session_in_timewait(session, now))
-                return false;
+            if (!notified) {
+                if (cma && !roce_cma_service_event(cma, ROCE_CMA_DISCONNECTED, 0, NULL, 0))
+                    return false;
+                notified = true;
+            }
+            /* The DREP sender keeps QP1 available to replay a lost reply. */
+            if (!session->peer_dreq_received || !roce_cm_session_in_timewait(session, now))
+                return true;
         }
         rte_pause();
     }
