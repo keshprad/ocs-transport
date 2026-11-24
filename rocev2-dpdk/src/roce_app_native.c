@@ -332,7 +332,8 @@ static int release_queues(struct native_qp *queues, uint32_t count, bool abortin
 }
 
 bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
-                               uint32_t post_batch, bool scatter_gather)
+                               uint32_t post_batch, bool scatter_gather,
+                               int (*submitted)(void *), void *context)
 {
     if (!pd || !pd->context) {
         shutdown(app_socket, SHUT_RDWR);
@@ -362,6 +363,8 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     run.deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
     if (!error)
         error = submit_writes(&run, queues);
+    if (!error && submitted)
+        error = submitted(context);
     if (!error)
         error = finish_writes(&run, queues);
     if (error)

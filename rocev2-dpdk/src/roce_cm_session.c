@@ -37,6 +37,7 @@ bool roce_cm_session_init(struct roce_cm_session *session,
         config->connection.ece_vendor_id > 0xffffff || config->connection.rnr_retry_count > 7 ||
         !config->service_id || !config->udp_source || !config->retry_ns ||
         (config->initiator && !config->cma_source_port) ||
+        (!config->initiator && config->manual_establish) ||
         config->mtu < 1 || config->mtu > 5 || config->max_retries > 15 ||
         config->private_length > capacity || (config->private_length && !config->private_data))
         return false;
@@ -48,11 +49,22 @@ bool roce_cm_session_init(struct roce_cm_session *session,
         .tid = config->tid,
         .gsi_psn = config->connection.starting_psn,
         .send_pending = config->initiator,
+        .rtu_allowed = !config->manual_establish,
     };
     initialized.config.private_data = NULL;
     if (config->private_length)
         memcpy(initialized.local_private_data, config->private_data, config->private_length);
     *session = initialized;
+    return true;
+}
+
+bool roce_cm_session_establish(struct roce_cm_session *session)
+{
+    if (!session || session->phase != ROCE_CM_PENDING || !session->config.initiator ||
+        !session->received_peer || session->rtu_allowed)
+        return false;
+    session->rtu_allowed = true;
+    session->send_pending = true;
     return true;
 }
 
@@ -116,7 +128,7 @@ static enum roce_cm_type next_message(struct roce_cm_session *session, uint64_t 
         return !session->sends || retry_due(session, now) ? ROCE_CM_DREQ : 0;
     }
     if (session->config.initiator && session->received_peer)
-        return session->send_pending ? ROCE_CM_RTU : 0;
+        return session->rtu_allowed && session->send_pending ? ROCE_CM_RTU : 0;
     if (session->phase == ROCE_CM_ESTABLISHED ||
         (!session->config.initiator && !session->received_peer))
         return 0;

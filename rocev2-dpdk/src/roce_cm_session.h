@@ -13,6 +13,7 @@ enum roce_cm_phase {
 
 struct roce_cm_session_config {
     bool initiator;
+    bool manual_establish; /* An initiator waits for the application before sending RTU. */
     uint64_t tid; /* Initiator's transaction ID. Passive sessions learn it from REQ. */
     uint32_t local_comm_id;
     struct roce_address local;
@@ -51,6 +52,7 @@ struct roce_cm_session {
     unsigned sends;
     enum roce_cm_type prepared;
     bool received_peer;
+    bool rtu_allowed;
     bool send_pending;
     bool local_disconnect;
     bool peer_dreq_received;
@@ -59,6 +61,9 @@ struct roce_cm_session {
 
 bool roce_cm_session_init(struct roce_cm_session *session,
                           const struct roce_cm_session_config *config);
+
+/* Authorize RTU after a valid REP on an initiator awaiting application approval. */
+bool roce_cm_session_establish(struct roce_cm_session *session);
 
 /* Queue a DREQ on an established session. Closing and closed sessions succeed
  * without starting another transaction. A received DREQ queues its own DREP. */

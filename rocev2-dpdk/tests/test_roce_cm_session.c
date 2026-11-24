@@ -89,6 +89,31 @@ static bool receive_at(struct roce_cm_session *session, uint64_t now, const uint
     return roce_cm_session_receive(session, now, frame, ROCE_CM_FRAME_SIZE);
 }
 
+static void check_explicit_establishment(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    active.manual_establish = true;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    assert(!roce_cm_session_establish(&pair.active));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    send_at(&pair.passive, 0, pair.rep);
+    assert(receive_at(&pair.active, 0, pair.rep));
+    assert(!roce_cm_session_prepare(&pair.active, 0, pair.rtu, sizeof(pair.rtu)));
+
+    send_at(&pair.passive, RETRY_NS, pair.rep);
+    assert(receive_at(&pair.active, RETRY_NS, pair.rep));
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, pair.rtu, sizeof(pair.rtu)));
+    assert(pair.active.phase == ROCE_CM_PENDING && pair.passive.phase == ROCE_CM_PENDING);
+    assert(roce_cm_session_establish(&pair.active));
+    send_at(&pair.active, RETRY_NS, pair.rtu);
+    assert(receive_at(&pair.passive, RETRY_NS, pair.rtu));
+    assert(pair.active.phase == ROCE_CM_ESTABLISHED && pair.passive.phase == ROCE_CM_ESTABLISHED);
+}
+
 static void check_loss(void)
 {
     struct test_pair pair;
@@ -352,6 +377,7 @@ static void check_disconnect_timeout(void)
 
 int main(void)
 {
+    check_explicit_establishment();
     check_loss();
     check_identity();
     check_retry_limit();

@@ -45,6 +45,7 @@ struct datapath_options {
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     const char *app_socket;
     const char *mr_socket;
+    const char *rdmacm_socket;
     struct roce_address cm_peer;
     bool report_bandwidth;
     bool scatter_gather;
@@ -754,6 +755,10 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             if (++i == argc || !argv[i][0] || options->mr_socket)
                 return false;
             options->mr_socket = argv[i];
+        } else if (strcmp(argv[i], "--rdmacm-socket") == 0) {
+            if (++i == argc || !argv[i][0] || options->rdmacm_socket)
+                return false;
+            options->rdmacm_socket = argv[i];
         } else {
             return false;
         }
@@ -799,7 +804,7 @@ int main(int argc, char **argv)
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
                         " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues]"
-                        " [--scatter-gather] [--cm-peer IPV4 MAC]\n");
+                        " [--scatter-gather] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -823,6 +828,14 @@ int main(int argc, char **argv)
         (!datapath.mr_socket || !options.sender || datapath.writes > ROCE_NATIVE_QUEUE_DEPTH)) {
         fprintf(stderr, "native requester queues require an MR socket and at most %u WRITEs per QP\n",
                 ROCE_NATIVE_QUEUE_DEPTH);
+        goto cleanup_eal;
+    }
+    if (datapath.rdmacm_socket &&
+        (!datapath.app_socket || !datapath.cm_peer.ipv4 ||
+         (options.sender && !datapath.native_queues) ||
+         strcmp(datapath.rdmacm_socket, datapath.app_socket) == 0 ||
+         (datapath.mr_socket && strcmp(datapath.rdmacm_socket, datapath.mr_socket) == 0))) {
+        fprintf(stderr, "librdmacm needs a separate socket, in-band CM and native queues on the requester\n");
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -879,6 +892,8 @@ int main(int argc, char **argv)
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, options.workers, MBUF_CACHE_SIZE);
     struct roce_app_memory application = { .socket = -1 };
+    struct roce_cma_service cm_service = { .listener = -1, .socket = -1 };
+    struct roce_cma_service *cma = datapath.rdmacm_socket ? &cm_service : NULL;
     struct roce_mr_server *registrations = NULL;
     void *mlx5_pmd = NULL;
     uint8_t *buffer = datapath.app_socket ? NULL : malloc((size_t)bytes);
@@ -931,12 +946,20 @@ int main(int argc, char **argv)
             goto cleanup_port;
         }
     }
+    if (cma && !roce_cma_service_listen(cma, datapath.rdmacm_socket)) {
+        perror("librdmacm listener");
+        goto cleanup_port;
+    }
     if (datapath.app_socket) {
-        uint32_t post_batch = datapath.app_post_batch ? RTE_MIN(datapath.app_post_batch, options.writes) :
-            options.writes;
-        if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif,
-                             in_band, datapath.scatter_gather, datapath.native_queues, post_batch,
-                             registrations, &application)) {
+        const struct roce_app_config configuration = {
+            .registrations = registrations,
+            .post_batch = datapath.app_post_batch ? RTE_MIN(datapath.app_post_batch, options.writes) :
+                options.writes,
+            .dma_writable = datapath.scatter_gather && !memif,
+            .in_band_cm = in_band, .scatter_gather = datapath.scatter_gather,
+            .native_queues = datapath.native_queues, .rdmacm = cma != NULL,
+        };
+        if (!roce_app_attach(datapath.app_socket, &options, &configuration, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
@@ -995,17 +1018,30 @@ int main(int argc, char **argv)
     local.psn &= ROCE_PSN_MASK;
     local.qpn = 2 + local.qpn % (ROCE_PSN_MASK - options.qps - 1);
 
+    if (cma) {
+        const struct roce_cma_lab_address addresses = {
+            .local_ipv4 = local.data.ipv4, .peer_ipv4 = datapath.cm_peer.ipv4,
+            .local_qpn = local.qpn, .service_port = options.control_port,
+        };
+        if (!roce_cma_service_attach(cma, application.socket, &addresses, options.sender)) {
+            perror("librdmacm session attachment");
+            goto cleanup_port;
+        }
+    }
     int fd = roce_lab_open(&options);
     if (fd < 0) {
         perror("control socket");
         goto cleanup_port;
     }
-    struct roce_cm_session cm;
+    struct roce_cm_session cm = {0};
     bool connected = in_band ?
-        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer, &cm) :
+        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer, &cm, cma) :
         roce_lab_exchange(fd, &options, &local, &peer);
     if (!connected) {
         fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
+        if (cma)
+            roce_cma_service_event(cma, ROCE_CMA_CONNECT_ERROR,
+                                   cm.phase == ROCE_CM_FAILED ? ETIMEDOUT : EPROTO, NULL, 0);
     } else if (application.socket >= 0 && !connect_application(&application, &options, &datapath, &local, &peer)) {
         perror("application establishment");
     } else {
@@ -1014,10 +1050,13 @@ int main(int argc, char **argv)
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
                      options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL);
         if (!result && in_band) {
-            if (roce_cm_lab_close(port, pool, fd, &cm)) {
+            if (roce_cm_lab_close(port, pool, fd, &cm, cma)) {
                 puts("RoCEv2 CM disconnected");
             } else {
                 fprintf(stderr, "RoCEv2 CM disconnect failed\n");
+                if (cma)
+                    roce_cma_service_event(cma, ROCE_CMA_DISCONNECTED,
+                                           cm.disconnect_error ? cm.disconnect_error : EPROTO, NULL, 0);
                 result = 1;
             }
         }
@@ -1080,6 +1119,8 @@ cleanup_port:
     if (result)
         roce_app_flush_native(&application, &options);
 cleanup_buffers:
+    if (cma)
+        roce_cma_service_close(cma);
     if (mlx5_pmd)
         dlclose(mlx5_pmd);
     if (application.socket >= 0)

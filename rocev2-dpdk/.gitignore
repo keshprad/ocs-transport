@@ -1,6 +1,7 @@
 /roce_write
 /roce_verbs_write
 /roce_app_write
+/libroce_rdmacm.so
 /tests/test_roce
 /tests/test_roce_cm_wire
 /tests/test_roce_cm_session

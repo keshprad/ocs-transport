@@ -46,9 +46,13 @@ ROCE_DPDK_MR_REQUIRE_NETLINK=1 python3 rocev2-dpdk/tests/check_app_memif.py \
     --verbs-provider "$PROVIDER_DIR/libroce_dpdk"
 ```
 
-The memif check runs native copy and scatter/gather with one QP.
-With four available CPUs it also runs four QPs across two workers.
-The local queue mapping is currently supplied by the lab client after
-connection negotiation. The standard librdmacm adapter is pending.
+The memif check runs native copy and scatter/gather with one QP using
+standard librdmacm event and connection calls. The application checks
+peer addresses and private data during establishment, polls native
+WRITE completions, and observes disconnect. With four available CPUs
+it also runs four QPs across two workers using the TCP lab setup.
+The lab client supplies the local queue mapping after connection
+negotiation. The optional [librdmacm adapter](../README.md#in-band-connection-setup)
+uses the worker-assigned QPN for connect and accept.
 
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

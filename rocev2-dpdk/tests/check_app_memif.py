@@ -46,7 +46,7 @@ def expect_success(child, *markers):
 
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
-          provider=None, post_batch=None, native_queues=False):
+          provider=None, post_batch=None, native_queues=False, rdmacm=False):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -60,12 +60,16 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         tx_cm = ["--cm-peer", "192.0.2.2", rx_mac] if cm else []
         rx_mr = ["--mr-socket", str(directory / "rx-mr.sock")] if provider else []
         tx_mr = ["--mr-socket", str(directory / "tx-mr.sock")] if provider else []
+        rx_cma = ["--rdmacm-socket", str(directory / "rx-cma.sock")] if rdmacm else []
+        tx_cma = ["--rdmacm-socket", str(directory / "tx-cma.sock")] if rdmacm else []
 
         rx_path = directory / "rx.sock"
         rx = process(stack, command(cpus[:workers], directory, "rx", size, port, "192.0.2.2", 1024, mac=rx_mac)
-                     + options + rx_cm + rx_mr + ["--app-socket", str(rx_path)])
+                     + options + rx_cm + rx_mr + rx_cma + ["--app-socket", str(rx_path)])
         expect_ready(rx, "application listener ready")
         rx_env = {**os.environ, "ROCE_DPDK_MR_SOCKET": rx_mr[1], "RDMAV_DRIVERS": provider} if provider else None
+        if rdmacm:
+            rx_env["ROCE_DPDK_CM_SOCKET"] = rx_cma[1]
         rx_app = process(stack, [APPLICATION, str(rx_path), *app_options], env=rx_env)
         expect_ready(rx, "control listener ready")
 
@@ -76,9 +80,11 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         if native_queues:
             tx_options.append("--verbs-queues")
         tx = process(stack, command(cpus[workers:2 * workers], directory, "tx", size, port, "192.0.2.1", 1024, mac=tx_mac)
-                     + tx_options + tx_cm + tx_mr + ["--app-socket", str(tx_path)])
+                     + tx_options + tx_cm + tx_mr + tx_cma + ["--app-socket", str(tx_path)])
         expect_ready(tx, "application listener ready")
         tx_env = {**os.environ, "ROCE_DPDK_MR_SOCKET": tx_mr[1], "RDMAV_DRIVERS": provider} if provider else None
+        if rdmacm:
+            tx_env["ROCE_DPDK_CM_SOCKET"] = tx_cma[1]
         tx_app = process(stack, [APPLICATION, str(tx_path), *app_options], env=tx_env)
 
         total = size * writes * qps
@@ -86,6 +92,8 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         expect_success(tx, f"WRITE complete: {total} bytes", *cm_marker)
         expect_success(rx, f"WRITE verified: {total} bytes", *cm_marker)
         app_marker = ("Application CM established",) if cm else ()
+        if rdmacm:
+            app_marker = ("Application librdmacm established", "Application librdmacm disconnected")
         completion_suffix = " via libibverbs" if native_queues else ""
         expect_success(tx_app, f"Application completed {total} bytes",
                        f"Application observed {writes} WRITE completions per QP{completion_suffix}", *app_marker)
@@ -103,9 +111,10 @@ def main():
     if len(cpus) < 2:
         raise RuntimeError("application test needs two available CPUs")
     if args.verbs_provider:
-        check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider, post_batch=1, native_queues=True)
+        check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider,
+              post_batch=1, native_queues=True, rdmacm=True)
         check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
-              post_batch=1, native_queues=True)
+              post_batch=1, native_queues=True, rdmacm=True)
         if len(cpus) >= 4:
             check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=1, native_queues=True)
         return

@@ -109,10 +109,30 @@ over the local Unix socket. The requester gets its doorbell queue after
 the worker reports establishment. `make check-app` exercises this path
 alongside scatter/gather TX and CPU receive placement.
 
+To exercise the standard librdmacm calls, add `--rdmacm-socket CM_PATH`
+on each worker and export `ROCE_DPDK_CM_SOCKET="$CM_PATH"` for its local
+application. Use a distinct path from the application and MR sockets.
+Enable `--verbs-queues` on the requester. The application resolves the
+configured IPv4 peer, connects or accepts using a worker-assigned QPN,
+and consumes pollable librdmacm events. The active application receives
+`CONNECT_RESPONSE` and calls `rdma_establish()` before the worker sends
+RTU. The passive application receives `ESTABLISHED` when RTU arrives.
+The worker authenticates the CM socket against the application process
+and sends the CM packets on DPDK queue 0. The requester asks the worker
+to disconnect after posting its last WRITE. The worker sends DREQ after
+the transfer and delivers `DISCONNECTED` after the DREP exchange.
+
+This profile supports a single IPv4 RC QP and up to 23 bytes of application
+private data in the lab REQ and REP. It uses the negotiated queue mapping
+for verbs QP creation. `make libroce_rdmacm.so` builds the adapter for
+explicit linking. The `roce_app_write` lab client already includes it.
+See the [provider test](provider/README.md) for the combined CM, native
+queue, and kernel MR run.
+
 ## Build and verify
 
 Build with a C compiler, pkg-config, DPDK with the desired PMD, and
-libibverbs development files. For a non-system DPDK install, select its
+libibverbs and librdmacm development files. For a non-system DPDK install, select its
 `libdpdk.pc` with `PKG_CONFIG_PATH` and its libraries with `LD_LIBRARY_PATH`.
 
 ```sh
