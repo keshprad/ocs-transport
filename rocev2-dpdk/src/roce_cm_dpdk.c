@@ -99,6 +99,20 @@ static void progress_cm(void *context, uint64_t now)
     roce_cm_transmit(wait->port, wait->pool, &wait->cm->session, now);
 }
 
+static bool passive_accept(struct roce_cma_service *cma, struct roce_cm_session *session,
+                           const uint8_t *data, uint8_t length, const struct roce_cma_wait *wait)
+{
+    if (!roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
+                                  data, length, wait))
+        return false;
+    const struct roce_cma_message *response = &cma->app_parameters;
+    if (response->type != ROCE_CMA_REJECT)
+        return true;
+    errno = roce_cm_session_reject_request(session, response->private_data, response->private_length) ?
+            ECONNREFUSED : EPROTO;
+    return false;
+}
+
 static bool prepare_application(struct roce_cma_service *cma, struct roce_app_memory *application,
                                 const struct roce_lab_options *options, struct roce_lab_offer *local,
                                 const struct roce_lab_offer *peer, struct roce_cm_session *session,
@@ -108,8 +122,7 @@ static bool prepare_application(struct roce_cma_service *cma, struct roce_app_me
     cma->peer_qpn = session->peer_qpn;
     if (!options->sender && cma->owned_qp) {
         /* The passive application supplies its new QPN in ACCEPT. */
-        if (!roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
-                                       private_data, private_length, wait))
+        if (!passive_accept(cma, session, private_data, private_length, wait))
             return false;
         local->qpn = cma->local_qpn;
     }
@@ -126,8 +139,7 @@ static bool prepare_application(struct roce_cma_service *cma, struct roce_app_me
                 roce_cm_session_set_local_qpn(session, local->qpn);
     } else {
         /* An external QP is configured through the application socket before ACCEPT. */
-        ready = roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
-                                         private_data, private_length, wait);
+        ready = passive_accept(cma, session, private_data, private_length, wait);
     }
     if (queue_fd >= 0) {
         int error = errno;
@@ -191,6 +203,20 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
     const uint8_t *cma_private = NULL;
     for (uint64_t now = roce_now_ns(); now < deadline; now = roce_now_ns()) {
         receive_cm(port, cm, valid_peer && !options->sender ? &responder : NULL, now);
+        if (session->phase == ROCE_CM_REJECTED) {
+            if (options->sender) {
+                if (cma && !roce_cma_service_event(cma, ROCE_CMA_REJECTED, session->reject_reason,
+                                                   session->peer_private_data, session->peer_private_length))
+                    return false;
+                errno = ECONNREFUSED;
+                return false;
+            }
+            roce_cm_transmit(port, pool, session, now);
+            if (!roce_cm_session_replays_reject(session, now))
+                break;
+            rte_pause();
+            continue;
+        }
         if (session->peer_private_length && !valid_peer) {
             *peer = (struct roce_lab_offer) {
                 .data = *destination, .qpn = session->peer_qpn, .psn = session->config.connection.starting_psn,
@@ -204,10 +230,14 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                 struct cm_application_wait context = { .port = port, .pool = pool, .cm = cm };
                 const struct roce_cma_wait wait = { .deadline = deadline, .progress = progress_cm,
                                                    .context = &context };
-                if (!roce_cm_session_hold_response(session, now, deadline) ||
-                    !prepare_application(cma, application, options, local, peer, session,
-                                         cma_private, cma_private_length, &wait))
+                if (!roce_cm_session_hold_response(session, now, deadline))
                     return false;
+                if (!prepare_application(cma, application, options, local, peer, session,
+                                         cma_private, cma_private_length, &wait)) {
+                    if (session->phase == ROCE_CM_REJECTED)
+                        continue;
+                    return false;
+                }
                 roce_cm_session_resume_response(session);
             }
             if (!options->sender) {
@@ -237,6 +267,7 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
             return false;
         rte_pause();
     }
+    errno = session->phase == ROCE_CM_REJECTED ? ECONNREFUSED : ETIMEDOUT;
     return false;
 }
 

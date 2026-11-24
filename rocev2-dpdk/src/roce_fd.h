@@ -33,14 +33,14 @@ static inline bool roce_send_fd(int socket, const void *bytes, size_t length, in
     return sent == (ssize_t)length;
 }
 
-static inline bool roce_receive_optional_fd_flags(int socket, void *bytes, size_t length,
-                                                  int *fd_out, int flags)
+static inline ssize_t roce_receive_record_fd(int socket, void *bytes, size_t capacity,
+                                              int *fd_out, int flags)
 {
     union {
         struct cmsghdr align;
         unsigned char bytes[CMSG_SPACE(sizeof(int))];
     } control = {0};
-    struct iovec data = { .iov_base = bytes, .iov_len = length };
+    struct iovec data = { .iov_base = bytes, .iov_len = capacity };
     struct msghdr message = {
         .msg_iov = &data, .msg_iovlen = 1,
         .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes),
@@ -50,7 +50,7 @@ static inline bool roce_receive_optional_fd_flags(int socket, void *bytes, size_
         received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC | flags);
     } while (received < 0 && errno == EINTR);
     if (received < 0)
-        return false;
+        return -1;
     int descriptor = -1;
     unsigned int count = 0;
     for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header;
@@ -68,13 +68,30 @@ static inline bool roce_receive_optional_fd_flags(int socket, void *bytes, size_
                 close(fd);
         }
     }
-    if (received == (ssize_t)length && count <= 1 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+    if (received > 0 && count <= 1 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
         *fd_out = descriptor;
-        return true;
+        return received;
     }
     if (descriptor >= 0)
         close(descriptor);
     errno = received == 0 ? ECONNRESET : EPROTO;
+    return -1;
+}
+
+static inline bool roce_receive_optional_fd_flags(int socket, void *bytes, size_t length,
+                                                  int *fd_out, int flags)
+{
+    int fd;
+    ssize_t received = roce_receive_record_fd(socket, bytes, length, &fd, flags);
+    if (received < 0)
+        return false;
+    if (received == (ssize_t)length) {
+        *fd_out = fd;
+        return true;
+    }
+    if (fd >= 0)
+        close(fd);
+    errno = EPROTO;
     return false;
 }
 

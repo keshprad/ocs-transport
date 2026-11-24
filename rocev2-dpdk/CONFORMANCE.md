@@ -30,6 +30,7 @@ to check implementation behavior and run independent interoperability tests.
 | §§9.7.2, 9.7.5.2, 9.7.6, 9.7.7.1, 9.9.2 | Cumulative ACK progress, MSN and error syndromes, timeout and bounded Go-Back-N retry | **P**. `RC` asserts cumulative progress, stale and unsent feedback rejection, MSN, access errors, and retry exhaustion. `PEER` confirms the live requester resumes from the missing PSN after a NAK, then retransmits from the same PSN when the final ACK is withheld. Only feedback applicable to plain WRITE with no receive credits is exercised. The endpoint defaults to a 32-packet window and 10 ms local timeout. `RC` also verifies that packet preparation and a partial TX burst advance only the PSNs accepted by the driver. |
 | §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for the configured host region. `RC` checks incorrect keys, below-base and overrun addresses, and inconsistent message lengths with no memory modification on first-packet rejection. |
 | §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5 | CM Message Receipt Acknowledgment (MRA) format and retry deferral | **V** for the lab RC REQ and REP paths. `CM` verifies peer deferral, transaction matching, accepted TX, and replay. The DPDK worker sends MRA while waiting for slow application setup. The exact-kernel guest verifies that behavior with and without packet loss. |
+| §12.6.7, Table 108 | Reject an RC connection request and report the wire reason and private data | **V** for the lab REQ path. `CM` verifies the REJ MAD, transaction matching, retry replay, and TX acceptance. `CMA-IPC` verifies the private-data handoff and descriptor rules. |
 | A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **V** for the tested one-QP IPv4 host-memory WRITE. Two runs verified 8,195 bytes in each direction at PMTU 1024 with raw Ethernet on the DPDK function and native RoCE on the verbs peer. |
 
 Zero-length WRITE, WRITE with Immediate, SEND, READ, atomics, IPv6 and
@@ -42,7 +43,8 @@ the supported RDMA CM and DPDK-side verbs provider profiles.
 | --- | --- | --- |
 | WIRE | `make check` → `tests/check_wire.py` | Independent BTH/RETH/AETH and iCRC vectors for five opcodes, plus negative decode cases |
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
-| CM | `make check` → `tests/test_roce_cm_wire` and `tests/test_roce_cm_session` | Fixed CM MAD vectors, QP1 encapsulation, establishment and teardown, replay, REQ/REP retry timing, and outgoing MRA while the final response is held |
+| CM | `make check` → `tests/test_roce_cm_wire` and `tests/test_roce_cm_session` | Fixed CM MAD vectors, QP1 encapsulation, establishment, rejection and teardown, replay, REQ/REP retry timing, and outgoing MRA while the final response is held |
+| CMA-IPC | `make check` → `tests/test_roce_cma_ipc` | Original 56-byte Unix records, full REJ private data, and rejection of malformed records and unexpected FDs |
 | MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. With four available CPUs, a two-queue test verifies WRITEs on three QPs. |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
 | PEER-VERBS | `python3 tests/check_peer.py --verbs-provider "$PROVIDER_DIR/libroce_dpdk"` | On the exact Spark-04 kernel in QEMU, the independent peer sent a sequence NAK and withheld the final ACK. It verified both retransmissions from a native scatter/gather requester and checked the payload. The application received one libibverbs completion. Netlink handoff was required. |
@@ -301,6 +303,28 @@ sent one REP after the change and five with the previous build. With a
 5.3-second delay before ACCEPT, RXE sent one REQ after the change and
 two with the previous build. The updated worker sent one MRA in each
 role. Every run verified an 8,195-byte WRITE and clean CM disconnect.
+
+The passive application can reject a validated REQ through `rdma_reject()`
+before it creates a QP. The worker sends a QP1 REJ with reason 28
+(consumer-defined). A duplicate matching REQ can replay the cached REJ
+within the retry window. The requester matches the peer, transaction and
+communication IDs before delivering `RDMA_CM_EVENT_REJECTED`. The event
+carries the positive wire reason and the full 148-byte private-data field.
+The library moves a CM-owned requester QP to `IBV_QPS_ERR` before
+delivering the event.
+[IBTA Volume 1 §12.6.7](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf),
+[Linux Table 108 field definitions](https://codebrowser.dev/linux/linux/include/rdma/ibta_vol1_c12.h.html#108),
+[librdmacm rejection API](https://github.com/linux-rdma/rdma-core/blob/v50.0/librdmacm/man/rdma_reject.3)
+
+Stock Linux RXE and the DPDK worker each rejected the other side's REQ
+over TAP in the exact Spark-04 kernel guest. In both directions the
+passive application rejected without a QP, and the active application
+observed reason 28, verified all 148 bytes and saw its QP in error. A
+DPDK TX shim dropped the first outgoing REJ in the DPDK-passive trial.
+The repeated REQ and the replayed REJ had the original transaction ID.
+Separate RXE controls paired the new worker with the previous application
+and the previous worker with the new application. Each pairing verified
+8,195 bytes and completed CM disconnect in both directions at PMTU 4096.
 
 The kernel guest used QEMU TCG with networking disabled and the Ubuntu
 `6.17.0-1021.21-nvidia` image. Both `check_provider` and `check_mr`

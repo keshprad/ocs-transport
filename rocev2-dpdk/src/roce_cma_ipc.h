@@ -1,6 +1,8 @@
 #ifndef ROCE_CMA_IPC_H
 #define ROCE_CMA_IPC_H
 
+#include "roce_cm_wire.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -20,6 +22,7 @@ enum roce_cma_message_type {
     ROCE_CMA_ESTABLISH,
     ROCE_CMA_DISCONNECT,
     ROCE_CMA_QP_READY,
+    ROCE_CMA_REJECT,
     ROCE_CMA_ADDR_RESOLVED = 16,
     ROCE_CMA_ADDR_ERROR,
     ROCE_CMA_ROUTE_RESOLVED,
@@ -45,9 +48,13 @@ struct roce_cma_message {
     uint16_t peer_port;
     uint8_t private_length;
     uint8_t flags;
-    uint8_t private_data[ROCE_CMA_PRIVATE_MAX];
-    uint8_t reserved[3];
+    uint8_t private_data[ROCE_CM_REJ_PRIVATE_SIZE];
 };
+
+static inline bool roce_cma_is_rejection(uint32_t type)
+{
+    return type == ROCE_CMA_REJECT || type == ROCE_CMA_REJECTED;
+}
 
 struct roce_cma_lab_address {
     uint32_t local_ipv4;

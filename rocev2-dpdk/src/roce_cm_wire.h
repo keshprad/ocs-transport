@@ -7,6 +7,8 @@ enum {
     ROCE_CM_GID_SIZE = 16,
     ROCE_CM_REQ_PRIVATE_SIZE = 92,
     ROCE_CM_MRA_PRIVATE_SIZE = 222,
+    ROCE_CM_REJ_PRIVATE_SIZE = 148,
+    ROCE_CM_REJ_CONSUMER_DEFINED = 28,
     ROCE_CM_REP_PRIVATE_SIZE = 196,
     ROCE_CM_RTU_PRIVATE_SIZE = 224,
     ROCE_CM_DREQ_PRIVATE_SIZE = 220,
@@ -21,6 +23,7 @@ enum {
 enum roce_cm_type {
     ROCE_CM_REQ = 0x0010,
     ROCE_CM_MRA = 0x0011,
+    ROCE_CM_REJ = 0x0012,
     ROCE_CM_REP = 0x0013,
     ROCE_CM_RTU = 0x0014,
     ROCE_CM_DREQ = 0x0015,
@@ -31,6 +34,12 @@ enum roce_cm_mra_message {
     ROCE_CM_MRA_REQ = 0,
     ROCE_CM_MRA_REP = 1,
     ROCE_CM_MRA_LAP = 2,
+};
+
+enum roce_cm_rej_message {
+    ROCE_CM_REJ_REQ = 0,
+    ROCE_CM_REJ_REP = 1,
+    ROCE_CM_REJ_OTHER = 2,
 };
 
 struct roce_cm_path {
@@ -86,6 +95,10 @@ struct roce_cm_message {
             enum roce_cm_mra_message message;
             uint8_t service_timeout;
         } mra;
+        struct {
+            enum roce_cm_rej_message message;
+            uint16_t reason;
+        } rej;
         struct {
             uint32_t remote_qpn;
         } dreq;

@@ -475,6 +475,53 @@ static void establish_pair(struct test_pair *pair, bool deliver_rtu)
         assert(receive_at(&pair->passive, 0, pair->rtu));
 }
 
+static void check_reject_replay(void)
+{
+    struct test_pair pair;
+    init_pair(&pair);
+    const uint8_t data[ROCE_CM_REJ_PRIVATE_SIZE] = {0xa1, 0, 0xa2, [147] = 0xa3};
+    uint8_t rejected[ROCE_CM_FRAME_SIZE];
+    assert(!roce_cm_session_reject_request(&pair.passive, data, sizeof(data)));
+    send_at(&pair.active, 1, pair.req);
+    assert(receive_at(&pair.passive, 1, pair.req));
+    assert(!roce_cm_session_reject_request(&pair.active, data, sizeof(data)));
+    assert(!roce_cm_session_reject_request(&pair.passive, data, sizeof(data) + 1));
+    assert(roce_cm_session_reject_request(&pair.passive, data, sizeof(data)));
+    assert(roce_cm_session_prepare(&pair.passive, 2, rejected, sizeof(rejected)) == sizeof(rejected));
+    assert(pair.passive.sends == 0);
+    send_at(&pair.passive, 3, rejected);
+    assert(!roce_cm_session_prepare(&pair.passive, 4, pair.rep, sizeof(pair.rep)));
+
+    struct roce_cm_frame outer;
+    struct roce_cm_message bad = unpack(rejected, &outer);
+    assert(bad.type == ROCE_CM_REJ && bad.rej.reason == ROCE_CM_REJ_CONSUMER_DEFINED);
+    ++bad.remote_comm_id;
+    pack(pair.rep, outer, &bad);
+    assert(!receive_at(&pair.active, 4, pair.rep));
+    --bad.remote_comm_id;
+    ++bad.tid;
+    pack(pair.rep, outer, &bad);
+    assert(!receive_at(&pair.active, 4, pair.rep));
+    --bad.tid;
+    bad.rej.message = ROCE_CM_REJ_REP;
+    pack(pair.rep, outer, &bad);
+    assert(!receive_at(&pair.active, 4, pair.rep));
+
+    send_at(&pair.active, 1 + RETRY_NS, pair.req);
+    assert(receive_at(&pair.passive, 1 + RETRY_NS, pair.req));
+    send_at(&pair.passive, 2 + RETRY_NS, pair.rep);
+    const struct roce_cm_message replay = unpack(pair.rep, &outer);
+    assert(replay.type == ROCE_CM_REJ && replay.tid == bad.tid && replay.private_length == sizeof(data));
+    assert(!memcmp(replay.private_data, data, sizeof(data)));
+    assert(receive_at(&pair.active, 2 + RETRY_NS, pair.rep));
+    assert(pair.active.phase == ROCE_CM_REJECTED && pair.active.reject_reason == 28);
+    assert(pair.active.peer_private_length == sizeof(data));
+    assert(!memcmp(pair.active.peer_private_data, data, sizeof(data)));
+    assert(!roce_cm_session_prepare(&pair.active, 3 + RETRY_NS, pair.rtu, sizeof(pair.rtu)));
+    assert(!receive_at(&pair.active, 3 + RETRY_NS, pair.rep));
+    assert(!receive_at(&pair.passive, 3 + 100 * RETRY_NS, pair.req));
+}
+
 static void check_disconnect_replay(void)
 {
     struct test_pair pair;
@@ -598,6 +645,7 @@ int main(void)
     check_mra_rep();
     check_mra_send(false);
     check_mra_send(true);
+    check_reject_replay();
     check_disconnect_replay();
     check_simultaneous_disconnect(false);
     check_simultaneous_disconnect(true);

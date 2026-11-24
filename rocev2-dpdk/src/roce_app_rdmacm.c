@@ -89,7 +89,9 @@ static bool expect_event(struct roce_app_rdmacm *cm, enum rdma_cm_event_type exp
             unexpected_child = event->id;
     }
     int error = EPROTO;
-    if (event->status >= -4095 && event->status <= 4095 && event->status) {
+    if (event->event == RDMA_CM_EVENT_REJECTED) {
+        error = ECONNREFUSED;
+    } else if (event->status >= -4095 && event->status <= 4095 && event->status) {
         error = event->status < 0 ? -event->status : event->status;
     } else if (!event->status && event->event == expected && cm->id && event->id == cm->id &&
                (!address || match_addresses(event->id, address, sender))) {

@@ -62,7 +62,7 @@ struct cm_event {
     struct rdma_cm_event public;
     struct cm_id *id;
     struct cm_id *listener;
-    uint8_t private_data[ROCE_CMA_PRIVATE_MAX];
+    uint8_t private_data[ROCE_CM_REJ_PRIVATE_SIZE];
 };
 
 static int fail(int error)
@@ -560,6 +560,27 @@ int rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *params)
     return connection_command(id, params, ROCE_CMA_ACCEPT, CM_REQUEST);
 }
 
+int rdma_reject(struct rdma_cm_id *public, const void *data, uint8_t length)
+{
+    if (!public || !public->channel || length > ROCE_CM_REJ_PRIVATE_SIZE || (length && !data))
+        return fail(EINVAL);
+
+    struct cm_id *id = cm_id(public);
+    struct cm_channel *channel = cm_channel(public->channel);
+    pthread_mutex_lock(&channel->mutex);
+    int error = EINVAL;
+    if (id == channel->child && id->state == CM_REQUEST) {
+        struct roce_cma_message message = command(ROCE_CMA_REJECT, &public->route.addr.src_sin,
+                                                   &public->route.addr.dst_sin);
+        if (length)
+            memcpy(message.private_data, data, length);
+        message.private_length = length;
+        error = send_command(channel, id, &message, CM_CLOSED);
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    return error ? fail(error) : 0;
+}
+
 int rdma_establish(struct rdma_cm_id *id)
 {
     return simple_command(id, ROCE_CMA_ESTABLISH, CM_RESPONSE, CM_ESTABLISHED);
@@ -615,7 +636,7 @@ static void prepare_event(struct cm_event *event, struct cm_id *id, struct cm_id
     event->listener = listener;
     event->public.id = &id->public;
     event->public.event = type;
-    event->public.status = -message->status;
+    event->public.status = type == RDMA_CM_EVENT_REJECTED ? message->status : -message->status;
     if (type == RDMA_CM_EVENT_CONNECT_REQUEST || type == RDMA_CM_EVENT_CONNECT_RESPONSE ||
         type == RDMA_CM_EVENT_ESTABLISHED ||
         type == RDMA_CM_EVENT_REJECTED) {
@@ -737,6 +758,10 @@ static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
              id->state != CM_LISTENING) || !message->status)
             return EPROTO;
         type = message->type == ROCE_CMA_REJECTED ? RDMA_CM_EVENT_REJECTED : RDMA_CM_EVENT_CONNECT_ERROR;
+        if (type == RDMA_CM_EVENT_REJECTED && id->owned_qp) {
+            struct ibv_qp_attr attr = { .qp_state = IBV_QPS_ERR };
+            ibv_modify_qp(id->owned_qp, &attr, IBV_QP_STATE);
+        }
         next = CM_CLOSED;
         break;
     case ROCE_CMA_DISCONNECTED:

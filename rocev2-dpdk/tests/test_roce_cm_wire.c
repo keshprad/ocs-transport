@@ -49,6 +49,16 @@ static const uint8_t mra_fixture[256] = {
     [255] = 0x43,
 };
 
+static const uint8_t rej_fixture[256] = {
+    [0] = 0x01, 0x07, 0x02, 0x03,
+    [8] = 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    [16] = 0x00, 0x12,
+    [24] = 0x10, 0x20, 0x30, 0x40, 0x80, 0x70, 0x60, 0x50,
+    [34] = 0x00, 0x1c,
+    [108] = 0x62, 0x00, 0x47,
+    [255] = 0x83,
+};
+
 static const uint8_t rtu_fixture[256] = {
     [0] = 0x01, 0x07, 0x02, 0x03,
     [8] = 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -255,6 +265,30 @@ static void check_mra(void)
     assert(!roce_cm_encode(mad, sizeof(mad), &message));
 }
 
+static void check_reject(void)
+{
+    const uint8_t data[ROCE_CM_REJ_PRIVATE_SIZE] = {0x62, 0, 0x47, [147] = 0x83};
+    const struct roce_cm_message message = {
+        .type = ROCE_CM_REJ, .tid = UINT64_C(0x1122334455667788),
+        .local_comm_id = 0x10203040, .remote_comm_id = 0x80706050,
+        .rej = {.message = ROCE_CM_REJ_REQ, .reason = ROCE_CM_REJ_CONSUMER_DEFINED},
+        .private_data = data, .private_length = sizeof(data),
+    };
+    check_fixture(&message, rej_fixture, 108, sizeof(data));
+
+    uint8_t mad[ROCE_CM_MAD_SIZE];
+    memcpy(mad, rej_fixture, sizeof(mad));
+    struct roce_cm_message decoded;
+    mad[33] = 72 << 1;
+    assert(roce_cm_decode(&decoded, mad, sizeof(mad)));
+    assert(decoded.rej.reason == 28 && decoded.rej.message == ROCE_CM_REJ_REQ);
+    mad[33] = 73 << 1;
+    assert(!roce_cm_decode(&decoded, mad, sizeof(mad)));
+    mad[33] = 0;
+    mad[32] = 3 << 6;
+    assert(!roce_cm_decode(&decoded, mad, sizeof(mad)));
+}
+
 static void check_disconnect(void)
 {
     const uint8_t request_data[] = {0xaa, 0xcd};
@@ -437,6 +471,7 @@ int main(void)
     check_rep_rtu();
     check_lengths();
     check_mra();
+    check_reject();
     check_disconnect();
     check_invalid_fields();
     check_cm_frame();

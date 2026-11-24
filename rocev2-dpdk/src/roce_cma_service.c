@@ -72,7 +72,8 @@ bool roce_cma_service_attach(struct roce_cma_service *service, int app_socket,
 static bool send_event(const struct roce_cma_service *service, enum roce_cma_message_type type,
                        int status, const uint8_t *private_data, uint8_t private_length, int fd)
 {
-    if (private_length > ROCE_CMA_PRIVATE_MAX || (private_length && !private_data)) {
+    size_t private_max = roce_cma_is_rejection(type) ? ROCE_CM_REJ_PRIVATE_SIZE : ROCE_CMA_PRIVATE_MAX;
+    if (private_length > private_max || (private_length && !private_data)) {
         errno = EINVAL;
         return false;
     }
@@ -128,7 +129,8 @@ static bool command(const struct roce_cma_service *service, struct roce_cma_mess
         errno = received < 0 ? -received : ETIMEDOUT;
         return false;
     }
-    if (message->type != (uint32_t)expected || message->status) {
+    if ((message->type != (uint32_t)expected &&
+         !(expected == ROCE_CMA_ACCEPT && message->type == ROCE_CMA_REJECT)) || message->status) {
         errno = EPROTO;
         return false;
     }
@@ -201,6 +203,14 @@ bool roce_cma_service_request(struct roce_cma_service *service, uint16_t peer_po
     if (!roce_cma_service_event(service, ROCE_CMA_CONNECT_REQUEST, 0, private_data, private_length) ||
         !command(service, &message, ROCE_CMA_ACCEPT, wait))
         return false;
+    if (message.type == ROCE_CMA_REJECT) {
+        if (!matches_peer(service, &message) || message.qp_num) {
+            errno = EINVAL;
+            return false;
+        }
+        service->app_parameters = message;
+        return true;
+    }
     return accept_local_qp(service, &message);
 }
 

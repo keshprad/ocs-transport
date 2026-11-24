@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-/* IBTA Volume 1, sections 12.6.5–12.6.6 and 12.6.8–12.6.11. Body offsets
+/* IBTA Volume 1, sections 12.6.5–12.6.11. Body offsets
  * start after the common MAD header, as in Linux ibta_vol1_c12.h. */
 enum {
     MAD_HEADER_SIZE = 24,
@@ -12,6 +12,8 @@ enum {
     MAD_METHOD_SEND = 3,
     REQ_PRIVATE_OFFSET = 140,
     MRA_PRIVATE_OFFSET = 10,
+    REJ_PRIVATE_OFFSET = 84,
+    REJ_MAX_ARI_LENGTH = 72,
     REP_PRIVATE_OFFSET = 36,
     RTU_PRIVATE_OFFSET = 8,
     DREQ_QPN_OFFSET = 8,
@@ -164,6 +166,8 @@ static size_t private_offset(enum roce_cm_type type)
         return MAD_HEADER_SIZE + REQ_PRIVATE_OFFSET;
     case ROCE_CM_MRA:
         return MAD_HEADER_SIZE + MRA_PRIVATE_OFFSET;
+    case ROCE_CM_REJ:
+        return MAD_HEADER_SIZE + REJ_PRIVATE_OFFSET;
     case ROCE_CM_REP:
         return MAD_HEADER_SIZE + REP_PRIVATE_OFFSET;
     case ROCE_CM_RTU:
@@ -182,6 +186,9 @@ static bool valid_fields(const struct roce_cm_message *message)
         return valid_connection(&message->connection) && valid_req(message);
     case ROCE_CM_MRA:
         return (unsigned)message->mra.message <= ROCE_CM_MRA_LAP && message->mra.service_timeout <= 31;
+    case ROCE_CM_REJ:
+        return (unsigned)message->rej.message <= ROCE_CM_REJ_OTHER && message->rej.reason &&
+               message->remote_comm_id;
     case ROCE_CM_REP:
         return valid_connection(&message->connection) && valid_rep(message);
     case ROCE_CM_RTU:
@@ -224,6 +231,9 @@ size_t roce_cm_encode(uint8_t *mad, size_t capacity, const struct roce_cm_messag
     if (message->type == ROCE_CM_MRA) {
         body[8] = (uint8_t)(message->mra.message << 6);
         body[9] = (uint8_t)(message->mra.service_timeout << 3);
+    } else if (message->type == ROCE_CM_REJ) {
+        body[8] = (uint8_t)(message->rej.message << 6);
+        write_be(body + 10, 2, message->rej.reason);
     } else if (message->type == ROCE_CM_REQ) {
         encode_req(body, message);
     } else if (message->type == ROCE_CM_REP) {
@@ -264,6 +274,11 @@ bool roce_cm_decode(struct roce_cm_message *message, const uint8_t *mad, size_t 
     } else if (decoded.type == ROCE_CM_MRA) {
         decoded.mra.message = (enum roce_cm_mra_message)(body[8] >> 6);
         decoded.mra.service_timeout = body[9] >> 3;
+    } else if (decoded.type == ROCE_CM_REJ) {
+        if ((body[9] >> 1) > REJ_MAX_ARI_LENGTH)
+            return false;
+        decoded.rej.message = (enum roce_cm_rej_message)(body[8] >> 6);
+        decoded.rej.reason = (uint16_t)read_be(body + 10, 2);
     } else if (decoded.type == ROCE_CM_DREQ) {
         decoded.dreq.remote_qpn = (uint32_t)read_be(body + DREQ_QPN_OFFSET, 3);
     }

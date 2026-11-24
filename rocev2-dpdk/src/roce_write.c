@@ -1399,10 +1399,14 @@ int main(int argc, char **argv)
         roce_cm_lab_exchange(port, pool, &options, &local, &datapath.cm_peer, &peer, &cm, cma, &application) :
         roce_lab_exchange(fd, &options, &local, &peer);
     if (!connected) {
-        fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
-        if (cma)
-            roce_cma_service_event(cma, ROCE_CMA_CONNECT_ERROR,
-                                   cm.session.phase == ROCE_CM_FAILED ? ETIMEDOUT : EPROTO, NULL, 0);
+        if (in_band && cm.session.phase == ROCE_CM_REJECTED) {
+            fprintf(stderr, "RoCEv2 CM rejected reason=%u\n", cm.session.reject_reason);
+        } else {
+            fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
+            if (cma)
+                roce_cma_service_event(cma, ROCE_CMA_CONNECT_ERROR,
+                                       cm.session.phase == ROCE_CM_FAILED ? ETIMEDOUT : EPROTO, NULL, 0);
+        }
     } else if (application.socket >= 0 && !connect_application(&application, &options, &datapath, &local, &peer)) {
         perror("application establishment");
     } else {

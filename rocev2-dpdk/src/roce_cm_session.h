@@ -6,6 +6,7 @@
 enum roce_cm_phase {
     ROCE_CM_PENDING,
     ROCE_CM_ESTABLISHED,
+    ROCE_CM_REJECTED,
     ROCE_CM_FAILED,
     ROCE_CM_DISCONNECTING,
     ROCE_CM_DISCONNECTED,
@@ -40,6 +41,7 @@ struct roce_cm_session {
     /* Received fixed-width user area, including its zero-fill. */
     uint8_t peer_private_data[ROCE_CM_REP_PRIVATE_SIZE];
     size_t peer_private_length;
+    uint16_t reject_reason;
     int disconnect_error; /* Positive ETIMEDOUT if a local DREQ exhausts retries. */
 
     struct roce_cm_session_config config;
@@ -54,6 +56,8 @@ struct roce_cm_session {
     uint64_t disconnect_tid;
     uint64_t peer_dreq_tid;
     uint64_t disconnected_at;
+    uint64_t reject_sent_at;
+    uint64_t reject_replay_until;
     uint32_t gsi_psn;
     unsigned sends;
     unsigned dreps_sent;
@@ -84,6 +88,10 @@ void roce_cm_session_resume_response(struct roce_cm_session *session);
 
 /* A validated first RC packet can confirm communication after a passive REP. */
 bool roce_cm_session_peer_ready(struct roce_cm_session *session);
+
+/* Reject a validated REQ before the passive side has sent a REP. */
+bool roce_cm_session_reject_request(struct roce_cm_session *session, const uint8_t *data, size_t length);
+bool roce_cm_session_replays_reject(const struct roce_cm_session *session, uint64_t now);
 
 /* Queue a DREQ on an established session. Closing and closed sessions succeed
  * without starting another transaction. A received DREQ queues its own DREP. */

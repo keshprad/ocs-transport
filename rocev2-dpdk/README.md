@@ -169,6 +169,12 @@ to disconnect after posting its last WRITE. The worker sends DREQ after
 the transfer. Each side delivers `DISCONNECTED` after its local DREP
 step. The reply sender keeps polling QP1 during the bounded replay window.
 
+After `CONNECT_REQUEST`, the passive application can call `rdma_reject()`
+before creating a QP. The worker sends a standard CM REJ and can replay it
+in response to a duplicate REQ. The initiator receives
+`RDMA_CM_EVENT_REJECTED` with the wire reason and the fixed 148-byte
+private-data field, including padding for a shorter payload.
+
 This profile supports a single IPv4 RC QP and up to 23 bytes of application
 private data in the lab REQ and REP. The receiver QP accepts plain RDMA
 WRITEs into its MR. Use `rdma_destroy_qp()` to release the CM-owned QP after

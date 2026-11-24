@@ -119,6 +119,38 @@ bool roce_cm_session_peer_ready(struct roce_cm_session *session)
     return true;
 }
 
+bool roce_cm_session_reject_request(struct roce_cm_session *session, const uint8_t *data, size_t length)
+{
+    if (!session || session->phase != ROCE_CM_PENDING || session->config.initiator ||
+        !session->received_peer || session->sends || length > ROCE_CM_REJ_PRIVATE_SIZE ||
+        (length && !data))
+        return false;
+    if (length)
+        memcpy(session->local_private_data, data, length);
+    session->config.private_length = length;
+    /* A transmitted MRA may postpone the requester's next retry. */
+    if (session->response_deadline && !session->mra_pending)
+        session->reject_replay_until = session->response_deadline;
+    roce_cm_session_resume_response(session);
+    session->phase = ROCE_CM_REJECTED;
+    session->reject_reason = ROCE_CM_REJ_CONSUMER_DEFINED;
+    session->send_pending = true;
+    session->prepared = 0;
+    return true;
+}
+
+bool roce_cm_session_replays_reject(const struct roce_cm_session *session, uint64_t now)
+{
+    if (session->phase != ROCE_CM_REJECTED || session->config.initiator)
+        return false;
+    uint64_t interval = UINT64_C(4096) << session->req_response_timeout;
+    if (interval < session->config.retry_ns)
+        interval = session->config.retry_ns;
+    uint64_t start = session->reject_sent_at > session->reject_replay_until ?
+                     session->reject_sent_at : session->reject_replay_until;
+    return !session->sends || now <= start || (now - start) / interval <= session->config.max_retries;
+}
+
 bool roce_cm_session_disconnect(struct roce_cm_session *session, uint64_t tid)
 {
     if (!session)
@@ -176,6 +208,8 @@ static enum roce_cm_type next_message(struct roce_cm_session *session, uint64_t 
     update_timeouts(session, now);
     if (session->phase == ROCE_CM_FAILED)
         return 0;
+    if (session->phase == ROCE_CM_REJECTED)
+        return session->send_pending && roce_cm_session_replays_reject(session, now) ? ROCE_CM_REJ : 0;
     if (session->phase == ROCE_CM_DISCONNECTED)
         return session->drep_pending && roce_cm_session_in_timewait(session, now) ? ROCE_CM_DREP : 0;
     if (session->phase == ROCE_CM_DISCONNECTING) {
@@ -250,6 +284,11 @@ size_t roce_cm_session_prepare(struct roce_cm_session *session, uint64_t now,
     } else if (type == ROCE_CM_MRA) {
         message.mra.message = config->initiator ? ROCE_CM_MRA_REP : ROCE_CM_MRA_REQ;
         message.mra.service_timeout = timeout_code(session->response_deadline - now);
+    } else if (type == ROCE_CM_REJ) {
+        message.rej.message = ROCE_CM_REJ_REQ;
+        message.rej.reason = session->reject_reason;
+        message.private_data = session->local_private_data;
+        message.private_length = config->private_length;
     } else if (type == ROCE_CM_REP) {
         message.rep.target_ack_delay = timeout_code(config->retry_ns);
         message.rep.failover_accepted = 1;
@@ -298,6 +337,8 @@ void roce_cm_session_sent(struct roce_cm_session *session, uint64_t now)
         if (session->phase == ROCE_CM_DISCONNECTING)
             disconnect_complete(session, now, 0);
     } else {
+        if (session->prepared == ROCE_CM_REJ && !session->sends)
+            session->reject_sent_at = now;
         ++session->sends;
         session->last_sent = now;
         session->mra_service_ns = 0;
@@ -379,6 +420,8 @@ static bool receive_req(struct roce_cm_session *session, uint64_t now,
     }
     if (session->phase == ROCE_CM_PENDING)
         queue_response(session, now);
+    else if (session->phase == ROCE_CM_REJECTED)
+        session->send_pending = true;
     return true;
 }
 
@@ -417,6 +460,22 @@ static bool receive_mra(struct roce_cm_session *session, uint64_t now,
         session->mra_received_at = now;
         session->mra_service_ns = UINT64_C(4096) << message->mra.service_timeout;
     }
+    return true;
+}
+
+static bool receive_reject(struct roce_cm_session *session, const struct roce_cm_message *message)
+{
+    if (!session->config.initiator || session->phase != ROCE_CM_PENDING ||
+        !session->sends || session->received_peer || message->rej.message != ROCE_CM_REJ_REQ ||
+        message->tid != session->tid || message->remote_comm_id != session->config.local_comm_id ||
+        (session->peer_comm_id && message->local_comm_id != session->peer_comm_id))
+        return false;
+    session->reject_reason = message->rej.reason;
+    memcpy(session->peer_private_data, message->private_data, message->private_length);
+    session->peer_private_length = message->private_length;
+    session->phase = ROCE_CM_REJECTED;
+    session->send_pending = false;
+    session->prepared = 0;
     return true;
 }
 
@@ -469,10 +528,15 @@ bool roce_cm_session_receive(struct roce_cm_session *session, uint64_t now,
 
     if (message.type == ROCE_CM_DREQ || message.type == ROCE_CM_DREP)
         return receive_disconnect(session, now, &message);
+    if (session->phase == ROCE_CM_REJECTED)
+        return message.type == ROCE_CM_REQ && roce_cm_session_replays_reject(session, now) &&
+               receive_req(session, now, &message);
     if (session->phase == ROCE_CM_DISCONNECTING || session->phase == ROCE_CM_DISCONNECTED)
         return false;
     if (message.type == ROCE_CM_MRA)
         return receive_mra(session, now, &message);
+    if (message.type == ROCE_CM_REJ)
+        return receive_reject(session, &message);
 
     if (session->config.initiator)
         return message.type == ROCE_CM_REP && receive_rep(session, now, &message);
