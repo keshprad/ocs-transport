@@ -19,7 +19,8 @@ check_provider: check_provider.c
 	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CFLAGS) $(WARNINGS) -std=c11 $(LDFLAGS) -o $@ $< $(VERBS_LIBS) $(LDLIBS)
 
 check_provider_mr: check_provider_mr.c ../src/roce_mr_server.c ../src/roce_mr_server.h \
-                   ../src/roce_mr_ipc.c ../src/roce_mr_ipc.h ../src/roce_fd.h ../kernel/roce_mr_uapi.h
+                   ../src/roce_mr_ipc.c ../src/roce_mr_ipc.h ../src/roce_fd.h \
+                   ../src/roce_mr_netlink.c ../src/roce_mr_netlink.h ../kernel/roce_mr_uapi.h
 	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CFLAGS) $(WARNINGS) -std=gnu11 -pthread $(LDFLAGS) \
 		-o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
 

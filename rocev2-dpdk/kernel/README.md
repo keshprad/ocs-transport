@@ -22,7 +22,8 @@ access to the application account explicitly.
 The mapped alias uses special PTEs to give the worker CPU access to
 anonymous folios. Linux GUP rejects that alias for a second pin. The
 descriptor handoff uses the Unix socket. Generic Netlink registration
-events and uverbs integration are follow-up milestones.
+events provide an alternative handoff. Verbs memory registration remains
+a follow-up milestone.
 [Linux GUP design](https://docs.kernel.org/core-api/pin_user_pages.html)
 
 On kernels built with `CONFIG_DMA_SHARED_BUFFER`,
@@ -52,6 +53,31 @@ With `libibverbs` development files and access to an RDMA device, run
 This test imports a writable export after releasing both the application
 VMA and CPU mapping descriptor, then verifies rejection of a read-only
 export by the bidirectional RDMA importer.
+
+## Generic Netlink handoff
+
+The worker binds a `NETLINK_GENERIC` socket in the same network namespace
+as the application. It communicates the resulting Netlink port ID and a
+registration cookie over the connected Unix management socket. The app
+calls `ROCE_MR_EXPORT_TICKET` on its mapping descriptor with that port ID,
+cookie, and its connected management descriptor. The kernel takes the
+worker process identity from the management peer credentials and checks
+that the two processes share an effective UID and user namespace.
+
+Family `roce_mr` version `1` sends a unicast `ROCE_MR_GENL_CMD_TICKET`
+notification with a 16-byte ticket and the native-endian 64-bit cookie.
+The worker checks that the sender is the kernel and uses the cookie to
+associate the notification with its pending registration. The worker
+passes the ticket to `ROCE_MR_IMPORT_TICKET` on `/dev/roce_mr` and receives
+a fresh close-on-exec mapping descriptor with the same access permissions.
+
+Only the designated process can import the ticket. A successful import
+consumes it, and a failed import can be retried while it remains valid.
+Each exporting file can have one pending ticket. The ticket expires after
+30 seconds or when the last reference to the exporting file is dropped.
+`make -C rocev2-dpdk/kernel check-ticket` verifies notification and cookie
+delivery, cross-process authorization, descriptor exhaustion, replay
+rejection, cancellation, and CPU mapping visibility.
 
 ## Verbs device discovery
 

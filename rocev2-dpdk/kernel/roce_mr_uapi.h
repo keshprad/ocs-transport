@@ -28,4 +28,27 @@ struct roce_mr_info {
 /* Export the mapping descriptor's pinned pages as a new CLOEXEC DMA-BUF fd. */
 #define ROCE_MR_EXPORT_DMABUF _IO(0xB7, 2)
 
+#define ROCE_MR_GENL_NAME "roce_mr"
+#define ROCE_MR_GENL_VERSION 1U
+#define ROCE_MR_GENL_CMD_TICKET 1U
+#define ROCE_MR_GENL_A_TICKET 1U
+#define ROCE_MR_GENL_A_COOKIE 2U
+#define ROCE_MR_GENL_A_PAD 3U
+#define ROCE_MR_TICKET_SIZE 16U
+
+struct roce_mr_export_ticket {
+	__s32 worker_socket;
+	__u32 portid;
+	__aligned_u64 cookie;
+};
+
+struct roce_mr_ticket {
+	__u8 bytes[ROCE_MR_TICKET_SIZE];
+};
+
+/* Export on the mapping FD to the peer of a connected AF_UNIX socket. */
+#define ROCE_MR_EXPORT_TICKET _IOW(0xB7, 3, struct roce_mr_export_ticket)
+/* Import once on the control FD. Returns a CLOEXEC mapping descriptor. */
+#define ROCE_MR_IMPORT_TICKET _IOW(0xB7, 4, struct roce_mr_ticket)
+
 #endif

@@ -158,16 +158,17 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | Reference | Component | Current evidence |
 | --- | --- | --- |
 | Figure 5(a), §4.1 | Separate application and DPDK worker processes | `make check-app` verifies an 8,195-byte WRITE and 3,145,764 bytes across four QPs and two workers. Each endpoint uses an application-owned shared buffer. The receiving application checks every byte before peer verification. |
-| Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins page-aligned ranges from the caller's own address space and exports a CPU mapping descriptor and an optional DMA-BUF for the same pinned pages. An isolated guest booted the exact Spark-04 kernel and verified mapping permissions, cross-process mapping lifetime and DMA-BUF export from a worker lease. Generic Netlink coordination remains pending. |
+| Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins caller pages and sends a single-use Generic Netlink ticket bound to the worker. The worker imports a CPU mapping and can export its lease as a DMA-BUF. The exact Spark-04 kernel guest verified process authorization, retry after FD exhaustion, duplicate import rejection, cancellation, and expiry. The provider lifecycle and both copy and scatter/gather WRITE tests passed with Netlink required. The same binaries passed on the older kernel module using SCM_RIGHTS. |
 | Figure 5(a), §4.1 | Standard verbs device, protection domains and MRs | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest and exercised context, port and PD commands. `check_provider_mr` verifies `ibv_reg_mr()` and `ibv_dereg_mr()` with a separate worker-side listener, exact address range and access validation, process-scoped keys, deregistration after lease release and application exit with an outstanding worker lease. Service-backed CQ and QP operations remain pending. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification | Each worker consumes live batches from its per-worker multi-producer doorbell. The app reads process-shared completion counters. `make check` verifies full-queue handling, a producer exit before publication, and 60,000 unique notifications from six processes. `make check-app` posts one WRITE at a time on four QPs across two workers and observes every completion. Native verbs SQ and CQ operations remain pending. |
 | Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The requester chains worker-owned headers and trailer around the application payload. Independent wire vectors cover PMTU 4096. The RC peer verifies sequence NAK and timeout retries. With standard verbs registration on both ends, a four-process memif test verified 24,585 bytes in both copy and scatter/gather modes before deregistration. RX copies into the MR before acknowledging. The DPDK 23.11.7 mlx5 patch builds, and the worker resolves its DMA-BUF map/unmap APIs. Physical ConnectX-7 DMA from native MRs remains unverified. |
 | Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies the wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. The single-QP `--cm-peer` lab path exchanges setup and disconnect on DPDK queue 0. Separate processes issue connect/listen on their Unix sockets and wait for establishment before the WRITEs. The lab uses private MR data and a TCP test synchronization and verification channel. A librdmacm backend and native CM interoperability remain pending. |
 
-The first registration interface transfers a scoped FD over the Unix
-socket. A kernel registration notification can identify an authorized
-mapping so the service acquires it through the driver. This keeps
-the page checks and mapping lifetime in the kernel. [BURST design](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=6)
+The registration socket carries the request, the correlation cookie
+and the assigned keys. The kernel resolves the Unix peer and binds the
+ticket to that worker's process and namespaces. The ticket identifies
+the mapping while the exporter holds the kernel file descriptor.
+[BURST design](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=6)
 
 The CM wire tests cover fixed 256-byte MADs in Volume 1 Chapter 12
 and the QP1 transport described in

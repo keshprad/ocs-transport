@@ -66,9 +66,11 @@ WRITE and the local TX queues release their references.
 With the kernel modules and [provider](provider/README.md) available,
 give the worker separate paths with `--app-socket PATH --mr-socket MR_PATH`.
 The application calls `ibv_reg_mr()` on `roce_dpdk0`. The provider pins
-the enclosing pages and sends the scoped mapping descriptor to the
-worker over the MR socket. The worker assigns keys to the requested
-range and holds a lease until the transfer and TX cleanup finish.
+the enclosing pages. The kernel sends a single-use Generic Netlink
+ticket to the worker, which imports the mapping, assigns keys to the
+requested range, and holds a lease through transfer and TX cleanup.
+The worker matches the registration to the request on the MR socket.
+With an older module, the same socket can pass the scoped FD directly.
 
 ```sh
 RDMAV_DRIVERS="$PROVIDER_DIR/libroce_dpdk" ROCE_DPDK_MR_SOCKET="$MR_PATH" \

@@ -1,9 +1,11 @@
 #define _GNU_SOURCE
 #include "roce_mr_server.h"
 #include "roce_mr_ipc.h"
+#include "roce_mr_netlink.h"
 #include "../kernel/roce_mr_uapi.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/magic.h>
 #include <poll.h>
 #include <pthread.h>
@@ -25,12 +27,14 @@ struct roce_mr_registration {
     pid_t owner;
     unsigned leases;
     uint32_t lkey, rkey;
+    uint64_t ticket_cookie;
 };
 
 struct roce_mr_server {
     char *path;
     int listener;
     int wakeup;
+    struct roce_mr_netlink netlink;
     pthread_t thread;
     pthread_mutex_t mutex;
     size_t page_size;
@@ -52,6 +56,7 @@ static void disconnect(struct roce_mr_registration *region)
     region->owner = 0;
     region->lkey = 0;
     region->rkey = 0;
+    region->ticket_cookie = 0;
     if (!region->leases)
         release_mapping(region);
     if (region->socket >= 0) {
@@ -92,7 +97,7 @@ static bool valid_request(const struct roce_mr_server *server, const struct roce
 {
     size_t mask = server->page_size - 1;
     bool writable = request->access & ROCE_MR_IPC_WRITE;
-    return request->version == ROCE_MR_IPC_VERSION &&
+    return (request->version == ROCE_MR_IPC_VERSION || request->version == ROCE_MR_IPC_TICKET_VERSION) &&
            !(request->access & ~(ROCE_MR_IPC_WRITE | ROCE_MR_IPC_REMOTE_WRITE)) &&
            (!(request->access & ROCE_MR_IPC_REMOTE_WRITE) || writable) &&
            request->length && request->length - 1 <= UINT64_MAX - request->iova &&
@@ -132,17 +137,14 @@ static int install_mapping(struct roce_mr_server *server, struct roce_mr_registr
     return 0;
 }
 
-static void register_mapping(struct roce_mr_server *server, struct roce_mr_registration *region)
+static void finish_registration(struct roce_mr_server *server, struct roce_mr_registration *region,
+                                const struct roce_mr_request *request, int fd, int error)
 {
-    struct roce_mr_request request;
-    int fd = roce_mr_ipc_receive_registration(region->socket, &request);
-    if (fd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return;
-    struct roce_mr_reply reply = {0};
-    if (fd < 0) {
-        reply.error = errno;
-    } else {
-        reply.error = install_mapping(server, region, &request, fd, &reply);
+    region->ticket_cookie = 0;
+    struct roce_mr_reply reply = { .error = error };
+    if (fd >= 0) {
+        if (!reply.error)
+            reply.error = install_mapping(server, region, request, fd, &reply);
         if (reply.error)
             close(fd);
     }
@@ -150,6 +152,75 @@ static void register_mapping(struct roce_mr_server *server, struct roce_mr_regis
         reply.lkey = reply.rkey = 0;
     if (roce_mr_ipc_send_reply(region->socket, &reply) || reply.error)
         disconnect(region);
+}
+
+static bool unused_cookie(const struct roce_mr_server *server, uint64_t cookie)
+{
+    if (!cookie)
+        return false;
+    for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i)
+        if (server->regions[i].ticket_cookie == cookie)
+            return false;
+    return true;
+}
+
+static void start_ticket(struct roce_mr_server *server, struct roce_mr_registration *region,
+                         const struct roce_mr_request *request, int fd)
+{
+    struct roce_mr_ticket_ready reply = {0};
+    if (fd >= 0) {
+        close(fd);
+        reply.error = EPROTO;
+    } else if (!valid_request(server, request)) {
+        reply.error = EINVAL;
+    } else if (server->netlink.fd < 0) {
+        reply.error = EOPNOTSUPP;
+    } else {
+        do {
+            if (getentropy(&reply.cookie, sizeof(reply.cookie)) < 0) {
+                reply.error = errno;
+                break;
+            }
+        } while (!unused_cookie(server, reply.cookie));
+        reply.portid = server->netlink.portid;
+        region->request = *request;
+        region->ticket_cookie = reply.cookie;
+    }
+    if (roce_mr_ipc_send_ticket_ready(region->socket, &reply) || reply.error)
+        disconnect(region);
+}
+
+static void register_mapping(struct roce_mr_server *server, struct roce_mr_registration *region)
+{
+    struct roce_mr_request request = {0};
+    int fd = -1;
+    int error = roce_mr_ipc_receive_registration(region->socket, &request, &fd);
+    if (error == EAGAIN || error == EWOULDBLOCK)
+        return;
+    if (!error && request.version == ROCE_MR_IPC_TICKET_VERSION)
+        start_ticket(server, region, &request, fd);
+    else
+        finish_registration(server, region, &request, fd, error ? error : fd < 0 ? EPROTO : 0);
+}
+
+static void import_ticket(struct roce_mr_server *server, const struct roce_mr_ticket_notification *notice)
+{
+    for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i) {
+        struct roce_mr_registration *region = &server->regions[i];
+        if (!region->ticket_cookie || region->ticket_cookie != notice->cookie)
+            continue;
+
+        int control = open(ROCE_MR_DEVICE, O_RDWR | O_CLOEXEC);
+        int fd = -1;
+        int error = control < 0 ? errno : 0;
+        if (control >= 0) {
+            fd = ioctl(control, ROCE_MR_IMPORT_TICKET, &notice->ticket);
+            error = fd < 0 ? errno : 0;
+            close(control);
+        }
+        finish_registration(server, region, &region->request, fd, error);
+        break;
+    }
 }
 
 static void deregister_mapping(struct roce_mr_registration *region)
@@ -200,14 +271,15 @@ static void accept_registration(struct roce_mr_server *server)
 static void *server_loop(void *opaque)
 {
     struct roce_mr_server *server = opaque;
-    struct pollfd pollfds[ROCE_MR_IPC_MAX_REGISTRATIONS + 2] = {
+    struct pollfd pollfds[ROCE_MR_IPC_MAX_REGISTRATIONS + 3] = {
         { .fd = server->wakeup, .events = POLLIN },
         { .fd = server->listener, .events = POLLIN },
+        { .fd = server->netlink.fd, .events = POLLIN },
     };
     for (;;) {
         for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i)
-            pollfds[i + 2] = (struct pollfd) { .fd = server->regions[i].socket, .events = POLLIN };
-        if (poll(pollfds, ROCE_MR_IPC_MAX_REGISTRATIONS + 2, -1) < 0) {
+            pollfds[i + 3] = (struct pollfd) { .fd = server->regions[i].socket, .events = POLLIN };
+        if (poll(pollfds, ROCE_MR_IPC_MAX_REGISTRATIONS + 3, -1) < 0) {
             if (errno == EINTR)
                 continue;
             break;
@@ -217,16 +289,24 @@ static void *server_loop(void *opaque)
 
         pthread_mutex_lock(&server->mutex);
         for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i) {
-            if (!pollfds[i + 2].revents)
+            if (!pollfds[i + 3].revents)
                 continue;
             struct roce_mr_registration *region = &server->regions[i];
             if (region->mapping)
                 deregister_mapping(region);
+            else if (region->ticket_cookie)
+                disconnect(region);
             else
                 register_mapping(server, region);
         }
         if (pollfds[1].revents & POLLIN)
             accept_registration(server);
+        if (pollfds[2].revents & POLLIN) {
+            struct roce_mr_ticket_notification notice;
+            for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS &&
+                               roce_mr_netlink_receive(&server->netlink, &notice) == 1; ++i)
+                import_ticket(server, &notice);
+        }
         pthread_mutex_unlock(&server->mutex);
     }
     pthread_mutex_lock(&server->mutex);
@@ -260,6 +340,9 @@ struct roce_mr_server *roce_mr_server_start(const char *path)
     for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i)
         server->regions[i].socket = -1;
     server->page_size = (size_t)page_size;
+    server->netlink.fd = -1;
+    if (roce_mr_netlink_open(&server->netlink))
+        server->netlink.fd = -1;
     int error = pthread_mutex_init(&server->mutex, NULL);
     if (!error) {
         error = pthread_create(&server->thread, NULL, server_loop, server);
@@ -268,6 +351,8 @@ struct roce_mr_server *roce_mr_server_start(const char *path)
         pthread_mutex_destroy(&server->mutex);
     }
     close(server->wakeup);
+    if (server->netlink.fd >= 0)
+        close(server->netlink.fd);
     errno = error;
 
 close_listener:
@@ -346,6 +431,8 @@ int roce_mr_server_stop(struct roce_mr_server *server)
     pthread_mutex_destroy(&server->mutex);
     close(server->listener);
     close(server->wakeup);
+    if (server->netlink.fd >= 0)
+        close(server->netlink.fd);
     unlink(server->path);
     free(server->path);
     free(server);

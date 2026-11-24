@@ -22,6 +22,7 @@ _Static_assert(IBVERBS_PABI_VERSION == 34, "Use libibverbs provider ABI 34");
 struct roce_verbs_context {
     struct verbs_context verbs;
     char *mr_socket;
+    bool require_netlink;
 };
 
 struct roce_verbs_pd {
@@ -143,6 +144,45 @@ static int pin_mapping(const struct roce_mr_register *request)
     return fd;
 }
 
+static int offer_ticket(int socket, const struct roce_mr_request *request, int mapping,
+                        bool *unsupported)
+{
+    struct roce_mr_request message = *request;
+    message.version = ROCE_MR_IPC_TICKET_VERSION;
+    int error = roce_mr_ipc_send_registration(socket, &message, -1);
+    if (error)
+        return error;
+    struct roce_mr_ticket_ready ready;
+    error = roce_mr_ipc_read_ticket_ready(socket, &ready);
+    if (error)
+        return error;
+    if (ready.error) {
+        *unsupported = ready.error == EOPNOTSUPP;
+        return ready.error;
+    }
+    const struct roce_mr_export_ticket ticket = {
+        .worker_socket = socket, .portid = ready.portid, .cookie = ready.cookie,
+    };
+    return ioctl(mapping, ROCE_MR_EXPORT_TICKET, &ticket) < 0 ? errno : 0;
+}
+
+static int send_mapping(const struct roce_verbs_context *context, const struct roce_mr_request *request,
+                         int mapping, struct roce_verbs_mr *mr)
+{
+    mr->socket = roce_mr_ipc_connect(context->mr_socket);
+    if (mr->socket < 0)
+        return errno;
+    bool unsupported = false;
+    int error = offer_ticket(mr->socket, request, mapping, &unsupported);
+    if (!unsupported || context->require_netlink)
+        return error;
+    close(mr->socket);
+    mr->socket = roce_mr_ipc_connect(context->mr_socket);
+    if (mr->socket < 0)
+        return errno;
+    return roce_mr_ipc_send_registration(mr->socket, request, mapping);
+}
+
 static struct ibv_mr *reg_mr(struct ibv_pd *ibv, void *address, size_t length, uint64_t iova, int access)
 {
     struct roce_verbs_context *context =
@@ -172,19 +212,12 @@ static struct ibv_mr *reg_mr(struct ibv_pd *ibv, void *address, size_t length, u
         goto free_mr;
     }
 
-    mr->socket = roce_mr_ipc_connect(context->mr_socket);
-    if (mr->socket < 0) {
-        error = errno;
-        close(mapping);
-        goto free_mr;
-    }
-    error = roce_mr_ipc_send_registration(mr->socket, &request, mapping);
-    close(mapping);
-    if (error)
-        goto close_socket;
-
     struct roce_mr_reply reply;
-    error = roce_mr_ipc_read_reply(mr->socket, &reply);
+    error = send_mapping(context, &request, mapping, mr);
+    if (!error)
+        error = roce_mr_ipc_read_reply(mr->socket, &reply);
+    /* Keep the export alive until the worker has imported its ticket. */
+    close(mapping);
     if (!error)
         error = reply.error;
     if (error)
@@ -197,7 +230,8 @@ static struct ibv_mr *reg_mr(struct ibv_pd *ibv, void *address, size_t length, u
     return &mr->verbs.ibv_mr;
 
 close_socket:
-    close(mr->socket);
+    if (mr->socket >= 0)
+        close(mr->socket);
 free_mr:
     atomic_fetch_sub_explicit(&pd->mr_count, 1, memory_order_release);
     free(mr);
@@ -273,6 +307,8 @@ static struct verbs_context *alloc_context(struct ibv_device *device, int comman
         return NULL;
     }
     const char *socket = secure_getenv("ROCE_DPDK_MR_SOCKET");
+    const char *require_netlink = secure_getenv("ROCE_DPDK_MR_REQUIRE_NETLINK");
+    context->require_netlink = require_netlink && strcmp(require_netlink, "1") == 0;
     if (socket && *socket) {
         context->mr_socket = strdup(socket);
         if (!context->mr_socket) {

@@ -32,10 +32,13 @@ The discovery probe checks the device without a worker connection.
 With both kernel modules loaded, run the separate MR lifecycle check.
 It starts a worker-side registration listener and checks MR permissions,
 unaligned ranges and deregistration while a lease is active.
+Set `ROCE_DPDK_MR_REQUIRE_NETLINK=1` to require the kernel's ticket
+handoff in these checks.
 
 ```sh
-make -C rocev2-dpdk/provider RDMA_CORE_BUILD="$RDMA_CORE_BUILD" check-mr
-python3 rocev2-dpdk/tests/check_app_memif.py \
+ROCE_DPDK_MR_REQUIRE_NETLINK=1 \
+    make -C rocev2-dpdk/provider RDMA_CORE_BUILD="$RDMA_CORE_BUILD" check-mr
+ROCE_DPDK_MR_REQUIRE_NETLINK=1 python3 rocev2-dpdk/tests/check_app_memif.py \
     --verbs-provider "$PROVIDER_DIR/libroce_dpdk"
 ```
 

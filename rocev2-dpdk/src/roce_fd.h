@@ -33,7 +33,7 @@ static inline bool roce_send_fd(int socket, void *bytes, size_t length, int fd)
     return sent == (ssize_t)length;
 }
 
-static inline int roce_receive_fd(int socket, void *bytes, size_t length)
+static inline bool roce_receive_optional_fd(int socket, void *bytes, size_t length, int *fd_out)
 {
     union {
         struct cmsghdr align;
@@ -49,7 +49,7 @@ static inline int roce_receive_fd(int socket, void *bytes, size_t length)
         received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
     } while (received < 0 && errno == EINTR);
     if (received < 0)
-        return -1;
+        return false;
     int descriptor = -1;
     unsigned int count = 0;
     for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header;
@@ -67,11 +67,24 @@ static inline int roce_receive_fd(int socket, void *bytes, size_t length)
                 close(fd);
         }
     }
-    if (received == (ssize_t)length && count == 1 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
-        return descriptor;
+    if (received == (ssize_t)length && count <= 1 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC))) {
+        *fd_out = descriptor;
+        return true;
+    }
     if (descriptor >= 0)
         close(descriptor);
     errno = received == 0 ? ECONNRESET : EPROTO;
+    return false;
+}
+
+static inline int roce_receive_fd(int socket, void *bytes, size_t length)
+{
+    int fd;
+    if (!roce_receive_optional_fd(socket, bytes, length, &fd))
+        return -1;
+    if (fd >= 0)
+        return fd;
+    errno = EPROTO;
     return -1;
 }
 

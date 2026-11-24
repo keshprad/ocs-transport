@@ -6,6 +6,7 @@
 
 enum {
     ROCE_MR_IPC_VERSION = 1,
+    ROCE_MR_IPC_TICKET_VERSION = 2,
     ROCE_MR_IPC_MAX_REGISTRATIONS = 64,
     ROCE_MR_IPC_WRITE = 1u << 0,
     ROCE_MR_IPC_REMOTE_WRITE = 1u << 1,
@@ -28,12 +29,20 @@ struct roce_mr_reply {
     uint32_t reserved;
 };
 
+struct roce_mr_ticket_ready {
+    int32_t error;
+    uint32_t portid;
+    uint64_t cookie;
+};
+
 /* A channel is bound to one registration until the provider deregisters or disconnects. */
 int roce_mr_ipc_connect(const char *path);
 int roce_mr_ipc_listen(const char *path);
 int roce_mr_ipc_send_registration(int socket, const struct roce_mr_request *request, int mapping_fd);
 int roce_mr_ipc_read_reply(int socket, struct roce_mr_reply *reply);
-int roce_mr_ipc_receive_registration(int socket, struct roce_mr_request *request);
+int roce_mr_ipc_receive_registration(int socket, struct roce_mr_request *request, int *mapping_fd);
 int roce_mr_ipc_send_reply(int socket, const struct roce_mr_reply *reply);
+int roce_mr_ipc_read_ticket_ready(int socket, struct roce_mr_ticket_ready *reply);
+int roce_mr_ipc_send_ticket_ready(int socket, const struct roce_mr_ticket_ready *reply);
 
 #endif

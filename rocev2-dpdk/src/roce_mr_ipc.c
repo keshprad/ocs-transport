@@ -56,37 +56,63 @@ int roce_mr_ipc_listen(const char *path)
     return open_socket(path, true);
 }
 
-int roce_mr_ipc_send_registration(int socket, const struct roce_mr_request *request, int mapping_fd)
-{
-    struct roce_mr_request message = *request;
-    return roce_send_fd(socket, &message, sizeof(message), mapping_fd) ? 0 : errno;
-}
-
-int roce_mr_ipc_read_reply(int socket, struct roce_mr_reply *reply)
+static int send_wire(int socket, const void *message, size_t length)
 {
     ssize_t bytes;
     do {
-        bytes = recv(socket, reply, sizeof(*reply), MSG_TRUNC);
+        bytes = send(socket, message, length, MSG_NOSIGNAL);
+    } while (bytes < 0 && errno == EINTR);
+    return bytes == (ssize_t)length ? 0 : bytes < 0 ? errno : EPROTO;
+}
+
+static int receive_wire(int socket, void *message, size_t length)
+{
+    ssize_t bytes;
+    do {
+        bytes = recv(socket, message, length, MSG_TRUNC);
     } while (bytes < 0 && errno == EINTR);
     if (bytes < 0)
         return errno;
     if (!bytes)
         return ECONNRESET;
-    if (bytes != sizeof(*reply) || reply->reserved || reply->error < 0)
-        return EPROTO;
-    return 0;
+    return bytes == (ssize_t)length ? 0 : EPROTO;
 }
 
-int roce_mr_ipc_receive_registration(int socket, struct roce_mr_request *request)
+int roce_mr_ipc_send_registration(int socket, const struct roce_mr_request *request, int mapping_fd)
 {
-    return roce_receive_fd(socket, request, sizeof(*request));
+    struct roce_mr_request message = *request;
+    if (mapping_fd < 0)
+        return send_wire(socket, &message, sizeof(message));
+    return roce_send_fd(socket, &message, sizeof(message), mapping_fd) ? 0 : errno;
+}
+
+int roce_mr_ipc_read_reply(int socket, struct roce_mr_reply *reply)
+{
+    int error = receive_wire(socket, reply, sizeof(*reply));
+    if (!error && (reply->reserved || reply->error < 0))
+        return EPROTO;
+    return error;
+}
+
+int roce_mr_ipc_receive_registration(int socket, struct roce_mr_request *request, int *mapping_fd)
+{
+    return roce_receive_optional_fd(socket, request, sizeof(*request), mapping_fd) ? 0 : errno;
 }
 
 int roce_mr_ipc_send_reply(int socket, const struct roce_mr_reply *reply)
 {
-    ssize_t bytes;
-    do {
-        bytes = send(socket, reply, sizeof(*reply), MSG_NOSIGNAL);
-    } while (bytes < 0 && errno == EINTR);
-    return bytes == sizeof(*reply) ? 0 : bytes < 0 ? errno : EPROTO;
+    return send_wire(socket, reply, sizeof(*reply));
+}
+
+int roce_mr_ipc_read_ticket_ready(int socket, struct roce_mr_ticket_ready *reply)
+{
+    int error = receive_wire(socket, reply, sizeof(*reply));
+    if (!error && (reply->error < 0 || (!reply->error && (!reply->portid || !reply->cookie))))
+        return EPROTO;
+    return error;
+}
+
+int roce_mr_ipc_send_ticket_ready(int socket, const struct roce_mr_ticket_ready *reply)
+{
+    return send_wire(socket, reply, sizeof(*reply));
 }
