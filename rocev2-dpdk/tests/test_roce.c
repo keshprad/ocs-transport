@@ -257,6 +257,46 @@ static void test_pipelined_writes(void)
     assert(tx.acked == tx.sent && tx.last_progress == 3);
 }
 
+static void test_variable_write_packets(void)
+{
+    const uint32_t lengths[] = {255, 515, 256};
+    const enum roce_opcode opcodes[] = {
+        ROCE_WRITE_ONLY, ROCE_WRITE_FIRST, ROCE_WRITE_MIDDLE, ROCE_WRITE_LAST, ROCE_WRITE_ONLY,
+    };
+    uint8_t source[1026], destination[sizeof(source)] = {0};
+    for (size_t i = 0; i < sizeof(source); ++i)
+        source[i] = (uint8_t)(i ^ (i >> 5));
+
+    struct roce_region region = { .address = 1000, .rkey = 77, .size = 342 };
+    const uint32_t start = ROCE_PSN_MASK - 1;
+    struct roce_requester tx;
+    assert(roce_requester_init(&tx, &send_qp, start, region, source, 3, 64, 3));
+    tx.total = 5;
+    region.size = sizeof(destination);
+    struct roce_responder rx = responder(destination, region, start);
+    size_t offset = 0;
+    for (size_t wr = 0; wr < sizeof(lengths) / sizeof(lengths[0]); ++wr) {
+        uint32_t count = 1 + (lengths[wr] - 1) / send_qp.pmtu;
+        for (uint32_t segment = 0; segment < count; ++segment) {
+            struct roce_packet packet, ack;
+            uint32_t index = tx.next;
+            assert(roce_requester_can_stage(&tx, 0));
+            roce_requester_write_packet(&tx, index, segment, source + offset,
+                                        region.address + offset, lengths[wr], &packet);
+            assert(packet.opcode == opcodes[index] && packet.psn == ((start + index) & ROCE_PSN_MASK));
+            assert(packet.write_length == lengths[wr] && packet.remote_address == region.address + offset);
+            roce_requester_sent(&tx, 1, 1);
+            bool last = segment + 1 == count;
+            assert(roce_responder_receive(&rx, &packet, &ack) == last);
+            if (last)
+                roce_requester_feedback(&tx, &ack, 2);
+        }
+        offset += lengths[wr];
+    }
+    assert(tx.acked == tx.total && rx.accepted == tx.total && rx.bytes_received == sizeof(source));
+    assert(rx.msn == 3 && memcmp(source, destination, sizeof(source)) == 0);
+}
+
 int main(void)
 {
     test_sequence_nak_and_lost_final_ack();
@@ -265,6 +305,7 @@ int main(void)
     test_fatal_nak_progress();
     test_short_tx_burst();
     test_pipelined_writes();
+    test_variable_write_packets();
     puts("RoCEv2 RC state tests passed");
     return 0;
 }

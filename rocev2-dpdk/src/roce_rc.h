@@ -58,6 +58,7 @@ struct roce_responder {
     uint64_t offset;
     uint32_t remaining;
     uint64_t accepted;
+    uint64_t bytes_received;
     bool reported_gap;
     bool failed;
 };
@@ -67,6 +68,16 @@ bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
                          uint32_t psn, struct roce_region remote,
                          const uint8_t *source, unsigned int retry_limit,
                          uint32_t window, uint32_t writes);
+static inline bool roce_requester_can_stage(const struct roce_requester *r, uint32_t staged)
+{
+    return !r->failure && staged < r->total - r->next &&
+           r->next + staged - r->acked < r->window;
+}
+/* The caller supplies a validated segment within an admitted WRITE. */
+void roce_requester_write_packet(const struct roce_requester *r, uint32_t index,
+                                 uint32_t segment, const uint8_t *source,
+                                 uint64_t remote_address, uint32_t length,
+                                 struct roce_packet *packet);
 /* Returns the zero-based WRITE index, or UINT32_MAX if no packet is sendable. */
 uint32_t roce_requester_stage(const struct roce_requester *r, uint32_t staged,
                               struct roce_packet *packet);

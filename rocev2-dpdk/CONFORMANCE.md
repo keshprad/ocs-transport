@@ -205,6 +205,18 @@ Both runs required Netlink and completed resource teardown. The same
 build passed the four-QP, two-worker stock TAP test at PMTU 4096 with
 2,084 ordered WCs and 17,078,380 verified bytes.
 
+The native send queue accepts different nonempty WRITE lengths within
+its negotiated byte budget. The worker assigns each admitted WR a packet
+range and advances the verbs completion cursor only when the ACK covers
+the entire range. The RC unit test verifies WRITE Only and First/Middle/Last
+segments across PSN wrap. In the Spark-04-kernel guest at PMTU 256, three
+WRITEs of 255, 515, and 256 bytes produced five packets and verified all
+1,026 bytes. The serial copy run completed each WR before admission of
+the next. The scatter/gather run recovered the same RETH and payload
+after loss and a sequence NAK. Both returned ordered WCs with the
+individual WRITE lengths. A separate stock TAP run at PMTU 4096
+verified 2,084 ordered WCs across four QPs and two workers.
+
 Selective WRITE signaling keeps the per-WR flag in the provider. The
 worker retires all WRs after the covering ACK and TX reference release.
 The fixture verified that successful unsignaled work releases posting

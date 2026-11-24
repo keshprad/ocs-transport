@@ -75,9 +75,12 @@ union write_qp {
 
 enum run_state { WRITE_WAITING, WRITE_RUNNING, WRITE_STOPPED };
 
-struct native_write_address {
+struct native_write {
     const uint8_t *source;
     uint64_t remote;
+    uint32_t first_packet;
+    uint32_t end_packet;
+    uint32_t length;
 };
 
 struct write_run {
@@ -86,7 +89,7 @@ struct write_run {
     struct roce_app_work *work;
     struct roce_native_work *native;
     struct roce_cm_port *cm;
-    struct native_write_address (*native_addresses)[ROCE_NATIVE_QUEUE_DEPTH];
+    struct native_write (*native_writes)[ROCE_NATIVE_QUEUE_DEPTH];
     const uint8_t *local_buffer;
     uint64_t local_iova;
     size_t local_length;
@@ -121,7 +124,10 @@ struct write_worker {
     uint32_t fully_posted;
     uint32_t pending_completions;
     uint32_t posted[ROCE_LAB_MAX_QPS];
+    uint32_t next_write[ROCE_LAB_MAX_QPS];
+    uint32_t acknowledged_writes[ROCE_LAB_MAX_QPS];
     uint32_t completions[ROCE_LAB_MAX_QPS];
+    uint64_t admitted_bytes[ROCE_LAB_MAX_QPS];
     bool finished;
     struct poll_usage initial_usage;
     struct poll_usage usage;
@@ -190,14 +196,33 @@ static struct rte_mbuf_ext_shared_info *write_tx_reference(const struct write_wo
     return &run->tx_refs[slot].shared;
 }
 
+static uint32_t stage_native_write(struct write_worker *worker, uint32_t index, uint32_t staged,
+                                   struct roce_packet *packet)
+{
+    const struct roce_requester *requester = &worker->states[index].requester;
+    if (!roce_requester_can_stage(requester, staged))
+        return UINT32_MAX;
+    uint32_t packet_index = requester->next + staged;
+    const struct native_write *writes = worker->run->native_writes[worker->first_qp + index];
+    uint32_t sequence = RTE_MAX(worker->next_write[index], worker->acknowledged_writes[index]);
+    /* Short TX and retry can resume before the last staged WRITE. */
+    if (packet_index < writes[sequence % ROCE_NATIVE_QUEUE_DEPTH].first_packet)
+        sequence = worker->acknowledged_writes[index];
+    while (packet_index >= writes[sequence % ROCE_NATIVE_QUEUE_DEPTH].end_packet)
+        ++sequence;
+    worker->next_write[index] = sequence;
+    const struct native_write *write = &writes[sequence % ROCE_NATIVE_QUEUE_DEPTH];
+    roce_requester_write_packet(requester, packet_index, packet_index - write->first_packet,
+                                write->source, write->remote, write->length, packet);
+    return sequence;
+}
+
 static bool send_requests(struct write_worker *worker,
                           uint32_t index, uint32_t posted_packets,
                           uint32_t credit, uint64_t now)
 {
     const struct write_run *run = worker->run;
     struct roce_requester *requester = &worker->states[index].requester;
-    const struct native_write_address *addresses =
-        run->native_addresses ? run->native_addresses[worker->first_qp + index] : NULL;
     uint32_t budget = RTE_MIN(posted_packets - requester->next,
                               credit + (requester->sent - requester->next));
     uint32_t limit = RTE_MIN(budget, run->options->tx_burst);
@@ -205,16 +230,10 @@ static bool send_requests(struct write_worker *worker,
     struct roce_packet packet;
     uint16_t count = 0;
     while (count < limit) {
-        uint32_t sequence = roce_requester_stage(requester, count, &packet);
+        uint32_t sequence = run->native ? stage_native_write(worker, index, count, &packet) :
+                                         roce_requester_stage(requester, count, &packet);
         if (sequence == UINT32_MAX)
             break;
-        if (addresses) {
-            size_t write_offset = packet.remote_address - requester->remote.address;
-            size_t segment_offset = (size_t)(packet.payload - requester->source) - write_offset;
-            const struct native_write_address *address = &addresses[sequence % ROCE_NATIVE_QUEUE_DEPTH];
-            packet.payload = address->source + segment_offset;
-            packet.remote_address = address->remote;
-        }
         /* A full queue window must still generate an ACK before another send. */
         if (run->options->queue_window && count + 1u == budget)
             packet.ack_requested = true;
@@ -332,6 +351,8 @@ static bool init_qps(struct write_worker *worker, uint32_t first, uint16_t pmtu,
                                      remote, buffer + offset, ROCE_LAB_RETRIES,
                                      options->send_window, options->writes))
                 return false;
+            if (run->native)
+                worker->states[i].requester.total = 0;
         } else {
             worker->states[i].responder = (struct roce_responder) {
                 .qp = qp, .buffer = buffer + offset,
@@ -403,7 +424,8 @@ static bool receive_packets(struct write_worker *worker, uint64_t now)
                     uint32_t acknowledged = requester->acked;
                     roce_requester_feedback(requester, &packet, now);
                     if (requester->acked != acknowledged) {
-                        worker->completed += requester->acked == requester->total;
+                        worker->completed += requester->acked == requester->total &&
+                            (!run->native || worker->posted[index] == writes);
                         if (run->work || run->native)
                             worker->pending_completions |= UINT32_C(1) << index;
                     }
@@ -475,14 +497,15 @@ static enum roce_native_wc_status validate_native_write(const struct write_worke
 {
     const struct write_run *run = worker->run;
     const struct roce_requester *requester = &worker->states[index].requester;
-    uint64_t bytes = requester->remote.size;
-    if (wqe->length != bytes)
+    uint64_t bytes = wqe->length;
+    if (!bytes || bytes > ROCE_NATIVE_MAX_WRITE)
         return ROCE_NATIVE_WC_LOCAL_LENGTH;
     if (wqe->lkey != run->local_lkey ||
         !roce_native_contains(run->local_iova, run->local_length, wqe->local_address, bytes))
         return ROCE_NATIVE_WC_LOCAL_PROTECTION;
     if (wqe->rkey != requester->remote.rkey ||
-        !roce_native_contains(requester->remote.address, bytes * run->options->writes, wqe->remote_address, bytes))
+        !roce_native_contains(requester->remote.address, requester->remote.size * run->options->writes,
+                              wqe->remote_address, bytes))
         return ROCE_NATIVE_WC_REMOTE_ACCESS;
     return ROCE_NATIVE_WC_SUCCESS;
 }
@@ -492,6 +515,7 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
     const struct write_run *run = worker->run;
     uint32_t qp = worker->first_qp + index;
     struct roce_native_sq *sq = &run->native->qps[qp];
+    struct roce_requester *requester = &worker->states[index].requester;
     uint32_t head = atomic_load_explicit(&sq->posted, memory_order_acquire);
     uint32_t sequence = worker->posted[index];
     if (head == sequence)
@@ -499,6 +523,9 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
     if (head > run->options->writes || head - sequence > ROCE_NATIVE_QUEUE_DEPTH ||
         head - worker->completions[index] > ROCE_NATIVE_QUEUE_DEPTH)
         return false;
+    uint64_t bytes = worker->admitted_bytes[index];
+    uint64_t capacity = requester->remote.size * run->options->writes;
+    uint32_t packets = requester->total;
     for (; sequence < head; ++sequence) {
         uint32_t slot = sequence % ROCE_NATIVE_QUEUE_DEPTH;
         const struct roce_native_write wqe = sq->entries[slot];
@@ -507,12 +534,23 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
             sq->status[slot] = result;
             return false;
         }
-        /* Retain the validated addresses until this WR retires, including on replay. */
-        run->native_addresses[qp][slot] = (struct native_write_address) {
+        uint32_t count = (wqe.length - 1) / requester->qp.pmtu + 1;
+        bytes += wqe.length;
+        if (bytes > capacity || capacity - bytes < run->options->writes - sequence - 1 ||
+            (sequence + 1 == run->options->writes && bytes != capacity) || count > UINT32_MAX - packets) {
+            sq->status[slot] = ROCE_NATIVE_WC_LOCAL_LENGTH;
+            return false;
+        }
+        /* Keep both PSN bounds even when the preceding slot has been reused. */
+        run->native_writes[qp][slot] = (struct native_write) {
             .source = run->local_buffer + (wqe.local_address - run->local_iova),
-            .remote = wqe.remote_address,
+            .remote = wqe.remote_address, .length = wqe.length,
+            .first_packet = packets, .end_packet = packets + count,
         };
+        packets += count;
     }
+    requester->total = packets;
+    worker->admitted_bytes[index] = bytes;
     worker->posted[index] = head;
     worker->fully_posted += head == run->options->writes;
     atomic_store_explicit(&sq->admitted, head, memory_order_release);
@@ -570,9 +608,15 @@ static void publish_completions(struct write_worker *worker)
     for (; pending; pending &= pending - 1) {
         uint32_t i = (uint32_t)__builtin_ctz(pending);
         const struct roce_requester *requester = &worker->states[i].requester;
-        uint32_t completed = requester->acked / requester->packets_per_write;
+        uint32_t completed;
         if (run->native) {
             struct roce_native_sq *sq = &run->native->qps[worker->first_qp + i];
+            const struct native_write *writes = run->native_writes[worker->first_qp + i];
+            completed = worker->acknowledged_writes[i];
+            while (completed < worker->posted[i] &&
+                   writes[completed % ROCE_NATIVE_QUEUE_DEPTH].end_packet <= requester->acked)
+                ++completed;
+            worker->acknowledged_writes[i] = completed;
             atomic_store_explicit(&sq->acknowledged, completed, memory_order_relaxed);
             uint32_t retired = worker->completions[i];
             for (; retired < completed; ++retired) {
@@ -595,9 +639,11 @@ static void publish_completions(struct write_worker *worker)
                 continue;
             atomic_store_explicit(&sq->retired, retired, memory_order_release);
             completed = retired;
-        } else if (completed != worker->completions[i]) {
-            atomic_store_explicit(&run->work->qps[worker->first_qp + i].completed, completed,
-                                  memory_order_release);
+        } else {
+            completed = requester->acked / requester->packets_per_write;
+            if (completed != worker->completions[i])
+                atomic_store_explicit(&run->work->qps[worker->first_qp + i].completed, completed,
+                                      memory_order_release);
         }
         worker->completions[i] = completed;
     }
@@ -608,7 +654,7 @@ static void record_requester_failure(const struct write_worker *worker, uint32_t
     const struct roce_requester *requester = &worker->states[index].requester;
     fprintf(stderr, "QP %06x WRITE failed after %u retries (%u/%u packets acknowledged)\n",
             requester->qp.local_qpn, requester->retries, requester->acked, requester->total);
-    uint32_t write = requester->acked / requester->packets_per_write;
+    uint32_t write = worker->acknowledged_writes[index];
     if (!worker->run->native || write >= worker->posted[index])
         return;
 
@@ -669,7 +715,7 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     for (uint32_t i = 0; i < worker->qps; ++i) {
         uint32_t next = worker->next;
         struct roce_requester *requester = &worker->states[next].requester;
-        uint32_t posted_packets = run->work || run->native ?
+        uint32_t posted_packets = run->work ?
             worker->posted[next] * requester->packets_per_write : requester->total;
         if (++worker->next == worker->qps)
             worker->next = 0;
@@ -763,11 +809,11 @@ static bool wait_for_completion(int fd, struct write_worker *main_worker, uint64
 }
 
 static bool verify_result(int fd, int application, const struct write_worker *workers, uint64_t started,
-                          const uint8_t *buffer, uint64_t bytes, uint64_t qp_packets)
+                          const uint8_t *buffer, uint64_t bytes)
 {
     const struct write_run *run = workers[0].run;
     const struct datapath_options *options = run->options;
-    uint64_t finished = started, retries = 0;
+    uint64_t finished = started, retries = 0, packets = 0;
     struct poll_usage usage = { .has_faults = true };
     for (uint32_t i = 0; i < options->workers; ++i) {
         const struct write_worker *worker = &workers[i];
@@ -779,20 +825,22 @@ static bool verify_result(int fd, int application, const struct write_worker *wo
         usage.has_faults = usage.has_faults && worker->usage.has_faults;
         for (uint32_t j = 0; j < worker->qps; ++j) {
             if (run->sender) {
-                retries += worker->states[j].requester.retries;
+                const struct roce_requester *requester = &worker->states[j].requester;
+                retries += requester->retries;
+                packets += requester->total;
             } else {
                 const struct roce_responder *responder = &worker->states[j].responder;
                 if (responder->msn != options->writes || responder->remaining ||
-                    responder->accepted != qp_packets) {
+                    responder->bytes_received != bytes / options->qps) {
                     fprintf(stderr, "QP %06x ended with %u WRITEs and %" PRIu64 " packets\n",
                             responder->qp.local_qpn, responder->msn, responder->accepted);
                     return false;
                 }
+                packets += responder->accepted;
             }
         }
     }
 
-    uint64_t packets = qp_packets * options->qps;
     if (run->sender) {
         if (!roce_lab_send(fd, 'D') || roce_lab_receive(fd, 'V', false) != 1)
             return false;
@@ -824,9 +872,9 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                              .application_socket = application->socket,
                              .tx_refs = tx_refs, .cm = cm };
     if (run.native) {
-        run.native_addresses = rte_zmalloc(NULL, options->qps * sizeof(*run.native_addresses), RTE_CACHE_LINE_SIZE);
-        if (!run.native_addresses) {
-            fprintf(stderr, "could not allocate native WRITE addresses\n");
+        run.native_writes = rte_zmalloc(NULL, options->qps * sizeof(*run.native_writes), RTE_CACHE_LINE_SIZE);
+        if (!run.native_writes) {
+            fprintf(stderr, "could not allocate native WRITEs\n");
             return 1;
         }
     }
@@ -893,8 +941,7 @@ stop_workers:
 
     if (!result) {
         uint64_t bytes = local->region.size * options->writes * options->qps;
-        uint64_t qp_packets = ((local->region.size - 1) / pmtu + 1) * options->writes;
-        result = !verify_result(fd, application->socket, workers, started, buffer, bytes, qp_packets);
+        result = !verify_result(fd, application->socket, workers, started, buffer, bytes);
     }
     if (result)
         fprintf(stderr, "WRITE or verification exchange did not complete\n");
@@ -903,7 +950,7 @@ cleanup_flows:
     for (uint32_t i = 0; i < options->qps; ++i)
         if (flows[i])
             rte_flow_destroy(port, flows[i], NULL);
-    rte_free(run.native_addresses);
+    rte_free(run.native_writes);
     return result;
 }
 

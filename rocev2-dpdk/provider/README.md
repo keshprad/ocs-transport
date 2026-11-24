@@ -15,8 +15,9 @@ MR for the lane. The QP retains both that MR and its CQs until destroy.
 With a matching worker, a native WRITE can use any source offset within
 the configured local MR and destination offset within the receiving
 QP's slice. The worker snapshots the validated addresses when admitting
-each WR and reuses them for retransmission. The lab still negotiates a
-fixed length and count of WRITEs per QP.
+each WR and reuses them for retransmission. Individual WRITEs can have
+different nonzero lengths. The lab still negotiates a WRITE count and a
+total byte budget per QP.
 
 Multiple bound QPs can share one polling CQ. Completions carry the
 originating QPN and remain ordered within each send queue. The CQ reserves
