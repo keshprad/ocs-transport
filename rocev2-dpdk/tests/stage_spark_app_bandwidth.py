@@ -10,7 +10,8 @@ import shutil
 import tempfile
 
 from check_spark_bandwidth import (
-    APP_DESTINATION_ROOT, APP_FILES, APP_PROFILES, PREFAULT_PROFILES, Endpoint, unit_argv, unit_environment,
+    APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER, APP_PROFILES, HUGEPAGE_PROFILES,
+    PREFAULT_PROFILES, Endpoint, unit_argv, unit_environment,
 )
 from stage_spark_cm import APP_LAUNCHER
 
@@ -104,6 +105,10 @@ def render_unit(endpoint, destination):
     runtime = destination / "lib"
     environment = "\n".join(f"Environment={shlex.quote(f'{key}={value}')}"
                             for key, value in unit_environment(endpoint, destination, runtime).items())
+    hugepage_hooks = ""
+    if endpoint.settings.hugepages:
+        helper = destination / APP_HUGEPAGE_HELPER
+        hugepage_hooks = f"ExecStartPre=+/bin/bash {helper} prepare\nExecStopPost=+/bin/bash {helper} cleanup\n"
     return f"""[Unit]
 Description=RoCEv2 Spark application bandwidth ({endpoint.profile}, {endpoint.role})
 ConditionHost={HOSTS[endpoint.host]}
@@ -125,7 +130,7 @@ ProtectHome=yes
 ProtectSystem=strict
 PrivateTmp=yes
 RuntimeMaxSec=120
-ExecStart={shlex.join(unit_argv(endpoint, destination, runtime))}
+{hugepage_hooks}ExecStart={shlex.join(unit_argv(endpoint, destination, runtime))}
 """
 
 
@@ -238,6 +243,10 @@ def stage_host(bundle, inputs, destination, endpoints):
         f'OWNER:="root", GROUP:="{ACCOUNT}", MODE:="0660"\n'
     )
     payload = (*APP_FILES, *libraries)
+    if any(endpoint.settings.hugepages for endpoint in endpoints):
+        source = Path(__file__).with_name("manage_spark_app_hugepages.sh")
+        shutil.copyfile(source, directory / APP_HUGEPAGE_HELPER)
+        payload += (APP_HUGEPAGE_HELPER,)
     manifest = directory / "SHA256SUMS"
     manifest.write_text(manifest_text(directory, (*payload, *units, RULES, SUDOERS)))
     installer = directory / "install.sh"
@@ -254,7 +263,10 @@ def stage(revision, inputs, profiles):
                   for role in ("tx", "rx"))
         if tx != rx:
             raise ValueError("The pinned application artifacts differ between Spark hosts")
-        (bundle / "APP_SHA256SUMS").write_text(manifest_text(bundle / "spark-04", APP_FILES))
+        app_files = APP_FILES
+        if any(name in HUGEPAGE_PROFILES for name in profiles):
+            app_files += (APP_HUGEPAGE_HELPER,)
+        (bundle / "APP_SHA256SUMS").write_text(manifest_text(bundle / "spark-04", app_files))
     except Exception:
         shutil.rmtree(bundle)
         raise
@@ -269,12 +281,16 @@ def main():
                         help="profile to stage (default: all profiles without prefaulting)")
     parser.add_argument("--include-prefault", action="store_true",
                         help="also stage prefault variants of the selected profiles")
+    parser.add_argument("--include-hugepages", action="store_true",
+                        help="also stage the 2 MiB packet-pool variants of selected MTU 4200 profiles")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{7,40}", args.revision):
         parser.error("revision must be a 7- to 40-character Git commit ID")
     profiles = tuple(args.profile or APP_PROFILES)
     if args.include_prefault:
         profiles += tuple(f"{name}-prefault" for name in profiles if name in APP_PROFILES)
+    if args.include_hugepages:
+        profiles += tuple(f"{name}-hugepages" for name in profiles if f"{name}-hugepages" in HUGEPAGE_PROFILES)
     try:
         print(stage(args.revision, args.inputs, tuple(dict.fromkeys(profiles))))
     except (OSError, ValueError) as error:

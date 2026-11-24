@@ -30,6 +30,9 @@ CONTROL_IP = "10.61.0.13"
 DESTINATION_ROOT = Path("/opt/ocs-roce-bw")
 APP_DESTINATION_ROOT = Path("/opt/ocs-roce-app-bw")
 APP_FILES = ("roce_write", "roce_app_write", "run_app", "provider/libroce_dpdk-rdmav34.so")
+APP_HUGEPAGE_HELPER = "manage_hugepages"
+APP_HUGEPAGE_DIR = "/dev/hugepages/ocs-roce-app-bw"
+APP_HUGEPAGES_RELEASED = "DPDK_HUGEPAGES restored=0 page_kib=2048"
 APP_MODES = ("memfd-gather", "mr-copy", "mr-gather")
 APP_POST_BATCH = 32
 LOOPBACK = "127.0.0.1"
@@ -58,6 +61,7 @@ class Profile:
     payload: int = PAYLOAD
     app_mode: str | None = None
     prefault_app: bool = False
+    hugepages: bool = False
 
     @property
     def writes(self):
@@ -120,7 +124,11 @@ PREFAULT_PROFILES = {
     f"{name}-prefault": replace(profile, port=profile.port + len(APP_PROFILES), prefault_app=True)
     for name, profile in APP_PROFILES.items()
 }
-ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES | PREFAULT_PROFILES
+HUGEPAGE_PROFILES = {
+    f"{name}-hugepages": replace(profile, port=profile.port + 2 * len(APP_PROFILES), hugepages=True)
+    for name, profile in (APP_PROFILES | PREFAULT_PROFILES).items() if profile.ethernet_mtu == 4200
+}
+ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES | PREFAULT_PROFILES | HUGEPAGE_PROFILES
 
 
 @dataclass(frozen=True)
@@ -156,10 +164,12 @@ def unit_argv(endpoint, destination, runtime):
     lock = profile.runtime_dir / "function.lock"
     control_ip = LOOPBACK if profile.uses_tunnel else CONTROL_IP
     device = f"{pci},max_dump_files_num=1" if profile.app_mode else pci
+    backing = ([f"--huge-dir={APP_HUGEPAGE_DIR}", "--socket-mem=128", "--huge-unlink=always"]
+               if profile.hugepages else ["--no-huge"])
     argv = [
         "/usr/bin/flock", "--exclusive", "--nonblock", str(lock),
         str(destination / ("run_app" if profile.app_mode else "roce_write")),
-        "-l", cpus, "--iova-mode=va", "--no-huge",
+        "-l", cpus, "--iova-mode=va", *backing,
         "--no-telemetry", f"--file-prefix=ocs-roce-bw-{endpoint.profile}",
         "-d", str(runtime / "librte_mempool_ring.so.24"),
         "-d", str(runtime / "librte_net_mlx5.so.24"), "-a", device,
@@ -195,7 +205,7 @@ def unit_environment(endpoint, destination, runtime):
 def verify_unit(commands, endpoint, destination):
     props = commands.properties(
         endpoint, "LoadState", "ActiveState", "WorkingDirectory", "ExecStart",
-        "Environment", "UnsetEnvironment",
+        "Environment", "UnsetEnvironment", "ExecStartPre", "ExecStopPost",
     )
     require(props.get("LoadState") == "loaded", f"{endpoint.label}: benchmark unit is missing")
     require(props.get("ActiveState") in ("inactive", "failed"), f"{endpoint.label}: already running")
@@ -219,6 +229,12 @@ def verify_unit(commands, endpoint, destination):
     installed = re.findall(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
     require(len(installed) == 1 and shlex.split(installed[0]) == expected,
             f"{endpoint.label}: installed ExecStart differs from the expected benchmark profile")
+    if endpoint.settings.hugepages:
+        for prop, action in (("ExecStartPre", "prepare"), ("ExecStopPost", "cleanup")):
+            hook = re.findall(r"argv\[\]=(.*?) ;", props.get(prop, ""))
+            expected_hook = ["/bin/bash", str(destination / APP_HUGEPAGE_HELPER), action]
+            require(len(hook) == 1 and shlex.split(hook[0]) == expected_hook,
+                    f"{endpoint.label}: invalid hugepage {prop}")
     for operation in ("start", "stop"):
         commands.run(endpoint.host, "sudo", "-n", "-l", "/usr/bin/systemctl", operation, endpoint.unit)
     # A personal journal can be readable even when the unit's records are hidden.
@@ -252,10 +268,10 @@ def app_digests(bundle):
     digests = {}
     for line in (bundle / "APP_SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([a-f0-9]{64})  (\S+)", line)
-        require(match and match[2] in APP_FILES and match[2] not in digests,
+        require(match and match[2] in (*APP_FILES, APP_HUGEPAGE_HELPER) and match[2] not in digests,
                 "unexpected application bundle digest entry")
         digests[match[2]] = match[1]
-    require(set(digests) == set(APP_FILES), "incomplete application bundle manifest")
+    require(set(APP_FILES) <= digests.keys(), "incomplete application bundle manifest")
     return digests
 
 
@@ -272,6 +288,8 @@ def preflight(commands, profiles, destination, digests):
     aggregate = settings[0].aggregate
     app_mode = settings[0].app_mode
     native_mr = any(profile.native_mr for profile in settings)
+    if any(profile.hugepages for profile in settings):
+        require(APP_HUGEPAGE_HELPER in digests, "application bundle lacks the hugepage helper")
     links = {name: {} for name in profiles} if aggregate else {}
     for role, (host, _, _, _) in PORTS.items():
         require_idle(commands, host)
@@ -413,7 +431,8 @@ def wait_endpoint(commands, endpoint, invocation, deadline, *, ready=False):
             )
             # Read after observing the terminal state so journal records can settle.
             app_finished = not endpoint.settings.app_mode or app_completion_marker(endpoint) in messages
-            if app_finished and any(line.startswith("BANDWIDTH ") for line in messages):
+            restored = not endpoint.settings.hugepages or APP_HUGEPAGES_RELEASED in messages
+            if app_finished and restored and any(line.startswith("BANDWIDTH ") for line in messages):
                 return messages
         time.sleep(0.2)
     phase = "receiver readiness" if ready else "completion and verification"
@@ -517,6 +536,19 @@ def parse_result(endpoint, messages):
         require(len(counters) == 1, f"{endpoint.label}: expected one port counter result")
         fields["port_stats"] = {name: int(value) for name, value in
                                 (field.split("=", 1) for field in counters[0].split()[1:])}
+    pools = [line for line in messages if line.startswith("DPDK_PACKET_POOL ")]
+    if profile.hugepages or pools:
+        require(len(pools) == 1, f"{endpoint.label}: expected one packet pool result")
+        match = re.fullmatch(r"DPDK_PACKET_POOL hugepages=([01]) chunks=([1-9][0-9]*)", pools[0])
+        require(match and bool(int(match[1])) == profile.hugepages,
+                f"{endpoint.label}: packet pool backing differs from the profile")
+        fields["packet_pool"] = {"hugepages": profile.hugepages, "chunks": int(match[2])}
+        modes = [re.fullmatch(r"DPDK_RX_MODE queue=([0-9]+) mode=(.+)", line) for line in messages
+                 if line.startswith("DPDK_RX_MODE ")]
+        if modes:
+            require(all(modes) and [int(mode[1]) for mode in modes] == list(range(profile.workers)),
+                    f"{endpoint.label}: incomplete RX mode diagnostics")
+            fields["rx_modes"] = [mode[2] for mode in modes]
     return fields
 
 
@@ -653,7 +685,8 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
             profile_result.update(ethernet_mtu=config.ethernet_mtu, pmtu=config.pmtu)
         if config.app_mode:
             profile_result.update(app_mode=config.app_mode, payload_bytes=config.payload,
-                                  app_post_batch=min(APP_POST_BATCH, config.writes), prefault_app=config.prefault_app)
+                                  app_post_batch=min(APP_POST_BATCH, config.writes), prefault_app=config.prefault_app,
+                                  hugepages=config.hugepages)
         report["profiles"][profile] = profile_result
         for sample in range(1, samples + 1):
             try:
@@ -696,6 +729,8 @@ def main():
                              help="include matching application profiles that prefault the worker's memory alias")
     fault_modes.add_argument("--prefault-only", action="store_true",
                              help="run the prefaulting application profiles alone")
+    parser.add_argument("--compare-hugepages", action="store_true",
+                        help="compare default and 2 MiB packet-pool backing at MTU 4200")
     parser.add_argument("--profile", action="append", choices=APP_SHAPES,
                         help="repeat to select profiles; smoke is an 8 MiB application check")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
@@ -728,7 +763,11 @@ def main():
         parser.error("--compare-prefault requires --app-bench")
     if args.prefault_only and not args.app_bench:
         parser.error("--prefault-only requires --app-bench")
+    if args.compare_hugepages and (not args.app_bench or args.mtu not in (None, 4200)):
+        parser.error("--compare-hugepages requires an application benchmark at MTU 4200")
     mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
+    if args.compare_hugepages:
+        mtus = (4200,)
     if args.aggregate:
         profiles = tuple(AGGREGATE_PROFILES)
     elif args.app_bench:
@@ -737,6 +776,8 @@ def main():
             variants += ("-prefault",)
         profiles = tuple(f"app-{mode}-mtu-{mtu}-{name}{suffix}" for mtu in mtus
                          for mode in dict.fromkeys(args.app_bench) for name in selected for suffix in variants)
+        if args.compare_hugepages:
+            profiles = tuple(variant for name in profiles for variant in (name, f"{name}-hugepages"))
     elif args.burst_style_bench:
         profiles = tuple(f"mtu-{mtu}-{name}" for mtu in mtus for name in selected)
     else:

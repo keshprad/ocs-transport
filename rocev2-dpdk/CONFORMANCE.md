@@ -385,6 +385,24 @@ isolates a receive-side hardware completion error for the requester
 while the underlying buffer or queue cause remains open.
 [rdma-core mlx5 syndrome definitions](https://github.com/linux-rdma/rdma-core/blob/v50.0/providers/mlx5/mlx5dv.h#L994-L1006)
 
+The reported jumbo error WQE counters were past the initial 1,024
+receive descriptors. A local DPDK 23.11.7 allocator probe with PCI
+disabled and the same `--no-huge` pool parameters found one backing
+chunk at MTU 1500 and two at MTU 4200 for all tested queue counts.
+Each jumbo buffer spanned 4 KiB page boundaries within its chunk.
+On the same Spark pair, the MRC jumbo comparison eliminated the
+same `0x04` errors twice by switching packet backing to 2 MiB pages
+while holding scalar RX and the workload fixed. The RoCEv2 stager
+provides the corresponding page-backing comparison and logs the actual
+DPDK RX mode and pool chunk count.
+[MRC jumbo hardware evidence](../mrc-dpdk/CONFORMANCE.md#spark-04-to-spark-02-link-recovery-and-jumbo-mtu)
+
+An isolated Spark-04 kernel guest verified the hugepage service helper.
+DPDK EAL used 128 MiB as the service account and allocated the production
+four-queue jumbo pool with 10,239 buffers in one backing chunk. The
+helper rejected mismatched mounts and competing reservations, kept the
+pages while EAL was active, and restored the pool to zero on exit.
+
 On the four-worker MTU 1500 profile, one prefaulted trial measured
 84.899 Gbit/s with zero misses and retries. Receiver polling faults
 fell from 4,194,308 in the default median trial to six in that run.

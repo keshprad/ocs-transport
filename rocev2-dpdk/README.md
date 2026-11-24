@@ -535,6 +535,14 @@ stage the updated worker with `--include-prefault` and add
 `--prefault-only` to run the staged prefault variants after collecting
 the baseline.
 
+For the jumbo mlx5 investigation, stage with `--include-hugepages`.
+Add `--compare-hugepages` to repeat the same MTU 4200 profile with the
+normal 4 KiB backing and with 64 temporary 2 MiB pages for the DPDK
+packet pools. Use `--prefault-only` to hold application alias prefaulting
+constant across the two trials. The launcher records the actual RX mode
+per queue and the packet-pool chunk count. The hugepage service releases
+its temporary reservation on exit. [DPDK hugepage requirements](https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html#use-of-hugepages-in-the-linux-environment)
+
 ### DPDK and hardware RoCEv2 comparison
 
 The earlier hardware benchmarks measured about 92.6 Gbit/s per path,

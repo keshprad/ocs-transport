@@ -252,6 +252,16 @@ static bool prefault_application(const uint8_t *buffer, size_t bytes)
     return true;
 }
 
+static void report_dpdk_rx(uint16_t port, const struct rte_mempool *pool, uint16_t queues)
+{
+    fprintf(stderr, "DPDK_PACKET_POOL hugepages=%d chunks=%u\n", rte_eal_has_hugepages(), pool->nb_mem_chunks);
+    for (uint16_t queue = 0; queue < queues; ++queue) {
+        struct rte_eth_burst_mode mode = {0};
+        const char *description = rte_eth_rx_burst_mode_get(port, queue, &mode) ? "Unavailable" : mode.info;
+        fprintf(stderr, "DPDK_RX_MODE queue=%u mode=%s\n", queue, description);
+    }
+}
+
 static void report_bandwidth(bool sender, uint64_t bytes, uint64_t started, uint64_t elapsed,
                              const struct poll_usage *usage, const struct datapath_options *options)
 {
@@ -1097,6 +1107,8 @@ int main(int argc, char **argv)
             goto cleanup_port;
         }
     }
+    if (datapath.report_bandwidth)
+        report_dpdk_rx(port, pool, (uint16_t)options.workers);
     bool in_band = datapath.cm_peer.ipv4 != 0;
     if (dma_gather && datapath.mr_socket) {
         /* Use the same PMD instance that owns the port and its protection domain. */
