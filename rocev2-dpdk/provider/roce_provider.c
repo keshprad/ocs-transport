@@ -818,8 +818,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
         } else {
             uint32_t worker = ((qp->index + 1) * config->workers - 1) / config->qps;
             uint64_t item = (uint64_t)(qp->index + 1) << 32 | posted;
-            /* The worker also scans posted heads when the doorbell queue is full. */
-            roce_doorbell_publish(&context->work->doorbells[worker], item);
+            roce_native_notify(&context->work->doorbells[worker], item);
         }
     }
 unlock:

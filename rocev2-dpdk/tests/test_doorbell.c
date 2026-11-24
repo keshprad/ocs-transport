@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "roce_doorbell.h"
+#include "roce_native_queue.h"
 
 #include <assert.h>
 #include <sched.h>
@@ -26,8 +26,33 @@ static void wait_success(pid_t child)
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void check_native_notifications(void)
+{
+    struct roce_doorbell queue;
+    assert(roce_doorbell_init(&queue));
+    for (uint64_t item = 1; item <= ROCE_DOORBELL_SLOTS; ++item)
+        roce_native_notify(&queue, item);
+    uint64_t generation = 2 * ROCE_DOORBELL_SLOTS;
+    assert(atomic_load(&queue.notifications) == generation);
+    roce_native_notify(&queue, ROCE_DOORBELL_SLOTS + 1);
+    assert(atomic_load(&queue.notifications) == (generation | ROCE_NATIVE_DOORBELL_OVERFLOW));
+
+    uint32_t cursor = 0;
+    assert(roce_doorbell_take(&queue, &cursor) == 1);
+    roce_native_notify(&queue, ROCE_DOORBELL_SLOTS + 2);
+    generation += 2;
+    assert(atomic_load(&queue.notifications) == (generation | ROCE_NATIVE_DOORBELL_OVERFLOW));
+    atomic_fetch_and(&queue.notifications, ~ROCE_NATIVE_DOORBELL_OVERFLOW);
+    assert(atomic_load(&queue.notifications) == generation);
+    for (uint64_t item = 2; item <= ROCE_DOORBELL_SLOTS; ++item)
+        assert(roce_doorbell_take(&queue, &cursor) == item);
+    assert(roce_doorbell_take(&queue, &cursor) == ROCE_DOORBELL_SLOTS + 2);
+    assert(roce_doorbell_take(&queue, &cursor) == 0);
+}
+
 int main(void)
 {
+    check_native_notifications();
     struct roce_doorbell *queue = mmap(NULL, sizeof(*queue), PROT_READ | PROT_WRITE,
                                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     assert(queue != MAP_FAILED && roce_doorbell_init(queue));

@@ -12,6 +12,7 @@ enum {
 };
 
 #define ROCE_NATIVE_SQ_CLOSED (UINT32_C(1) << 31)
+#define ROCE_NATIVE_DOORBELL_OVERFLOW UINT64_C(1)
 
 enum roce_native_wc_status {
     ROCE_NATIVE_WC_SUCCESS,
@@ -71,6 +72,15 @@ struct roce_native_work {
 static inline uint32_t roce_native_posted_count(uint32_t posted)
 {
     return posted & ~ROCE_NATIVE_SQ_CLOSED;
+}
+
+static inline void roce_native_notify(struct roce_doorbell *doorbell, uint64_t item)
+{
+    if (roce_doorbell_publish(doorbell, item))
+        atomic_fetch_add_explicit(&doorbell->notifications, 2, memory_order_release);
+    else
+        atomic_fetch_or_explicit(&doorbell->notifications, ROCE_NATIVE_DOORBELL_OVERFLOW,
+                                 memory_order_release);
 }
 
 static inline uint32_t roce_native_queue_capacity(uint32_t writes)

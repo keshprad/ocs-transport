@@ -90,6 +90,11 @@ completions to reuse slots during longer runs. With scatter/gather it
 refills as credits arrive and drains the final completions after the
 worker retires the last TX descriptors.
 
+Each native worker checks a shared notification counter before draining its
+doorbell ring. It scans the posted send-queue heads on overflow and
+periodically to recover from an interrupted notification. The shared ring
+layout also lets the worker recover postings from older providers.
+
 The native requester reports a fatal NAK on the affected WRITE and retry
 exhaustion on the first outstanding WRITE. Earlier covered WRITEs complete
 successfully and later posted WRITEs are flushed. On transfer failure, the

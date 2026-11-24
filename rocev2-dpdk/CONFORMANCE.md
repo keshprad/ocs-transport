@@ -278,6 +278,18 @@ PMTU 1024. Both runs used required Generic Netlink handoff and had zero
 RC retries. The worker retires scatter/gather WRITEs in QP order after
 the RC ACK and release of that slot's PMD references.
 
+The native worker skips the doorbell ring when its publication counter
+has stayed idle. A full ring triggers immediate send-queue recovery.
+A 1 ms periodic scan covers the gap between publishing an SQ head and
+signaling the worker. The notification word occupies existing padding
+and preserves the shared queue layout. The doorbell unit test exercises
+overflow and reuse. On the exact Spark-04 kernel in QEMU, the original
+build, updated build, and updated worker with either an older provider
+or a test provider that suppressed every notification each verified
+17,078,380 bytes and 2,084 ordered completions in both copy and
+scatter/gather mode. All four QPs posted, admitted, acknowledged and
+retired 521 WRITEs.
+
 The exact Spark-04 kernel guest also verified `rdma_create_qp()` on the
 active ID and the passive child. Its trace matched each app's actual QPN
 to both workers' views, checked the queue FD at both ends, and observed

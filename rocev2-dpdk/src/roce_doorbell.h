@@ -2,6 +2,7 @@
 #define ROCE_DOORBELL_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include <stdint.h>
 
@@ -9,15 +10,23 @@ enum { ROCE_DOORBELL_SLOTS = 64 };
 
 struct roce_doorbell {
     _Alignas(64) _Atomic uint32_t producer_hint;
+    _Atomic uint64_t notifications;
     _Alignas(64) _Atomic uint64_t slots[ROCE_DOORBELL_SLOTS];
 };
+
+/* Notification state uses padding in the original shared layout. */
+_Static_assert(offsetof(struct roce_doorbell, notifications) == 8, "unexpected doorbell notification offset");
+_Static_assert(offsetof(struct roce_doorbell, slots) == 64, "doorbell slots moved");
+_Static_assert(sizeof(struct roce_doorbell) == 64 + 8 * ROCE_DOORBELL_SLOTS, "doorbell size changed");
 
 static inline bool roce_doorbell_init(struct roce_doorbell *queue)
 {
     atomic_init(&queue->producer_hint, 0);
+    atomic_init(&queue->notifications, 0);
     for (uint32_t i = 0; i < ROCE_DOORBELL_SLOTS; ++i)
         atomic_init(&queue->slots[i], 0);
-    return atomic_is_lock_free(&queue->producer_hint) && atomic_is_lock_free(&queue->slots[0]);
+    return atomic_is_lock_free(&queue->producer_hint) && atomic_is_lock_free(&queue->notifications) &&
+           atomic_is_lock_free(&queue->slots[0]);
 }
 
 /* An item becomes visible in one write, so a producer exit leaves no reserved slot. */

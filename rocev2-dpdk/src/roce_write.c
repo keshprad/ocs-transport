@@ -105,6 +105,8 @@ struct write_worker {
     uint32_t completed;
     uint32_t next;
     uint32_t doorbell_cursor;
+    uint64_t doorbell_generation;
+    uint64_t next_doorbell_recovery;
     uint32_t fully_posted;
     uint32_t posted[ROCE_LAB_MAX_QPS];
     uint32_t completions[ROCE_LAB_MAX_QPS];
@@ -472,21 +474,38 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
     return true;
 }
 
-static bool admit_native_writes(struct write_worker *worker)
+static bool admit_native_writes(struct write_worker *worker, uint64_t now)
 {
     const struct write_run *run = worker->run;
     if (!run->native || worker->fully_posted == worker->qps)
         return true;
     struct roce_doorbell *doorbell = &run->native->doorbells[worker->queue];
+    uint64_t notifications = atomic_load_explicit(&doorbell->notifications, memory_order_acquire);
+    uint64_t generation = notifications & ~ROCE_NATIVE_DOORBELL_OVERFLOW;
+    bool overflow = (notifications & ROCE_NATIVE_DOORBELL_OVERFLOW) != 0;
+    bool recover = now >= worker->next_doorbell_recovery;
+    if (generation == worker->doorbell_generation && !overflow && !recover)
+        return true;
+
+    /* Drain in bounded batches. A full batch may have more notifications behind it. */
+    worker->doorbell_generation = UINT64_MAX;
     for (unsigned i = 0; i < ROCE_DOORBELL_SLOTS; ++i) {
         uint64_t item = roce_doorbell_take(doorbell, &worker->doorbell_cursor);
-        if (!item)
+        if (!item) {
+            worker->doorbell_generation = generation;
             break;
+        }
         uint32_t index = (uint32_t)(item >> 32) - worker->first_qp - 1;
         if (index >= worker->qps || !admit_native_qp(worker, index))
             return false;
     }
-    /* A full doorbell ring does not hide already-published SQ entries. */
+    if (!overflow && !recover)
+        return true;
+    if (overflow)
+        atomic_fetch_and_explicit(&doorbell->notifications, ~ROCE_NATIVE_DOORBELL_OVERFLOW,
+                                  memory_order_acquire);
+    /* Recover published heads if notification was interrupted or the queue was full. */
+    worker->next_doorbell_recovery = now + CONTROL_POLL_NS;
     for (uint32_t i = 0; i < worker->qps; ++i)
         if (!admit_native_qp(worker, i))
             return false;
@@ -557,7 +576,7 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     struct write_run *run = worker->run;
     if (run->sender && worker->finished)
         return true;
-    if (!admit_writes(worker) || !admit_native_writes(worker)) {
+    if (!admit_writes(worker) || !admit_native_writes(worker, now)) {
         fprintf(stderr, "application work rejected on worker %u\n", worker->queue);
         return false;
     }
