@@ -555,9 +555,10 @@ the baseline.
 For the jumbo mlx5 investigation, stage with `--include-hugepages`.
 Add `--compare-hugepages` to repeat the same MTU 4200 profile with the
 normal 4 KiB backing and with 64 temporary 2 MiB pages for the DPDK
-packet pools. Use `--prefault-only` to hold application alias prefaulting
-constant across the two trials. The launcher records the actual RX mode
-per queue and the packet-pool chunk count. The hugepage service releases
+packet pools. Use `--hugepages-only` to run the MTU 4200 profile with
+2 MiB backing alone. Use `--prefault-only` to hold application alias
+prefaulting constant across the two trials. The launcher records the RX
+mode per queue and the packet-pool chunk count. The hugepage service releases
 its temporary reservation on exit. [DPDK hugepage requirements](https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html#use-of-hugepages-in-the-linux-environment)
 
 On November 24, 2026, the `8c5058a` four-worker, 16-QP memfd

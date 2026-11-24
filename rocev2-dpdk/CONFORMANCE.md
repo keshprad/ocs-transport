@@ -490,6 +490,15 @@ relocations and PCI-disabled EAL startup. The worker's mlx5 DMA-BUF
 symbols resolved in that runtime. Both hosts require trusted module
 signatures before the physical DMA-BUF mapping test.
 
+The kernel modules in the `c5c8dd9` lab bundle were built against the
+running headers on Spark-04 (`6.17.0-1021-nvidia`) and Spark-02
+(`7.0.0-1025-nvidia`). Each `roce_mr` and `roce_uverbs` signature verified against
+the module-signing-only certificate. Both hosts passed relocation checks
+for the pinned applications, provider and mlx5 libraries. The signed
+Spark-04 binaries passed the Netlink ticket and CM application tests in
+the exact-kernel guest. Loading the modules on the physical hosts still
+requires console enrollment of the certificate.
+
 The paired application bandwidth harness stages identical userspace and
 DPDK artifacts on Spark-04 and Spark-02. The 16 GiB modes mirror the
 standalone MTU 1500 and 4200 tests. An 8 MiB profile checks first use.
@@ -579,6 +588,13 @@ in the repeats. The median is 91.3% of the 92.320 Gbit/s native
 16-QP result on the same path at MTU 1500. The median sender and receiver
 journal invocation IDs are `1390e60312d24588b5e67f6bcd23899c` and
 `1eebdfda86bb430e89c55252d429c6c6`.
+
+The `--hugepages-only` runner selected just the 2 MiB variant on both
+hosts. A verification run with the installed `8c5058a` memfd build
+reported 98.015 Gbit/s at the requester, verified 16 GiB, and recorded
+zero requester retries and zero NIC errors. The sender and receiver
+invocation IDs are `38171ad1580f4308a5d4b250f64848db` and
+`615a5a2eb0834f60b4526a60261c28be`.
 
 ### Additional datapath measurements
 

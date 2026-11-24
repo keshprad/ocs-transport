@@ -5,6 +5,17 @@ kernel headers with `make -C rocev2-dpdk/kernel` from the repository
 root. The device defaults to mode `0600`. Deployment can grant
 access to the application account explicitly.
 
+On a Secure Boot host, sign both modules for the running kernel with an
+administrator-approved module-signing certificate. Ubuntu supports
+enrolling a module-signing-only Machine Owner Key through MokManager at
+the boot console. After enrollment, `mokutil --test-key "$MOK_DER"`
+checks that the certificate is present. `modinfo -F vermagic` and
+`modinfo -F signer` identify each signed module's kernel and signer.
+Load `ib_uverbs` before `roce_uverbs`. The lab services also need access
+to `/dev/roce_mr` and the `roce_dpdk0` uverbs device.
+[Ubuntu Secure Boot documentation](https://documentation.ubuntu.com/security/security-features/platform-protections/secure-boot/)
+[Linux kernel module signing](https://docs.kernel.org/admin-guide/module-signing.html)
+
 1. The application populates its page-aligned memory and calls
    `ROCE_MR_REGISTER`. The module pins only pages in the caller's
    address space and charges them against the registering address

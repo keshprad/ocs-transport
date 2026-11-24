@@ -749,8 +749,11 @@ def main():
                              help="include matching application profiles that prefault the worker's memory alias")
     fault_modes.add_argument("--prefault-only", action="store_true",
                              help="run the prefaulting application profiles alone")
-    parser.add_argument("--compare-hugepages", action="store_true",
-                        help="compare default and 2 MiB packet-pool backing at MTU 4200")
+    backing_modes = parser.add_mutually_exclusive_group()
+    backing_modes.add_argument("--compare-hugepages", action="store_true",
+                               help="compare default and 2 MiB packet-pool backing at MTU 4200")
+    backing_modes.add_argument("--hugepages-only", action="store_true",
+                               help="run only the 2 MiB packet-pool profiles at MTU 4200")
     parser.add_argument("--profile", action="append", choices=(*APP_SHAPES, "short"),
                         help="repeat to select profiles; short checks individual native gather completions")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
@@ -779,17 +782,18 @@ def main():
     selected = tuple(dict.fromkeys(args.profile or PROFILES))
     if "smoke" in selected and not args.app_bench:
         parser.error("--profile smoke requires --app-bench")
+    hugepages = args.compare_hugepages or args.hugepages_only
     if "short" in selected and (set(args.app_bench or ()) != {"mr-gather"} or
-                                args.compare_prefault or args.prefault_only or args.compare_hugepages):
+                                args.compare_prefault or args.prefault_only or hugepages):
         parser.error("--profile short requires --app-bench mr-gather without memory backing comparisons")
     if args.compare_prefault and not args.app_bench:
         parser.error("--compare-prefault requires --app-bench")
     if args.prefault_only and not args.app_bench:
         parser.error("--prefault-only requires --app-bench")
-    if args.compare_hugepages and (not args.app_bench or args.mtu not in (None, 4200)):
-        parser.error("--compare-hugepages requires an application benchmark at MTU 4200")
+    if hugepages and (not args.app_bench or args.mtu not in (None, 4200)):
+        parser.error("hugepage profiles require an application benchmark at MTU 4200")
     mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
-    if args.compare_hugepages:
+    if hugepages:
         mtus = (4200,)
     if args.aggregate:
         profiles = tuple(AGGREGATE_PROFILES)
@@ -801,6 +805,8 @@ def main():
                          for mode in dict.fromkeys(args.app_bench) for name in selected for suffix in variants)
         if args.compare_hugepages:
             profiles = tuple(variant for name in profiles for variant in (name, f"{name}-hugepages"))
+        if args.hugepages_only:
+            profiles = tuple(f"{name}-hugepages" for name in profiles)
     elif args.burst_style_bench:
         profiles = tuple(f"mtu-{mtu}-{name}" for mtu in mtus for name in selected)
     else:
