@@ -39,9 +39,9 @@ multi-producer doorbell queue per worker. Workers admit each batch
 while polling the data path and publish cumulative completions per QP.
 Use `--app-post-batch N` on the requester to exercise smaller live
 posts. Copy TX can wait for each batch's acknowledgement before the next
-post. Scatter/gather can admit later batches while TX descriptors still
-refer to earlier application buffers. The worker publishes those pending
-completions after returning the TX references.
+post. Scatter/gather producers post batches as long as there is room in
+the doorbell ring or native send queue. The worker publishes completions
+after returning the TX references.
 
 With the registration module loaded and accessible to the client, use
 `./roce_app_write "$APP_SOCKET" --kernel-mr /dev/roce_mr` to register a

@@ -183,13 +183,6 @@ static int produce_batches(struct native_qp *state)
             error = poll_completions(state, posted, true);
             if (error)
                 return error;
-        } else if (writes <= run->capacity && posted < writes) {
-            /* Keep the admission check for a transfer that fits in one queue. */
-            while (atomic_load_explicit(&state->shared->admitted, memory_order_acquire) < posted) {
-                error = wait_for_worker(run);
-                if (error && atomic_load_explicit(&state->shared->admitted, memory_order_acquire) < posted)
-                    return error;
-            }
         }
     }
     return 0;

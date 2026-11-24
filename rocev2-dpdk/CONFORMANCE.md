@@ -331,6 +331,20 @@ successful WRITEs per run and no retries. The same builds emitted no
 timing records when disabled. During in-band CM the responder's application
 elapsed time includes the disconnect replay wait before worker completion.
 
+Scatter/gather application producers now wait for ring space or native
+SQ completion credit when needed. They can post successive batches without
+waiting for the worker to acknowledge admission of each batch. In five
+alternating 128 MiB memif runs per build on Spark-04 at PMTU 1024, one
+WRITE per batch improved from 8.00 to 22.41 Gbit/s. At 8 and 32 WRITEs per
+batch the medians were 23.90 to 23.74 and 23.94 to 22.55 Gbit/s. Seven
+additional 512 MiB runs per build with prefaulting and 32 WRITEs per batch
+measured 36.09 to 36.54 Gbit/s. Every run verified all bytes with zero RC
+retries. A four-producer test submitted 516 WRITEs to one worker and verified
+every completion. The exact Spark-04 kernel guest verified 521 completions
+per QP across native queue wrap. Separate guest trials verified recovery
+from packet loss and short or zero-accepted TX, along with terminal
+completion statuses and resource teardown.
+
 The optional Arm PMULL iCRC produces the same IEEE checksum as scalar
 CRC32. Independent jumbo vectors verify the encoded bytes and reject
 payload corruption on decode. A local Spark-04 Cortex-X925 packet

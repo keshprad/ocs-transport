@@ -492,7 +492,7 @@ static int pin_mapping(const char *device, void *buffer, size_t length, bool sen
 
 struct producer {
     struct roce_doorbell *queue;
-    const _Atomic uint32_t *progress;
+    const _Atomic uint32_t *completed;
     uint32_t qp;
     uint32_t writes;
     uint32_t post_batch;
@@ -522,10 +522,8 @@ static void *publish_work(void *opaque)
             if (!wait_to_post(producer->socket, deadline))
                 return NULL;
         posted += count;
-        /* Copy TX can reuse a range when it completes. Scatter/gather may
-         * retain TX references until queue stop, so it gates on admission. */
-        while (posted < producer->writes &&
-               atomic_load_explicit(producer->progress, memory_order_acquire) < posted)
+        while (producer->completed && posted < producer->writes &&
+               atomic_load_explicit(producer->completed, memory_order_acquire) < posted)
             if (!wait_to_post(producer->socket, deadline))
                 return NULL;
     }
@@ -552,11 +550,10 @@ static bool post_writes(int socket, const struct app_workload *workload)
     for (; created < workload->qps; ++created) {
         uint32_t qp = created + 1;
         uint32_t worker = (qp * workload->workers - 1) / workload->qps;
-        const struct roce_app_qp_progress *progress = &work->qps[created];
         producers[created] = (struct producer) {
             .queue = &work->doorbells[worker], .qp = qp, .writes = workload->writes,
             .post_batch = workload->post_batch, .socket = socket,
-            .progress = workload->flags & APP_SCATTER_GATHER ? &progress->admitted : &progress->completed,
+            .completed = workload->flags & APP_SCATTER_GATHER ? NULL : &work->qps[created].completed,
         };
         if (pthread_create(&threads[created], NULL, publish_work, &producers[created]) != 0)
             break;
