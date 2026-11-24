@@ -9,11 +9,14 @@ PROVIDER = libroce_dpdk-rdmav34.so
 .PHONY: all check check-mr clean
 all: $(PROVIDER) check_provider check_provider_mr
 
-$(PROVIDER): roce_provider.c ../src/roce_mr_ipc.c ../src/roce_mr_ipc.h ../src/roce_fd.h ../kernel/roce_mr_uapi.h
+$(PROVIDER): roce_provider.c ../src/roce_mr_ipc.c ../src/roce_mr_ipc.h ../src/roce_fd.h \
+             ../src/roce_native_queue.h ../src/roce_doorbell.h ../src/roce_lab.h ../src/roce_rc.h \
+             ../src/roce_wire.h ../kernel/roce_mr_uapi.h
 	@test -n "$(RDMA_CORE_BUILD)" && test -f "$(RDMA_CORE_BUILD)/include/kernel-abi/ib_user_verbs.h" || \
 		{ echo 'Set RDMA_CORE_BUILD to a v50.0 rdma-core build with the ibverbs target built.' >&2; exit 1; }
 	$(CC) $(CPPFLAGS) -isystem "$(RDMA_CORE_BUILD)/include" $(CFLAGS) $(WARNINGS) \
-		-std=gnu11 -fPIC -shared $(LDFLAGS) -Wl,-z,defs -o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
+		-std=gnu11 -fPIC -shared $(LDFLAGS) -Wl,-z,defs,-soname,$(PROVIDER) \
+		-o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
 
 check_provider: check_provider.c
 	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CFLAGS) $(WARNINGS) -std=c11 $(LDFLAGS) -o $@ $< $(VERBS_LIBS) $(LDLIBS)

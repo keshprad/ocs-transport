@@ -77,6 +77,15 @@ RDMAV_DRIVERS="$PROVIDER_DIR/libroce_dpdk" ROCE_DPDK_MR_SOCKET="$MR_PATH" \
   ./roce_app_write "$APP_SOCKET"
 ```
 
+Add `--verbs-queues` to the requester to use stock libibverbs queue
+operations. After the worker negotiates a connection, the lab client
+binds its queue mapping to the provider, creates a CQ and RC QP for
+each lane, and submits WRITEs with `ibv_post_send()`. It retrieves
+individual WR IDs and statuses with `ibv_poll_cq()`. The current lab
+shape supports up to 256 signaled one-SGE WRITEs per QP and a distinct
+completion queue for each QP. The worker checks the registered source
+range and negotiated destination before packet submission.
+
 For physical `--scatter-gather` with native registration, apply the
 [mlx5 patch](dpdk/dpdk-23.11.7-mlx5-dmabuf.patch) to DPDK 23.11.7 and use
 the matching common and net mlx5 PMDs built with `-Dibverbs_link=shared`.

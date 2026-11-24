@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "roce_app.h"
+#include "roce_app_native.h"
 #include "roce_doorbell.h"
 #include "roce_fd.h"
 #include "roce_lab.h"
@@ -31,6 +32,7 @@ enum {
     APP_USE_VERBS_MR = 1u << 1,
     APP_WRITE_DMA_ALIAS = 1u << 2,
     APP_SCATTER_GATHER = 1u << 3,
+    APP_NATIVE_QUEUES = 1u << 4,
     APP_CONNECT = 'A',
     APP_LISTEN = 'L',
     APP_ESTABLISHED = 'E',
@@ -252,7 +254,8 @@ static bool receive_verbs_memory(struct roce_app_memory *memory, struct roce_mr_
 }
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     bool dma_writable, bool in_band_cm, bool scatter_gather, uint32_t post_batch,
+                     bool dma_writable, bool in_band_cm, bool scatter_gather, bool native_queues,
+                     uint32_t post_batch,
                      struct roce_mr_server *registrations, struct roce_app_memory *memory)
 {
     uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
@@ -271,7 +274,7 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         .qps = options->qps, .workers = options->workers, .writes = options->writes,
         .flags = (in_band_cm ? APP_USE_CM : 0) | (registrations ? APP_USE_VERBS_MR : 0) |
                  (registrations && dma_writable ? APP_WRITE_DMA_ALIAS : 0) |
-                 (scatter_gather ? APP_SCATTER_GATHER : 0),
+                 (scatter_gather ? APP_SCATTER_GATHER : 0) | (native_queues ? APP_NATIVE_QUEUES : 0),
         .post_batch = post_batch,
     };
     if (!configure_peer(socket, &pid) ||
@@ -291,7 +294,7 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         receive_local_memory(&attached, length, options->sender, dma_writable);
     if (!received)
         goto disconnect;
-    if (options->sender && !in_band_cm) {
+    if (options->sender && !in_band_cm && !native_queues) {
         attached.work = offer_work(socket, options);
         if (!attached.work)
             goto disconnect;
@@ -318,8 +321,80 @@ bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_op
     return memory->work != NULL;
 }
 
+bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_native_queue_config *config)
+{
+    int fd = create_shared_file("roce-native-queues", sizeof(struct roce_native_work));
+    if (fd < 0)
+        return false;
+    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    bool valid = work != MAP_FAILED;
+    if (valid)
+        work->config = *config;
+    for (uint32_t i = 0; valid && i < config->workers; ++i)
+        valid = roce_doorbell_init(&work->doorbells[i]);
+    for (uint32_t i = 0; valid && i < config->qps; ++i) {
+        struct roce_native_sq *sq = &work->qps[i];
+        atomic_init(&sq->posted, 0);
+        atomic_init(&sq->admitted, 0);
+        atomic_init(&sq->acknowledged, 0);
+        atomic_init(&sq->retired, 0);
+        valid = atomic_is_lock_free(&sq->posted) && atomic_is_lock_free(&sq->retired);
+    }
+    if (work != MAP_FAILED && !valid)
+        errno = ENOTSUP;
+    bool sent = valid && roce_lab_send(memory->socket, APP_ESTABLISHED) &&
+                send_mapping(memory->socket, fd, ROCE_NATIVE_QUEUE_FD);
+    int error = errno;
+    close(fd);
+    if (sent) {
+        memory->native = work;
+        return true;
+    }
+    if (work != MAP_FAILED)
+        munmap(work, sizeof(*work));
+    errno = error;
+    return false;
+}
+
+static bool finish_native(struct roce_native_work *work, const struct roce_lab_options *options,
+                          bool success)
+{
+    bool valid = true;
+    for (uint32_t i = 0; i < options->qps; ++i) {
+        struct roce_native_sq *sq = &work->qps[i];
+        uint32_t head = atomic_fetch_or_explicit(&sq->posted, ROCE_NATIVE_SQ_CLOSED, memory_order_acq_rel);
+        uint32_t posted = roce_native_posted_count(head);
+        uint32_t acknowledged = atomic_load_explicit(&sq->acknowledged, memory_order_relaxed);
+        uint32_t retired = atomic_load_explicit(&sq->retired, memory_order_relaxed);
+        if (posted > options->writes || posted - retired > ROCE_NATIVE_QUEUE_DEPTH ||
+            (success && posted != options->writes)) {
+            valid = false;
+            continue;
+        }
+        for (uint32_t seq = retired; seq < posted; ++seq) {
+            uint8_t *status = &sq->status[seq % ROCE_NATIVE_QUEUE_DEPTH];
+            if (success || seq < acknowledged)
+                *status = ROCE_NATIVE_WC_SUCCESS;
+            else if (*status == ROCE_NATIVE_WC_SUCCESS)
+                *status = ROCE_NATIVE_WC_FLUSHED;
+        }
+        atomic_store_explicit(&sq->retired, posted, memory_order_release);
+    }
+    return valid;
+}
+
+void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options)
+{
+    if (memory->native)
+        finish_native(memory->native, options, false);
+}
+
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options)
 {
+    if (memory->native && !finish_native(memory->native, options, true)) {
+        errno = EPROTO;
+        return false;
+    }
     /* The worker has verified every WRITE and released its PMD references. */
     if (memory->work)
         for (uint32_t i = 0; i < options->qps; ++i)
@@ -343,6 +418,8 @@ void roce_app_detach(struct roce_app_memory *memory)
     if (memory->socket >= 0) {
         if (memory->work)
             munmap(memory->work, sizeof(*memory->work));
+        if (memory->native)
+            munmap(memory->native, sizeof(*memory->native));
         if (memory->mr.server)
             roce_mr_release(&memory->mr);
         else if (memory->buffer)
@@ -498,6 +575,21 @@ static int release_verbs_memory(const struct app_verbs *verbs)
     return error;
 }
 
+static bool post_native_writes(struct ibv_pd *pd, int socket, const struct app_workload *workload)
+{
+    uint8_t kind;
+    int fd = receive_mapping(socket, &kind);
+    if (fd < 0)
+        return false;
+    bool success = kind == ROCE_NATIVE_QUEUE_FD &&
+        roce_app_run_native_verbs(pd, fd, socket, workload->post_batch,
+                                  (workload->flags & APP_SCATTER_GATHER) != 0);
+    int error = errno;
+    close(fd);
+    errno = error;
+    return success;
+}
+
 bool roce_app_write(const char *path, const char *registration_device)
 {
     int socket = open_socket(path, false);
@@ -509,7 +601,8 @@ bool roce_app_write(const char *path, const char *registration_device)
     if (!configure_peer(socket, NULL) ||
         recv(socket, &workload, sizeof(workload), MSG_TRUNC) != sizeof(workload) ||
         workload.version != APP_VERSION || workload.sender > 1 ||
-        (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS | APP_SCATTER_GATHER)) ||
+        (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS | APP_SCATTER_GATHER |
+                             APP_NATIVE_QUEUES)) ||
         workload.reserved || !workload.post_batch || workload.post_batch > workload.writes ||
         !workload.qps || workload.qps > ROCE_LAB_MAX_QPS || !workload.workers ||
         workload.workers > workload.qps || !workload.writes || workload.writes > ROCE_PSN_MASK) {
@@ -518,7 +611,8 @@ bool roce_app_write(const char *path, const char *registration_device)
     }
     bool in_band_cm = (workload.flags & APP_USE_CM) != 0;
     bool verbs_mr = (workload.flags & APP_USE_VERBS_MR) != 0;
-    if (verbs_mr && registration_device) {
+    bool native_queues = (workload.flags & APP_NATIVE_QUEUES) != 0;
+    if ((verbs_mr && registration_device) || (native_queues && (!verbs_mr || !workload.sender))) {
         errno = EINVAL;
         goto disconnect;
     }
@@ -554,12 +648,19 @@ bool roce_app_write(const char *path, const char *registration_device)
         offered = region >= 0 && send_mapping(socket, region, registration_device ? APP_PINNED : APP_MEMFD);
     }
     if (offered) {
-        bool connected = !in_band_cm || roce_lab_receive(socket, APP_ESTABLISHED, false) == 1;
+        bool connected = (!in_band_cm && !native_queues) ||
+                         roce_lab_receive(socket, APP_ESTABLISHED, false) == 1;
         if (connected && in_band_cm)
             puts("Application CM established");
-        success = connected && (workload.sender ? post_writes(socket, &workload) :
-            roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
-            roce_lab_send(socket, 'V') && roce_lab_receive(socket, 'C', false) == 1);
+        if (connected) {
+            if (native_queues)
+                success = post_native_writes(verbs.pd, socket, &workload);
+            else if (workload.sender)
+                success = post_writes(socket, &workload);
+            else
+                success = roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
+                          roce_lab_send(socket, 'V') && roce_lab_receive(socket, 'C', false) == 1;
+        }
         if (!success)
             errno = EPROTO;
     }

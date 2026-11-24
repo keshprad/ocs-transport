@@ -46,7 +46,7 @@ def expect_success(child, *markers):
 
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
-          provider=None, post_batch=None):
+          provider=None, post_batch=None, native_queues=False):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -73,6 +73,8 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         tx_options = options + (["--scatter-gather"] if scatter_gather else [])
         if post_batch:
             tx_options += ["--app-post-batch", str(post_batch)]
+        if native_queues:
+            tx_options.append("--verbs-queues")
         tx = process(stack, command(cpus[workers:2 * workers], directory, "tx", size, port, "192.0.2.1", 1024, mac=tx_mac)
                      + tx_options + tx_cm + tx_mr + ["--app-socket", str(tx_path)])
         expect_ready(tx, "application listener ready")
@@ -84,8 +86,9 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         expect_success(tx, f"WRITE complete: {total} bytes", *cm_marker)
         expect_success(rx, f"WRITE verified: {total} bytes", *cm_marker)
         app_marker = ("Application CM established",) if cm else ()
+        completion_suffix = " via libibverbs" if native_queues else ""
         expect_success(tx_app, f"Application completed {total} bytes",
-                       f"Application observed {writes} WRITE completions per QP", *app_marker)
+                       f"Application observed {writes} WRITE completions per QP{completion_suffix}", *app_marker)
         expect_success(rx_app, f"Application verified {total} bytes", *app_marker)
 
 
@@ -100,9 +103,11 @@ def main():
     if len(cpus) < 2:
         raise RuntimeError("application test needs two available CPUs")
     if args.verbs_provider:
-        check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider, post_batch=1)
+        check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider, post_batch=1, native_queues=True)
         check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
-              post_batch=1)
+              post_batch=1, native_queues=True)
+        if len(cpus) >= 4:
+            check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=1, native_queues=True)
         return
     check(cpus, 8195, 1, 1, 1, args.kernel_mr)
     check(cpus, 8195, 1, 1, 1, args.kernel_mr, scatter_gather=True)

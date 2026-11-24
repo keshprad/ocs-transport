@@ -5,7 +5,11 @@ It uses the standard uverbs context, device queries, port queries
 and protection-domain commands. With `ROCE_DPDK_MR_SOCKET` set before
 opening the device, the provider also supports `ibv_reg_mr()` and
 `ibv_dereg_mr()` through the worker's registration socket. The CQ and
-QP operations are pending.
+QP operations are available after the negotiated queue mapping is bound
+to the context. The lab requester enables this with `--verbs-queues`.
+The provider supports RC QP setup and query, signaled one-SGE
+RDMA WRITE posting and CQ polling. The supplied PD must own the source
+MR for the lane. The QP retains both that MR and its CQs until destroy.
 
 The provider uses libibverbs private ABI 34, the ABI of rdma-core v50
 on both tested Sparks. Build the `ibverbs` target from the official
@@ -41,5 +45,10 @@ ROCE_DPDK_MR_REQUIRE_NETLINK=1 \
 ROCE_DPDK_MR_REQUIRE_NETLINK=1 python3 rocev2-dpdk/tests/check_app_memif.py \
     --verbs-provider "$PROVIDER_DIR/libroce_dpdk"
 ```
+
+The memif check runs native copy and scatter/gather with one QP.
+With four available CPUs it also runs four QPs across two workers.
+The local queue mapping is currently supplied by the lab client after
+connection negotiation. The standard librdmacm adapter is pending.
 
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

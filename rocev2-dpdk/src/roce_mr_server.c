@@ -384,7 +384,7 @@ int roce_mr_acquire(struct roce_mr_server *server, pid_t owner, uint32_t lkey, u
             .server = server, .registration = region,
             .buffer = region->mapping + region->request.offset, .length = (size_t)region->request.length,
             .mapping = region->mapping, .mapped_length = (size_t)region->request.mapped_length,
-            .iova = region->request.iova, .rkey = region->rkey,
+            .iova = region->request.iova, .lkey = region->lkey, .rkey = region->rkey,
         };
         error = 0;
         break;

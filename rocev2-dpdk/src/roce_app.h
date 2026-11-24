@@ -4,6 +4,7 @@
 #include "roce_mr_server.h"
 #include "roce_doorbell.h"
 #include "roce_lab.h"
+#include "roce_native_queue.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -24,14 +25,18 @@ struct roce_app_memory {
     uint8_t *buffer;
     size_t length;
     struct roce_app_work *work;
+    struct roce_native_work *native;
     struct roce_mr_lease mr;
 };
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     bool dma_writable, bool in_band_cm, bool scatter_gather, uint32_t post_batch,
+                     bool dma_writable, bool in_band_cm, bool scatter_gather, bool native_queues,
+                     uint32_t post_batch,
                      struct roce_mr_server *registrations, struct roce_app_memory *memory);
 bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_options *options);
+bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_native_queue_config *config);
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options);
+void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_detach(struct roce_app_memory *memory);
 bool roce_app_write(const char *path, const char *registration_device);
 

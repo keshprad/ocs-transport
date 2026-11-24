@@ -48,6 +48,7 @@ struct datapath_options {
     struct roce_address cm_peer;
     bool report_bandwidth;
     bool scatter_gather;
+    bool native_queues;
 };
 
 struct tx_memory_ref {
@@ -68,6 +69,9 @@ struct write_run {
     const struct datapath_options *options;
     struct rte_mempool *pool;
     struct roce_app_work *work;
+    struct roce_native_work *native;
+    uint64_t local_iova;
+    uint32_t local_lkey;
     struct tx_memory_ref *tx_refs;
     uint16_t port;
     int application_socket;
@@ -227,19 +231,18 @@ static bool init_qps(struct write_worker *worker, uint32_t first, uint16_t pmtu,
             .udp_source = options->workers > 1 ? qp_source_port(local->qpn + index) : 0,
         };
         uint64_t offset = qp_bytes * index;
-        uint32_t psn_offset = index * UINT32_C(0x100001);
         if (run->sender) {
             struct roce_region remote = peer->region;
             remote.address += offset;
             if (!roce_requester_init(&worker->states[i].requester, &qp,
-                                     (local->psn + psn_offset) & ROCE_PSN_MASK,
+                                     roce_native_psn(local->psn, index),
                                      remote, buffer + offset, ROCE_LAB_RETRIES,
                                      options->send_window, options->writes))
                 return false;
         } else {
             worker->states[i].responder = (struct roce_responder) {
                 .qp = qp, .buffer = buffer + offset,
-                .expected = (peer->psn + psn_offset) & ROCE_PSN_MASK,
+                .expected = roce_native_psn(peer->psn, index),
                 .region = { .address = local->region.address + offset,
                             .rkey = local->region.rkey, .size = qp_bytes },
             };
@@ -349,19 +352,92 @@ static bool admit_writes(struct write_worker *worker)
     return true;
 }
 
+static enum roce_native_wc_status validate_native_write(const struct write_worker *worker, uint32_t index,
+                                                        uint32_t sequence, struct roce_native_write wqe)
+{
+    const struct write_run *run = worker->run;
+    const struct roce_requester *requester = &worker->states[index].requester;
+    uint64_t bytes = requester->remote.size;
+    uint64_t ordinal = (uint64_t)(worker->first_qp + index) * run->options->writes + sequence;
+    if (wqe.length != bytes)
+        return ROCE_NATIVE_WC_LOCAL_LENGTH;
+    if (wqe.lkey != run->local_lkey || wqe.local_address != run->local_iova + ordinal * bytes)
+        return ROCE_NATIVE_WC_LOCAL_PROTECTION;
+    if (wqe.rkey != requester->remote.rkey || wqe.remote_address != requester->remote.address + sequence * bytes)
+        return ROCE_NATIVE_WC_REMOTE_ACCESS;
+    return ROCE_NATIVE_WC_SUCCESS;
+}
+
+static bool admit_native_qp(struct write_worker *worker, uint32_t index)
+{
+    const struct write_run *run = worker->run;
+    struct roce_native_sq *sq = &run->native->qps[worker->first_qp + index];
+    uint32_t head = atomic_load_explicit(&sq->posted, memory_order_acquire);
+    uint32_t sequence = worker->posted[index];
+    if (head == sequence)
+        return true;
+    if (head > run->options->writes || head - sequence > ROCE_NATIVE_QUEUE_DEPTH ||
+        head - worker->completions[index] > ROCE_NATIVE_QUEUE_DEPTH)
+        return false;
+    for (; sequence < head; ++sequence) {
+        uint32_t slot = sequence % ROCE_NATIVE_QUEUE_DEPTH;
+        enum roce_native_wc_status result = validate_native_write(worker, index, sequence, sq->entries[slot]);
+        if (result != ROCE_NATIVE_WC_SUCCESS) {
+            sq->status[slot] = result;
+            return false;
+        }
+    }
+    worker->posted[index] = head;
+    worker->fully_posted += head == run->options->writes;
+    atomic_store_explicit(&sq->admitted, head, memory_order_release);
+    return true;
+}
+
+static bool admit_native_writes(struct write_worker *worker)
+{
+    const struct write_run *run = worker->run;
+    if (!run->native || worker->fully_posted == worker->qps)
+        return true;
+    struct roce_doorbell *doorbell = &run->native->doorbells[worker->queue];
+    for (unsigned i = 0; i < ROCE_DOORBELL_SLOTS; ++i) {
+        uint64_t item = roce_doorbell_take(doorbell, &worker->doorbell_cursor);
+        if (!item)
+            break;
+        uint32_t index = (uint32_t)(item >> 32) - worker->first_qp - 1;
+        if (index >= worker->qps || !admit_native_qp(worker, index))
+            return false;
+    }
+    /* A full doorbell ring does not hide already-published SQ entries. */
+    for (uint32_t i = 0; i < worker->qps; ++i)
+        if (!admit_native_qp(worker, i))
+            return false;
+    return true;
+}
+
 static void publish_completions(struct write_worker *worker)
 {
     const struct write_run *run = worker->run;
-    if (!run->work || (run->tx_refs && rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) != 1))
+    if (!run->work && !run->native)
+        return;
+    bool drained = !run->tx_refs || rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) == 1;
+    if (!run->native && !drained)
         return;
     for (uint32_t i = 0; i < worker->qps; ++i) {
         const struct roce_requester *requester = &worker->states[i].requester;
         uint32_t completed = requester->acked / requester->packets_per_write;
-        if (completed != worker->completions[i]) {
-            worker->completions[i] = completed;
+        if (run->native) {
+            struct roce_native_sq *sq = &run->native->qps[worker->first_qp + i];
+            atomic_store_explicit(&sq->acknowledged, completed, memory_order_relaxed);
+            if (!drained || completed == worker->completions[i])
+                continue;
+            for (uint32_t seq = worker->completions[i]; seq < completed; ++seq)
+                sq->status[seq % ROCE_NATIVE_QUEUE_DEPTH] = ROCE_NATIVE_WC_SUCCESS;
+            atomic_store_explicit(&sq->retired, completed, memory_order_release);
+        } else if (completed != worker->completions[i]) {
             atomic_store_explicit(&run->work->qps[worker->first_qp + i].completed, completed,
                                   memory_order_release);
         }
+        worker->completions[i] = completed;
     }
 }
 
@@ -370,7 +446,11 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     struct write_run *run = worker->run;
     if (run->sender && worker->finished)
         return true;
-    if (!admit_writes(worker) || !receive_packets(worker, now))
+    if (!admit_writes(worker) || !admit_native_writes(worker)) {
+        fprintf(stderr, "application work rejected on worker %u\n", worker->queue);
+        return false;
+    }
+    if (!receive_packets(worker, now))
         return false;
     publish_completions(worker);
     if (worker->completed == worker->qps && !worker->finished) {
@@ -398,7 +478,8 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
     for (uint32_t i = 0; i < worker->qps; ++i) {
         uint32_t next = worker->next;
         struct roce_requester *requester = &worker->states[next].requester;
-        uint32_t posted_packets = run->work ? worker->posted[next] * requester->packets_per_write : requester->total;
+        uint32_t posted_packets = run->work || run->native ?
+            worker->posted[next] * requester->packets_per_write : requester->total;
         if (++worker->next == worker->qps)
             worker->next = 0;
         if (send_requests(worker, requester, posted_packets, credit, now))
@@ -531,6 +612,8 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
                              .state = WRITE_WAITING, .work = application->work,
+                             .native = application->native, .local_iova = local->region.address,
+                             .local_lkey = application->mr.lkey,
                              .application_socket = application->socket,
                              .tx_refs = tx_refs };
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
@@ -618,6 +701,8 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             options->report_bandwidth = true;
         } else if (strcmp(argv[i], "--scatter-gather") == 0) {
             options->scatter_gather = true;
+        } else if (strcmp(argv[i], "--verbs-queues") == 0) {
+            options->native_queues = true;
         } else if (strcmp(argv[i], "--cm-peer") == 0) {
             struct in_addr ip;
             struct rte_ether_addr mac;
@@ -676,6 +761,26 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
     return true;
 }
 
+static bool connect_application(struct roce_app_memory *application, const struct roce_lab_options *options,
+                                const struct datapath_options *datapath, const struct roce_lab_offer *local,
+                                const struct roce_lab_offer *peer)
+{
+    if (!datapath->native_queues)
+        return !datapath->cm_peer.ipv4 || roce_app_connected(application, options);
+    const struct roce_native_queue_config config = {
+        .version = ROCE_NATIVE_QUEUE_VERSION,
+        .qps = options->qps, .workers = options->workers, .writes = options->writes,
+        .write_size = options->size,
+        .local_qpn = local->qpn, .peer_qpn = peer->qpn,
+        .local_psn = local->psn, .peer_psn = peer->psn,
+        .pmtu = RTE_MIN(local->pmtu, peer->pmtu),
+        .local_lkey = application->mr.lkey, .remote_rkey = peer->region.rkey,
+        .local_ipv4 = local->data.ipv4, .peer_ipv4 = peer->data.ipv4,
+        .local_address = local->region.address, .remote_address = peer->region.address,
+    };
+    return roce_app_offer_native(application, &config);
+}
+
 int main(int argc, char **argv)
 {
     int consumed = rte_eal_init(argc, argv);
@@ -693,7 +798,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--mr-socket PATH] [--app-post-batch N] [--scatter-gather] [--cm-peer IPV4 MAC]\n");
+                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues]"
+                        " [--scatter-gather] [--cm-peer IPV4 MAC]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -711,6 +817,12 @@ int main(int argc, char **argv)
     }
     if (datapath.app_post_batch && (!options.sender || !datapath.app_socket)) {
         fprintf(stderr, "an application-backed requester uses the application post batch\n");
+        goto cleanup_eal;
+    }
+    if (datapath.native_queues &&
+        (!datapath.mr_socket || !options.sender || datapath.writes > ROCE_NATIVE_QUEUE_DEPTH)) {
+        fprintf(stderr, "native requester queues require an MR socket and at most %u WRITEs per QP\n",
+                ROCE_NATIVE_QUEUE_DEPTH);
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -823,7 +935,8 @@ int main(int argc, char **argv)
         uint32_t post_batch = datapath.app_post_batch ? RTE_MIN(datapath.app_post_batch, options.writes) :
             options.writes;
         if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif,
-                             in_band, datapath.scatter_gather, post_batch, registrations, &application)) {
+                             in_band, datapath.scatter_gather, datapath.native_queues, post_batch,
+                             registrations, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
@@ -893,7 +1006,7 @@ int main(int argc, char **argv)
         roce_lab_exchange(fd, &options, &local, &peer);
     if (!connected) {
         fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
-    } else if (in_band && application.socket >= 0 && !roce_app_connected(&application, &options)) {
+    } else if (application.socket >= 0 && !connect_application(&application, &options, &datapath, &local, &peer)) {
         perror("application establishment");
     } else {
         if (in_band)
@@ -964,6 +1077,8 @@ cleanup_port:
         perror("application WRITE completion");
         result = 1;
     }
+    if (result)
+        roce_app_flush_native(&application, &options);
 cleanup_buffers:
     if (mlx5_pmd)
         dlclose(mlx5_pmd);

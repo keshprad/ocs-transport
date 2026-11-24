@@ -16,6 +16,7 @@ struct roce_mr_lease {
     void *mapping;
     size_t mapped_length;
     uint64_t iova;
+    uint32_t lkey;
     uint32_t rkey;
 };
 
