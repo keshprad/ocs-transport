@@ -274,6 +274,16 @@ relocations and PCI-disabled EAL startup. The worker's mlx5 DMA-BUF
 symbols resolved in that runtime. Both hosts require trusted module
 signatures before the physical DMA-BUF mapping test.
 
+The paired application bandwidth harness stages identical userspace and
+DPDK artifacts on Spark-04 and Spark-02. The 16 GiB modes mirror the
+standalone MTU 1500 and 4200 tests. An 8 MiB profile checks first use.
+The result parser requires distinct application and worker PIDs, sender
+completions, receiver verification and the expected mlx5 mapping in
+scatter/gather modes. The signed-module modes require the Generic Netlink
+registration path. A local PMTU 1024 memif transfer through the staged
+launchers verified 8 MiB and eight WRITEs over 8,192 packets with zero
+retries. The physical Spark performance sweep is pending.
+
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
 memif port teardown. Backtraces located that diagnostic in
 `memif_free_regions()` during both port stop and EAL interrupt handling. The affected trials

@@ -28,6 +28,10 @@ TX_BURST = 16
 SEND_WINDOW = 256
 CONTROL_IP = "10.61.0.13"
 DESTINATION_ROOT = Path("/opt/ocs-roce-bw")
+APP_DESTINATION_ROOT = Path("/opt/ocs-roce-app-bw")
+APP_FILES = ("roce_write", "roce_app_write", "run_app", "provider/libroce_dpdk-rdmav34.so")
+APP_MODES = ("memfd-gather", "mr-copy", "mr-gather")
+APP_POST_BATCH = 32
 LOOPBACK = "127.0.0.1"
 GATE_PORT = 28872
 GATE_TIMEOUT = 20
@@ -51,10 +55,12 @@ class Profile:
     aggregate: bool = False
     pmtu: int = PMTU
     ethernet_mtu: int | None = None
+    payload: int = PAYLOAD
+    app_mode: str | None = None
 
     @property
     def writes(self):
-        return PAYLOAD // (self.qps * WRITE_BYTES)
+        return self.payload // (self.qps * WRITE_BYTES)
 
     @property
     def packets(self):
@@ -71,7 +77,17 @@ class Profile:
 
     @property
     def runtime_dir(self):
+        if self.app_mode:
+            return Path("/run/ocs-roce-app-bw")
         return Path("/run/ocs-roce-bw" if self.rail == 1 else "/run/ocs-roce-bw-2")
+
+    @property
+    def native_mr(self):
+        return self.app_mode in ("mr-copy", "mr-gather")
+
+    @property
+    def scatter_gather(self):
+        return self.app_mode in ("memfd-gather", "mr-gather")
 
 
 PROFILES = {
@@ -89,7 +105,17 @@ BURST_STYLE_PROFILES = {
     for mtu, pmtu, base in ((1500, 1024, 28876), (4200, 4096, 28880))
     for i, (name, profile) in enumerate(PROFILES.items())
 }
-ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES
+APP_SHAPES = PROFILES | {"smoke": Profile(0, 1, 1, payload=8 * WRITE_BYTES)}
+APP_PROFILES = {
+    f"app-{mode}-mtu-{mtu}-{name}": Profile(
+        28900 + mode_index * 10 + mtu_index * 5 + index, profile.qps, profile.workers,
+        pmtu=pmtu, ethernet_mtu=mtu, payload=profile.payload, app_mode=mode,
+    )
+    for mode_index, mode in enumerate(APP_MODES)
+    for mtu_index, (mtu, pmtu) in enumerate(((1500, 1024), (4200, 4096)))
+    for index, (name, profile) in enumerate(APP_SHAPES.items())
+}
+ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES
 
 
 @dataclass(frozen=True)
@@ -124,19 +150,39 @@ def unit_argv(endpoint, destination, runtime):
     cpus = ",".join(map(str, profile.cpus))
     lock = profile.runtime_dir / "function.lock"
     control_ip = LOOPBACK if profile.uses_tunnel else CONTROL_IP
+    device = f"{pci},max_dump_files_num=1" if profile.app_mode else pci
     argv = [
         "/usr/bin/flock", "--exclusive", "--nonblock", str(lock),
-        str(destination / "roce_write"), "-l", cpus, "--iova-mode=va", "--no-huge",
+        str(destination / ("run_app" if profile.app_mode else "roce_write")),
+        "-l", cpus, "--iova-mode=va", "--no-huge",
         "--no-telemetry", f"--file-prefix=ocs-roce-bw-{endpoint.profile}",
         "-d", str(runtime / "librte_mempool_ring.so.24"),
-        "-d", str(runtime / "librte_net_mlx5.so.24"), "-a", pci,
+        "-d", str(runtime / "librte_net_mlx5.so.24"), "-a", device,
         "--", endpoint.role, str(WRITE_BYTES), control_ip, str(profile.port), data_ip, str(profile.pmtu),
         pci, "--report-bw", "--tx-burst", str(TX_BURST), "--send-window", str(SEND_WINDOW),
         "--writes", str(profile.writes), "--qps", str(profile.qps), "--workers", str(profile.workers),
     ]
     if profile.aggregate and endpoint.role == "tx":
         argv += ["--start-gate", str(GATE_PORT)]
+    if profile.native_mr:
+        argv += ["--mr-socket", str(profile.runtime_dir / "registration.sock")]
+    if profile.app_mode and endpoint.role == "tx":
+        argv += ["--app-post-batch", str(APP_POST_BATCH)]
+        if profile.native_mr:
+            argv.append("--verbs-queues")
+        if profile.scatter_gather:
+            argv.append("--scatter-gather")
     return argv
+
+
+def unit_environment(endpoint, destination, runtime):
+    profile = endpoint.settings
+    environment = {"LD_LIBRARY_PATH": str(runtime), "XDG_RUNTIME_DIR": str(profile.runtime_dir)}
+    if profile.native_mr:
+        environment.update(RDMAV_DRIVERS=str(destination / "provider/libroce_dpdk"),
+                           ROCE_DPDK_MR_SOCKET=str(profile.runtime_dir / "registration.sock"),
+                           ROCE_DPDK_MR_REQUIRE_NETLINK="1")
+    return environment
 
 
 def verify_unit(commands, endpoint, destination):
@@ -157,6 +203,11 @@ def verify_unit(commands, endpoint, destination):
                 if word.startswith("LD_LIBRARY_PATH=")]
     require(len(runtimes) == 1 and runtimes[0].is_absolute() and ":" not in str(runtimes[0]),
             f"{endpoint.label}: expected one absolute DPDK runtime library path")
+    if endpoint.settings.app_mode:
+        runtime = destination / "lib"
+        expected_environment = unit_environment(endpoint, destination, runtime)
+        require(sorted(environment) == sorted(f"{key}={value}" for key, value in expected_environment.items()),
+                f"{endpoint.label}: installed Environment differs from the expected application profile")
     expected = unit_argv(endpoint, destination, runtimes[0])
     installed = re.findall(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
     require(len(installed) == 1 and shlex.split(installed[0]) == expected,
@@ -190,8 +241,30 @@ def require_idle(commands, host):
     require(not active.strip(), f"{host}: another lab service is running")
 
 
-def preflight(commands, profiles, destination, digest):
-    aggregate = ALL_PROFILES[profiles[0]].aggregate
+def app_digests(bundle):
+    digests = {}
+    for line in (bundle / "APP_SHA256SUMS").read_text().splitlines():
+        match = re.fullmatch(r"([a-f0-9]{64})  (\S+)", line)
+        require(match and match[2] in APP_FILES and match[2] not in digests,
+                "unexpected application bundle digest entry")
+        digests[match[2]] = match[1]
+    require(set(digests) == set(APP_FILES), "incomplete application bundle manifest")
+    return digests
+
+
+def verify_deployed_file(commands, host, path):
+    require(commands.run(host, "realpath", "-e", "--", path).strip() == str(path),
+            f"{host}: unexpected installed path for {path}")
+    owner, mode = commands.run(host, "stat", "-c", "%u %a", "--", path).split()
+    require(owner == "0" and not (int(mode, 8) & 0o022),
+            f"{host}: {path} must be writable only by root")
+
+
+def preflight(commands, profiles, destination, digests):
+    settings = [ALL_PROFILES[name] for name in profiles]
+    aggregate = settings[0].aggregate
+    app_mode = settings[0].app_mode
+    native_mr = any(profile.native_mr for profile in settings)
     links = {name: {} for name in profiles} if aggregate else {}
     for role, (host, _, _, _) in PORTS.items():
         require_idle(commands, host)
@@ -204,15 +277,19 @@ def preflight(commands, profiles, destination, digest):
         else:
             links[role] = verify_link(commands, PORTS[role])
 
-        executable = destination / "roce_write"
-        for path in (destination, executable):
-            require(commands.run(host, "realpath", "-e", "--", path).strip() == str(path),
-                    f"{host}: unexpected installed path for {path}")
-            owner, mode = commands.run(host, "stat", "-c", "%u %a", "--", path).split()
-            require(owner == "0" and not (int(mode, 8) & 0o022),
-                    f"{host}: {path} must be writable only by root")
-        actual = commands.run(host, "sha256sum", "--", executable).split()[0]
-        require(actual == digest, f"{host}: installed binary does not match the expected SHA-256")
+        if native_mr:
+            commands.run(host, "test", "-c", "/dev/roce_mr")
+            description = commands.run(host, "cat", "/sys/class/infiniband/roce_dpdk0/node_desc")
+            require(description.strip() == "RoCEv2 DPDK", f"{host}: provider device is missing")
+        verify_deployed_file(commands, host, destination)
+        if app_mode:
+            for directory in ("lib", "provider"):
+                verify_deployed_file(commands, host, destination / directory)
+        for file, digest in digests.items():
+            path = destination / file
+            verify_deployed_file(commands, host, path)
+            actual = commands.run(host, "sha256sum", "--", path).split()[0]
+            require(actual == digest, f"{host}: installed file {file} does not match the expected SHA-256")
         for profile in profiles:
             verify_unit(commands, Endpoint(role, profile), destination)
     return links
@@ -307,6 +384,11 @@ def invocation_messages(commands, endpoint, invocation):
     return messages
 
 
+def app_completion_marker(endpoint):
+    outcome = "completed" if endpoint.role == "tx" else "verified"
+    return f"Application {outcome} {endpoint.settings.payload} bytes"
+
+
 def wait_endpoint(commands, endpoint, invocation, deadline, *, ready=False):
     while time.monotonic() < deadline:
         status = commands.properties(endpoint, "ActiveState", "InvocationID", "Result", "ExecMainStatus")
@@ -323,7 +405,8 @@ def wait_endpoint(commands, endpoint, invocation, deadline, *, ready=False):
                 f"{endpoint.label}: unexpected service exit\n" + "\n".join(messages[-12:]),
             )
             # Read after observing the terminal state so journal records can settle.
-            if any(line.startswith("BANDWIDTH ") for line in messages):
+            app_finished = not endpoint.settings.app_mode or app_completion_marker(endpoint) in messages
+            if app_finished and any(line.startswith("BANDWIDTH ") for line in messages):
                 return messages
         time.sleep(0.2)
     phase = "receiver readiness" if ready else "completion and verification"
@@ -335,8 +418,9 @@ def parse_result(endpoint, messages):
     require(len(lines) == 1, f"{endpoint.label}: expected one bandwidth result")
     fields = dict(field.split("=", 1) for field in lines[0].split()[1:])
     profile = endpoint.settings
+    payload = profile.payload
     expected = {
-        "role": endpoint.role, "payload_bytes": str(PAYLOAD), "writes": str(profile.writes),
+        "role": endpoint.role, "payload_bytes": str(payload), "writes": str(profile.writes),
         "qps": str(profile.qps), "workers": str(profile.workers),
     }
     if endpoint.role == "tx":
@@ -350,21 +434,37 @@ def parse_result(endpoint, messages):
     cores = float(fields["poll_cores"])
     require(elapsed > 0 and cpu > 0 and cores > 0 and rate > 0,
             f"{endpoint.label}: expected positive bandwidth and CPU counters")
-    require(math.isclose(rate, PAYLOAD * 8 / elapsed, rel_tol=0, abs_tol=0.000501)
+    require(math.isclose(rate, payload * 8 / elapsed, rel_tol=0, abs_tol=0.000501)
             and math.isclose(cores, cpu / elapsed, rel_tol=0, abs_tol=0.000501),
             f"{endpoint.label}: inconsistent bandwidth or CPU counters")
     if profile.aggregate:
         require(int(fields.get("start_ns", "0")) > 0, f"{endpoint.label}: missing monotonic start")
 
     if endpoint.role == "tx":
-        pattern = rf"WRITE complete: {PAYLOAD} bytes, {profile.packets} packets, ([0-9]+) retries, peer verified"
+        pattern = rf"WRITE complete: {payload} bytes, {profile.packets} packets, ([0-9]+) retries, peer verified"
         matches = [re.fullmatch(pattern, message) for message in messages]
         retries = [int(match[1]) for match in matches if match]
         require(len(retries) == 1, f"{endpoint.label}: missing verified sender completion or retry count")
         fields["retries"] = str(retries[0])
     else:
-        marker = f"WRITE verified: {PAYLOAD} bytes, {profile.packets} packets"
+        marker = f"WRITE verified: {payload} bytes, {profile.packets} packets"
         require(messages.count(marker) == 1, f"{endpoint.label}: missing byte verification")
+    if profile.app_mode:
+        require(messages.count(app_completion_marker(endpoint)) == 1,
+                f"{endpoint.label}: missing application verification")
+        processes = [match for message in messages if
+                     (match := re.fullmatch(r"APP_PROCESSES worker_pid=([1-9][0-9]*) app_pid=([1-9][0-9]*)", message))]
+        require(len(processes) == 1 and processes[0][1] != processes[0][2],
+                f"{endpoint.label}: missing separate worker and application process IDs")
+        fields.update(worker_pid=int(processes[0][1]), app_pid=int(processes[0][2]))
+        if endpoint.role == "tx":
+            suffix = " via libibverbs" if profile.native_mr else ""
+            completion = f"Application observed {profile.writes} WRITE completions per QP{suffix}"
+            require(messages.count(completion) == 1, f"{endpoint.label}: missing application WRITE completions")
+            if profile.scatter_gather:
+                kind = "DMA-BUF" if profile.native_mr else "DMA"
+                require(messages.count(f"Application {kind} region mapped for scatter/gather TX ({payload} bytes)") == 1,
+                        f"{endpoint.label}: missing {kind} registration for scatter/gather")
     counters = [line for line in messages if line.startswith("PORT_STATS ")]
     if counters:
         require(len(counters) == 1, f"{endpoint.label}: expected one port counter result")
@@ -376,12 +476,13 @@ def parse_result(endpoint, messages):
 def run_endpoints(commands, profiles, output, sample):
     receivers = [Endpoint("rx", name) for name in profiles]
     senders = [Endpoint("tx", name) for name in profiles]
-    aggregate = senders[0].settings.aggregate
+    settings = senders[0].settings
+    aggregate = settings.aggregate
     invocations = {}
     try:
         for endpoint in receivers:
             invocations[endpoint] = start(commands, endpoint)
-        ready_deadline = time.monotonic() + 20
+        ready_deadline = time.monotonic() + (60 if settings.app_mode else 20)
         for endpoint in receivers:
             wait_endpoint(commands, endpoint, invocations[endpoint], ready_deadline, ready=True)
             if endpoint.settings.uses_tunnel:
@@ -396,7 +497,7 @@ def run_endpoints(commands, profiles, output, sample):
             if aggregate:
                 release_ns = release_senders(listener, [endpoint.settings.port for endpoint in senders],
                                              gate_deadline)
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + (90 if settings.app_mode else 60)
         results = {name: {} for name in profiles}
         for endpoint in (*senders, *receivers):
             invocation = invocations[endpoint]
@@ -503,6 +604,9 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
         profile_result = {"trials": trials}
         if config.ethernet_mtu is not None:
             profile_result.update(ethernet_mtu=config.ethernet_mtu, pmtu=config.pmtu)
+        if config.app_mode:
+            profile_result.update(app_mode=config.app_mode, payload_bytes=config.payload,
+                                  app_post_batch=min(APP_POST_BATCH, config.writes))
         report["profiles"][profile] = profile_result
         for sample in range(1, samples + 1):
             try:
@@ -531,34 +635,49 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", required=True, type=Path, help="pinned installed snapshot directory")
-    parser.add_argument("--sha256", required=True, help="expected SHA-256 of the installed roce_write binary")
+    parser.add_argument("--sha256", help="expected SHA-256 of the installed standalone roce_write binary")
+    parser.add_argument("--app-bundle", type=Path, help="staged application bundle containing APP_SHA256SUMS")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--aggregate", action="store_true",
                            help="run four-worker 16-QP transfers concurrently on both 100 Gbit/s rails")
     selection.add_argument("--burst-style-bench", action="store_true",
                            help="compare the same WRITE profiles at Ethernet MTUs 1500 and 4200")
-    parser.add_argument("--profile", action="append", choices=PROFILES, help="repeat to select profiles")
+    selection.add_argument("--app-bench", action="append", choices=APP_MODES,
+                           help="repeat to select separate-process application profiles at both MTUs")
+    parser.add_argument("--profile", action="append", choices=APP_SHAPES,
+                        help="repeat to select profiles; smoke is an 8 MiB application check")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
-                        help="limit --burst-style-bench to this Ethernet MTU")
+                        help="limit a paired-MTU benchmark to this Ethernet MTU")
     parser.add_argument("--samples", type=int, default=3, help="trials per profile (default 3)")
     parser.add_argument("--output", type=Path, help="new directory for logs and results")
     args = parser.parse_args()
-    digest = args.sha256.lower()
-    if not re.fullmatch(r"[a-f0-9]{64}", digest):
-        parser.error("--sha256 must contain 64 hexadecimal digits")
-    if args.destination.parent != DESTINATION_ROOT or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*",
-                                                                       args.destination.name):
-        parser.error(f"--destination must name a snapshot directly under {DESTINATION_ROOT}")
+    root = APP_DESTINATION_ROOT if args.app_bench else DESTINATION_ROOT
+    if args.destination.parent != root or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.destination.name):
+        parser.error(f"--destination must name a snapshot directly under {root}")
+    if args.app_bench:
+        if args.sha256 or not args.app_bundle:
+            parser.error("--app-bench requires --app-bundle in place of --sha256")
+        digests = app_digests(args.app_bundle)
+    else:
+        if not args.sha256 or not re.fullmatch(r"[a-f0-9]{64}", args.sha256.lower()) or args.app_bundle:
+            parser.error("standalone runs require --sha256 with 64 hexadecimal digits")
+        digests = {"roce_write": args.sha256.lower()}
     if args.samples <= 0:
         parser.error("--samples must be positive")
     if args.aggregate and args.profile:
         parser.error("--aggregate cannot be combined with --profile")
-    if args.mtu is not None and not args.burst_style_bench:
-        parser.error("--mtu requires --burst-style-bench")
+    paired_mtu = args.burst_style_bench or args.app_bench
+    if args.mtu is not None and not paired_mtu:
+        parser.error("--mtu requires --burst-style-bench or --app-bench")
     selected = tuple(dict.fromkeys(args.profile or PROFILES))
+    if "smoke" in selected and not args.app_bench:
+        parser.error("--profile smoke requires --app-bench")
     mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
     if args.aggregate:
         profiles = tuple(AGGREGATE_PROFILES)
+    elif args.app_bench:
+        profiles = tuple(f"app-{mode}-mtu-{mtu}-{name}" for mtu in mtus
+                         for mode in dict.fromkeys(args.app_bench) for name in selected)
     elif args.burst_style_bench:
         profiles = tuple(f"mtu-{mtu}-{name}" for mtu in mtus for name in selected)
     else:
@@ -567,12 +686,14 @@ def main():
     require(socket.gethostname().split(".")[0] == "spark-7e64", "run the benchmark from Spark-04")
     with tempfile.TemporaryDirectory(prefix="roce-bw-control-") as sockets:
         commands = Commands(sockets)
-        links = preflight(commands, profiles, args.destination, digest)
+        links = preflight(commands, profiles, args.destination, digests)
         output = args.output or Path(tempfile.mkdtemp(prefix="roce-bw-results-"))
         if args.output:
             output.mkdir()
         print(f"Benchmark output {output}", flush=True)
-        report = {"sha256": digest, "destination": str(args.destination), "links": links}
+        report = {"sha256": digests["roce_write"], "destination": str(args.destination), "links": links}
+        if args.app_bench:
+            report["files_sha256"] = digests
         if args.aggregate:
             trials = []
             report["aggregate"] = {"trials": trials}
@@ -591,7 +712,7 @@ def main():
             print(f"aggregate median verified payload TX {median:.3f} Gbit/s", flush=True)
             return
         report["profiles"] = {}
-        if args.burst_style_bench:
+        if paired_mtu:
             failures = []
             with control_tunnel(commands, sockets, [ALL_PROFILES[name] for name in profiles]):
                 for mtu in mtus:

@@ -440,6 +440,45 @@ polling core per endpoint. Each jumbo attempt with 16 QPs ended in
 retry exhaustion and Spark-04 logged mlx5 RX queue errors. The cause
 of those driver errors remains open.
 
+### Separate application and worker bandwidth
+
+The application sweep uses the same 16 GiB, 1 MiB WRITE workload, QP
+counts, workers, send window and MTUs as the paired standalone sweep.
+Use `--profile smoke` for an 8 MiB first transfer on the same path. The
+service pins application threads to CPUs 10–13. The bandwidth report
+measures the datapath interval and reports DPDK polling-thread CPU time.
+The paired sweep uses the TCP lab setup for the workload and verification.
+
+Stage the paired installers with the matching
+per-host worker, application, provider and patched DPDK runtime. The input
+directory contains `spark-04` and `spark-02`, each with its own
+`SHA256SUMS`.
+
+```sh
+bundle=$(python3 tests/stage_spark_app_bandwidth.py "$REVISION" --inputs "$PINNED_INPUTS")
+```
+
+Copy the `spark-02` subdirectory to Spark-02 and run its `install.sh` with
+sudo. On Spark-04, run `sudo /bin/bash "$bundle/spark-04/install.sh"`.
+The services use a dedicated account with access to the two lab
+registration devices. Load the signed `roce_mr` and `roce_uverbs` modules
+before the native MR profiles. The memfd profile runs with the modules
+absent.
+
+```sh
+python3 tests/check_spark_bandwidth.py --app-bench memfd-gather --profile smoke --samples 1 \
+  --destination "/opt/ocs-roce-app-bw/$REVISION" --app-bundle "$bundle"
+python3 tests/check_spark_bandwidth.py --app-bench mr-copy --app-bench mr-gather \
+  --destination "/opt/ocs-roce-app-bw/$REVISION" --app-bundle "$bundle"
+```
+
+Each recorded sample requires distinct application and worker processes,
+application completions and byte verification. The native modes require
+Generic Netlink handoff and the native gather trial checks that mlx5 mapped
+the DMA-BUF for the entire payload. The service writes the first mlx5 RX
+error syndrome per queue to the journal if the PMD enters queue recovery.
+[mlx5 PMD runtime options](https://doc.dpdk.org/guides-23.11/nics/mlx5.html#runtime-configuration)
+
 ### Physical dual-rail sweep
 
 The native runner accepts a local perftest 6.30 binary and checks the
