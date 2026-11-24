@@ -49,6 +49,8 @@ struct roce_cm_session {
     uint64_t last_sent;
     uint64_t mra_received_at;
     uint64_t mra_service_ns;
+    uint64_t response_deadline;
+    uint64_t mra_due;
     uint64_t disconnect_tid;
     uint64_t peer_dreq_tid;
     uint64_t disconnected_at;
@@ -56,12 +58,14 @@ struct roce_cm_session {
     unsigned sends;
     unsigned dreps_sent;
     enum roce_cm_type prepared;
+    uint8_t req_response_timeout;
     bool received_peer;
     bool rtu_allowed;
     bool send_pending;
     bool local_disconnect;
     bool peer_dreq_received;
     bool drep_pending;
+    bool mra_pending;
 };
 
 bool roce_cm_session_init(struct roce_cm_session *session,
@@ -72,6 +76,11 @@ bool roce_cm_session_set_local_qpn(struct roce_cm_session *session, uint32_t qpn
 
 /* Authorize RTU after a valid REP on an initiator awaiting application approval. */
 bool roce_cm_session_establish(struct roce_cm_session *session);
+
+/* Hold REP or RTU while the application prepares its QP. A slow reply can send
+ * MRA up to the exchange deadline. Resume when the final response is ready. */
+bool roce_cm_session_hold_response(struct roce_cm_session *session, uint64_t now, uint64_t deadline);
+void roce_cm_session_resume_response(struct roce_cm_session *session);
 
 /* A validated first RC packet can confirm communication after a passive REP. */
 bool roce_cm_session_peer_ready(struct roce_cm_session *session);

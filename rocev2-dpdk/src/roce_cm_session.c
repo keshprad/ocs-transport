@@ -85,6 +85,30 @@ bool roce_cm_session_establish(struct roce_cm_session *session)
     return true;
 }
 
+bool roce_cm_session_hold_response(struct roce_cm_session *session, uint64_t now, uint64_t deadline)
+{
+    if (!session || !session->received_peer || session->phase != ROCE_CM_PENDING ||
+        session->response_deadline || deadline <= now ||
+        (session->config.initiator ? session->rtu_allowed : session->sends != 0))
+        return false;
+
+    uint8_t response_code = session->config.initiator ? timeout_code(session->config.retry_ns) :
+                            session->req_response_timeout;
+    uint64_t response_ns = UINT64_C(4096) << response_code;
+    /* Leave half the response budget for scheduling and transmission. */
+    uint64_t delay_ns = response_ns > UINT64_C(2000000) ? response_ns / 2 : 0;
+    session->response_deadline = deadline;
+    session->mra_due = now + (delay_ns < deadline - now ? delay_ns : deadline - now);
+    session->mra_pending = true;
+    return true;
+}
+
+void roce_cm_session_resume_response(struct roce_cm_session *session)
+{
+    session->response_deadline = 0;
+    session->mra_pending = false;
+}
+
 bool roce_cm_session_peer_ready(struct roce_cm_session *session)
 {
     if (!session || session->phase != ROCE_CM_PENDING || session->config.initiator ||
@@ -159,6 +183,9 @@ static enum roce_cm_type next_message(struct roce_cm_session *session, uint64_t 
             return ROCE_CM_DREP;
         return !session->sends || retry_due(session, now) ? ROCE_CM_DREQ : 0;
     }
+    if (session->response_deadline)
+        return session->mra_pending && now >= session->mra_due && now < session->response_deadline ?
+               ROCE_CM_MRA : 0;
     if (session->config.initiator && session->received_peer)
         return session->rtu_allowed && session->send_pending ? ROCE_CM_RTU : 0;
     if (session->phase == ROCE_CM_ESTABLISHED || session->config.defer_local_qpn ||
@@ -220,6 +247,9 @@ size_t roce_cm_session_prepare(struct roce_cm_session *session, uint64_t now,
     uint8_t private_data[ROCE_CM_REQ_PRIVATE_SIZE];
     if (type == ROCE_CM_REQ) {
         prepare_req(&message, config, session->local_private_data, private_data);
+    } else if (type == ROCE_CM_MRA) {
+        message.mra.message = config->initiator ? ROCE_CM_MRA_REP : ROCE_CM_MRA_REQ;
+        message.mra.service_timeout = timeout_code(session->response_deadline - now);
     } else if (type == ROCE_CM_REP) {
         message.rep.target_ack_delay = timeout_code(config->retry_ns);
         message.rep.failover_accepted = 1;
@@ -254,6 +284,12 @@ void roce_cm_session_sent(struct roce_cm_session *session, uint64_t now)
     if (!session || !session->prepared)
         return;
 
+    if (session->prepared == ROCE_CM_MRA) {
+        session->mra_pending = false;
+        session->gsi_psn = (session->gsi_psn + 1) & ROCE_PSN_MASK;
+        session->prepared = 0;
+        return;
+    }
     if (session->prepared == ROCE_CM_RTU) {
         session->phase = ROCE_CM_ESTABLISHED;
     } else if (session->prepared == ROCE_CM_DREP) {
@@ -293,7 +329,19 @@ static void cache_peer(struct roce_cm_session *session, const struct roce_cm_mes
     session->received_peer = true;
 }
 
-static bool receive_req(struct roce_cm_session *session, const struct roce_cm_message *message)
+static void queue_response(struct roce_cm_session *session, uint64_t now)
+{
+    /* While the application is still preparing its reply, a duplicate of the
+     * original peer message requests a replay of a previously accepted MRA. */
+    if (session->response_deadline && !session->mra_pending) {
+        session->mra_due = now;
+        session->mra_pending = true;
+    }
+    session->send_pending = true;
+}
+
+static bool receive_req(struct roce_cm_session *session, uint64_t now,
+                        const struct roce_cm_message *message)
 {
     struct roce_cm_session_config *config = &session->config;
     struct roce_cma_ipv4 cma;
@@ -320,6 +368,7 @@ static bool receive_req(struct roce_cm_session *session, const struct roce_cm_me
     } else {
         cache_peer(session, message, private_data, private_length);
         session->mtu = message->req.mtu;
+        session->req_response_timeout = message->req.remote_response_timeout;
         config->cma_source_port = cma.source_port;
         if (config->max_retries > message->req.max_cm_retries)
             config->max_retries = message->req.max_cm_retries;
@@ -329,11 +378,12 @@ static bool receive_req(struct roce_cm_session *session, const struct roce_cm_me
             config->connection.initiator_depth = message->connection.responder_resources;
     }
     if (session->phase == ROCE_CM_PENDING)
-        session->send_pending = true;
+        queue_response(session, now);
     return true;
 }
 
-static bool receive_rep(struct roce_cm_session *session, const struct roce_cm_message *message)
+static bool receive_rep(struct roce_cm_session *session, uint64_t now,
+                        const struct roce_cm_message *message)
 {
     if (!session->sends || message->tid != session->tid ||
         message->remote_comm_id != session->config.local_comm_id ||
@@ -346,7 +396,7 @@ static bool receive_rep(struct roce_cm_session *session, const struct roce_cm_me
     } else {
         cache_peer(session, message, message->private_data, message->private_length);
     }
-    session->send_pending = true;
+    queue_response(session, now);
     return true;
 }
 
@@ -425,9 +475,9 @@ bool roce_cm_session_receive(struct roce_cm_session *session, uint64_t now,
         return receive_mra(session, now, &message);
 
     if (session->config.initiator)
-        return message.type == ROCE_CM_REP && receive_rep(session, &message);
+        return message.type == ROCE_CM_REP && receive_rep(session, now, &message);
     if (message.type == ROCE_CM_REQ)
-        return receive_req(session, &message);
+        return receive_req(session, now, &message);
     if (message.type != ROCE_CM_RTU || !session->received_peer || !session->sends ||
         message.tid != session->tid || message.local_comm_id != session->peer_comm_id ||
         message.remote_comm_id != session->config.local_comm_id)

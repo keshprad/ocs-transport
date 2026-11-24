@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 bool roce_cma_service_listen(struct roce_cma_service *service, const char *path)
@@ -96,10 +97,33 @@ bool roce_cma_service_event(const struct roce_cma_service *service, enum roce_cm
     return send_event(service, type, status, private_data, private_length, -1);
 }
 
-static bool command(const struct roce_cma_service *service, struct roce_cma_message *message,
-                    enum roce_cma_message_type expected)
+static int receive_command(int socket, struct roce_cma_message *message, const struct roce_cma_wait *wait)
 {
-    int received = roce_cma_receive(service->socket, message, false);
+    if (!wait)
+        return roce_cma_receive(socket, message, false);
+
+    struct pollfd ready = { .fd = socket, .events = POLLIN };
+    for (;;) {
+        uint64_t now = roce_now_ns();
+        if (now >= wait->deadline)
+            return -ETIMEDOUT;
+        int received = roce_cma_receive(socket, message, true);
+        if (received)
+            return received;
+
+        wait->progress(wait->context, now);
+        const uint64_t interval = UINT64_C(1000000);
+        uint64_t remaining = wait->deadline - now;
+        struct timespec timeout = { .tv_nsec = remaining < interval ? remaining : interval };
+        if (ppoll(&ready, 1, &timeout, NULL) < 0 && errno != EINTR)
+            return -errno;
+    }
+}
+
+static bool command(const struct roce_cma_service *service, struct roce_cma_message *message,
+                    enum roce_cma_message_type expected, const struct roce_cma_wait *wait)
+{
+    int received = receive_command(service->socket, message, wait);
     if (received != 1) {
         errno = received < 0 ? -received : ETIMEDOUT;
         return false;
@@ -135,7 +159,7 @@ bool roce_cma_service_prepare(struct roce_cma_service *service)
 {
     struct roce_cma_message message;
     if (!service->sender) {
-        if (!command(service, &message, ROCE_CMA_LISTEN))
+        if (!command(service, &message, ROCE_CMA_LISTEN, NULL))
             return false;
         if (message.local_ipv4 == service->address.local_ipv4 && message.local_port == service->local_port)
             return true;
@@ -143,7 +167,7 @@ bool roce_cma_service_prepare(struct roce_cma_service *service)
         return false;
     }
 
-    if (!command(service, &message, ROCE_CMA_RESOLVE_ADDR))
+    if (!command(service, &message, ROCE_CMA_RESOLVE_ADDR, NULL))
         return false;
     if ((message.local_ipv4 && message.local_ipv4 != service->address.local_ipv4) ||
         message.peer_ipv4 != service->address.peer_ipv4 || message.peer_port != service->peer_port) {
@@ -154,7 +178,7 @@ bool roce_cma_service_prepare(struct roce_cma_service *service)
     if (message.local_port)
         service->local_port = message.local_port;
     if (!roce_cma_service_event(service, ROCE_CMA_ADDR_RESOLVED, 0, NULL, 0) ||
-        !command(service, &message, ROCE_CMA_RESOLVE_ROUTE))
+        !command(service, &message, ROCE_CMA_RESOLVE_ROUTE, NULL))
         return false;
     if (!matches_peer(service, &message)) {
         roce_cma_service_event(service, ROCE_CMA_ROUTE_ERROR, EHOSTUNREACH, NULL, 0);
@@ -162,24 +186,26 @@ bool roce_cma_service_prepare(struct roce_cma_service *service)
         return false;
     }
     if (!roce_cma_service_event(service, ROCE_CMA_ROUTE_RESOLVED, 0, NULL, 0) ||
-        !command(service, &message, ROCE_CMA_CONNECT))
+        !command(service, &message, ROCE_CMA_CONNECT, NULL))
         return false;
     return accept_local_qp(service, &message);
 }
 
 bool roce_cma_service_request(struct roce_cma_service *service, uint16_t peer_port, uint32_t peer_qpn,
-                              const uint8_t *private_data, uint8_t private_length)
+                              const uint8_t *private_data, uint8_t private_length,
+                              const struct roce_cma_wait *wait)
 {
     service->peer_port = peer_port;
     service->peer_qpn = peer_qpn;
     struct roce_cma_message message;
     if (!roce_cma_service_event(service, ROCE_CMA_CONNECT_REQUEST, 0, private_data, private_length) ||
-        !command(service, &message, ROCE_CMA_ACCEPT))
+        !command(service, &message, ROCE_CMA_ACCEPT, wait))
         return false;
     return accept_local_qp(service, &message);
 }
 
-bool roce_cma_service_configure_qp(const struct roce_cma_service *service, int queue_fd)
+bool roce_cma_service_configure_qp(const struct roce_cma_service *service, int queue_fd,
+                                  const struct roce_cma_wait *wait)
 {
     if (!service->owned_qp || service->sender || queue_fd < 0) {
         errno = EINVAL;
@@ -187,7 +213,7 @@ bool roce_cma_service_configure_qp(const struct roce_cma_service *service, int q
     }
     struct roce_cma_message message;
     if (!send_event(service, ROCE_CMA_CONFIGURE_QP, 0, NULL, 0, queue_fd) ||
-        !command(service, &message, ROCE_CMA_QP_READY))
+        !command(service, &message, ROCE_CMA_QP_READY, wait))
         return false;
     if (matches_peer(service, &message) && message.qp_num == service->local_qpn)
         return true;
@@ -196,7 +222,8 @@ bool roce_cma_service_configure_qp(const struct roce_cma_service *service, int q
 }
 
 bool roce_cma_service_response(const struct roce_cma_service *service,
-                               const uint8_t *private_data, uint8_t private_length, int queue_fd)
+                               const uint8_t *private_data, uint8_t private_length, int queue_fd,
+                               const struct roce_cma_wait *wait)
 {
     if (service->owned_qp != (queue_fd >= 0)) {
         errno = EINVAL;
@@ -204,7 +231,7 @@ bool roce_cma_service_response(const struct roce_cma_service *service,
     }
     struct roce_cma_message message;
     if (!send_event(service, ROCE_CMA_CONNECT_RESPONSE, 0, private_data, private_length, queue_fd) ||
-        !command(service, &message, ROCE_CMA_ESTABLISH))
+        !command(service, &message, ROCE_CMA_ESTABLISH, wait))
         return false;
     if (matches_peer(service, &message))
         return true;
@@ -217,7 +244,7 @@ bool roce_cma_service_wait_disconnect(const struct roce_cma_service *service)
     if (!service->sender)
         return true;
     struct roce_cma_message message;
-    if (!command(service, &message, ROCE_CMA_DISCONNECT))
+    if (!command(service, &message, ROCE_CMA_DISCONNECT, NULL))
         return false;
     if (matches_peer(service, &message))
         return true;

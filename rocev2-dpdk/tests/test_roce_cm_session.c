@@ -402,6 +402,66 @@ static void check_mra_rep(void)
     assert(pair.passive.phase == ROCE_CM_FAILED);
 }
 
+static void check_mra_send(bool initiator)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    active.retry_ns = 4000000;
+    active.manual_establish = true;
+    uint32_t passive_qpn = passive.connection.local_qpn;
+    passive.defer_local_qpn = true;
+    passive.connection.local_qpn = 0;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    assert(!roce_cm_session_hold_response(&pair.passive, 0, 5000000));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+
+    if (initiator) {
+        assert(roce_cm_session_set_local_qpn(&pair.passive, passive_qpn));
+        send_at(&pair.passive, 0, pair.rep);
+        assert(receive_at(&pair.active, 0, pair.rep));
+    }
+    struct roce_cm_session *held = initiator ? &pair.active : &pair.passive;
+    const uint8_t *original = initiator ? pair.rep : pair.req;
+    const uint64_t due = 2097152;
+    const uint64_t deadline = 5000000;
+    unsigned sends = held->sends;
+    uint32_t psn = held->gsi_psn;
+    assert(roce_cm_session_hold_response(held, 0, deadline));
+    uint8_t frame[ROCE_CM_FRAME_SIZE];
+    assert(!roce_cm_session_prepare(held, due - 1, frame, sizeof(frame)));
+
+    /* The first attempt is prepared but rejected by TX. */
+    assert(roce_cm_session_prepare(held, due, frame, sizeof(frame)) == sizeof(frame));
+    assert(held->gsi_psn == psn);
+    send_at(held, due + 1, frame);
+    struct roce_cm_frame outer;
+    struct roce_cm_message mra = unpack(frame, &outer);
+    assert(mra.type == ROCE_CM_MRA && mra.tid == active.tid);
+    assert(mra.mra.message == (initiator ? ROCE_CM_MRA_REP : ROCE_CM_MRA_REQ));
+    assert(mra.local_comm_id == held->config.local_comm_id && mra.remote_comm_id == held->peer_comm_id);
+    assert((UINT64_C(4096) << mra.mra.service_timeout) >= deadline - (due + 1));
+    assert(outer.psn == psn && held->sends == sends && held->send_pending);
+    assert(!roce_cm_session_prepare(held, due + 2, frame, sizeof(frame)));
+
+    assert(receive_at(held, due + 3, original));
+    send_at(held, due + 3, frame);
+    mra = unpack(frame, &outer);
+    assert(mra.type == ROCE_CM_MRA && mra.tid == active.tid);
+    assert(outer.psn == ((psn + 1) & ROCE_PSN_MASK) && held->sends == sends);
+
+    if (initiator)
+        assert(roce_cm_session_establish(held));
+    else
+        assert(roce_cm_session_set_local_qpn(held, passive_qpn));
+    assert(!roce_cm_session_prepare(held, due + 4, frame, sizeof(frame)));
+    roce_cm_session_resume_response(held);
+    send_at(held, due + 4, frame);
+    assert(unpack(frame, &outer).type == (initiator ? ROCE_CM_RTU : ROCE_CM_REP));
+}
+
 static void establish_pair(struct test_pair *pair, bool deliver_rtu)
 {
     init_pair(pair);
@@ -536,6 +596,8 @@ int main(void)
     check_retry_limit();
     check_mra_req();
     check_mra_rep();
+    check_mra_send(false);
+    check_mra_send(true);
     check_disconnect_replay();
     check_simultaneous_disconnect(false);
     check_simultaneous_disconnect(true);

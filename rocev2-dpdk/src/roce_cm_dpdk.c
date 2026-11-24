@@ -86,16 +86,30 @@ void roce_cm_transmit(uint16_t port, struct rte_mempool *pool, struct roce_cm_se
     rte_pktmbuf_free(mbuf);
 }
 
+struct cm_application_wait {
+    uint16_t port;
+    struct rte_mempool *pool;
+    struct roce_cm_port *cm;
+};
+
+static void progress_cm(void *context, uint64_t now)
+{
+    struct cm_application_wait *wait = context;
+    receive_cm(wait->port, wait->cm, NULL, now);
+    roce_cm_transmit(wait->port, wait->pool, &wait->cm->session, now);
+}
+
 static bool prepare_application(struct roce_cma_service *cma, struct roce_app_memory *application,
                                 const struct roce_lab_options *options, struct roce_lab_offer *local,
                                 const struct roce_lab_offer *peer, struct roce_cm_session *session,
-                                const uint8_t *private_data, uint8_t private_length)
+                                const uint8_t *private_data, uint8_t private_length,
+                                const struct roce_cma_wait *wait)
 {
     cma->peer_qpn = session->peer_qpn;
     if (!options->sender && cma->owned_qp) {
         /* The passive application supplies its new QPN in ACCEPT. */
         if (!roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
-                                       private_data, private_length))
+                                       private_data, private_length, wait))
             return false;
         local->qpn = cma->local_qpn;
     }
@@ -105,15 +119,15 @@ static bool prepare_application(struct roce_cma_service *cma, struct roce_app_me
         return false;
     bool ready;
     if (options->sender) {
-        ready = roce_cma_service_response(cma, private_data, private_length, queue_fd) &&
+        ready = roce_cma_service_response(cma, private_data, private_length, queue_fd, wait) &&
                 roce_cm_session_establish(session);
     } else if (cma->owned_qp) {
-        ready = roce_cma_service_configure_qp(cma, queue_fd) &&
+        ready = roce_cma_service_configure_qp(cma, queue_fd, wait) &&
                 roce_cm_session_set_local_qpn(session, local->qpn);
     } else {
         /* An external QP is configured through the application socket before ACCEPT. */
         ready = roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
-                                         private_data, private_length);
+                                         private_data, private_length, wait);
     }
     if (queue_fd >= 0) {
         int error = errno;
@@ -186,9 +200,16 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                 (!options->sender && session->mtu != mtu_code(RTE_MIN(options->pmtu, peer->pmtu))))
                 return false;
             local->psn = session->send_psn;
-            if (cma && !prepare_application(cma, application, options, local, peer, session,
-                                            cma_private, cma_private_length))
-                return false;
+            if (cma) {
+                struct cm_application_wait context = { .port = port, .pool = pool, .cm = cm };
+                const struct roce_cma_wait wait = { .deadline = deadline, .progress = progress_cm,
+                                                   .context = &context };
+                if (!roce_cm_session_hold_response(session, now, deadline) ||
+                    !prepare_application(cma, application, options, local, peer, session,
+                                         cma_private, cma_private_length, &wait))
+                    return false;
+                roce_cm_session_resume_response(session);
+            }
             if (!options->sender) {
                 responder = (struct roce_responder) {
                     .qp = { .local = local->data, .peer = peer->data, .local_qpn = local->qpn,

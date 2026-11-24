@@ -29,7 +29,7 @@ to check implementation behavior and run independent interoperability tests.
 | §§9.7.1, 9.7.4–9.7.5, C9-105, C9-121–122 | PSN increments and wrap, gap NAK with expected PSN, duplicate ACK without replaying placement | **V** in `RC` and `PEER`. The live responder returns the missing PSN in its NAK and returns the same cumulative ACK and MSN for a duplicate after wrap. Byte verification detects any duplicate placement. |
 | §§9.7.2, 9.7.5.2, 9.7.6, 9.7.7.1, 9.9.2 | Cumulative ACK progress, MSN and error syndromes, timeout and bounded Go-Back-N retry | **P**. `RC` asserts cumulative progress, stale and unsent feedback rejection, MSN, access errors, and retry exhaustion. `PEER` confirms the live requester resumes from the missing PSN after a NAK, then retransmits from the same PSN when the final ACK is withheld. Only feedback applicable to plain WRITE with no receive credits is exercised. The endpoint defaults to a 32-packet window and 10 ms local timeout. `RC` also verifies that packet preparation and a partial TX burst advance only the PSNs accepted by the driver. |
 | §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for the configured host region. `RC` checks incorrect keys, below-base and overrun addresses, and inconsistent message lengths with no memory modification on first-packet rejection. |
-| §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5 | CM Message Receipt Acknowledgment (MRA) format and retry deferral | **P**. `CM` verifies pending REQ and REP deferral, transaction matching, and duplicate handling. The DPDK worker honors incoming MRA for those messages. Automatic MRA generation for slow application setup remains open. |
+| §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5 | CM Message Receipt Acknowledgment (MRA) format and retry deferral | **V** for the lab RC REQ and REP paths. `CM` verifies peer deferral, transaction matching, accepted TX, and replay. The DPDK worker sends MRA while waiting for slow application setup. The exact-kernel guest verifies that behavior with and without packet loss. |
 | A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **V** for the tested one-QP IPv4 host-memory WRITE. Two runs verified 8,195 bytes in each direction at PMTU 1024 with raw Ethernet on the DPDK function and native RoCE on the verbs peer. |
 
 Zero-length WRITE, WRITE with Immediate, SEND, READ, atomics, IPv6 and
@@ -42,7 +42,7 @@ the supported RDMA CM and DPDK-side verbs provider profiles.
 | --- | --- | --- |
 | WIRE | `make check` → `tests/check_wire.py` | Independent BTH/RETH/AETH and iCRC vectors for five opcodes, plus negative decode cases |
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
-| CM | `make check` → `tests/test_roce_cm_wire` and `tests/test_roce_cm_session` | Fixed CM MAD vectors, QP1 encapsulation, establishment and teardown, replay, and REQ/REP retry timing with MRA |
+| CM | `make check` → `tests/test_roce_cm_wire` and `tests/test_roce_cm_session` | Fixed CM MAD vectors, QP1 encapsulation, establishment and teardown, replay, REQ/REP retry timing, and outgoing MRA while the final response is held |
 | MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. With four available CPUs, a two-queue test verifies WRITEs on three QPs. |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
 | PEER-VERBS | `python3 tests/check_peer.py --verbs-provider "$PROVIDER_DIR/libroce_dpdk"` | On the exact Spark-04 kernel in QEMU, the independent peer sent a sequence NAK and withheld the final ACK. It verified both retransmissions from a native scatter/gather requester and checked the payload. The application received one libibverbs completion. Netlink handoff was required. |
@@ -276,6 +276,31 @@ The updated implementation also verified an 8,195-byte WRITE and clean
 in-band CM teardown in both directions against stock Linux RXE over TAP
 at PMTU 4096 in the same kernel guest. That interoperability run used a
 separate DPDK application with Netlink MR handoff.
+
+During `librdmacm` application setup, the DPDK worker polls QP1 while
+waiting for ACCEPT, QP_READY, or ESTABLISH on the Unix socket. It holds
+REP or RTU until the application is ready and polls at up to 1 ms
+intervals while the socket is idle. It schedules MRA halfway
+through the applicable REQ timeout budget and allows immediate MRA for
+budgets of 2 ms or less. The advertised service timeout covers the
+remaining lab setup deadline. A duplicate REQ or REP while the worker
+is still waiting can trigger replay of an accepted MRA.
+
+In the exact Spark-04 kernel guest, the prompt application exchanged
+REQ, REP and RTU with no MRA. Three separate trials delayed ACCEPT,
+QP_READY, or ESTABLISH by 550 ms. Each emitted one MRA and the peer
+sent its pending message once. Two trials delayed the application by
+2.3 seconds and dropped the first outgoing MRA, once in each role. A
+single peer retry elicited the replay in each trial. All six trials
+verified 24,585 bytes and three native WRITE completions with zero RC
+retries. Both kernel modules unloaded cleanly.
+
+Packet captures with a stock Linux RXE peer confirmed both directions at
+PMTU 4096. With a 1.2-second DPDK application delay before ESTABLISH, RXE
+sent one REP after the change and five with the previous build. With a
+5.3-second delay before ACCEPT, RXE sent one REQ after the change and
+two with the previous build. The updated worker sent one MRA in each
+role. Every run verified an 8,195-byte WRITE and clean CM disconnect.
 
 The kernel guest used QEMU TCG with networking disabled and the Ubuntu
 `6.17.0-1021.21-nvidia` image. Both `check_provider` and `check_mr`
