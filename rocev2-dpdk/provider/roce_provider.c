@@ -800,7 +800,7 @@ static int query_qp(struct ibv_qp *ibv, struct ibv_qp_attr *attr, int mask, stru
 }
 
 static int prepare_native_write(struct roce_native_write *entry, const struct ibv_send_wr *wr,
-                                const struct roce_verbs_qp *qp, uint32_t ordinal)
+                                const struct roce_verbs_qp *qp)
 {
     const struct roce_native_queue_config *config = &provider_context(qp->verbs.qp.context)->config;
     if (wr->opcode != IBV_WR_RDMA_WRITE || (wr->send_flags & ~IBV_SEND_SIGNALED))
@@ -809,9 +809,12 @@ static int prepare_native_write(struct roce_native_write *entry, const struct ib
         return EINVAL;
 
     const struct ibv_sge *sge = wr->sg_list;
-    uint64_t offset = ((uint64_t)qp->index * config->writes + ordinal) * config->write_size;
-    if (sge->addr != config->local_address + offset || wr->wr.rdma.remote_addr != config->remote_address + offset ||
-        sge->length != config->write_size || sge->lkey != config->local_lkey || wr->wr.rdma.rkey != config->remote_rkey)
+    uint64_t qp_bytes = (uint64_t)config->writes * config->write_size;
+    uint64_t remote_base = config->remote_address + qp->index * qp_bytes;
+    if (sge->length != config->write_size || sge->lkey != config->local_lkey ||
+        wr->wr.rdma.rkey != config->remote_rkey ||
+        !roce_native_contains(config->local_address, native_queue_bytes(config), sge->addr, sge->length) ||
+        !roce_native_contains(remote_base, qp_bytes, wr->wr.rdma.remote_addr, sge->length))
         return EINVAL;
 
     *entry = (struct roce_native_write) {
@@ -859,7 +862,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
             break;
         }
         uint32_t slot = posted % ROCE_NATIVE_QUEUE_DEPTH;
-        error = prepare_native_write(&sq->entries[slot], next, qp, posted);
+        error = prepare_native_write(&sq->entries[slot], next, qp);
         if (error)
             break;
         sq->status[slot] = ROCE_NATIVE_WC_SUCCESS;

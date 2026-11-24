@@ -200,8 +200,20 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     struct roce_native_work *next = map_test_work(&config, &next_fd);
     assert(roce_native_bind_work(context, next_fd) == EBUSY);
 
+    segments[0][0].addr = iova + QPS * WRITES * WRITE_SIZE - WRITE_SIZE + 1;
+    assert(ibv_post_send(qps[0], writes[0], &bad) == EINVAL && bad == &writes[0][0]);
+    segments[0][0].addr = iova + 2 * WRITE_SIZE;
+    writes[0][0].wr.rdma.remote_addr = work->config.remote_address + WRITES * WRITE_SIZE;
+    assert(ibv_post_send(qps[0], writes[0], &bad) == EINVAL && bad == &writes[0][0]);
+    assert(atomic_load(&work->qps[0].posted) == 0);
+    writes[0][0].wr.rdma.remote_addr = work->config.remote_address + 2 * WRITE_SIZE;
+    segments[0][2].addr = iova;
+    writes[0][2].wr.rdma.remote_addr = work->config.remote_address;
+
     writes[0][1].next = NULL;
     assert(!ibv_post_send(qps[0], writes[0], &bad) && !bad);
+    assert(work->qps[0].entries[0].local_address == segments[0][0].addr &&
+           work->qps[0].entries[0].remote_address == writes[0][0].wr.rdma.remote_addr);
     assert(ibv_post_send(qps[1], writes[1], &bad) == ENOMEM && bad == &writes[1][2]);
     assert(atomic_load(&work->qps[0].posted) == 2 && atomic_load(&work->qps[1].posted) == 2);
     assert(ibv_post_send(qps[0], &writes[0][2], &bad) == ENOMEM && bad == &writes[0][2]);
@@ -255,12 +267,12 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     struct ibv_qp *next_qp = ibv_create_qp(pd, &next_init);
     assert(next_qp && next_qp->qp_num == config.local_qpn);
     assert(!roce_native_init_qp(next_qp, false) && !roce_native_connect_qp(next_qp, &config, 0));
-    writes[0][0].next = NULL;
-    assert(!ibv_post_send(next_qp, writes[0], &bad) && !bad);
+    writes[0][2].next = NULL;
+    assert(!ibv_post_send(next_qp, &writes[0][2], &bad) && !bad);
     assert(atomic_load(&work->qps[0].posted) == 3 && atomic_load(&next->qps[0].posted) == 1);
     atomic_store_explicit(&next->qps[0].retired, 1, memory_order_release);
     assert(ibv_poll_cq(send_cq, 1, wc) == 1);
-    check_wc(&wc[0], next_qp, 1, IBV_WC_SUCCESS);
+    check_wc(&wc[0], next_qp, 3, IBV_WC_SUCCESS);
     assert(!ibv_destroy_qp(next_qp));
     assert(roce_native_bind_work(context, next_fd) == EBUSY);
 

@@ -74,6 +74,12 @@ static inline uint32_t roce_native_posted_count(uint32_t posted)
     return posted & ~ROCE_NATIVE_SQ_CLOSED;
 }
 
+static inline bool roce_native_contains(uint64_t base, uint64_t size,
+                                        uint64_t address, uint64_t length)
+{
+    return address >= base && length <= size && address - base <= size - length;
+}
+
 static inline void roce_native_notify(struct roce_doorbell *doorbell, uint64_t item)
 {
     if (roce_doorbell_publish(doorbell, item))

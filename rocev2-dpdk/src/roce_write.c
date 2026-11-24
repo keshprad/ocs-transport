@@ -75,13 +75,21 @@ union write_qp {
 
 enum run_state { WRITE_WAITING, WRITE_RUNNING, WRITE_STOPPED };
 
+struct native_write_address {
+    const uint8_t *source;
+    uint64_t remote;
+};
+
 struct write_run {
     const struct datapath_options *options;
     struct rte_mempool *pool;
     struct roce_app_work *work;
     struct roce_native_work *native;
     struct roce_cm_port *cm;
+    struct native_write_address (*native_addresses)[ROCE_NATIVE_QUEUE_DEPTH];
+    const uint8_t *local_buffer;
     uint64_t local_iova;
+    size_t local_length;
     uint32_t local_lkey;
     struct tx_memory_ref *tx_refs;
     uint16_t port;
@@ -188,6 +196,8 @@ static bool send_requests(struct write_worker *worker,
 {
     const struct write_run *run = worker->run;
     struct roce_requester *requester = &worker->states[index].requester;
+    const struct native_write_address *addresses =
+        run->native_addresses ? run->native_addresses[worker->first_qp + index] : NULL;
     uint32_t budget = RTE_MIN(posted_packets - requester->next,
                               credit + (requester->sent - requester->next));
     uint32_t limit = RTE_MIN(budget, run->options->tx_burst);
@@ -198,6 +208,13 @@ static bool send_requests(struct write_worker *worker,
         uint32_t sequence = roce_requester_stage(requester, count, &packet);
         if (sequence == UINT32_MAX)
             break;
+        if (addresses) {
+            size_t write_offset = packet.remote_address - requester->remote.address;
+            size_t segment_offset = (size_t)(packet.payload - requester->source) - write_offset;
+            const struct native_write_address *address = &addresses[sequence % ROCE_NATIVE_QUEUE_DEPTH];
+            packet.payload = address->source + segment_offset;
+            packet.remote_address = address->remote;
+        }
         /* A full queue window must still generate an ACK before another send. */
         if (run->options->queue_window && count + 1u == budget)
             packet.ack_requested = true;
@@ -454,17 +471,18 @@ static bool admit_writes(struct write_worker *worker)
 }
 
 static enum roce_native_wc_status validate_native_write(const struct write_worker *worker, uint32_t index,
-                                                        uint32_t sequence, struct roce_native_write wqe)
+                                                        const struct roce_native_write *wqe)
 {
     const struct write_run *run = worker->run;
     const struct roce_requester *requester = &worker->states[index].requester;
     uint64_t bytes = requester->remote.size;
-    uint64_t ordinal = (uint64_t)(worker->first_qp + index) * run->options->writes + sequence;
-    if (wqe.length != bytes)
+    if (wqe->length != bytes)
         return ROCE_NATIVE_WC_LOCAL_LENGTH;
-    if (wqe.lkey != run->local_lkey || wqe.local_address != run->local_iova + ordinal * bytes)
+    if (wqe->lkey != run->local_lkey ||
+        !roce_native_contains(run->local_iova, run->local_length, wqe->local_address, bytes))
         return ROCE_NATIVE_WC_LOCAL_PROTECTION;
-    if (wqe.rkey != requester->remote.rkey || wqe.remote_address != requester->remote.address + sequence * bytes)
+    if (wqe->rkey != requester->remote.rkey ||
+        !roce_native_contains(requester->remote.address, bytes * run->options->writes, wqe->remote_address, bytes))
         return ROCE_NATIVE_WC_REMOTE_ACCESS;
     return ROCE_NATIVE_WC_SUCCESS;
 }
@@ -472,7 +490,8 @@ static enum roce_native_wc_status validate_native_write(const struct write_worke
 static bool admit_native_qp(struct write_worker *worker, uint32_t index)
 {
     const struct write_run *run = worker->run;
-    struct roce_native_sq *sq = &run->native->qps[worker->first_qp + index];
+    uint32_t qp = worker->first_qp + index;
+    struct roce_native_sq *sq = &run->native->qps[qp];
     uint32_t head = atomic_load_explicit(&sq->posted, memory_order_acquire);
     uint32_t sequence = worker->posted[index];
     if (head == sequence)
@@ -482,11 +501,17 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
         return false;
     for (; sequence < head; ++sequence) {
         uint32_t slot = sequence % ROCE_NATIVE_QUEUE_DEPTH;
-        enum roce_native_wc_status result = validate_native_write(worker, index, sequence, sq->entries[slot]);
+        const struct roce_native_write wqe = sq->entries[slot];
+        enum roce_native_wc_status result = validate_native_write(worker, index, &wqe);
         if (result != ROCE_NATIVE_WC_SUCCESS) {
             sq->status[slot] = result;
             return false;
         }
+        /* Retain the validated addresses until this WR retires, including on replay. */
+        run->native_addresses[qp][slot] = (struct native_write_address) {
+            .source = run->local_buffer + (wqe.local_address - run->local_iova),
+            .remote = wqe.remote_address,
+        };
     }
     worker->posted[index] = head;
     worker->fully_posted += head == run->options->writes;
@@ -793,10 +818,18 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
                              .state = WRITE_WAITING, .work = application->work,
-                             .native = lab->sender ? application->native : NULL, .local_iova = local->region.address,
-                             .local_lkey = application->mr.lkey,
+                             .native = lab->sender ? application->native : NULL,
+                             .local_iova = local->region.address, .local_buffer = buffer,
+                             .local_length = application->length, .local_lkey = application->mr.lkey,
                              .application_socket = application->socket,
                              .tx_refs = tx_refs, .cm = cm };
+    if (run.native) {
+        run.native_addresses = rte_zmalloc(NULL, options->qps * sizeof(*run.native_addresses), RTE_CACHE_LINE_SIZE);
+        if (!run.native_addresses) {
+            fprintf(stderr, "could not allocate native WRITE addresses\n");
+            return 1;
+        }
+    }
     struct write_worker workers[ROCE_LAB_MAX_QPS] = {0};
     struct rte_flow *flows[ROCE_LAB_MAX_QPS] = {0};
     uint16_t pmtu = local->pmtu < peer->pmtu ? local->pmtu : peer->pmtu;
@@ -870,6 +903,7 @@ cleanup_flows:
     for (uint32_t i = 0; i < options->qps; ++i)
         if (flows[i])
             rte_flow_destroy(port, flows[i], NULL);
+    rte_free(run.native_addresses);
     return result;
 }
 

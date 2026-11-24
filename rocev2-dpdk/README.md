@@ -93,7 +93,9 @@ individual WR IDs and statuses with `ibv_poll_cq()`. The current lab
 shape supports up to 256 outstanding signaled one-SGE WRITEs per QP and
 uses a distinct completion queue per QP. The provider also supports
 [shared polling CQs](provider/README.md). The worker checks the registered source
-range and negotiated destination before packet submission. The app polls
+range and receiving QP's slice before packet submission. A native WRITE can
+choose source and destination offsets within those ranges. The worker keeps
+the validated addresses for retransmission. The app polls
 completions to reuse slots during longer runs. With scatter/gather it
 refills as credits arrive and drains the final completions after the
 worker retires the last TX descriptors.

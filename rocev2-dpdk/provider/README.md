@@ -12,6 +12,11 @@ enables native posting with `--verbs-queues`.
 The provider supports RC QP setup and query, one-SGE
 RDMA WRITE posting and CQ polling. The supplied PD must own the source
 MR for the lane. The QP retains both that MR and its CQs until destroy.
+With a matching worker, a native WRITE can use any source offset within
+the configured local MR and destination offset within the receiving
+QP's slice. The worker snapshots the validated addresses when admitting
+each WR and reuses them for retransmission. The lab still negotiates a
+fixed length and count of WRITEs per QP.
 
 Multiple bound QPs can share one polling CQ. Completions carry the
 originating QPN and remain ordered within each send queue. The CQ reserves

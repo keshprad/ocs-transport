@@ -191,6 +191,20 @@ reserved until the worker's final lease released the mapping. The same
 build passed a CM-owned scatter/gather transfer with four ordered
 1,024-byte WRITEs and clean resource teardown.
 
+The native provider rejects requests that overrun the local MR or cross
+the destination QP's slice. The worker validates those bounds again
+and snapshots the accepted addresses before admitting the WR. In the
+Spark-04-kernel guest, a CM-owned QP posted three 8,195-byte WRITEs in
+reverse address order at PMTU 1024. Copy and scatter/gather each placed
+the payload at offsets 16,390, 8,195, and 0, with three ordered WCs and
+24,585 verified bytes. The wire trace preserved the RETH addresses after
+the test rewrote the shared WQEs after admission. In scatter/gather the
+peer returned a sequence NAK after the test dropped the first WRITE
+packet. The retransmission kept the original destination and payload.
+Both runs required Netlink and completed resource teardown. The same
+build passed the four-QP, two-worker stock TAP test at PMTU 4096 with
+2,084 ordered WCs and 17,078,380 verified bytes.
+
 Selective WRITE signaling keeps the per-WR flag in the provider. The
 worker retires all WRs after the covering ACK and TX reference release.
 The fixture verified that successful unsignaled work releases posting
