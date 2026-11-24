@@ -29,13 +29,15 @@ roce_app_write: src/roce_app_write.c $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADER
 	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 tests/test_roce: tests/test_roce.c $(CORE) $(CORE_HEADERS)
+tests/test_roce_cm_wire: tests/test_roce_cm_wire.c src/roce_cm_wire.c src/roce_cm_wire.h src/roce_wire.c src/roce_wire.h ../common/roce_icrc.h
 tests/roce_wire_cli: tests/roce_wire_cli.c src/roce_wire.c src/roce_wire.h ../common/roce_icrc.h
 tests/test_doorbell: tests/test_doorbell.c src/roce_doorbell.h
-tests/test_roce tests/roce_wire_cli tests/test_doorbell:
+tests/test_roce tests/test_roce_cm_wire tests/roce_wire_cli tests/test_doorbell:
 	$(CC) $(CPPFLAGS) $(CFLAGS) -Isrc -std=c11 $(WARNINGS) -pedantic $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-check: tests/test_roce tests/roce_wire_cli tests/test_doorbell
+check: tests/test_roce tests/test_roce_cm_wire tests/roce_wire_cli tests/test_doorbell
 	./tests/test_roce
+	./tests/test_roce_cm_wire
 	./tests/test_doorbell
 	python3 tests/check_wire.py
 
@@ -50,4 +52,4 @@ check-app: roce_write roce_app_write
 	python3 tests/check_app_memif.py
 
 clean:
-	$(RM) roce_write roce_verbs_write roce_app_write tests/test_roce tests/roce_wire_cli tests/test_doorbell
+	$(RM) roce_write roce_verbs_write roce_app_write tests/test_roce tests/test_roce_cm_wire tests/roce_wire_cli tests/test_doorbell

@@ -2,5 +2,6 @@
 /roce_verbs_write
 /roce_app_write
 /tests/test_roce
+/tests/test_roce_cm_wire
 /tests/roce_wire_cli
 /tests/test_doorbell

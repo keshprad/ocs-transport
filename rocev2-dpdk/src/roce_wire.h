@@ -14,6 +14,8 @@ enum {
     ROCE_MAX_TRAILER = 3 + 4,
     ROCE_MAX_FRAME = ROCE_MAX_HEADER + ROCE_MAX_PMTU + 4,
     ROCE_MAC_LEN = 6,
+    ROCE_CM_MAD_SIZE = 256,
+    ROCE_CM_FRAME_SIZE = 14 + 20 + 8 + 12 + 8 + ROCE_CM_MAD_SIZE + 4,
 };
 
 enum roce_opcode {
@@ -22,6 +24,7 @@ enum roce_opcode {
     ROCE_WRITE_LAST = 0x08,
     ROCE_WRITE_ONLY = 0x0a,
     ROCE_ACK = 0x11,
+    ROCE_CM_SEND_ONLY = 0x64,
 };
 
 enum roce_syndrome {
@@ -55,11 +58,25 @@ struct roce_packet {
     size_t payload_length;
 };
 
+struct roce_cm_frame {
+    struct roce_address src;
+    struct roce_address dst;
+    uint16_t udp_source;
+    uint16_t pkey;
+    uint32_t psn;
+    const uint8_t *mad; /* ROCE_CM_MAD_SIZE bytes. */
+};
+
 size_t roce_encode(uint8_t *frame, size_t capacity, const struct roce_packet *packet);
 /* The wire order is header, packet->payload, trailer. */
 bool roce_encode_split(uint8_t header[ROCE_MAX_HEADER], uint8_t trailer[ROCE_MAX_TRAILER],
                        const struct roce_packet *packet, uint16_t *header_length,
                        uint16_t *trailer_length);
 bool roce_decode(struct roce_packet *packet, const uint8_t *frame, size_t frame_length);
+
+/* QP1 UD SEND_ONLY with one MAD. Encode uses separate input and output buffers.
+ * Decode borrows the MAD bytes from the input frame. */
+size_t roce_cm_frame_encode(uint8_t *frame, size_t capacity, const struct roce_cm_frame *cm);
+bool roce_cm_frame_decode(struct roce_cm_frame *cm, const uint8_t *frame, size_t frame_length);
 
 #endif

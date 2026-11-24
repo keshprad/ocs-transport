@@ -158,12 +158,18 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | Reference | Component | Current evidence |
 | --- | --- | --- |
 | Figure 5(a), §4.1 | Separate application and DPDK worker processes | `make check-app` verifies an 8,195-byte WRITE and 3,145,764 bytes across four QPs and two workers. Each endpoint uses an application-owned shared buffer. The receiving application checks every byte before peer verification. |
-| Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins page-aligned ranges from the caller's own address space and exports a mapping descriptor. The module and runtime test build against both Spark kernels. Runtime validation, uverbs device discovery, libibverbs provider integration, and Generic Netlink export coordination are pending. |
+| Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins page-aligned ranges from the caller's own address space and exports a CPU mapping descriptor and an optional DMA-BUF for the same pinned pages. Both Spark kernels build the module, CPU alias test and standard verbs import test. Loading the module, importing the DMA-BUF at runtime, mlx5 PMD integration, uverbs discovery and Generic Netlink coordination remain pending. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification | The split-process WRITE accepts each preconfigured QP batch through a per-worker multi-producer doorbell. `make check` verifies full-queue handling, a producer exit before publication, and 60,000 unique notifications from six producer processes. Shared verbs SQs and CQs and live WQE submission are pending. |
-| Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The opt-in requester chains service-owned headers and trailer around the mapped application payload. Independent wire vectors verify split encoding through PMTU 4096. The independent RC peer verifies both sequence NAK and timeout retries with application-owned payloads. The four-process memif test verifies delivery with one and two workers and checks that TX references are released before completion. RX copies into the mapped application buffer before sending transport ACKs. mlx5 memfd DMA mapping is implemented and awaits physical verification. Kernel-registered MRs still need a DMA-capable export. |
-| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | The lab endpoint still uses its TCP setup protocol. The librdmacm backend, event channel, and in-band CM exchange are pending. |
+| Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The opt-in requester chains service-owned headers and trailer around the mapped application payload. Independent wire vectors verify split encoding through PMTU 4096. The independent RC peer verifies both sequence NAK and timeout retries with application-owned payloads. The four-process memif test verifies delivery with one and two workers and checks that TX references are released before completion. RX copies into the mapped application buffer before sending transport ACKs. mlx5 memfd DMA mapping is implemented and awaits physical verification. The kernel DMA-BUF export still needs a DPDK mlx5 importer. |
+| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | Independent byte fixtures cover the IBTA REQ, REP and RTU MADs, the Linux IPv4 CMA prefix and IPv4 RoCEv2 QP1 UD framing. The lab endpoint uses TCP setup. The connection state machine, DPDK dispatch, Unix-socket requests, librdmacm backend and native interoperability are pending. |
 
 The first registration interface transfers a scoped FD over the Unix
 socket. A kernel registration notification can identify an authorized
 mapping so the service acquires it through the driver. This keeps
 the page checks and mapping lifetime in the kernel. [BURST design](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=6)
+
+The CM wire tests cover the fixed 256-byte MADs in Volume 1
+§§12.6.5, 12.6.8 and 12.6.9 and the QP1 transport described in
+Annex A17 §A17.6.1.1. They check the UD opcode, destination and source QPs,
+Q_Key, length, IPv4 checksum and iCRC against independent vectors.
+[Linux CM field definitions](https://codebrowser.dev/linux/linux/include/rdma/ibta_vol1_c12.h.html)
