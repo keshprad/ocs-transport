@@ -691,8 +691,11 @@ def main():
                            help="compare the same WRITE profiles at Ethernet MTUs 1500 and 4200")
     selection.add_argument("--app-bench", action="append", choices=APP_MODES,
                            help="repeat to select separate-process application profiles at both MTUs")
-    parser.add_argument("--compare-prefault", action="store_true",
-                        help="include matching application profiles that prefault the worker's memory alias")
+    fault_modes = parser.add_mutually_exclusive_group()
+    fault_modes.add_argument("--compare-prefault", action="store_true",
+                             help="include matching application profiles that prefault the worker's memory alias")
+    fault_modes.add_argument("--prefault-only", action="store_true",
+                             help="run the prefaulting application profiles alone")
     parser.add_argument("--profile", action="append", choices=APP_SHAPES,
                         help="repeat to select profiles; smoke is an 8 MiB application check")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
@@ -723,11 +726,15 @@ def main():
         parser.error("--profile smoke requires --app-bench")
     if args.compare_prefault and not args.app_bench:
         parser.error("--compare-prefault requires --app-bench")
+    if args.prefault_only and not args.app_bench:
+        parser.error("--prefault-only requires --app-bench")
     mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
     if args.aggregate:
         profiles = tuple(AGGREGATE_PROFILES)
     elif args.app_bench:
-        variants = ("", "-prefault") if args.compare_prefault else ("",)
+        variants = ("-prefault",) if args.prefault_only else ("",)
+        if args.compare_prefault:
+            variants += ("-prefault",)
         profiles = tuple(f"app-{mode}-mtu-{mtu}-{name}{suffix}" for mtu in mtus
                          for mode in dict.fromkeys(args.app_bench) for name in selected for suffix in variants)
     elif args.burst_style_bench:

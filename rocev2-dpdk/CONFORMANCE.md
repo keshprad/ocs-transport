@@ -365,6 +365,33 @@ mapped the full application memfd for scatter/gather. Requester throughput
 was 25.454 Gbit/s at MTU 1500 and 32.239 Gbit/s at MTU 4200, with zero RC
 retries. These smoke transfers used eight 1 MiB WRITEs per trial.
 
+At MTU 1500, the `8b075bb` 16 GiB application four-worker profile
+verified all three transfers at 84.577 Gbit/s median requester
+throughput. That is 91.6% of the 92.320 Gbit/s ConnectX-7 control on
+the same path with 16 QPs. The median sender and receiver invocation
+IDs are `4163dced97e74fe59c8bbf3cd8901bdd` and
+`28a9a72fcafd49b0a7c8da277c766441`. The three requester retry counts
+were 0, 1,424, and 421. See the
+[hardware comparison](README.md#dpdk-and-hardware-rocev2-comparison).
+
+At MTU 4200, the `8b075bb` single-QP application profile verified
+three 16 GiB transfers at a median of 30.690 Gbit/s with zero retries.
+All three 16-QP profiles exhausted retries. Spark-04 logged mlx5 RX
+syndrome `0x04`, the local protection error, in those trials. The
+prefaulted four-worker jumbo trial reproduced the syndrome. The sender
+TX and receiver RX counters both reached 386,593 packets, and the
+receiver reported no misses. The sender recorded four RX errors. This
+isolates a receive-side hardware completion error for the requester
+while the underlying buffer or queue cause remains open.
+[rdma-core mlx5 syndrome definitions](https://github.com/linux-rdma/rdma-core/blob/v50.0/providers/mlx5/mlx5dv.h#L994-L1006)
+
+On the four-worker MTU 1500 profile, one prefaulted trial measured
+84.899 Gbit/s with zero misses and retries. Receiver polling faults
+fell from 4,194,308 in the default median trial to six in that run.
+Prefaulting the receiver alias took 337 ms. The prefaulted single-worker
+16-QP trial completed at 25.373 Gbit/s with 2,765,156 receiver misses
+and 33,583 retries. These two prefaulted rates are individual samples.
+
 Two matched 8 MiB runs on the exact Spark-04 kernel in QEMU put one
 read per application MR page before transport setup. Prefaulting
 2,048 pages took 63–66 ms per worker. It removed 2,048 sender and

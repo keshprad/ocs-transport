@@ -531,7 +531,49 @@ set `ROCE_DPDK_APP_BW=1` on the application.
 With `--prefault-app`, the worker reads one byte per registered page before
 the control exchange and reports the upfront cost. To compare both paths,
 stage the updated worker with `--include-prefault` and add
-`--compare-prefault` to the application bandwidth command.
+`--compare-prefault` to the application bandwidth command. Use
+`--prefault-only` to run the staged prefault variants after collecting
+the baseline.
+
+### DPDK and hardware RoCEv2 comparison
+
+The earlier hardware benchmarks measured about 92.6 Gbit/s per path,
+185.17–185.18 Gbit/s across two paths in one direction, and 370.16 Gbit/s
+across both paths and both directions. These are the 1 MiB results from
+`spark-7e64` with `spark-28a3` and `spark-4ed9` with `spark-016e`.
+Each path used one QP at Ethernet MTU 1500 and RoCE PMTU 1024.
+[Earlier two-path hardware benchmarks](../summary.md)
+
+The table uses requester payload rates from Spark-04 to Spark-02 on
+their first 100 Gbit/s path. Each successful DPDK trial verified 16 GiB
+of 1 MiB WRITEs. The ConnectX-7 control used the same WRITE size and
+perftest 6.30 with four-second measurement windows as described below.
+MTUs 1500 and 4200 used PMTUs 1024 and 4096 respectively.
+
+| DPDK build and mode | QPs | Polling workers per endpoint | DPDK MTU 1500 Gbit/s | DPDK MTU 4200 Gbit/s | Hardware MTU 1500 Gbit/s | DPDK share at 1500 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `8b075bb` separate processes, memfd scatter/gather | 1 | 1 | 24.619 | 30.690 | 92.600 | 26.6% |
+| `8b075bb` separate processes, memfd scatter/gather | 16 | 1 | Failed | Failed | 92.320 | — |
+| `8b075bb` separate processes, memfd scatter/gather | 16 | 2 | 37.165 | Failed | 92.320 | 40.3% |
+| `8b075bb` separate processes, memfd scatter/gather | 16 | 4 | 84.577 | Failed | 92.320 | 91.6% |
+| `3a6a1ca` standalone DPDK | 16 | 4 | 90.506 | — | 92.320 | 98.0% |
+
+The rates are three-trial medians. Rows marked failed stopped after the
+first unsuccessful trial for that MTU. The fastest four-worker `8b075bb`
+trial reached 85.795 Gbit/s. The earlier 134.99 Gbit/s result used
+local memif on Spark-04.
+
+The [two-path DPDK run](#physical-dual-rail-sweep) reached 92.568 Gbit/s
+in one direction on Spark-04 → Spark-02, where the matched hardware
+control reached 92.340 Gbit/s. The two-path bidirectional DPDK measurement
+for comparison with the earlier 370.16 Gbit/s result is pending.
+
+In single-sample prefault runs at MTU 1500, four workers reached
+84.899 Gbit/s with zero retries and misses. The 16-QP single-worker
+profile completed at 25.373 Gbit/s with 33,583 retries. The prefaulted
+four-worker jumbo trial hit requester mlx5 RX syndrome `0x04` and
+exhausted retries. See the [conformance ledger](CONFORMANCE.md) for
+the diagnostic counters.
 
 ### Physical dual-rail sweep
 
