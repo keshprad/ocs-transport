@@ -37,6 +37,7 @@ enum {
 };
 
 _Static_assert((int)ROCE_CM_RX_BURST <= (int)RX_BURST, "the data burst can hold prefetched CM packets");
+_Static_assert(ROCE_LAB_MAX_QPS <= 32, "the completion mask must hold all worker QPs");
 
 struct datapath_options {
     uint32_t send_window;
@@ -110,6 +111,7 @@ struct write_worker {
     uint64_t doorbell_generation;
     uint64_t next_doorbell_recovery;
     uint32_t fully_posted;
+    uint32_t pending_completions;
     uint32_t posted[ROCE_LAB_MAX_QPS];
     uint32_t completions[ROCE_LAB_MAX_QPS];
     bool finished;
@@ -381,9 +383,13 @@ static bool receive_packets(struct write_worker *worker, uint64_t now)
             if (index < worker->qps) {
                 if (run->sender) {
                     struct roce_requester *requester = &worker->states[index].requester;
-                    bool pending = requester->acked < requester->total;
+                    uint32_t acknowledged = requester->acked;
                     roce_requester_feedback(requester, &packet, now);
-                    worker->completed += pending && requester->acked == requester->total;
+                    if (requester->acked != acknowledged) {
+                        worker->completed += requester->acked == requester->total;
+                        if (run->work || run->native)
+                            worker->pending_completions |= UINT32_C(1) << index;
+                    }
                 } else {
                     struct roce_responder *responder = &worker->states[index].responder;
                     bool pending = responder->msn < writes;
@@ -529,12 +535,15 @@ static bool admit_native_writes(struct write_worker *worker, uint64_t now)
 static void publish_completions(struct write_worker *worker)
 {
     const struct write_run *run = worker->run;
-    if (!run->work && !run->native)
+    uint32_t pending = worker->pending_completions;
+    if (!pending)
         return;
     if (!run->native && run->tx_refs && rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) != 1)
         return;
+    worker->pending_completions = 0;
     bool polled_tx = false;
-    for (uint32_t i = 0; i < worker->qps; ++i) {
+    for (; pending; pending &= pending - 1) {
+        uint32_t i = (uint32_t)__builtin_ctz(pending);
         const struct roce_requester *requester = &worker->states[i].requester;
         uint32_t completed = requester->acked / requester->packets_per_write;
         if (run->native) {
@@ -554,6 +563,9 @@ static void publish_completions(struct write_worker *worker)
                 }
                 sq->status[retired % ROCE_NATIVE_QUEUE_DEPTH] = ROCE_NATIVE_WC_SUCCESS;
             }
+            /* The PMD can finish DMA after the peer's last ACK. */
+            if (retired < completed)
+                worker->pending_completions |= UINT32_C(1) << i;
             if (retired == worker->completions[i])
                 continue;
             atomic_store_explicit(&sq->retired, retired, memory_order_release);

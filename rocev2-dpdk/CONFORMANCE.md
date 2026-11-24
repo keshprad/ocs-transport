@@ -365,6 +365,26 @@ or a test provider that suppressed every notification each verified
 scatter/gather mode. All four QPs posted, admitted, acknowledged and
 retired 521 WRITEs.
 
+The requester visits a QP's application completion state when an ACK
+advances it or while a covered WRITE is still waiting on a TX reference.
+On Spark-04, a synthetic 16-QP native completion loop on one Cortex-X925
+core went from 21.38 to 1.39 ns per idle poll. Nine alternating local memif
+trials per build and QP count at PMTU 1024 verified 128 MiB per trial with
+no retries or port errors. Median requester goodput was 34.862 to 34.963
+Gbit/s with one QP and 34.325 to 34.369 Gbit/s with 16 QPs. Those samples
+used memfd scatter/gather and one worker per endpoint.
+
+The exact Spark-04-kernel guest held the final WRITE's TX reference for
+20 ms after the last ACK. The requester issued the final verbs completion
+after releasing that reference, with no subsequent ACK. The same build
+passed a stock TAP PMTU 4096 test with four QPs on two workers. All
+2,084 native completions arrived in order and the receiver verified
+17,078,380 bytes with nine RC retries. Both runs required Netlink
+registration and completed resource teardown. The terminal fault
+fixture preserved the successful prefix, followed by the remote-access
+or retry-exhausted WC and the flushed suffix. The retry-exhaustion trial
+observed exactly seven retries after ACK progress reset the budget.
+
 The exact Spark-04 kernel guest also verified `rdma_create_qp()` on the
 active ID and the passive child. Its trace matched each app's actual QPN
 to both workers' views, checked the queue FD at both ends, and observed
