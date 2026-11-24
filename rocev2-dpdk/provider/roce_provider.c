@@ -67,7 +67,8 @@ struct roce_verbs_qp {
     struct ibv_qp_attr attributes;
     struct roce_verbs_mr *region;
     uint32_t index;
-    uint32_t polled;
+    uint32_t reaped;
+    bool signaled[ROCE_NATIVE_QUEUE_DEPTH];
 };
 
 static const struct verbs_device_ops device_ops;
@@ -612,6 +613,31 @@ static struct roce_native_sq *qp_sq(const struct roce_verbs_qp *qp)
     return &provider_context(qp->verbs.qp.context)->work->qps[qp->index];
 }
 
+static bool visible_completion(const struct roce_verbs_qp *qp, const struct roce_native_sq *sq,
+                               uint32_t slot)
+{
+    return qp->signaled[slot] || sq->status[slot] != ROCE_NATIVE_WC_SUCCESS;
+}
+
+static bool reap_unsignaled_tail(struct roce_verbs_qp *qp, struct roce_verbs_cq *cq)
+{
+    const struct roce_native_sq *sq = qp_sq(qp);
+    if (!sq)
+        return true;
+    uint32_t posted = roce_native_posted_count(atomic_load_explicit(&sq->posted, memory_order_relaxed));
+    if (posted == qp->reaped)
+        return true;
+    if (posted < qp->reaped || atomic_load_explicit(&sq->retired, memory_order_acquire) != posted)
+        return false;
+    for (uint32_t i = qp->reaped; i < posted; ++i)
+        if (visible_completion(qp, sq, i % ROCE_NATIVE_QUEUE_DEPTH))
+            return false;
+
+    cq->outstanding -= posted - qp->reaped;
+    qp->reaped = posted;
+    return true;
+}
+
 static int destroy_qp(struct ibv_qp *ibv)
 {
     struct roce_verbs_qp *qp = container_of(ibv, struct roce_verbs_qp, verbs.qp);
@@ -622,10 +648,8 @@ static int destroy_qp(struct ibv_qp *ibv)
 
     pthread_mutex_lock(&ibv->context->mutex);
     pthread_mutex_lock(&send_cq->ibv.mutex);
-    const struct roce_native_sq *sq = qp_sq(qp);
-    bool pending = sq &&
-        roce_native_posted_count(atomic_load_explicit(&sq->posted, memory_order_relaxed)) != qp->polled;
-    if (!pending) {
+    bool drained = reap_unsignaled_tail(qp, send_cq);
+    if (drained) {
         uint32_t sender = 0;
         while (send_cq->senders[sender] != qp)
             ++sender;
@@ -645,7 +669,7 @@ static int destroy_qp(struct ibv_qp *ibv)
     }
     pthread_mutex_unlock(&send_cq->ibv.mutex);
     pthread_mutex_unlock(&ibv->context->mutex);
-    if (pending)
+    if (!drained)
         return EBUSY;
 
     pthread_cond_destroy(&ibv->cond);
@@ -761,8 +785,7 @@ static int prepare_native_write(struct roce_native_write *entry, const struct ib
                                 const struct roce_verbs_qp *qp, uint32_t ordinal)
 {
     const struct roce_native_queue_config *config = &provider_context(qp->verbs.qp.context)->config;
-    if (wr->opcode != IBV_WR_RDMA_WRITE || (wr->send_flags & ~IBV_SEND_SIGNALED) ||
-        (!(wr->send_flags & IBV_SEND_SIGNALED) && !qp->init.sq_sig_all))
+    if (wr->opcode != IBV_WR_RDMA_WRITE || (wr->send_flags & ~IBV_SEND_SIGNALED))
         return EOPNOTSUPP;
     if (wr->num_sge != 1 || !wr->sg_list)
         return EINVAL;
@@ -812,7 +835,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
     uint32_t available = (uint32_t)cq->ibv.cqe - cq->outstanding;
     uint32_t posted = first;
     for (; next; next = next->next) {
-        if (posted >= config->writes || posted - qp->polled >= qp->init.cap.max_send_wr ||
+        if (posted >= config->writes || posted - qp->reaped >= qp->init.cap.max_send_wr ||
             posted - first >= available) {
             error = ENOMEM;
             break;
@@ -822,6 +845,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
         if (error)
             break;
         sq->status[slot] = ROCE_NATIVE_WC_SUCCESS;
+        qp->signaled[slot] = qp->init.sq_sig_all || (next->send_flags & IBV_SEND_SIGNALED);
         ++posted;
     }
     if (posted != first) {
@@ -874,12 +898,19 @@ static int poll_sender(struct roce_verbs_qp *qp, int count, struct ibv_wc *wc)
         return 0;
     uint32_t retired = atomic_load_explicit(&sq->retired, memory_order_acquire);
     uint32_t posted = roce_native_posted_count(atomic_load_explicit(&sq->posted, memory_order_relaxed));
-    if (retired < qp->polled || retired > posted)
+    if (retired < qp->reaped || retired > posted)
         return -EIO;
 
     int done = 0;
-    while (done < count && qp->polled < retired) {
-        size_t index = qp->polled++ % ROCE_NATIVE_QUEUE_DEPTH;
+    while (qp->reaped < retired) {
+        uint32_t index = qp->reaped % ROCE_NATIVE_QUEUE_DEPTH;
+        if (!visible_completion(qp, sq, index)) {
+            ++qp->reaped;
+            continue;
+        }
+        if (done == count)
+            break;
+        ++qp->reaped;
         enum ibv_wc_status status = completion_status(sq->status[index]);
         wc[done++] = (struct ibv_wc) {
             .wr_id = sq->entries[index].wr_id, .status = status, .opcode = IBV_WC_RDMA_WRITE,
@@ -898,21 +929,26 @@ static int poll_cq(struct ibv_cq *ibv, int count, struct ibv_wc *wc)
     struct roce_verbs_cq *cq = container_of(ibv, struct roce_verbs_cq, ibv);
 
     pthread_mutex_lock(&ibv->mutex);
+    uint32_t outstanding = cq->outstanding;
     int done = 0, error = 0;
     /* Rotate between send queues while preserving each queue's WR order. */
     for (uint32_t i = 0; i < cq->sender_count && done < count; ++i) {
-        int polled = poll_sender(cq->senders[cq->next_sender], count - done, wc + done);
+        struct roce_verbs_qp *qp = cq->senders[cq->next_sender];
+        uint32_t first = qp->reaped;
+        int polled = poll_sender(qp, count - done, wc + done);
         if (polled < 0) {
             error = polled;
             break;
         }
+        cq->outstanding -= qp->reaped - first;
         done += polled;
         if (++cq->next_sender == cq->sender_count)
             cq->next_sender = 0;
     }
-    cq->outstanding -= (uint32_t)done;
+    /* Report consumed work before a later sender's counter error. */
+    int result = cq->outstanding == outstanding && error ? error : done;
     pthread_mutex_unlock(&ibv->mutex);
-    return done ? done : error;
+    return result;
 }
 
 static void free_context(struct ibv_context *ibv)

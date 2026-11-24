@@ -131,7 +131,7 @@ static void check_wc(const struct ibv_wc *wc, const struct ibv_qp *qp, uint64_t 
 
 static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
 {
-    enum { QPS = 2, WRITES = 3, WRITE_SIZE = 32 };
+    enum { QPS = 3, WRITES = 3, WRITE_SIZE = 32 };
     struct ibv_context *context = roce_native_open_device();
     assert(context);
     struct ibv_pd *pd = ibv_alloc_pd(context);
@@ -166,6 +166,7 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
         struct ibv_qp_init_attr init = {
             .send_cq = send_cq, .recv_cq = q ? recv_cq : send_cq, .qp_type = IBV_QPT_RC,
             .cap = { .max_send_wr = WRITES, .max_send_sge = 1 },
+            .sq_sig_all = q == 2,
         };
         qps[q] = ibv_create_qp(pd, &init);
         assert(qps[q] && !roce_native_init_qp(qps[q], false));
@@ -176,7 +177,7 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
             writes[q][i] = (struct ibv_send_wr) {
                 .wr_id = i + 1, .next = i + 1 < WRITES ? &writes[q][i + 1] : NULL,
                 .sg_list = &segments[q][i], .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
-                .send_flags = IBV_SEND_SIGNALED,
+                .send_flags = !q && i == 1 ? IBV_SEND_SIGNALED : 0,
                 .wr.rdma = { .remote_addr = work->config.remote_address + offset, .rkey = work->config.remote_rkey },
             };
         }
@@ -193,24 +194,40 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     struct ibv_wc wc[2];
     assert(!ibv_poll_cq(send_cq, 2, wc));
 
+    /* Reclaim a successful unsignaled prefix while returning zero WCs. */
+    atomic_store_explicit(&work->qps[0].retired, 1, memory_order_release);
+    assert(!ibv_poll_cq(send_cq, 1, wc));
+    writes[2][0].next = NULL;
+    assert(!ibv_post_send(qps[2], writes[2], &bad) && !bad);
+    assert(ibv_post_send(qps[0], &writes[0][2], &bad) == ENOMEM && bad == &writes[0][2]);
+
     atomic_store_explicit(&work->qps[0].retired, 2, memory_order_release);
     work->qps[1].status[0] = ROCE_NATIVE_WC_REMOTE_ACCESS;
     work->qps[1].status[1] = ROCE_NATIVE_WC_FLUSHED;
     atomic_store_explicit(&work->qps[1].retired, 2, memory_order_release);
+    assert(ibv_destroy_qp(qps[1]) == EBUSY);
     assert(ibv_poll_cq(send_cq, 1, wc) == 1);
-    check_wc(&wc[0], qps[0], 1, IBV_WC_SUCCESS);
+    check_wc(&wc[0], qps[0], 2, IBV_WC_SUCCESS);
+
+    /* Destroy may reclaim a fully retired tail that has no visible WC. */
     assert(!ibv_post_send(qps[0], &writes[0][2], &bad) && !bad);
+    assert(ibv_destroy_qp(qps[0]) == EBUSY);
     atomic_store_explicit(&work->qps[0].retired, 3, memory_order_release);
+    assert(!ibv_destroy_qp(qps[0]) && ibv_destroy_cq(send_cq) == EBUSY && ibv_dereg_mr(mr) == EBUSY);
+    writes[2][1].next = NULL;
+    assert(!ibv_post_send(qps[2], &writes[2][1], &bad) && !bad);
+    atomic_store_explicit(&work->qps[2].retired, 2, memory_order_release);
+
     assert(ibv_poll_cq(send_cq, 1, wc) == 1);
     check_wc(&wc[0], qps[1], 1, IBV_WC_REM_ACCESS_ERR);
     assert(ibv_poll_cq(send_cq, 2, wc) == 2);
-    check_wc(&wc[0], qps[0], 2, IBV_WC_SUCCESS);
-    check_wc(&wc[1], qps[0], 3, IBV_WC_SUCCESS);
-    assert(!ibv_destroy_qp(qps[0]) && ibv_destroy_cq(send_cq) == EBUSY && ibv_dereg_mr(mr) == EBUSY);
+    check_wc(&wc[0], qps[2], 1, IBV_WC_SUCCESS);
+    check_wc(&wc[1], qps[2], 2, IBV_WC_SUCCESS);
     assert(!ibv_poll_cq(recv_cq, 1, wc) && ibv_poll_cq(send_cq, 1, wc) == 1);
     check_wc(&wc[0], qps[1], 2, IBV_WC_WR_FLUSH_ERR);
     assert(!ibv_poll_cq(send_cq, 2, wc));
-    assert(!ibv_destroy_qp(qps[1]) && !ibv_destroy_cq(send_cq) && !ibv_destroy_cq(recv_cq));
+    assert(!ibv_destroy_qp(qps[1]) && ibv_destroy_cq(recv_cq) == EBUSY);
+    assert(!ibv_destroy_qp(qps[2]) && !ibv_destroy_cq(send_cq) && !ibv_destroy_cq(recv_cq));
     assert(!ibv_dereg_mr(mr) && !ibv_dealloc_pd(pd) && !ibv_close_device(context));
     assert(!munmap(work, sizeof(*work)) && !close(fd));
 }
@@ -339,5 +356,6 @@ int main(int argc, char **argv)
     puts("libibverbs MR registration, access, deregistration and worker leases verified");
     puts("Early QP lifetime, protected binding and receive-only queues verified");
     puts("Shared CQ credits, QP completion identity and resource lifetimes verified");
+    puts("Selective WRITE signaling and unsignaled error completions verified");
     return 0;
 }

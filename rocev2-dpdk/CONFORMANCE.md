@@ -172,13 +172,30 @@ the mapping while the exporter holds the kernel file descriptor.
 [BURST design](https://www.usenix.org/system/files/nsdi26-shen.pdf#page=6)
 
 The stock libibverbs provider fixture on the Spark-04 kernel checks
-two QPs sharing a four-entry polling CQ. It verifies aggregate posting
+three QPs sharing a four-entry polling CQ. It verifies aggregate posting
 credits, partial posting with `bad_wr`, completion identity for duplicate
 WR IDs on different QPs, ordered success and error completions within each
 QP, and continued polling after one QP is destroyed. The CQ stays busy
-until the last QP detaches. The signaled WRITE path reserves CQ capacity
-at posting time. Asynchronous CQ notifications and overrun events remain
-outside the polling profile. [IBTA Volume 1 §§10.2.6, 10.8.5](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
+until the last QP detaches. The WRITE path reserves CQ capacity at posting
+time to cover possible errors. Asynchronous CQ notifications and overrun
+events remain outside the polling profile.
+[IBTA Volume 1 §§10.2.6, 10.8.5](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
+
+Selective WRITE signaling keeps the per-WR flag in the provider. The
+worker retires all WRs after the covering ACK and TX reference release.
+The fixture verified that successful unsignaled work releases posting
+credits without emitting a WC. `sq_sig_all` reports success without
+individual flags. Remote-access and flush errors generate WCs with or
+without a signal flag. QP destruction can reclaim a fully retired,
+successful unsignaled suffix without discarding visible completions.
+[IBTA Volume 1 §§10.8.5–10.8.6](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf), [Linux RXE completion generation](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/sw/rxe/rxe_comp.c#L408-L431)
+
+A separate application signaled only the last WR in each linked post.
+With required Netlink and the production DPDK worker on the Spark-04
+kernel, four QPs each posted 521 scatter/gather WRITEs, wrapping their
+256-entry send queues twice. Each QP returned exactly the 19 expected
+WR IDs in order. The receiver verified 17,078,380 bytes with zero RC
+retries, and all application resources were released.
 
 A separate four-QP scatter/gather application used one CQ with the
 production DPDK worker on that kernel. It posted 129 WRITEs per QP
