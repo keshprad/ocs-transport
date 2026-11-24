@@ -559,6 +559,24 @@ It posts four 1,024-byte single-packet WRITEs at MTU 1500 and two
 each verbs WC before it posts the following WRITE on the same open QP.
 The runner verifies the mlx5 queue configuration and DMA-BUF mapping.
 
+For descriptor-level verification, build a separate shared-ibverbs DPDK
+23.11.7 runtime. Apply the [base mlx5 patch](dpdk/dpdk-23.11.7-mlx5-dmabuf.patch)
+first and then the [diagnostic overlay](dpdk/dpdk-23.11.7-mlx5-dmabuf-proof.patch).
+Use that runtime in the pinned inputs for both hosts. The diagnostic profile
+sends one packet per TX burst so each gathered application payload has its
+own signaled mlx5 WQE. It checks that the imported DMA-BUF key and address
+appear in the TX data segment and that the NIC reports a successful completion
+for that WQE. It also requires the application completions and receiver byte
+verification. Keep the regular PMDs installed for sustained bandwidth runs.
+
+```sh
+proof=$(python3 tests/stage_spark_app_bandwidth.py "$REVISION" --inputs "$DIAGNOSTIC_INPUTS" \
+  --profile app-mr-gather-mtu-1500-dma-proof --profile app-mr-gather-mtu-4200-dma-proof)
+# Install the staged Spark-04 and Spark-02 bundles as described above.
+python3 tests/check_spark_bandwidth.py --app-bench mr-gather --profile dma-proof --samples 1 \
+  --destination "/opt/ocs-roce-app-bw/$REVISION-dmabuf-proof" --app-bundle "$proof"
+```
+
 Each recorded sample requires distinct application and worker processes,
 application completions and byte verification. The native modes require
 Generic Netlink handoff and the native gather trial checks that mlx5 mapped
@@ -628,6 +646,7 @@ MTUs 1500 and 4200 used PMTUs 1024 and 4096 respectively.
 | `8b075bb` separate processes, memfd scatter/gather | 16 | 4 | 84.577 | Failed | 92.320 | 91.6% |
 | `3a6a1ca` standalone DPDK | 16 | 4 | 90.506 | — | 92.320 | 98.0% |
 | `8c5058a` separate processes, prefaulted memfd scatter/gather | 16 | 4 | 84.282 | 98.021 | 92.320 | 91.3% |
+| `8c5058a` prefaulted memfd scatter/gather, latest rerun | 16 | 4 | 84.942 | 98.026 | 92.320 | 92.0% |
 
 The rates are three-trial medians. Rows marked failed stopped after the
 first unsuccessful trial for that MTU. The `8c5058a` jumbo result used
@@ -644,14 +663,16 @@ hardware tests. The hardware control reached 92.340 Gbit/s. On
 November 24, 2026, `ethtool` and sysfs again reported 100,000 Mb/s at
 both endpoints of the app benchmark (`enp1s0f0np0` on Spark-04 and
 `enp1s0f1np1` on Spark-02). Both interfaces advertised 200 Gbit/s modes
-with auto-negotiation enabled. The earlier 200 Gbit/s runs used
-Spark-01 as Spark-04's peer and Spark-03 as Spark-02's peer. Both used
-`f1np1` on Spark-04 and Spark-02, while the current benchmark uses
-`f0np0` on Spark-04. The matched hardware control on the current pair
-also reported 100 Gbit/s with hardware RoCE enabled. The reason this
-connection comes up at 100 Gbit/s remains unverified. A DPDK sweep
-at an active 200 Gbit/s is pending in both one-way and bidirectional modes.
-[Physical dual-rail sweep](#physical-dual-rail-sweep)
+with auto-negotiation enabled. Each Spark also reported carrier on its
+other QSFP port. The earlier 200 Gbit/s runs used Spark-01 as Spark-04's
+peer and Spark-03 as Spark-02's peer. Both used `f1np1` on Spark-04 and
+Spark-02. The matched hardware control on the current pair also reported
+100 Gbit/s with hardware RoCE enabled. The 100 Gbit/s value is the active
+rate reported by the driver for this pair. The cable capability and the
+reason for the active rate still need verification. A DPDK sweep at an
+active 200 Gbit/s is pending in both one-way and bidirectional modes.
+[Physical dual-rail sweep](#physical-dual-rail-sweep),
+[NVIDIA DGX Spark port mapping](https://docs.nvidia.com/dgx/dgx-spark/spark-clustering.html)
 
 In single-sample prefault runs at MTU 1500, four workers reached
 84.899 Gbit/s with zero retries and misses. The 16-QP single-worker

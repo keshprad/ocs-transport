@@ -31,6 +31,11 @@ DESTINATION_ROOT = Path("/opt/ocs-roce-bw")
 APP_DESTINATION_ROOT = Path("/opt/ocs-roce-app-bw")
 APP_FILES = ("roce_write", "roce_app_write", "run_app", "provider/libroce_dpdk-rdmav34.so")
 APP_MLX5_FILES = ("lib/librte_common_mlx5.so.24", "lib/librte_net_mlx5.so.24")
+DMA_PROOF_MARKERS = {
+    APP_MLX5_FILES[0]: (b"MLX5_DMABUF_MAP ",),
+    APP_MLX5_FILES[1]: (b"MLX5_DMABUF_DSEG ", b"MLX5_DMABUF_CQE ", b"MLX5_DMABUF_CQ_ERROR "),
+}
+DMA_PROOF_SUFFIX = "-dmabuf-proof"
 APP_HUGEPAGE_HELPER = "manage_hugepages"
 APP_HUGEPAGE_DIR = "/dev/hugepages/ocs-roce-app-bw"
 APP_HUGEPAGES_RELEASED = "DPDK_HUGEPAGES restored=0 page_kib=2048"
@@ -65,6 +70,11 @@ class Profile:
     hugepages: bool = False
     write_bytes: int = WRITE_BYTES
     post_batch: int = APP_POST_BATCH
+    dma_proof: bool = False
+
+    @property
+    def tx_burst(self):
+        return 1 if self.dma_proof else TX_BURST
 
     @property
     def writes(self):
@@ -138,8 +148,12 @@ SHORT_WRITE_PROFILES = {
     )
     for mtu, pmtu, port, payload in ((1500, 1024, 29020, 4096), (4200, 4096, 29021, 8192))
 }
+DMA_PROOF_PROFILES = {
+    f"{name.removesuffix('-short')}-dma-proof": replace(profile, port=profile.port + 2, dma_proof=True)
+    for name, profile in SHORT_WRITE_PROFILES.items()
+}
 ALL_PROFILES = (PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES |
-                PREFAULT_PROFILES | HUGEPAGE_PROFILES | SHORT_WRITE_PROFILES)
+                PREFAULT_PROFILES | HUGEPAGE_PROFILES | SHORT_WRITE_PROFILES | DMA_PROOF_PROFILES)
 
 
 @dataclass(frozen=True)
@@ -185,7 +199,7 @@ def unit_argv(endpoint, destination, runtime):
         "-d", str(runtime / "librte_mempool_ring.so.24"),
         "-d", str(runtime / "librte_net_mlx5.so.24"), "-a", device,
         "--", endpoint.role, str(profile.write_bytes), control_ip, str(profile.port), data_ip, str(profile.pmtu),
-        pci, "--report-bw", "--tx-burst", str(TX_BURST), "--send-window", str(SEND_WINDOW),
+        pci, "--report-bw", "--tx-burst", str(profile.tx_burst), "--send-window", str(SEND_WINDOW),
         "--writes", str(profile.writes), "--qps", str(profile.qps), "--workers", str(profile.workers),
     ]
     if profile.aggregate and endpoint.role == "tx":
@@ -300,8 +314,8 @@ def preflight(commands, profiles, destination, digests):
     aggregate = settings[0].aggregate
     app_mode = settings[0].app_mode
     native_mr = any(profile.native_mr for profile in settings)
-    if any(name in SHORT_WRITE_PROFILES for name in profiles):
-        require(set(APP_MLX5_FILES) <= digests.keys(), "short WRITE profiles require pinned mlx5 libraries")
+    if any(name in SHORT_WRITE_PROFILES or name in DMA_PROOF_PROFILES for name in profiles):
+        require(set(APP_MLX5_FILES) <= digests.keys(), "short WRITE and DMA proof profiles require pinned mlx5 libraries")
     if any(profile.hugepages for profile in settings):
         require(APP_HUGEPAGE_HELPER in digests, "application bundle lacks the hugepage helper")
     links = {name: {} for name in profiles} if aggregate else {}
@@ -482,6 +496,49 @@ def app_transfer_timing(endpoint, messages):
     return dict(zip(("start_ns", "elapsed_ns", "process_cpu_ns"), map(int, match.groups())))
 
 
+def parse_dma_proof(endpoint, messages):
+    profile = endpoint.settings
+    maps = [(position, re.fullmatch(r"MLX5_DMABUF_MAP device=(\S+) address=(0x[0-9a-f]+) "
+                                   r"bytes=([1-9][0-9]*) lkey=(0x[0-9a-f]{8}) offset=0", line))
+            for position, line in enumerate(messages) if line.startswith("MLX5_DMABUF_MAP ")]
+    require(len(maps) == 1 and maps[0][1], f"{endpoint.label}: expected one DMA-BUF registration record")
+    map_position, registration = maps[0]
+    device, address, length, lkey = registration.groups()
+    base = int(address, 16)
+    require(device == endpoint.link[1] and base and int(length) == profile.payload,
+            f"{endpoint.label}: DMA-BUF registration differs from benchmark payload")
+
+    descriptors, completions, offsets = {}, {}, set()
+    for position, line in enumerate(messages):
+        if line.startswith("MLX5_DMABUF_DSEG "):
+            match = re.fullmatch(r"MLX5_DMABUF_DSEG port=([0-9]+) queue=([0-9]+) wqe=([0-9]+) "
+                                 r"address=(0x[0-9a-f]+) bytes=([1-9][0-9]*) lkey=(0x[0-9a-f]{8})", line)
+            require(match, f"{endpoint.label}: malformed mlx5 DMA payload descriptor")
+            port, queue, wqe, pointer, length, key = match.groups()
+            index = (int(port), int(queue), int(wqe))
+            offset = int(pointer, 16) - base
+            require(position > map_position and index[1] == 0 and index[2] <= 0xffff and
+                    index not in descriptors and key == lkey and
+                    0 <= offset <= profile.payload - profile.write_bytes and
+                    offset % profile.write_bytes == 0 and int(length) == profile.write_bytes,
+                    f"{endpoint.label}: TX payload descriptor does not match the DMA-BUF registration: {line}")
+            descriptors[index] = position
+            offsets.add(offset)
+        elif line.startswith("MLX5_DMABUF_CQE "):
+            match = re.fullmatch(r"MLX5_DMABUF_CQE port=([0-9]+) queue=([0-9]+) wqe=([0-9]+)", line)
+            require(match, f"{endpoint.label}: malformed mlx5 TX completion")
+            index = tuple(map(int, match.groups()))
+            require(index not in completions, f"{endpoint.label}: duplicate mlx5 TX completion {index}")
+            completions[index] = position
+
+    require(offsets == set(range(0, profile.payload, profile.write_bytes)),
+            f"{endpoint.label}: DMA-BUF descriptors do not cover every posted WRITE")
+    require(all(completions.get(index, -1) > position for index, position in descriptors.items()),
+            f"{endpoint.label}: missing successful mlx5 TX completion for a DMA-BUF payload WQE")
+    return {"lkey": lkey, "registered_bytes": profile.payload, "verified_offsets": sorted(offsets),
+            "completed_payload_wqes": len(descriptors)}
+
+
 def parse_result(endpoint, messages):
     lines = [line for line in messages if line.startswith("BANDWIDTH ")]
     require(len(lines) == 1, f"{endpoint.label}: expected one bandwidth result")
@@ -493,7 +550,7 @@ def parse_result(endpoint, messages):
         "qps": str(profile.qps), "workers": str(profile.workers),
     }
     if endpoint.role == "tx":
-        expected.update(send_window=str(SEND_WINDOW), tx_burst=str(TX_BURST))
+        expected.update(send_window=str(SEND_WINDOW), tx_burst=str(profile.tx_burst))
     require(all(fields.get(key) == value for key, value in expected.items()),
             f"{endpoint.label}: unexpected bandwidth profile: {lines[0]}")
 
@@ -545,12 +602,17 @@ def parse_result(endpoint, messages):
                 kind = "DMA-BUF" if profile.native_mr else "DMA"
                 require(messages.count(f"Application {kind} region mapped for scatter/gather TX ({payload} bytes)") == 1,
                         f"{endpoint.label}: missing {kind} registration for scatter/gather")
-            if endpoint.profile in SHORT_WRITE_PROFILES:
+            if endpoint.profile in SHORT_WRITE_PROFILES or profile.dma_proof:
                 require(messages.count(f"APP_SERIAL_COMPLETIONS writes_per_qp={profile.writes}") == 1,
                         f"{endpoint.label}: missing serial WRITE completions")
                 require(messages.count(f"DPDK_TX_BURST_COMPLETION queues={profile.workers}") == 1,
                         f"{endpoint.label}: missing mlx5 burst completion setup")
                 fields["serial_completions"] = profile.writes
+            if profile.dma_proof:
+                fields["dma_buf_proof"] = parse_dma_proof(endpoint, messages)
+    if profile.dma_proof:
+        require(not any(line.startswith("MLX5_DMABUF_CQ_ERROR ") for line in messages),
+                f"{endpoint.label}: mlx5 reported a TX completion error during the DMA proof")
     counters = [line for line in messages if line.startswith("PORT_STATS ")]
     if counters:
         require(len(counters) == 1, f"{endpoint.label}: expected one port counter result")
@@ -604,7 +666,11 @@ def run_endpoints(commands, profiles, output, sample):
             (output / f"{endpoint.profile}-{sample}-{endpoint.role}.txt").write_text("\n".join(messages) + "\n")
             fields = parse_result(endpoint, messages)
             results[endpoint.profile][endpoint.role] = {"invocation": invocation, **fields}
-            print(f"{endpoint.label} sample {sample} {invocation} {fields}", flush=True)
+            if endpoint.settings.dma_proof:
+                evidence = fields.get("dma_buf_proof", {"verified_bytes": endpoint.settings.payload})
+                print(f"{endpoint.label} sample {sample} {invocation} {evidence}", flush=True)
+            else:
+                print(f"{endpoint.label} sample {sample} {invocation} {fields}", flush=True)
         return results, release_ns
     finally:
         failed = sys.exc_info()[0] is not None
@@ -707,6 +773,8 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
             profile_result.update(app_mode=config.app_mode, payload_bytes=config.payload,
                                   write_bytes=config.write_bytes, app_post_batch=min(config.post_batch, config.writes),
                                   prefault_app=config.prefault_app, hugepages=config.hugepages)
+        if config.dma_proof:
+            profile_result["dma_proof"] = True
         report["profiles"][profile] = profile_result
         for sample in range(1, samples + 1):
             try:
@@ -722,13 +790,18 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
                 print(f"{profile} sample {sample} failed\n{error}", file=sys.stderr, flush=True)
                 break
             trials.append(results[profile])
-            median = {role: statistics.median(float(trial[role]["payload_gbps"]) for trial in trials)
-                      for role in PORTS}
-            profile_result["median_payload_gbps"] = median
+            if not config.dma_proof:
+                median = {role: statistics.median(float(trial[role]["payload_gbps"]) for trial in trials)
+                          for role in PORTS}
+                profile_result["median_payload_gbps"] = median
             save_report(output, report)
         else:
-            print(f"{profile} median verified payload TX {median['tx']:.3f} RX {median['rx']:.3f} Gbit/s",
-                  flush=True)
+            if config.dma_proof:
+                print(f"{profile} verified DMA-BUF payload descriptors and NIC completions in {samples} sample(s)",
+                      flush=True)
+            else:
+                print(f"{profile} median verified payload TX {median['tx']:.3f} RX {median['rx']:.3f} Gbit/s",
+                      flush=True)
     return failures
 
 
@@ -754,8 +827,8 @@ def main():
                                help="compare default and 2 MiB packet-pool backing at MTU 4200")
     backing_modes.add_argument("--hugepages-only", action="store_true",
                                help="run only the 2 MiB packet-pool profiles at MTU 4200")
-    parser.add_argument("--profile", action="append", choices=(*APP_SHAPES, "short"),
-                        help="repeat to select profiles; short checks individual native gather completions")
+    parser.add_argument("--profile", action="append", choices=(*APP_SHAPES, "short", "dma-proof"),
+                        help="repeat to select profiles; dma-proof verifies the mlx5 payload descriptors and CQEs")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
                         help="limit a paired-MTU benchmark to this Ethernet MTU")
     parser.add_argument("--samples", type=int, default=3, help="trials per profile (default 3)")
@@ -786,6 +859,9 @@ def main():
     if "short" in selected and (set(args.app_bench or ()) != {"mr-gather"} or
                                 args.compare_prefault or args.prefault_only or hugepages):
         parser.error("--profile short requires --app-bench mr-gather without memory backing comparisons")
+    if "dma-proof" in selected and (selected != ("dma-proof",) or set(args.app_bench or ()) != {"mr-gather"} or
+                                    args.compare_prefault or args.prefault_only or hugepages):
+        parser.error("--profile dma-proof runs by itself with --app-bench mr-gather")
     if args.compare_prefault and not args.app_bench:
         parser.error("--compare-prefault requires --app-bench")
     if args.prefault_only and not args.app_bench:

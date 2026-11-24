@@ -390,8 +390,14 @@ next call to post a WRITE. All WR IDs matched, both peers verified the
 payloads with zero retries, and the jumbo trace captured two 4,170-byte
 WRITE_ONLY Ethernet frames. Resource teardown and module unloads passed.
 The Spark hardware profiles check the same posting pattern and require
-the mlx5 queue configuration and DMA-BUF registration. Physical CQ
-generation from these queues still requires verification.
+the mlx5 queue configuration and DMA-BUF registration. The separate
+diagnostic mlx5 PMD builds on Spark-04. Its one-packet TX burst profile
+correlates the DMA-BUF registration address and lkey with each external
+payload data segment and its successful hardware CQE. It also checks
+verbs completions and receiver byte verification. Parser tests cover
+both PMTUs and reject an incorrect payload address, length or lkey, a
+missing CQE, and TX CQ errors. Physical verification requires the signed
+registration modules on both Sparks.
 
 Two exact Spark-04-kernel guest trials verified terminal error status and
 teardown with native scatter/gather queues. A cumulative remote-access
@@ -714,6 +720,24 @@ journal invocation IDs were `1306c7dad52440eb8b033dcfb0b96ce7` and
 `de66015e6789499f8cf1ff8d232b2230` and
 `6a989d33966f42718b8e2bb1dcf26885` at MTU 4200. Both Spark hosts still
 required enrollment of the module-signing key for kernel-backed MR runs.
+
+The latest rerun on November 24 used the same installed `8c5058a`
+services and verified 16 GiB per trial. All six trials recorded zero
+retries, NIC misses, packet errors, and RX buffer allocation failures.
+Both test interfaces reported 100,000 Mb/s. The runner restored each
+interface to MTU 1500 after the jumbo sweep.
+
+| Ethernet MTU | Requester trials (Gbit/s) | Requester median (Gbit/s) | Responder median (Gbit/s) |
+| --- | --- | ---: | ---: |
+| 1500 | 84.942, 84.346, 85.454 | 84.942 | 84.922 |
+| 4200 | 98.026, 98.027, 98.023 | 98.026 | 98.031 |
+
+The MTU 1500 median was 92.0% of the matched 92.320 Gbit/s hardware
+control. The median requester trial used sender and receiver journal
+invocations `8f031631d0b24338956b20155257f6cc` and
+`0fb30ab974cd405fb158d931bd1c6158` at MTU 1500, and
+`3e826d0d1ac04ad190f50222e9282d4d` and
+`e78f4698b3224bf596890d423624076d` at MTU 4200.
 
 ### Additional datapath measurements
 

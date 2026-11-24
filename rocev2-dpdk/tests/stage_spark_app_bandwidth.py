@@ -10,8 +10,9 @@ import shutil
 import tempfile
 
 from check_spark_bandwidth import (
-    APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER, APP_MLX5_FILES, APP_PROFILES, HUGEPAGE_PROFILES,
-    PREFAULT_PROFILES, SHORT_WRITE_PROFILES, Endpoint, unit_argv, unit_environment,
+    APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER, APP_MLX5_FILES, APP_PROFILES, DMA_PROOF_MARKERS,
+    DMA_PROOF_PROFILES, DMA_PROOF_SUFFIX, HUGEPAGE_PROFILES, PREFAULT_PROFILES, SHORT_WRITE_PROFILES,
+    Endpoint, unit_argv, unit_environment,
 )
 from stage_spark_cm import APP_LAUNCHER
 
@@ -144,8 +145,9 @@ def render_permissions(units):
     return "\n".join(rules) + "\n"
 
 
-def render_install(host, destination, units, payload, manifest_hash):
+def render_install(host, destination, units, payload, manifest_hash, dma_proof=False):
     managed = (*units, RULES, SUDOERS)
+    sudoers = "ocs-roce-app-bw-proof" if dma_proof else "ocs-roce-app-bw"
     return f"""#!/bin/bash
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -220,16 +222,26 @@ udevadm control --reload-rules
 udevadm trigger --action=change --settle --subsystem-match=misc --sysname-match=roce_mr
 udevadm trigger --action=change --settle --subsystem-match=infiniband_verbs --attr-match=ibdev=roce_dpdk0
 systemctl daemon-reload
-install -o root -g root -m 0440 -- "$stage/{SUDOERS}" /etc/sudoers.d/ocs-roce-app-bw
+install -o root -g root -m 0440 -- "$stage/{SUDOERS}" /etc/sudoers.d/{sudoers}
 echo '{host} RoCEv2 application bandwidth services installed.'
 """
 
 
-def stage_host(bundle, inputs, destination, endpoints):
+def check_mlx5_trace(directory, dma_proof):
+    for library, markers in DMA_PROOF_MARKERS.items():
+        contents = (directory / library).read_bytes()
+        if dma_proof and not all(marker in contents for marker in markers):
+            raise ValueError(f"{library}: DMA proof requires the diagnostic mlx5 patch")
+        if not dma_proof and any(marker in contents for marker in markers):
+            raise ValueError(f"{library}: throughput profiles require the regular mlx5 build")
+
+
+def stage_host(bundle, inputs, revision, destination, endpoints, dma_proof):
     host = endpoints[0].host
     directory = bundle / host
     directory.mkdir(mode=0o700)
-    libraries = stage_inputs(inputs / host, directory, destination.name)
+    libraries = stage_inputs(inputs / host, directory, revision)
+    check_mlx5_trace(directory, dma_proof)
     launcher = directory / "run_app"
     launcher.write_text(render_launcher())
     launcher.chmod(0o700)
@@ -250,21 +262,25 @@ def stage_host(bundle, inputs, destination, endpoints):
     manifest = directory / "SHA256SUMS"
     manifest.write_text(manifest_text(directory, (*payload, *units, RULES, SUDOERS)))
     installer = directory / "install.sh"
-    installer.write_text(render_install(host, destination, units, payload, digest(manifest)))
+    installer.write_text(render_install(host, destination, units, payload, digest(manifest), dma_proof))
     installer.chmod(0o700)
     return manifest_text(directory, payload)
 
 
 def stage(revision, inputs, profiles):
-    destination = APP_DESTINATION_ROOT / revision
+    dma_proof = any(name in DMA_PROOF_PROFILES for name in profiles)
+    if dma_proof and not all(name in DMA_PROOF_PROFILES for name in profiles):
+        raise ValueError("Stage DMA proof and throughput profiles in separate releases")
+    destination = APP_DESTINATION_ROOT / (revision + DMA_PROOF_SUFFIX if dma_proof else revision)
     bundle = Path(tempfile.mkdtemp(prefix="ocs-roce-app-bw-"))
     try:
-        tx, rx = (stage_host(bundle, inputs, destination, [Endpoint(role, profile) for profile in profiles])
+        tx, rx = (stage_host(bundle, inputs, revision, destination, [Endpoint(role, profile) for profile in profiles],
+                             dma_proof)
                   for role in ("tx", "rx"))
         if tx != rx:
             raise ValueError("The pinned application artifacts differ between Spark hosts")
         app_files = APP_FILES
-        if any(name in SHORT_WRITE_PROFILES for name in profiles):
+        if dma_proof or any(name in SHORT_WRITE_PROFILES for name in profiles):
             app_files += APP_MLX5_FILES
         if any(name in HUGEPAGE_PROFILES for name in profiles):
             app_files += (APP_HUGEPAGE_HELPER,)
@@ -279,7 +295,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("revision", help="revision of the pinned RoCEv2 application and worker")
     parser.add_argument("--inputs", type=Path, required=True, help="directory with spark-02 and spark-04 inputs")
-    parser.add_argument("--profile", action="append", choices=APP_PROFILES | PREFAULT_PROFILES | SHORT_WRITE_PROFILES,
+    parser.add_argument("--profile", action="append",
+                        choices=APP_PROFILES | PREFAULT_PROFILES | SHORT_WRITE_PROFILES | DMA_PROOF_PROFILES,
                         help="profile to stage (default: all profiles without prefaulting)")
     parser.add_argument("--include-prefault", action="store_true",
                         help="also stage prefault variants of the selected profiles")
