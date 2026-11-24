@@ -2,9 +2,10 @@
 
 `roce_provider.c` builds a libibverbs plugin for `roce_dpdk0`.
 It uses the standard uverbs context, device queries, port queries
-and protection-domain commands. The kernel device currently advertises
-zero CQ, QP and verbs MR capacity. The service-backed implementations
-of those resources are pending.
+and protection-domain commands. With `ROCE_DPDK_MR_SOCKET` set before
+opening the device, the provider also supports `ibv_reg_mr()` and
+`ibv_dereg_mr()` through the worker's registration socket. The CQ and
+QP operations are pending.
 
 The provider uses libibverbs private ABI 34, the ABI of rdma-core v50
 on both tested Sparks. Build the `ibverbs` target from the official
@@ -27,6 +28,15 @@ system-wide provider install is optional.
 make -C rocev2-dpdk/provider RDMA_CORE_BUILD="$RDMA_CORE_BUILD" check
 ```
 
-The probe checks enumeration, context and PD lifetimes, Ethernet
-port attributes, and rejection of CQ and MR commands.
+The discovery probe checks the device without a worker connection.
+With both kernel modules loaded, run the separate MR lifecycle check.
+It starts a worker-side registration listener and checks MR permissions,
+unaligned ranges and deregistration while a lease is active.
+
+```sh
+make -C rocev2-dpdk/provider RDMA_CORE_BUILD="$RDMA_CORE_BUILD" check-mr
+python3 rocev2-dpdk/tests/check_app_memif.py \
+    --verbs-provider "$PROVIDER_DIR/libroce_dpdk"
+```
+
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

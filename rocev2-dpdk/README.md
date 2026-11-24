@@ -52,12 +52,33 @@ reads the payload to compute the iCRC. The receiving worker copies into the
 application mapping before acknowledging the WRITE.
 
 On a physical port this mode currently supports mlx5 in IOVA-as-VA mode
-with the default memfd registration. The mlx5 driver registers a writable
-service alias for DMA. The application must keep the submitted bytes stable
+with either memfd backing or a registered MR and a DMA-BUF-capable PMD.
+The mlx5 driver registers a writable service alias for DMA. The application
+must keep the submitted bytes stable
 until completion, which the worker reports after the peer verifies the
-WRITE and the local TX queues release their references. The kernel-pinned
-registration path has a DMA-BUF export and still needs mlx5 PMD
-integration for physical scatter/gather.
+WRITE and the local TX queues release their references.
+
+### Native verbs memory registration
+
+With the kernel modules and [provider](provider/README.md) available,
+give the worker separate paths with `--app-socket PATH --mr-socket MR_PATH`.
+The application calls `ibv_reg_mr()` on `roce_dpdk0`. The provider pins
+the enclosing pages and sends the scoped mapping descriptor to the
+worker over the MR socket. The worker assigns keys to the requested
+range and holds a lease until the transfer and TX cleanup finish.
+
+```sh
+RDMAV_DRIVERS="$PROVIDER_DIR/libroce_dpdk" ROCE_DPDK_MR_SOCKET="$MR_PATH" \
+  ./roce_app_write "$APP_SOCKET"
+```
+
+For physical `--scatter-gather` with native registration, apply the
+[mlx5 patch](dpdk/dpdk-23.11.7-mlx5-dmabuf.patch) to DPDK 23.11.7 and use
+the matching common and net mlx5 PMDs built with `-Dibverbs_link=shared`.
+The worker resolves the import APIs from its loaded net PMD and uses
+the same protection domain as that port. The provider requests local
+write permission on the sender MR for the kernel's bidirectional
+DMA-BUF import. The sender MR has no remote-write key.
 
 ### In-band connection setup
 

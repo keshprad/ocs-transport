@@ -1,0 +1,92 @@
+#define _GNU_SOURCE
+#include "roce_mr_ipc.h"
+#include "roce_fd.h"
+
+#include <stddef.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+
+static int open_socket(const char *path, bool listener)
+{
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    size_t length = strlen(path);
+    if (!length || length >= sizeof(address.sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(address.sun_path, path, length + 1);
+    socklen_t size = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + 1);
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    if (listener) {
+        if (bind(fd, (struct sockaddr *)&address, size) == 0) {
+            if (chmod(path, S_IRUSR | S_IWUSR) == 0 && listen(fd, SOMAXCONN) == 0)
+                return fd;
+            int error = errno;
+            unlink(path);
+            errno = error;
+        }
+    } else if (connect(fd, (struct sockaddr *)&address, size) == 0) {
+        struct ucred peer;
+        socklen_t peer_length = sizeof(peer);
+        const struct timeval timeout = { .tv_sec = 10 };
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_length) == 0) {
+            if (peer_length != sizeof(peer) || peer.uid != geteuid()) {
+                errno = EACCES;
+            } else if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
+                       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0) {
+                return fd;
+            }
+        }
+    }
+    int error = errno;
+    close(fd);
+    errno = error;
+    return -1;
+}
+
+int roce_mr_ipc_connect(const char *path)
+{
+    return open_socket(path, false);
+}
+
+int roce_mr_ipc_listen(const char *path)
+{
+    return open_socket(path, true);
+}
+
+int roce_mr_ipc_send_registration(int socket, const struct roce_mr_request *request, int mapping_fd)
+{
+    struct roce_mr_request message = *request;
+    return roce_send_fd(socket, &message, sizeof(message), mapping_fd) ? 0 : errno;
+}
+
+int roce_mr_ipc_read_reply(int socket, struct roce_mr_reply *reply)
+{
+    ssize_t bytes;
+    do {
+        bytes = recv(socket, reply, sizeof(*reply), MSG_TRUNC);
+    } while (bytes < 0 && errno == EINTR);
+    if (bytes < 0)
+        return errno;
+    if (!bytes)
+        return ECONNRESET;
+    if (bytes != sizeof(*reply) || reply->reserved || reply->error < 0)
+        return EPROTO;
+    return 0;
+}
+
+int roce_mr_ipc_receive_registration(int socket, struct roce_mr_request *request)
+{
+    return roce_receive_fd(socket, request, sizeof(*request));
+}
+
+int roce_mr_ipc_send_reply(int socket, const struct roce_mr_reply *reply)
+{
+    ssize_t bytes;
+    do {
+        bytes = send(socket, reply, sizeof(*reply), MSG_NOSIGNAL);
+    } while (bytes < 0 && errno == EINTR);
+    return bytes == sizeof(*reply) ? 0 : bytes < 0 ? errno : EPROTO;
+}

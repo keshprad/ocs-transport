@@ -5,6 +5,7 @@
 #include "../../mrc-dpdk/src/dpdk_io.h"
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
 
 #include <rte_dev.h>
 #include <rte_eal.h>
@@ -41,6 +42,7 @@ struct datapath_options {
     uint32_t start_gate;
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     const char *app_socket;
+    const char *mr_socket;
     struct roce_address cm_peer;
     bool report_bandwidth;
     bool scatter_gather;
@@ -49,6 +51,9 @@ struct datapath_options {
 struct tx_memory_ref {
     struct rte_mbuf_ext_shared_info shared;
 } __rte_cache_aligned;
+
+typedef int (*mlx5_dmabuf_map_fn)(uint16_t, void *, size_t, int, uint64_t);
+typedef int (*mlx5_dmabuf_unmap_fn)(uint16_t, void *, size_t);
 
 union write_qp {
     struct roce_requester requester;
@@ -627,6 +632,10 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             if (++i == argc || !argv[i][0] || options->app_socket)
                 return false;
             options->app_socket = argv[i];
+        } else if (strcmp(argv[i], "--mr-socket") == 0) {
+            if (++i == argc || !argv[i][0] || options->mr_socket)
+                return false;
+            options->mr_socket = argv[i];
         } else {
             return false;
         }
@@ -651,7 +660,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--scatter-gather] [--cm-peer IPV4 MAC]\n");
+                        " [--mr-socket PATH] [--scatter-gather] [--cm-peer IPV4 MAC]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -660,6 +669,11 @@ int main(int argc, char **argv)
     }
     if (datapath.cm_peer.ipv4 && (datapath.qps != 1 || datapath.cm_peer.ipv4 == options.data_ip)) {
         fprintf(stderr, "in-band lab CM requires one QP and a distinct peer address\n");
+        goto cleanup_eal;
+    }
+    if (datapath.mr_socket &&
+        (!datapath.app_socket || strcmp(datapath.app_socket, datapath.mr_socket) == 0)) {
+        fprintf(stderr, "verbs memory registration requires separate application and MR socket paths\n");
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -716,6 +730,8 @@ int main(int argc, char **argv)
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, options.workers, MBUF_CACHE_SIZE);
     struct roce_app_memory application = { .socket = -1 };
+    struct roce_mr_server *registrations = NULL;
+    void *mlx5_pmd = NULL;
     uint8_t *buffer = datapath.app_socket ? NULL : malloc((size_t)bytes);
     if (!pool || (!datapath.app_socket && !buffer)) {
         fprintf(stderr, "packet pool or host buffer allocation failed\n");
@@ -732,6 +748,10 @@ int main(int argc, char **argv)
     struct rte_ether_addr mac;
     struct tx_memory_ref tx_refs[ROCE_LAB_MAX_QPS] = {0};
     bool dma_registered = false, dma_mapped = false;
+    void *dma_address = NULL;
+    size_t dma_length = 0;
+    mlx5_dmabuf_map_fn dmabuf_map = NULL;
+    mlx5_dmabuf_unmap_fn dmabuf_unmap = NULL;
     uint64_t offloads = datapath.scatter_gather ? RTE_ETH_TX_OFFLOAD_MULTI_SEGS : 0;
     int err = mrc_dpdk_open_port_with_offloads(port, pool, &mac, mtu, (uint16_t)options.workers, offloads);
     if (err) {
@@ -743,27 +763,61 @@ int main(int argc, char **argv)
         rte_mbuf_ext_refcnt_set(&tx_refs[i].shared, 1);
     }
     bool in_band = datapath.cm_peer.ipv4 != 0;
+    if (datapath.scatter_gather && datapath.mr_socket && !memif) {
+        /* Use the same PMD instance that owns the port and its protection domain. */
+        mlx5_pmd = dlopen("librte_net_mlx5.so.24", RTLD_NOW | RTLD_NOLOAD);
+        if (mlx5_pmd) {
+            dmabuf_map = (mlx5_dmabuf_map_fn)dlsym(mlx5_pmd, "rte_pmd_mlx5_dmabuf_map");
+            dmabuf_unmap = (mlx5_dmabuf_unmap_fn)dlsym(mlx5_pmd, "rte_pmd_mlx5_dmabuf_unmap");
+        }
+        if (!dmabuf_map || !dmabuf_unmap) {
+            fprintf(stderr, "physical scatter/gather from verbs memory requires the mlx5 DMA-BUF patch\n");
+            goto cleanup_port;
+        }
+    }
+    if (datapath.mr_socket) {
+        registrations = roce_mr_server_start(datapath.mr_socket);
+        if (!registrations) {
+            perror("verbs memory registration listener");
+            goto cleanup_port;
+        }
+    }
     if (datapath.app_socket) {
         if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif,
-                             in_band, &application)) {
+                             in_band, registrations, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
         buffer = application.buffer;
     }
     if (datapath.scatter_gather && !memif) {
+        dma_address = dmabuf_map ? application.mr.mapping : buffer;
+        dma_length = dmabuf_map ? application.mr.mapped_length : application.length;
         long page_size = sysconf(_SC_PAGESIZE);
-        if (page_size <= 0 || rte_extmem_register(buffer, application.length, NULL, 0, (size_t)page_size)) {
+        if (page_size <= 0 || rte_extmem_register(dma_address, dma_length, NULL, 0, (size_t)page_size)) {
             fprintf(stderr, "external memory registration failed: %s\n", rte_strerror(rte_errno));
             goto cleanup_port;
         }
         dma_registered = true;
-        if (rte_dev_dma_map(info.device, buffer, (uintptr_t)buffer, application.length)) {
+        if (dmabuf_map) {
+            int fd = roce_mr_export_dmabuf(&application.mr);
+            if (fd < 0) {
+                perror("application DMA-BUF export");
+                goto cleanup_port;
+            }
+            err = dmabuf_map(port, dma_address, dma_length, fd, 0);
+            close(fd);
+            if (err) {
+                fprintf(stderr, "mlx5 DMA-BUF mapping failed: %s\n", rte_strerror(-err));
+                goto cleanup_port;
+            }
+        } else if (rte_dev_dma_map(info.device, dma_address, (uintptr_t)dma_address, dma_length)) {
             fprintf(stderr, "mlx5 DMA mapping failed: %s\n", rte_strerror(rte_errno));
             goto cleanup_port;
         }
         dma_mapped = true;
-        printf("Application DMA region mapped for scatter/gather TX (%zu bytes)\n", application.length);
+        printf("Application %s region mapped for scatter/gather TX (%zu bytes)\n",
+               dmabuf_map ? "DMA-BUF" : "DMA", dma_length);
     }
     struct rte_eth_stats initial_stats = {0};
     bool measure_stats = datapath.report_bandwidth && rte_eth_stats_get(port, &initial_stats) == 0;
@@ -780,8 +834,12 @@ int main(int argc, char **argv)
     }, peer;
     memcpy(local.data.mac, mac.addr_bytes, ROCE_MAC_LEN);
     if (!roce_lab_random(&local.psn) || !roce_lab_random(&local.qpn) ||
-        !roce_lab_random(&local.region.rkey))
+        (!registrations && !roce_lab_random(&local.region.rkey)))
         goto cleanup_port;
+    if (registrations) {
+        local.region.address = application.mr.iova;
+        local.region.rkey = application.mr.rkey;
+    }
     local.psn &= ROCE_PSN_MASK;
     local.qpn = 2 + local.qpn % (ROCE_PSN_MASK - options.qps - 1);
 
@@ -833,11 +891,16 @@ cleanup_port:
                 return 1;
             }
         }
-        if (dma_mapped && rte_dev_dma_unmap(info.device, buffer, (uintptr_t)buffer, application.length)) {
-            fprintf(stderr, "mlx5 DMA unmapping failed: %s\n", rte_strerror(rte_errno));
-            return 1;
+        if (dma_mapped) {
+            err = dmabuf_unmap ? dmabuf_unmap(port, dma_address, dma_length) :
+                rte_dev_dma_unmap(info.device, dma_address, (uintptr_t)dma_address, dma_length);
+            if (err) {
+                fprintf(stderr, "mlx5 DMA unmapping failed: %s\n",
+                        rte_strerror(dmabuf_unmap ? -err : rte_errno));
+                return 1;
+            }
         }
-        if (dma_registered && rte_extmem_unregister(buffer, application.length)) {
+        if (dma_registered && rte_extmem_unregister(dma_address, dma_length)) {
             fprintf(stderr, "external memory deregistration failed: %s\n", rte_strerror(rte_errno));
             return 1;
         }
@@ -849,15 +912,24 @@ cleanup_port:
     } else {
         mrc_dpdk_close_port(port);
     }
-    if (!result && application.socket >= 0 && !roce_lab_send(application.socket, 'C')) {
+    if (!result && application.socket >= 0 && !roce_app_complete(&application)) {
         perror("application WRITE completion");
         result = 1;
     }
 cleanup_buffers:
+    if (mlx5_pmd)
+        dlclose(mlx5_pmd);
     if (application.socket >= 0)
         roce_app_detach(&application);
     else
         free(buffer);
+    if (registrations) {
+        int error = roce_mr_server_stop(registrations);
+        if (error) {
+            fprintf(stderr, "verbs memory registration shutdown: %s\n", strerror(error));
+            result = 1;
+        }
+    }
     if (pool)
         rte_mempool_free(pool);
 cleanup_eal:

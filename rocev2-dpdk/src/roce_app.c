@@ -1,11 +1,14 @@
 #define _GNU_SOURCE
 #include "roce_app.h"
 #include "roce_doorbell.h"
+#include "roce_fd.h"
 #include "roce_lab.h"
+#include "roce_mr_ipc.h"
 #include "../kernel/roce_mr_uapi.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <infiniband/verbs.h>
 #include <linux/magic.h>
 #include <poll.h>
 #include <pthread.h>
@@ -25,9 +28,12 @@ enum {
     APP_PINNED = 2,
     APP_DOORBELL = 3,
     APP_USE_CM = 1u << 0,
+    APP_USE_VERBS_MR = 1u << 1,
+    APP_WRITE_DMA_ALIAS = 1u << 2,
     APP_CONNECT = 'A',
     APP_LISTEN = 'L',
     APP_ESTABLISHED = 'E',
+    APP_DEREGISTERED = 'F',
     APP_SEALS = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL,
 };
 
@@ -82,7 +88,7 @@ static int open_socket(const char *path, bool listener)
     return -1;
 }
 
-static bool configure_peer(int fd)
+static bool configure_peer(int fd, pid_t *pid)
 {
     struct ucred credentials;
     socklen_t length = sizeof(credentials);
@@ -92,6 +98,8 @@ static bool configure_peer(int fd)
         errno = EACCES;
         return false;
     }
+    if (pid)
+        *pid = credentials.pid;
     const struct timeval timeout = { .tv_sec = ROCE_LAB_TIMEOUT };
     return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0;
@@ -123,56 +131,12 @@ static int accept_client(const char *path)
 
 static bool send_mapping(int socket, int fd, uint8_t kind)
 {
-    union {
-        struct cmsghdr align;
-        unsigned char bytes[CMSG_SPACE(sizeof(fd))];
-    } control = {0};
-    struct iovec data = { .iov_base = &kind, .iov_len = sizeof(kind) };
-    struct msghdr message = { .msg_iov = &data, .msg_iovlen = 1,
-                              .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes) };
-    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
-    header->cmsg_level = SOL_SOCKET;
-    header->cmsg_type = SCM_RIGHTS;
-    header->cmsg_len = CMSG_LEN(sizeof(fd));
-    memcpy(CMSG_DATA(header), &fd, sizeof(fd));
-    return sendmsg(socket, &message, MSG_NOSIGNAL) == (ssize_t)sizeof(kind);
+    return roce_send_fd(socket, &kind, sizeof(kind), fd);
 }
 
 static int receive_mapping(int socket, uint8_t *kind)
 {
-    union {
-        struct cmsghdr align;
-        unsigned char bytes[CMSG_SPACE(sizeof(int))];
-    } control = {0};
-    struct iovec data = { .iov_base = kind, .iov_len = sizeof(*kind) };
-    struct msghdr message = { .msg_iov = &data, .msg_iovlen = 1,
-                              .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes) };
-    ssize_t received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
-    if (received < 0)
-        return -1;
-    int descriptor = -1;
-    unsigned int count = 0;
-    for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header;
-         header = CMSG_NXTHDR(&message, header)) {
-        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
-            header->cmsg_len < CMSG_LEN(0))
-            continue;
-        size_t bytes = header->cmsg_len - CMSG_LEN(0);
-        for (size_t offset = 0; offset + sizeof(int) <= bytes; offset += sizeof(int)) {
-            int fd;
-            memcpy(&fd, CMSG_DATA(header) + offset, sizeof(fd));
-            if (++count == 1)
-                descriptor = fd;
-            else
-                close(fd);
-        }
-    }
-    if (received == sizeof(*kind) && count == 1 && !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)))
-        return descriptor;
-    if (descriptor >= 0)
-        close(descriptor);
-    errno = EPROTO;
-    return -1;
+    return roce_receive_fd(socket, kind, sizeof(*kind));
 }
 
 static bool valid_mapping(int fd, uint8_t kind, size_t length, bool sender)
@@ -245,8 +209,60 @@ bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32
     return roce_doorbell_take(doorbell, &cursor) == 0;
 }
 
+static bool receive_local_memory(struct roce_app_memory *memory, size_t length,
+                                 bool sender, bool dma_writable)
+{
+    uint8_t kind;
+    int fd = receive_mapping(memory->socket, &kind);
+    if (fd < 0)
+        return false;
+    /* mlx5 verbs registers external memory with local write access. */
+    if ((dma_writable && kind != APP_MEMFD) || !valid_mapping(fd, kind, length, sender)) {
+        close(fd);
+        errno = dma_writable && kind != APP_MEMFD ? EOPNOTSUPP : EINVAL;
+        return false;
+    }
+    int prot = PROT_READ | (!sender || dma_writable ? PROT_WRITE : 0);
+    void *buffer = mmap(NULL, length, prot, MAP_SHARED, fd, 0);
+    int error = errno;
+    close(fd);
+    if (buffer == MAP_FAILED) {
+        errno = error;
+        return false;
+    }
+    memory->buffer = buffer;
+    memory->length = length;
+    return true;
+}
+
+static bool receive_verbs_memory(struct roce_app_memory *memory, struct roce_mr_server *registrations,
+                                 pid_t pid, size_t bytes, bool sender, bool dma_writable)
+{
+    uint32_t lkey;
+    if (recv(memory->socket, &lkey, sizeof(lkey), MSG_TRUNC) != sizeof(lkey)) {
+        errno = EPROTO;
+        return false;
+    }
+    uint32_t access = sender ? 0 : ROCE_MR_IPC_WRITE | ROCE_MR_IPC_REMOTE_WRITE;
+    if (dma_writable)
+        access |= ROCE_MR_IPC_WRITE;
+    int error = roce_mr_acquire(registrations, pid, lkey, access, &memory->mr);
+    if (error) {
+        errno = error;
+        return false;
+    }
+    if (memory->mr.length != bytes) {
+        errno = EINVAL;
+        return false;
+    }
+    memory->buffer = memory->mr.buffer;
+    memory->length = memory->mr.length;
+    return true;
+}
+
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     bool dma_writable, bool in_band_cm, struct roce_app_memory *memory)
+                     bool dma_writable, bool in_band_cm, struct roce_mr_server *registrations,
+                     struct roce_app_memory *memory)
 {
     uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
     size_t length = mapping_length(bytes);
@@ -257,12 +273,16 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
     int socket = accept_client(path);
     if (socket < 0)
         return false;
+    struct roce_app_memory attached = { .socket = socket };
+    pid_t pid;
     const struct app_workload workload = {
         .bytes = bytes, .version = APP_VERSION, .sender = options->sender,
         .qps = options->qps, .workers = options->workers, .writes = options->writes,
-        .flags = in_band_cm ? APP_USE_CM : 0,
+        .flags = (in_band_cm ? APP_USE_CM : 0) | (registrations ? APP_USE_VERBS_MR : 0) |
+                 (registrations && dma_writable ? APP_WRITE_DMA_ALIAS : 0),
     };
-    if (!configure_peer(socket) || send(socket, &workload, sizeof(workload), MSG_NOSIGNAL) != sizeof(workload))
+    if (!configure_peer(socket, &pid) ||
+        send(socket, &workload, sizeof(workload), MSG_NOSIGNAL) != sizeof(workload))
         goto disconnect;
     if (in_band_cm) {
         char command;
@@ -273,45 +293,23 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         }
     }
 
-    uint8_t kind;
-    int fd = receive_mapping(socket, &kind);
-    if (fd < 0)
+    bool received = registrations ?
+        receive_verbs_memory(&attached, registrations, pid, (size_t)bytes, options->sender, dma_writable) :
+        receive_local_memory(&attached, length, options->sender, dma_writable);
+    if (!received)
         goto disconnect;
-    /* mlx5 verbs registers external memory with local write access. */
-    if (dma_writable && kind != APP_MEMFD) {
-        close(fd);
-        errno = EOPNOTSUPP;
-        goto disconnect;
-    }
-    if (!valid_mapping(fd, kind, length, options->sender)) {
-        close(fd);
-        errno = EINVAL;
-        goto disconnect;
-    }
-    int prot = PROT_READ | (!options->sender || dma_writable ? PROT_WRITE : 0);
-    void *buffer = mmap(NULL, length, prot, MAP_SHARED, fd, 0);
-    close(fd);
-    if (buffer == MAP_FAILED)
-        goto disconnect;
-    struct roce_doorbell *doorbells = NULL;
     if (options->sender && !in_band_cm) {
-        doorbells = offer_doorbells(socket, options->workers);
-        if (!doorbells) {
-            int error = errno;
-            munmap(buffer, length);
-            errno = error;
+        attached.doorbells = offer_doorbells(socket, options->workers);
+        if (!attached.doorbells)
             goto disconnect;
-        }
     }
-    *memory = (struct roce_app_memory) {
-        .socket = socket, .buffer = buffer, .length = length, .doorbells = doorbells,
-    };
+    *memory = attached;
     return true;
 
 disconnect:
     {
         int error = errno;
-        close(socket);
+        roce_app_detach(&attached);
         errno = error;
         return false;
     }
@@ -327,12 +325,31 @@ bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_op
     return memory->doorbells != NULL;
 }
 
+bool roce_app_complete(struct roce_app_memory *memory)
+{
+    bool verbs = memory->mr.server != NULL;
+    if (verbs) {
+        roce_mr_release(&memory->mr);
+        memory->buffer = NULL;
+    }
+    if (!roce_lab_send(memory->socket, 'C'))
+        return false;
+    if (verbs && roce_lab_receive(memory->socket, APP_DEREGISTERED, false) != 1) {
+        errno = EPROTO;
+        return false;
+    }
+    return true;
+}
+
 void roce_app_detach(struct roce_app_memory *memory)
 {
     if (memory->socket >= 0) {
         if (memory->doorbells)
             munmap(memory->doorbells, doorbell_bytes);
-        munmap(memory->buffer, memory->length);
+        if (memory->mr.server)
+            roce_mr_release(&memory->mr);
+        else if (memory->buffer)
+            munmap(memory->buffer, memory->length);
         close(memory->socket);
         memory->socket = -1;
     }
@@ -401,6 +418,51 @@ static bool post_writes(int socket, const struct app_workload *workload)
     return posted && roce_lab_send(socket, 'P');
 }
 
+struct app_verbs {
+    struct ibv_context *context;
+    struct ibv_pd *pd;
+    struct ibv_mr *mr;
+};
+
+static bool register_verbs_memory(struct app_verbs *verbs, uint8_t *buffer, size_t length,
+                                  bool sender, bool dma_writable)
+{
+    struct ibv_device **devices = ibv_get_device_list(NULL);
+    if (!devices)
+        return false;
+    errno = ENODEV;
+    for (size_t i = 0; devices[i]; ++i) {
+        if (strcmp(ibv_get_device_name(devices[i]), "roce_dpdk0") == 0) {
+            verbs->context = ibv_open_device(devices[i]);
+            break;
+        }
+    }
+    int error = errno;
+    ibv_free_device_list(devices);
+    if (!verbs->context) {
+        errno = error;
+        return false;
+    }
+    verbs->pd = ibv_alloc_pd(verbs->context);
+    if (!verbs->pd)
+        return false;
+    int access = sender ? 0 : IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    if (dma_writable)
+        access |= IBV_ACCESS_LOCAL_WRITE;
+    verbs->mr = ibv_reg_mr(verbs->pd, buffer, length, access);
+    return verbs->mr != NULL;
+}
+
+static int release_verbs_memory(const struct app_verbs *verbs)
+{
+    int error = verbs->mr ? ibv_dereg_mr(verbs->mr) : 0;
+    if (!error && verbs->pd)
+        error = ibv_dealloc_pd(verbs->pd);
+    if (!error && verbs->context)
+        error = ibv_close_device(verbs->context);
+    return error;
+}
+
 bool roce_app_write(const char *path, const char *registration_device)
 {
     int socket = open_socket(path, false);
@@ -409,15 +471,21 @@ bool roce_app_write(const char *path, const char *registration_device)
     bool success = false;
     int region = -1;
     struct app_workload workload;
-    if (!configure_peer(socket) ||
+    if (!configure_peer(socket, NULL) ||
         recv(socket, &workload, sizeof(workload), MSG_TRUNC) != sizeof(workload) ||
-        workload.version != APP_VERSION || workload.sender > 1 || (workload.flags & ~APP_USE_CM) ||
+        workload.version != APP_VERSION || workload.sender > 1 ||
+        (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS)) ||
         !workload.qps || workload.qps > ROCE_LAB_MAX_QPS || !workload.workers ||
         workload.workers > workload.qps || !workload.writes || workload.writes > ROCE_PSN_MASK) {
         errno = EPROTO;
         goto disconnect;
     }
     bool in_band_cm = (workload.flags & APP_USE_CM) != 0;
+    bool verbs_mr = (workload.flags & APP_USE_VERBS_MR) != 0;
+    if (verbs_mr && registration_device) {
+        errno = EINVAL;
+        goto disconnect;
+    }
     if (in_band_cm && !roce_lab_send(socket, workload.sender ? APP_CONNECT : APP_LISTEN))
         goto disconnect;
     size_t length = mapping_length(workload.bytes);
@@ -426,7 +494,7 @@ bool roce_app_write(const char *path, const char *registration_device)
         goto disconnect;
     }
     int flags = MAP_SHARED;
-    if (registration_device) {
+    if (registration_device || verbs_mr) {
         flags |= MAP_ANONYMOUS;
     } else {
         region = create_shared_file("roce-app-mr", length);
@@ -438,24 +506,47 @@ bool roce_app_write(const char *path, const char *registration_device)
         goto disconnect;
     size_t bytes = (size_t)workload.bytes;
     roce_lab_fill(buffer, bytes, workload.sender);
-    if (registration_device)
-        region = pin_mapping(registration_device, buffer, length, workload.sender);
-    if (region >= 0 && send_mapping(socket, region, registration_device ? APP_PINNED : APP_MEMFD)) {
+    struct app_verbs verbs = {0};
+    bool offered;
+    if (verbs_mr) {
+        offered = register_verbs_memory(&verbs, buffer, bytes, workload.sender,
+                                        (workload.flags & APP_WRITE_DMA_ALIAS) != 0) &&
+                  send(socket, &verbs.mr->lkey, sizeof(verbs.mr->lkey), MSG_NOSIGNAL) == sizeof(verbs.mr->lkey);
+    } else {
+        if (registration_device)
+            region = pin_mapping(registration_device, buffer, length, workload.sender);
+        offered = region >= 0 && send_mapping(socket, region, registration_device ? APP_PINNED : APP_MEMFD);
+    }
+    if (offered) {
         bool connected = !in_band_cm || roce_lab_receive(socket, APP_ESTABLISHED, false) == 1;
         if (connected && in_band_cm)
             puts("Application CM established");
         bool done = connected && (workload.sender ? post_writes(socket, &workload) :
             roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
             roce_lab_send(socket, 'V'));
-        if (done) {
-            success = roce_lab_receive(socket, 'C', false) == 1;
-            if (success)
-                printf("Application %s %zu bytes\n", workload.sender ? "completed" : "verified", bytes);
-        }
+        success = done && roce_lab_receive(socket, 'C', false) == 1;
         if (!success)
             errno = EPROTO;
     }
-    munmap(buffer, length);
+    int saved_errno = errno;
+    int error = release_verbs_memory(&verbs);
+    if (success && error) {
+        saved_errno = error;
+        success = false;
+    }
+    if (success && verbs_mr && !roce_lab_send(socket, APP_DEREGISTERED)) {
+        saved_errno = errno;
+        success = false;
+    }
+    if (success)
+        printf("Application %s %zu bytes\n", workload.sender ? "completed" : "verified", bytes);
+    if (!error)
+        munmap(buffer, length);
+    else if (saved_errno == 0)
+        saved_errno = error;
+    if (!success && !saved_errno)
+        saved_errno = EPROTO;
+    errno = saved_errno;
 
 disconnect:
     {

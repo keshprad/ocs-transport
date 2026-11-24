@@ -6,8 +6,10 @@ CORE = src/roce_wire.c src/roce_rc.c
 CORE_HEADERS = src/roce_wire.h src/roce_rc.h ../common/roce_icrc.h
 LAB = src/roce_lab.c
 LAB_HEADERS = src/roce_lab.h
-APP = src/roce_app.c
-APP_HEADERS = src/roce_app.h src/roce_doorbell.h kernel/roce_mr_uapi.h
+MR = src/roce_mr_server.c src/roce_mr_ipc.c
+MR_HEADERS = src/roce_mr_server.h src/roce_mr_ipc.h src/roce_fd.h kernel/roce_mr_uapi.h
+APP = src/roce_app.c $(MR)
+APP_HEADERS = src/roce_app.h src/roce_doorbell.h $(MR_HEADERS)
 DPDK_IO = ../mrc-dpdk/src/dpdk_io.c
 CM = src/roce_cm_wire.c src/roce_cm_session.c
 CM_HEADERS = src/roce_cm_wire.h src/roce_cm_session.h
@@ -21,14 +23,14 @@ all: roce_write roce_verbs_write roce_app_write
 
 roce_write: src/roce_write.c src/roce_cm_dpdk.c src/roce_cm_dpdk.h $(CM) $(CM_HEADERS) $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADERS) $(APP) $(APP_HEADERS) $(DPDK_IO) ../mrc-dpdk/src/dpdk_io.h
 	$(PKG_CONFIG) --exists libdpdk
-	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(DPDK_CFLAGS) $(VERBS_CFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(DPDK_LIBS) $(VERBS_LIBS) $(LDLIBS)
 
 roce_verbs_write: src/roce_verbs_write.c $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADERS)
 	$(PKG_CONFIG) --exists libibverbs
 	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CFLAGS) -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
 
 roce_app_write: src/roce_app_write.c $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADERS) $(APP) $(APP_HEADERS)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
 
 tests/test_roce: tests/test_roce.c $(CORE) $(CORE_HEADERS)
 tests/test_roce_cm_wire: tests/test_roce_cm_wire.c src/roce_cm_wire.c src/roce_cm_wire.h src/roce_wire.c src/roce_wire.h ../common/roce_icrc.h
