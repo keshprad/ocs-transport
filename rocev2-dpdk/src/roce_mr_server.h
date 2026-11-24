@@ -16,6 +16,7 @@ struct roce_mr_lease {
     void *mapping;
     size_t mapped_length;
     uint64_t iova;
+    uint64_t scope;
     uint32_t lkey;
     uint32_t rkey;
 };
@@ -24,6 +25,9 @@ struct roce_mr_server *roce_mr_server_start(const char *path);
 /* A lease retains the mapped pages even if the registering process exits. */
 int roce_mr_acquire(struct roce_mr_server *server, pid_t owner, uint32_t lkey, uint32_t access,
                    struct roce_mr_lease *lease);
+/* The anchor retains the authenticated process and PD of the connected QP. */
+int roce_mr_acquire_related(const struct roce_mr_lease *anchor, uint32_t lkey, uint32_t access,
+                           struct roce_mr_lease *lease);
 int roce_mr_export_dmabuf(const struct roce_mr_lease *lease);
 void roce_mr_release(struct roce_mr_lease *lease);
 /* Wait until the registration and any leases have released the key. */

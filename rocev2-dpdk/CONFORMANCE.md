@@ -455,13 +455,35 @@ RC retries. The worker retires scatter/gather WRITEs in QP order after
 the RC ACK and release of that slot's PMD references.
 
 Version 3 appends an array of second source descriptors after the
-version 2 send queue layout. Both SGEs must use the configured MR. The
-worker snapshots both addresses and lengths after validation and uses
-the same snapshot on retransmission.
+version 2 send queue layout. With `--two-sge-writes`, both SGEs use the
+configured MR. The worker snapshots both addresses and lengths after
+validation and uses the same snapshot on retransmission.
 The wire tests compare two-span packet bytes, padding and iCRC against
 the contiguous encoder. The provider test rejects the wrong descriptor
 size, an invalid second lkey and an out-of-range second address. It also
 polls ordered completions for a two-SGE WRITE followed by a one-SGE WRITE.
+
+With `--multi-mr-writes`, the same queue layout accepts source keys from
+separate registrations in the QP's PD. The provider checks and retains
+each source while posting. The worker resolves additional keys through
+the original registration's process and provider PD scope, validates
+their ranges, and keeps the resolved spans through retransmission. A
+secondary mapping is shared by overlapping outstanding WRs. The last
+retirement releases its mapping after RC ACK and PMD reference release.
+The provider fixture rejects foreign-PD keys at posting and at the
+broker, rejects a source overrun, reports `EBUSY` before completion,
+and deregisters the secondary MR after polling its WC on an open QP.
+
+In the exact Spark-04 kernel guest with Generic Netlink required,
+two independently registered source buffers verified 24,585 bytes in
+copy and in scatter/gather mode at PMTU 1024. The worker assembled
+the boundary-crossing packet from four mbufs. With one such packet
+dropped, the sender recovered it with one retry and all three WRs
+completed in order. Repeated drops exhausted RC retry and both guest
+modules unloaded after the failure path. The final four-QP, two-worker
+run verified 98,340 bytes and 12 WCs with zero retries. Stock Linux RXE
+verified an 8,195-byte WRITE sent from two MRs at PMTU 4096 over TAP.
+Physical mlx5 DMA from both registered buffers remains to be measured.
 
 On the exact Spark-04 kernel, one-QP Netlink-backed copy and scatter/gather
 CM runs each verified 24,585 bytes and three completions at PMTU 1024.

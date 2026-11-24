@@ -204,6 +204,68 @@ static void check_two_sge_queue(struct ibv_pd *pd, const struct ibv_mr *mr, uint
     assert(!munmap(work, roce_native_work_size(config.version)) && !close(fd));
 }
 
+static void check_multi_mr_queue(int broker, struct ibv_pd *pd, const struct ibv_mr *anchor, uint64_t iova)
+{
+    size_t length = (size_t)sysconf(_SC_PAGESIZE);
+    void *data = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(data != MAP_FAILED);
+    struct ibv_pd *foreign_pd = ibv_alloc_pd(pd->context);
+    assert(foreign_pd);
+    struct ibv_mr *secondary = ibv_reg_mr(pd, data, length, 0);
+    struct ibv_mr *foreign = ibv_reg_mr(foreign_pd, data, length, 0);
+    assert(secondary && foreign);
+    share_keys(broker, anchor, iova);
+    share_keys(broker, secondary, (uintptr_t)data);
+    share_keys(broker, foreign, (uintptr_t)data);
+    expect(broker, 'M');
+
+    const struct roce_native_queue_config config = {
+        .version = ROCE_NATIVE_SGE_QUEUE_VERSION, .qps = 1, .workers = 1, .writes = 1,
+        .write_size = 32, .local_qpn = 3100, .peer_qpn = 4200, .local_psn = 5001, .peer_psn = 6001,
+        .pmtu = 1024, .local_lkey = anchor->lkey, .remote_rkey = 42, .flags = ROCE_NATIVE_QUEUE_MULTI_MR,
+        .local_ipv4 = 0xc0000201, .peer_ipv4 = 0xc0000202, .local_address = iova, .remote_address = 0x100000,
+    };
+    int fd;
+    struct roce_native_work *work = map_test_work(&config, &fd);
+    assert(!roce_native_bind_work(pd->context, fd));
+    struct ibv_cq *cq = ibv_create_cq(pd->context, 1, NULL, NULL, 0);
+    assert(cq);
+    struct ibv_qp_init_attr init = {
+        .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = 1, .max_send_sge = 2 },
+    };
+    struct ibv_qp *qp = ibv_create_qp(pd, &init);
+    assert(qp && !roce_native_init_qp(qp, false) && !roce_native_connect_qp(qp, &config, 0));
+    struct ibv_sge segments[] = {
+        { .addr = (uintptr_t)data, .length = 13, .lkey = foreign->lkey },
+        { .addr = iova, .length = 19, .lkey = anchor->lkey },
+    };
+    struct ibv_send_wr write = {
+        .wr_id = 1, .sg_list = segments, .num_sge = 2, .opcode = IBV_WR_RDMA_WRITE,
+        .send_flags = IBV_SEND_SIGNALED, .wr.rdma = { .remote_addr = config.remote_address, .rkey = 42 },
+    };
+    struct ibv_send_wr *bad;
+    assert(ibv_post_send(qp, &write, &bad) == EINVAL && bad == &write);
+    segments[0].lkey = secondary->lkey;
+    segments[0].addr += length - 1;
+    assert(ibv_post_send(qp, &write, &bad) == EINVAL && bad == &write);
+    segments[0].addr = (uintptr_t)data;
+    assert(!ibv_post_send(qp, &write, &bad) && !bad && atomic_load(&work->qps[0].posted) == 1);
+    assert(work->qps[0].entries[0].lkey == secondary->lkey);
+    assert(((struct roce_native_sge_work *)work)->second[0][0].lkey == anchor->lkey);
+    assert(ibv_dereg_mr(secondary) == EBUSY);
+    send_value(broker, "M", 1);
+    expect(broker, 'R');
+    assert(ibv_dereg_mr(secondary) == EBUSY);
+    atomic_store_explicit(&work->qps[0].retired, 1, memory_order_release);
+    struct ibv_wc wc;
+    assert(ibv_poll_cq(cq, 1, &wc) == 1);
+    check_wc(&wc, qp, 1, IBV_WC_SUCCESS);
+    assert(!ibv_dereg_mr(secondary) && !ibv_dereg_mr(foreign) && !ibv_dealloc_pd(foreign_pd));
+    assert(!ibv_destroy_qp(qp) && !ibv_destroy_cq(cq));
+    assert(!munmap(work, roce_native_work_size(config.version)) && !close(fd) && !munmap(data, length));
+}
+
 static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
 {
     enum { QPS = 3, WRITES = 3, WRITE_SIZE = 32 };
@@ -356,6 +418,7 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
 
 static void client(int fd)
 {
+    assert(!setenv("ROCE_DPDK_MR_PD_SCOPE", "1", 1));
     struct ibv_device **devices = ibv_get_device_list(NULL);
     assert(devices);
     struct ibv_context *context = NULL;
@@ -388,6 +451,7 @@ static void client(int fd)
     check_early_qp(pd, mr, iova);
     check_early_qp(pd, mr, iova);
     check_two_sge_queue(pd, mr, iova);
+    check_multi_mr_queue(fd, pd, mr, iova);
     share_keys(fd, mr, iova);
 
     expect(fd, 'B');
@@ -407,6 +471,21 @@ static void client(int fd)
 
 static void check(struct roce_mr_server *server, int fd, pid_t child)
 {
+    struct mr_keys related[3];
+    for (size_t i = 0; i < sizeof(related) / sizeof(*related); ++i)
+        recv_value(fd, &related[i], sizeof(related[i]));
+    struct roce_mr_lease anchor = {0}, secondary = {0}, denied = {0};
+    assert(!roce_mr_acquire(server, child, related[0].lkey, 0, &anchor) && anchor.scope);
+    assert(roce_mr_acquire_related(&anchor, related[2].lkey, 0, &denied) == EACCES);
+    assert(roce_mr_acquire_related(&anchor, related[1].lkey, ROCE_MR_IPC_WRITE, &denied) == EACCES);
+    assert(!roce_mr_acquire_related(&anchor, related[1].lkey, 0, &secondary));
+    assert(secondary.scope == anchor.scope && secondary.iova == related[1].iova && secondary.lkey != anchor.lkey);
+    send_value(fd, "M", 1);
+    expect(fd, 'M');
+    roce_mr_release(&secondary);
+    roce_mr_release(&anchor);
+    send_value(fd, "R", 1);
+
     struct mr_keys keys;
     struct roce_mr_lease lease = {0};
     recv_value(fd, &keys, sizeof(keys));

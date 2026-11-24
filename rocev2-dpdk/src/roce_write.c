@@ -3,6 +3,7 @@
 #include "roce_cm_dpdk.h"
 #include "roce_doorbell.h"
 #include "roce_lab.h"
+#include "roce_mr_ipc.h"
 #include "../../mrc-dpdk/src/dpdk_io.h"
 
 #include <arpa/inet.h>
@@ -22,6 +23,7 @@
 
 #include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +60,7 @@ struct datapath_options {
     bool scatter_gather;
     bool native_queues;
     bool two_sge_writes;
+    bool multi_mr_writes;
     bool prefault_app;
 };
 
@@ -68,6 +71,22 @@ struct tx_memory_ref {
 typedef int (*mlx5_dmabuf_map_fn)(uint16_t, void *, size_t, int, uint64_t);
 typedef int (*mlx5_dmabuf_unmap_fn)(uint16_t, void *, size_t);
 typedef int (*mlx5_tx_burst_completion_fn)(uint16_t, uint16_t);
+
+struct tx_region {
+    struct roce_mr_lease lease;
+    uint32_t refs;
+    bool external;
+    bool mapped;
+};
+
+struct tx_regions {
+    pthread_mutex_t mutex;
+    const struct roce_mr_lease *anchor;
+    mlx5_dmabuf_map_fn map;
+    mlx5_dmabuf_unmap_fn unmap;
+    uint16_t port;
+    struct tx_region entries[ROCE_MR_IPC_MAX_REGISTRATIONS];
+};
 
 union write_qp {
     struct roce_requester requester;
@@ -84,6 +103,7 @@ struct native_write {
     uint32_t end_packet;
     uint32_t length;
     uint32_t first_length;
+    struct tx_region *regions[ROCE_NATIVE_MAX_SEND_SGES];
 };
 
 struct write_run {
@@ -98,6 +118,7 @@ struct write_run {
     size_t local_length;
     uint32_t local_lkey;
     struct tx_memory_ref *tx_refs;
+    struct tx_regions *regions;
     uint16_t port;
     int application_socket;
     bool sender;
@@ -515,22 +536,111 @@ static bool admit_writes(struct write_worker *worker)
     return true;
 }
 
+static bool unmap_tx_region(const struct tx_regions *regions, struct tx_region *entry)
+{
+    const struct roce_mr_lease *lease = &entry->lease;
+    if (entry->mapped) {
+        if (regions->unmap(regions->port, lease->mapping, lease->mapped_length))
+            return false;
+        entry->mapped = false;
+    }
+    if (entry->external) {
+        if (rte_extmem_unregister(lease->mapping, lease->mapped_length))
+            return false;
+        entry->external = false;
+    }
+    roce_mr_release(&entry->lease);
+    entry->refs = 0;
+    return true;
+}
+
+static bool map_tx_region(const struct tx_regions *regions, struct tx_region *entry)
+{
+    if (!regions->map)
+        return true;
+    const struct roce_mr_lease *lease = &entry->lease;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || rte_extmem_register(lease->mapping, lease->mapped_length, NULL, 0, (size_t)page))
+        return false;
+    entry->external = true;
+    int fd = roce_mr_export_dmabuf(lease);
+    if (fd < 0)
+        return false;
+    int error = regions->map(regions->port, lease->mapping, lease->mapped_length, fd, 0);
+    close(fd);
+    entry->mapped = !error;
+    return entry->mapped;
+}
+
+static const uint8_t *acquire_tx_span(struct tx_regions *regions, uint32_t lkey, uint64_t address,
+                                      uint32_t length, struct tx_region **retained)
+{
+    const uint8_t *source = NULL;
+    pthread_mutex_lock(&regions->mutex);
+    struct tx_region *entry = NULL, *unused = NULL;
+    for (size_t i = 0; i < RTE_DIM(regions->entries); ++i) {
+        struct tx_region *candidate = &regions->entries[i];
+        if (candidate->refs && candidate->lease.lkey == lkey) {
+            entry = candidate;
+            break;
+        }
+        if (!unused && !candidate->lease.server)
+            unused = candidate;
+    }
+    bool new_lease = !entry;
+    if (new_lease && unused &&
+        !roce_mr_acquire_related(regions->anchor, lkey, regions->map ? ROCE_MR_IPC_WRITE : 0, &unused->lease))
+        entry = unused;
+    if (entry) {
+        const struct roce_mr_lease *lease = &entry->lease;
+        if (roce_native_contains(lease->iova, lease->length, address, length) &&
+            (!new_lease || map_tx_region(regions, entry))) {
+            ++entry->refs;
+            *retained = entry;
+            source = lease->buffer + (address - lease->iova);
+        } else if (new_lease && !unmap_tx_region(regions, entry)) {
+            fprintf(stderr, "could not unwind a native TX mapping\n");
+        }
+    }
+    pthread_mutex_unlock(&regions->mutex);
+    return source;
+}
+
+static bool release_tx_regions(struct tx_regions *regions, struct native_write *write)
+{
+    if (!write->regions[0] && !write->regions[1])
+        return true;
+    bool released = true;
+    pthread_mutex_lock(&regions->mutex);
+    for (size_t i = 0; i < RTE_DIM(write->regions); ++i) {
+        struct tx_region *entry = write->regions[i];
+        if (entry && !--entry->refs && !unmap_tx_region(regions, entry))
+            released = false;
+        write->regions[i] = NULL;
+    }
+    pthread_mutex_unlock(&regions->mutex);
+    return released;
+}
+
+static const uint8_t *resolve_tx_span(const struct write_run *run, uint32_t lkey, uint64_t address,
+                                      uint32_t length, struct tx_region **retained)
+{
+    if (lkey == run->local_lkey)
+        return roce_native_contains(run->local_iova, run->local_length, address, length) ?
+               run->local_buffer + (address - run->local_iova) : NULL;
+    return run->regions ? acquire_tx_span(run->regions, lkey, address, length, retained) : NULL;
+}
+
 static enum roce_native_wc_status validate_native_write(const struct write_worker *worker, uint32_t index,
                                                         const struct roce_native_write *wqe,
                                                         const struct roce_native_sge *second)
 {
-    const struct write_run *run = worker->run;
     const struct roce_requester *requester = &worker->states[index].requester;
     uint64_t bytes = wqe->length;
     if (!bytes || bytes > ROCE_NATIVE_MAX_WRITE || second->length >= bytes)
         return ROCE_NATIVE_WC_LOCAL_LENGTH;
-    if (wqe->lkey != run->local_lkey ||
-        !roce_native_contains(run->local_iova, run->local_length, wqe->local_address, bytes - second->length) ||
-        (second->length && (second->lkey != run->local_lkey ||
-         !roce_native_contains(run->local_iova, run->local_length, second->address, second->length))))
-        return ROCE_NATIVE_WC_LOCAL_PROTECTION;
     if (wqe->rkey != requester->remote.rkey ||
-        !roce_native_contains(requester->remote.address, requester->remote.size * run->options->writes,
+        !roce_native_contains(requester->remote.address, requester->remote.size * worker->run->options->writes,
                               wqe->remote_address, bytes))
         return ROCE_NATIVE_WC_REMOTE_ACCESS;
     return ROCE_NATIVE_WC_SUCCESS;
@@ -571,13 +681,19 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
             return false;
         }
         /* Keep both PSN bounds even when the preceding slot has been reused. */
-        run->native_writes[qp][slot] = (struct native_write) {
-            .source = run->local_buffer + (wqe.local_address - run->local_iova),
-            .second = tail.length ? run->local_buffer + (tail.address - run->local_iova) : NULL,
+        struct native_write *write = &run->native_writes[qp][slot];
+        *write = (struct native_write) {
             .remote = wqe.remote_address, .length = wqe.length,
             .first_length = wqe.length - tail.length,
             .first_packet = packets, .end_packet = packets + count,
         };
+        write->source = resolve_tx_span(run, wqe.lkey, wqe.local_address, write->first_length, &write->regions[0]);
+        if (write->source && tail.length)
+            write->second = resolve_tx_span(run, tail.lkey, tail.address, tail.length, &write->regions[1]);
+        if (!write->source || (tail.length && !write->second)) {
+            sq->status[slot] = ROCE_NATIVE_WC_LOCAL_PROTECTION;
+            return false;
+        }
         packets += count;
     }
     requester->total = packets;
@@ -626,14 +742,14 @@ static bool admit_native_writes(struct write_worker *worker, uint64_t now)
     return true;
 }
 
-static void publish_completions(struct write_worker *worker)
+static bool publish_completions(struct write_worker *worker)
 {
     const struct write_run *run = worker->run;
     uint32_t pending = worker->pending_completions;
     if (!pending)
-        return;
+        return true;
     if (!run->native && run->tx_refs && rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) != 1)
-        return;
+        return true;
     worker->pending_completions = 0;
     bool polled_tx = false;
     for (; pending; pending &= pending - 1) {
@@ -642,7 +758,7 @@ static void publish_completions(struct write_worker *worker)
         uint32_t completed;
         if (run->native) {
             struct roce_native_sq *sq = &run->native->qps[worker->first_qp + i];
-            const struct native_write *writes = run->native_writes[worker->first_qp + i];
+            struct native_write *writes = run->native_writes[worker->first_qp + i];
             completed = worker->acknowledged_writes[i];
             while (completed < worker->posted[i] &&
                    writes[completed % ROCE_NATIVE_QUEUE_DEPTH].end_packet <= requester->acked)
@@ -661,6 +777,10 @@ static void publish_completions(struct write_worker *worker)
                     if (rte_mbuf_ext_refcnt_read(shared) != 1)
                         break;
                 }
+                if (run->regions && !release_tx_regions(run->regions, &writes[retired % ROCE_NATIVE_QUEUE_DEPTH])) {
+                    fprintf(stderr, "native TX mapping release failed\n");
+                    return false;
+                }
                 sq->status[retired % ROCE_NATIVE_QUEUE_DEPTH] = ROCE_NATIVE_WC_SUCCESS;
             }
             /* The PMD can finish DMA after the peer's last ACK. */
@@ -678,6 +798,7 @@ static void publish_completions(struct write_worker *worker)
         }
         worker->completions[i] = completed;
     }
+    return true;
 }
 
 static void record_requester_failure(const struct write_worker *worker, uint32_t index)
@@ -718,7 +839,8 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
         return false;
     }
     bool received = receive_packets(worker, now);
-    publish_completions(worker);
+    if (!publish_completions(worker))
+        return false;
     if (received && worker->completed == worker->qps && !worker->finished && all_native_writes_retired(worker)) {
         worker->finished = true;
         if (run->options->report_bandwidth)
@@ -893,7 +1015,8 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
                const struct roce_lab_options *lab, uint8_t *buffer,
                const struct roce_app_memory *application, bool steer,
-               const struct datapath_options *options, struct tx_memory_ref *tx_refs, struct roce_cm_port *cm)
+               const struct datapath_options *options, struct tx_memory_ref *tx_refs,
+               struct tx_regions *regions, struct roce_cm_port *cm)
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
                              .state = WRITE_WAITING, .work = application->work,
@@ -901,7 +1024,7 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                              .local_iova = local->region.address, .local_buffer = buffer,
                              .local_length = application->length, .local_lkey = application->mr.lkey,
                              .application_socket = application->socket,
-                             .tx_refs = tx_refs, .cm = cm };
+                             .tx_refs = tx_refs, .regions = regions, .cm = cm };
     if (run.native) {
         run.native_writes = rte_zmalloc(NULL, options->qps * sizeof(*run.native_writes), RTE_CACHE_LINE_SIZE);
         if (!run.native_writes) {
@@ -1005,6 +1128,9 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             options->native_queues = true;
         } else if (strcmp(argv[i], "--two-sge-writes") == 0) {
             options->two_sge_writes = true;
+        } else if (strcmp(argv[i], "--multi-mr-writes") == 0) {
+            options->two_sge_writes = true;
+            options->multi_mr_writes = true;
         } else if (strcmp(argv[i], "--tap-mtu") == 0) {
             if (++i == argc || options->tap_mtu ||
                 !roce_parse_uint(argv[i], UINT16_MAX - RTE_ETHER_HDR_LEN, &options->tap_mtu) || !options->tap_mtu)
@@ -1097,7 +1223,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--two-sge-writes] [--prefault-app]"
+                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--two-sge-writes] [--multi-mr-writes]"
+                        " [--prefault-app]"
                         " [--scatter-gather] [--tap-mtu N] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
     }
@@ -1207,6 +1334,9 @@ int main(int argc, char **argv)
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
     struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, options.workers, MBUF_CACHE_SIZE);
     struct roce_app_memory application = { .socket = -1 };
+    struct tx_regions extra_regions = { .mutex = PTHREAD_MUTEX_INITIALIZER, .port = port,
+                                        .anchor = &application.mr };
+    struct tx_regions *regions = datapath.multi_mr_writes ? &extra_regions : NULL;
     struct roce_cm_port cm = {0};
     struct roce_cma_service cm_service = { .listener = -1, .socket = -1 };
     struct roce_cma_service *cma = datapath.rdmacm_socket ? &cm_service : NULL;
@@ -1267,6 +1397,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "physical scatter/gather from verbs memory requires the mlx5 DMA-BUF patch\n");
             goto cleanup_port;
         }
+        extra_regions.map = dmabuf_map;
+        extra_regions.unmap = dmabuf_unmap;
         if (datapath.native_queues) {
             mlx5_tx_burst_completion_fn enable_completion =
                 (mlx5_tx_burst_completion_fn)dlsym(mlx5_pmd, "rte_pmd_mlx5_enable_tx_burst_completion");
@@ -1307,6 +1439,7 @@ int main(int argc, char **argv)
             .dma_writable = dma_gather,
             .in_band_cm = in_band, .scatter_gather = datapath.scatter_gather,
             .native_queues = datapath.native_queues, .two_sge_writes = datapath.two_sge_writes,
+            .multi_mr_writes = datapath.multi_mr_writes,
             .rdmacm = cma != NULL,
         };
         uint64_t attached = datapath.report_bandwidth ? roce_now_ns() : 0;
@@ -1413,7 +1546,7 @@ int main(int argc, char **argv)
         if (in_band)
             printf("RoCEv2 CM established local_qpn=%06x peer_qpn=%06x\n", local.qpn, peer.qpn);
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
-                     options.workers > 1 && !memif, &datapath, tx_refs,
+                     options.workers > 1 && !memif, &datapath, tx_refs, regions,
                      in_band ? &cm : NULL);
         if (!result && in_band) {
             if (roce_cm_lab_close(port, pool, &cm, cma)) {
@@ -1459,6 +1592,15 @@ cleanup_port:
                 return 1;
             }
         }
+    }
+    if (regions) {
+        for (size_t i = 0; i < RTE_DIM(regions->entries); ++i)
+            if (!unmap_tx_region(regions, &regions->entries[i])) {
+                fprintf(stderr, "could not release a native TX mapping after port shutdown\n");
+                return 1;
+            }
+    }
+    if (datapath.scatter_gather) {
         if (dma_mapped) {
             err = dmabuf_unmap ? dmabuf_unmap(port, dma_address, dma_length) :
                 rte_dev_dma_unmap(info.device, dma_address, (uintptr_t)dma_address, dma_length);
@@ -1487,6 +1629,7 @@ cleanup_port:
     if (result)
         roce_app_abort(&application, &options);
 cleanup_buffers:
+    pthread_mutex_destroy(&extra_regions.mutex);
     rte_free(tx_refs);
     if (cma)
         roce_cma_service_close(cma);

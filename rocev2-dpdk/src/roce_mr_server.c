@@ -99,8 +99,7 @@ static bool valid_request(const struct roce_mr_server *server, const struct roce
 {
     size_t mask = server->page_size - 1;
     bool writable = request->access & ROCE_MR_IPC_WRITE;
-    return (request->version == ROCE_MR_IPC_VERSION || request->version == ROCE_MR_IPC_TICKET_VERSION) &&
-           !(request->access & ~(ROCE_MR_IPC_WRITE | ROCE_MR_IPC_REMOTE_WRITE)) &&
+    return !(request->access & ~(ROCE_MR_IPC_WRITE | ROCE_MR_IPC_REMOTE_WRITE)) &&
            (!(request->access & ROCE_MR_IPC_REMOTE_WRITE) || writable) &&
            request->length && request->length - 1 <= UINT64_MAX - request->iova &&
            request->offset == (request->iova & mask) &&
@@ -199,7 +198,7 @@ static void register_mapping(struct roce_mr_server *server, struct roce_mr_regis
     int error = roce_mr_ipc_receive_registration(region->socket, &request, &fd);
     if (error == EAGAIN || error == EWOULDBLOCK)
         return;
-    if (!error && request.version == ROCE_MR_IPC_TICKET_VERSION)
+    if (!error && roce_mr_uses_ticket(request.version))
         start_ticket(server, region, &request, fd);
     else
         finish_registration(server, region, &request, fd, error ? error : fd < 0 ? EPROTO : 0);
@@ -372,16 +371,15 @@ free_server:
     return NULL;
 }
 
-int roce_mr_acquire(struct roce_mr_server *server, pid_t owner, uint32_t lkey, uint32_t access,
-                   struct roce_mr_lease *lease)
+static int acquire_locked(struct roce_mr_server *server, pid_t owner, uint64_t scope, uint32_t lkey,
+                          uint32_t access, struct roce_mr_lease *lease)
 {
     int error = ENOENT;
-    pthread_mutex_lock(&server->mutex);
     for (size_t i = 0; !server->stopping && i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i) {
         struct roce_mr_registration *region = &server->regions[i];
         if (region->socket < 0 || !region->mapping || region->owner != owner || region->lkey != lkey)
             continue;
-        if (access & ~region->request.access) {
+        if ((scope && scope != region->request.scope) || (access & ~region->request.access)) {
             error = EACCES;
             break;
         }
@@ -390,11 +388,33 @@ int roce_mr_acquire(struct roce_mr_server *server, pid_t owner, uint32_t lkey, u
             .server = server, .registration = region,
             .buffer = region->mapping + region->request.offset, .length = (size_t)region->request.length,
             .mapping = region->mapping, .mapped_length = (size_t)region->request.mapped_length,
-            .iova = region->request.iova, .lkey = region->lkey, .rkey = region->rkey,
+            .iova = region->request.iova, .scope = region->request.scope,
+            .lkey = region->lkey, .rkey = region->rkey,
         };
         error = 0;
         break;
     }
+    return error;
+}
+
+int roce_mr_acquire(struct roce_mr_server *server, pid_t owner, uint32_t lkey, uint32_t access,
+                   struct roce_mr_lease *lease)
+{
+    pthread_mutex_lock(&server->mutex);
+    int error = acquire_locked(server, owner, 0, lkey, access, lease);
+    pthread_mutex_unlock(&server->mutex);
+    return error;
+}
+
+int roce_mr_acquire_related(const struct roce_mr_lease *anchor, uint32_t lkey, uint32_t access,
+                           struct roce_mr_lease *lease)
+{
+    if (!anchor->registration || !anchor->scope)
+        return EACCES;
+    struct roce_mr_server *server = anchor->server;
+    pthread_mutex_lock(&server->mutex);
+    pid_t owner = anchor->registration->owner;
+    int error = owner ? acquire_locked(server, owner, anchor->scope, lkey, access, lease) : ENOENT;
     pthread_mutex_unlock(&server->mutex);
     return error;
 }

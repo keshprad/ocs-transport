@@ -12,7 +12,14 @@ enum {
     ROCE_NATIVE_MAX_WRITE = INT32_MAX,
     ROCE_NATIVE_QUEUE_FD = 4,
     ROCE_NATIVE_QUEUE_RECEIVE_ONLY = 1u << 0,
+    ROCE_NATIVE_QUEUE_MULTI_MR = 1u << 1,
 };
+
+static inline bool roce_native_valid_queue_flags(uint32_t version, uint32_t flags)
+{
+    return !flags || flags == ROCE_NATIVE_QUEUE_RECEIVE_ONLY ||
+           (version == ROCE_NATIVE_SGE_QUEUE_VERSION && flags == ROCE_NATIVE_QUEUE_MULTI_MR);
+}
 
 #define ROCE_NATIVE_SQ_CLOSED (UINT32_C(1) << 31)
 #define ROCE_NATIVE_DOORBELL_OVERFLOW UINT64_C(1)

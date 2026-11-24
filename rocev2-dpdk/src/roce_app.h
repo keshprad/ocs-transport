@@ -28,6 +28,7 @@ struct roce_app_memory {
     struct roce_app_work *work;
     struct roce_native_work *native;
     uint32_t native_version;
+    bool multi_mr_writes;
     struct roce_mr_lease mr;
 };
 
@@ -39,6 +40,7 @@ struct roce_app_config {
     bool scatter_gather;
     bool native_queues;
     bool two_sge_writes;
+    bool multi_mr_writes;
     bool rdmacm;
 };
 

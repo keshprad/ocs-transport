@@ -80,10 +80,10 @@ static int receive_wire(int socket, void *message, size_t length)
 
 int roce_mr_ipc_send_registration(int socket, const struct roce_mr_request *request, int mapping_fd)
 {
-    struct roce_mr_request message = *request;
+    size_t length = request->scope ? sizeof(*request) : offsetof(struct roce_mr_request, scope);
     if (mapping_fd < 0)
-        return send_wire(socket, &message, sizeof(message));
-    return roce_send_fd(socket, &message, sizeof(message), mapping_fd) ? 0 : errno;
+        return send_wire(socket, request, length);
+    return roce_send_fd(socket, request, length, mapping_fd) ? 0 : errno;
 }
 
 int roce_mr_ipc_read_reply(int socket, struct roce_mr_reply *reply)
@@ -96,7 +96,21 @@ int roce_mr_ipc_read_reply(int socket, struct roce_mr_reply *reply)
 
 int roce_mr_ipc_receive_registration(int socket, struct roce_mr_request *request, int *mapping_fd)
 {
-    return roce_receive_optional_fd(socket, request, sizeof(*request), mapping_fd) ? 0 : errno;
+    *request = (struct roce_mr_request){0};
+    *mapping_fd = -1;
+    ssize_t length = roce_receive_record_fd(socket, request, sizeof(*request), mapping_fd, 0);
+    if (length < 0)
+        return errno;
+    if (length == (ssize_t)offsetof(struct roce_mr_request, scope) &&
+        (request->version == ROCE_MR_IPC_VERSION || request->version == ROCE_MR_IPC_TICKET_VERSION))
+        return 0;
+    if (length == sizeof(*request) && request->scope &&
+        (request->version == ROCE_MR_IPC_SCOPED_VERSION || request->version == ROCE_MR_IPC_SCOPED_TICKET_VERSION))
+        return 0;
+    if (*mapping_fd >= 0)
+        close(*mapping_fd);
+    *mapping_fd = -1;
+    return EPROTO;
 }
 
 int roce_mr_ipc_send_reply(int socket, const struct roce_mr_reply *reply)

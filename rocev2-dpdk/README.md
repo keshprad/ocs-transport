@@ -109,6 +109,13 @@ uses separate DMA segments for both spans and a single iCRC. The default
 uses the version 2 queue layout for single-SGE WRITEs. Two-SGE mode
 requires a worker, application and provider that support version 3.
 
+Use `--multi-mr-writes` with `--verbs-queues` to source the two spans
+from independently registered buffers in the same protection domain.
+The worker resolves and retains each source through RC retry and TX
+descriptor release. The bundled requester registers both buffers with
+the provider. An application opening its own context enables scoped
+registration with `ROCE_DPDK_MR_PD_SCOPE=1` before opening the device.
+
 Each native worker checks a shared notification counter before draining its
 doorbell ring. It scans the posted send-queue heads on overflow and
 periodically to recover from an interrupted notification. The shared ring

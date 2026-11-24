@@ -18,6 +18,7 @@ enum { NATIVE_COMPLETION_BATCH = 32 };
 
 struct native_run {
     struct roce_native_queue_config config;
+    const struct ibv_mr *second_mr;
     uint64_t deadline;
     uint32_t post_batch;
     uint32_t capacity;
@@ -103,6 +104,11 @@ static int post_batch(struct native_qp *state, uint32_t first, uint32_t count)
             uint32_t second_length = config->write_size - first_length;
             segments[i][1] = segments[i][0];
             segments[i][1].length = second_length;
+            if (state->run->second_mr) {
+                const struct ibv_mr *mr = state->run->second_mr;
+                segments[i][1].addr = (uintptr_t)mr->addr + offset / config->write_size * second_length;
+                segments[i][1].lkey = mr->lkey;
+            }
             segments[i][0].addr += second_length;
             segments[i][0].length = first_length;
         }
@@ -277,7 +283,7 @@ static int release_queues(struct native_qp *queues, uint32_t count, bool abortin
     return first_error;
 }
 
-bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
+bool roce_app_run_native_verbs(struct ibv_pd *pd, const struct ibv_mr *second_mr, int queue_fd, int app_socket,
                                uint32_t post_batch, bool scatter_gather,
                                int (*submitted)(void *), void *context,
                                struct roce_app_native_qp *early_qp)
@@ -287,7 +293,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
         errno = EINVAL;
         return false;
     }
-    struct native_run run = { .socket = app_socket, .post_batch = post_batch,
+    struct native_run run = { .socket = app_socket, .post_batch = post_batch, .second_mr = second_mr,
                               .pipelined = scatter_gather && post_batch > 1 };
     atomic_init(&run.stopped, false);
     const struct roce_native_work *work = roce_native_map_work(queue_fd, false, &run.config);
@@ -301,7 +307,9 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     struct native_qp queues[ROCE_LAB_MAX_QPS] = {0};
     run.capacity = roce_native_queue_capacity(run.config.writes);
     int error = 0;
-    if (!post_batch || post_batch > run.capacity) {
+    if (!post_batch || post_batch > run.capacity ||
+        !!second_mr != !!(run.config.flags & ROCE_NATIVE_QUEUE_MULTI_MR) ||
+        (second_mr && second_mr->pd != pd)) {
         error = EPROTO;
     } else if (early_qp) {
         uint32_t need = run.pipelined ? run.capacity : post_batch;

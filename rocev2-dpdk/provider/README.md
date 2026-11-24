@@ -26,6 +26,14 @@ source ranges and the combined remote range before posting. The worker
 validates both spans before forming packets. Version 2 descriptors
 support one SGE and are used by default.
 
+`--multi-mr-writes` uses the same version 3 layout and permits one or
+two source MRs on an individual WRITE. The application's provider
+context uses `ROCE_DPDK_MR_PD_SCOPE=1` to associate registrations with
+that PD. The worker matches the registration scope and authenticated
+process to the QP's original MR. The application can deregister an
+additional MR after polling the completions for all WRs that reference
+it, with the QP still open.
+
 Multiple bound QPs can share one polling CQ. Completions carry the
 originating QPN and remain ordered within each send queue. The CQ reserves
 space for all accepted WRs across its QPs, including unsignaled WRs that
@@ -77,7 +85,8 @@ and teardown with more than one attached QP. It also checks selective
 signaling, zero-result polls that reclaim retired entries, and error CQEs
 for unsignaled WRs. It checks the version 3 size requirement, second-SGE
 key and range validation, and ordered completions for mixed one- and
-two-SGE requests.
+two-SGE requests. The multi-MR test exercises a foreign-PD key, local
+range checking, and deregistration before and after polling a WC.
 Set `ROCE_DPDK_MR_REQUIRE_NETLINK=1` to require the kernel's ticket
 handoff in these checks.
 
@@ -96,7 +105,7 @@ observes disconnect. The CM-owned runs post 521 WRITEs per QP to
 verify queue reuse after two full laps. With four available CPUs it
 also runs four QPs across two workers using the TCP lab setup. The
 two-SGE cases verify byte order across packet boundaries in both copy
-and scatter/gather modes.
+and scatter/gather modes with one MR and with two independent MRs.
 [librdmacm adapter](../README.md#in-band-connection-setup)
 
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

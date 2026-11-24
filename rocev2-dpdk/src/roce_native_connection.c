@@ -57,7 +57,8 @@ static bool valid_config(const struct roce_native_queue_config *config, bool rec
     if (!config->qps ||
         config->qps > ROCE_LAB_MAX_QPS || !config->workers || config->workers > config->qps ||
         !config->writes || config->writes > ROCE_PSN_MASK || !config->write_size ||
-        config->flags != (receiver ? ROCE_NATIVE_QUEUE_RECEIVE_ONLY : 0) || !verbs_mtu(config->pmtu) ||
+        !roce_native_valid_queue_flags(config->version, config->flags) ||
+        receiver != !!(config->flags & ROCE_NATIVE_QUEUE_RECEIVE_ONLY) || !verbs_mtu(config->pmtu) ||
         config->local_qpn < 2 || config->local_qpn > ROCE_PSN_MASK - config->qps ||
         config->peer_qpn < 2 || config->peer_qpn > ROCE_PSN_MASK - config->qps ||
         config->local_psn > ROCE_PSN_MASK || config->peer_psn > ROCE_PSN_MASK ||

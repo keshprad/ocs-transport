@@ -32,11 +32,14 @@ struct roce_verbs_context {
     uint32_t cq_count;
     char *mr_socket;
     bool require_netlink;
+    bool scoped_mrs;
 };
 
 struct roce_verbs_pd {
     struct ibv_pd ibv;
     atomic_size_t references;
+    uint64_t scope;
+    pthread_rwlock_t region_lock;
     struct roce_verbs_mr *regions;
 };
 
@@ -46,6 +49,7 @@ struct roce_verbs_mr {
     uint64_t iova;
     size_t length;
     unsigned qp_refs;
+    atomic_size_t wr_refs;
     int socket;
     bool live;
     bool dereg_pending;
@@ -70,6 +74,7 @@ struct roce_verbs_qp {
     uint32_t index;
     uint32_t reaped;
     bool signaled[ROCE_NATIVE_QUEUE_DEPTH];
+    struct roce_verbs_mr *sources[ROCE_NATIVE_QUEUE_DEPTH][ROCE_NATIVE_MAX_SEND_SGES];
 };
 
 static const struct verbs_device_ops device_ops;
@@ -86,7 +91,7 @@ static uint64_t native_queue_bytes(const struct roce_native_queue_config *config
 
 static bool valid_queue_config(const struct roce_native_queue_config *config)
 {
-    if ((config->flags & ~ROCE_NATIVE_QUEUE_RECEIVE_ONLY) ||
+    if (!roce_native_valid_queue_flags(config->version, config->flags) ||
         !config->qps || config->qps > ROCE_LAB_MAX_QPS || !config->workers || config->workers > config->qps ||
         !config->writes || config->writes > ROCE_PSN_MASK || !config->write_size ||
         config->local_qpn <= 1 || config->local_qpn >= ROCE_PSN_MASK ||
@@ -106,6 +111,8 @@ static bool valid_queue_config(const struct roce_native_queue_config *config)
 static struct roce_verbs_mr *queue_mr(const struct roce_verbs_pd *pd,
                                      const struct roce_native_queue_config *config)
 {
+    if ((config->flags & ROCE_NATIVE_QUEUE_MULTI_MR) && !pd->scope)
+        return NULL;
     uint64_t bytes = native_queue_bytes(config);
     bool receive_only = config->flags & ROCE_NATIVE_QUEUE_RECEIVE_ONLY;
     for (struct roce_verbs_mr *mr = pd->regions; mr; mr = mr->next)
@@ -254,9 +261,27 @@ static struct ibv_pd *alloc_pd(struct ibv_context *context)
     struct roce_verbs_pd *pd = calloc(1, sizeof(*pd));
     if (!pd)
         return NULL;
+    if (provider_context(context)->scoped_mrs) {
+        do {
+            if (getentropy(&pd->scope, sizeof(pd->scope)) < 0) {
+                int error = errno;
+                free(pd);
+                errno = error;
+                return NULL;
+            }
+        } while (!pd->scope);
+        int error = pthread_rwlock_init(&pd->region_lock, NULL);
+        if (error) {
+            free(pd);
+            errno = error;
+            return NULL;
+        }
+    }
     atomic_init(&pd->references, 0);
     int error = ibv_cmd_alloc_pd(context, &pd->ibv, &command, sizeof(command), &response, sizeof(response));
     if (error) {
+        if (pd->scope)
+            pthread_rwlock_destroy(&pd->region_lock);
         free(pd);
         errno = error;
         return NULL;
@@ -271,8 +296,11 @@ static int dealloc_pd(struct ibv_pd *ibv)
         return EBUSY;
 
     int error = ibv_cmd_dealloc_pd(ibv);
-    if (!error)
+    if (!error) {
+        if (pd->scope)
+            pthread_rwlock_destroy(&pd->region_lock);
         free(pd);
+    }
     return error;
 }
 
@@ -334,7 +362,7 @@ static int offer_ticket(int socket, const struct roce_mr_request *request, int m
                         bool *unsupported)
 {
     struct roce_mr_request message = *request;
-    message.version = ROCE_MR_IPC_TICKET_VERSION;
+    message.version = request->scope ? ROCE_MR_IPC_SCOPED_TICKET_VERSION : ROCE_MR_IPC_TICKET_VERSION;
     int error = roce_mr_ipc_send_registration(socket, &message, -1);
     if (error)
         return error;
@@ -369,6 +397,21 @@ static int send_mapping(const struct roce_verbs_context *context, const struct r
     return roce_mr_ipc_send_registration(mr->socket, request, mapping);
 }
 
+/* Binding reads under the context mutex. Scoped posts can read concurrently. */
+static void lock_mr_list(struct roce_verbs_pd *pd)
+{
+    pthread_mutex_lock(&pd->ibv.context->mutex);
+    if (pd->scope)
+        pthread_rwlock_wrlock(&pd->region_lock);
+}
+
+static void unlock_mr_list(struct roce_verbs_pd *pd)
+{
+    if (pd->scope)
+        pthread_rwlock_unlock(&pd->region_lock);
+    pthread_mutex_unlock(&pd->ibv.context->mutex);
+}
+
 static struct ibv_mr *reg_mr(struct ibv_pd *ibv, void *address, size_t length, uint64_t iova, int access)
 {
     struct roce_verbs_context *context =
@@ -386,10 +429,15 @@ static struct ibv_mr *reg_mr(struct ibv_pd *ibv, void *address, size_t length, u
         errno = error;
         return NULL;
     }
+    if (pd->scope) {
+        request.version = ROCE_MR_IPC_SCOPED_VERSION;
+        request.scope = pd->scope;
+    }
 
     struct roce_verbs_mr *mr = calloc(1, sizeof(*mr));
     if (!mr)
         return NULL;
+    atomic_init(&mr->wr_refs, 0);
     atomic_fetch_add_explicit(&pd->references, 1, memory_order_relaxed);
 
     int mapping = pin_mapping(&pin);
@@ -416,10 +464,10 @@ static struct ibv_mr *reg_mr(struct ibv_pd *ibv, void *address, size_t length, u
     mr->iova = iova;
     mr->length = length;
     mr->live = true;
-    pthread_mutex_lock(&ibv->context->mutex);
+    lock_mr_list(pd);
     mr->next = pd->regions;
     pd->regions = mr;
-    pthread_mutex_unlock(&ibv->context->mutex);
+    unlock_mr_list(pd);
     return &mr->verbs.ibv_mr;
 
 close_socket:
@@ -436,14 +484,13 @@ static int dereg_mr(struct verbs_mr *verbs)
 {
     struct roce_verbs_mr *mr = container_of(verbs, struct roce_verbs_mr, verbs);
     struct roce_verbs_pd *pd = container_of(verbs->ibv_mr.pd, struct roce_verbs_pd, ibv);
-    pthread_mutex_t *mutex = &pd->ibv.context->mutex;
-    pthread_mutex_lock(mutex);
-    if (mr->qp_refs) {
-        pthread_mutex_unlock(mutex);
+    lock_mr_list(pd);
+    if (mr->qp_refs || atomic_load_explicit(&mr->wr_refs, memory_order_acquire)) {
+        unlock_mr_list(pd);
         return EBUSY;
     }
     mr->live = false;
-    pthread_mutex_unlock(mutex);
+    unlock_mr_list(pd);
 
     /* A receive timeout leaves the original request pending on this channel. */
     if (!mr->dereg_pending) {
@@ -464,10 +511,10 @@ static int dereg_mr(struct verbs_mr *verbs)
     if (error)
         return error;
     mr->dereg_pending = false;
-    pthread_mutex_lock(mutex);
+    lock_mr_list(pd);
     if (reply.error) {
         mr->live = true;
-        pthread_mutex_unlock(mutex);
+        unlock_mr_list(pd);
         return reply.error;
     }
 
@@ -475,7 +522,7 @@ static int dereg_mr(struct verbs_mr *verbs)
     while (*link != mr)
         link = &(*link)->next;
     *link = mr->next;
-    pthread_mutex_unlock(mutex);
+    unlock_mr_list(pd);
 
     close(mr->socket);
     atomic_fetch_sub_explicit(&pd->references, 1, memory_order_release);
@@ -641,6 +688,17 @@ static bool visible_completion(const struct roce_verbs_qp *qp, const struct roce
     return qp->signaled[slot] || sq->status[slot] != ROCE_NATIVE_WC_SUCCESS;
 }
 
+static void release_sources(struct roce_verbs_qp *qp, uint32_t ordinal)
+{
+    struct roce_verbs_mr **sources = qp->sources[ordinal % ROCE_NATIVE_QUEUE_DEPTH];
+    for (size_t i = 0; i < ROCE_NATIVE_MAX_SEND_SGES; ++i) {
+        struct roce_verbs_mr *mr = sources[i];
+        sources[i] = NULL;
+        if (mr)
+            atomic_fetch_sub_explicit(&mr->wr_refs, 1, memory_order_release);
+    }
+}
+
 static bool reap_unsignaled_tail(struct roce_verbs_qp *qp, struct roce_verbs_cq *cq)
 {
     const struct roce_native_sq *sq = qp_sq(qp);
@@ -655,6 +713,9 @@ static bool reap_unsignaled_tail(struct roce_verbs_qp *qp, struct roce_verbs_cq 
         if (visible_completion(qp, sq, i % ROCE_NATIVE_QUEUE_DEPTH))
             return false;
 
+    if (provider_context(qp->verbs.qp.context)->config.flags & ROCE_NATIVE_QUEUE_MULTI_MR)
+        for (uint32_t i = qp->reaped; i < posted; ++i)
+            release_sources(qp, i);
     cq->outstanding -= posted - qp->reaped;
     qp->reaped = posted;
     return true;
@@ -806,9 +867,18 @@ static int query_qp(struct ibv_qp *ibv, struct ibv_qp_attr *attr, int mask, stru
     return 0;
 }
 
+static struct roce_verbs_mr *find_local_source(const struct ibv_pd *ibv, const struct ibv_sge *sge)
+{
+    const struct roce_verbs_pd *pd = container_of(ibv, struct roce_verbs_pd, ibv);
+    for (struct roce_verbs_mr *mr = pd->regions; mr; mr = mr->next)
+        if (mr->live && mr->verbs.ibv_mr.lkey == sge->lkey &&
+            roce_native_contains(mr->iova, mr->length, sge->addr, sge->length))
+            return mr;
+    return NULL;
+}
+
 static int prepare_native_write(struct roce_native_write *entry, struct roce_native_sge *second,
-                                const struct ibv_send_wr *wr,
-                                const struct roce_verbs_qp *qp)
+                                const struct ibv_send_wr *wr, struct roce_verbs_qp *qp, uint32_t slot)
 {
     const struct roce_native_queue_config *config = &provider_context(qp->verbs.qp.context)->config;
     if (wr->opcode != IBV_WR_RDMA_WRITE || (wr->send_flags & ~IBV_SEND_SIGNALED))
@@ -818,11 +888,19 @@ static int prepare_native_write(struct roce_native_write *entry, struct roce_nat
         return EINVAL;
 
     uint64_t bytes = 0;
+    struct roce_verbs_mr *sources[ROCE_NATIVE_MAX_SEND_SGES] = {0};
     for (int i = 0; i < wr->num_sge; ++i) {
         const struct ibv_sge *sge = &wr->sg_list[i];
-        if (!sge->length || sge->lkey != config->local_lkey ||
-            !roce_native_contains(config->local_address, native_queue_bytes(config), sge->addr, sge->length))
+        if (!sge->length)
             return EINVAL;
+        if ((config->flags & ROCE_NATIVE_QUEUE_MULTI_MR) && sge->lkey != config->local_lkey) {
+            sources[i] = find_local_source(qp->verbs.qp.pd, sge);
+            if (!sources[i])
+                return EINVAL;
+        } else if (sge->lkey != config->local_lkey ||
+                   !roce_native_contains(config->local_address, native_queue_bytes(config), sge->addr, sge->length)) {
+            return EINVAL;
+        }
         bytes += sge->length;
     }
     uint64_t qp_bytes = (uint64_t)config->writes * config->write_size;
@@ -833,7 +911,7 @@ static int prepare_native_write(struct roce_native_write *entry, struct roce_nat
 
     *entry = (struct roce_native_write) {
         .wr_id = wr->wr_id, .local_address = wr->sg_list[0].addr, .remote_address = wr->wr.rdma.remote_addr,
-        .length = (uint32_t)bytes, .lkey = config->local_lkey, .rkey = wr->wr.rdma.rkey,
+        .length = (uint32_t)bytes, .lkey = wr->sg_list[0].lkey, .rkey = wr->wr.rdma.rkey,
     };
     if (second) {
         *second = (struct roce_native_sge) {0};
@@ -842,18 +920,28 @@ static int prepare_native_write(struct roce_native_write *entry, struct roce_nat
             *second = (struct roce_native_sge) {.address = tail->addr, .length = tail->length, .lkey = tail->lkey};
         }
     }
+    if (config->flags & ROCE_NATIVE_QUEUE_MULTI_MR) {
+        for (size_t i = 0; i < ROCE_NATIVE_MAX_SEND_SGES; ++i) {
+            qp->sources[slot][i] = sources[i];
+            if (sources[i])
+                atomic_fetch_add_explicit(&sources[i]->wr_refs, 1, memory_order_relaxed);
+        }
+    }
     return 0;
 }
 
 static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send_wr **bad_wr)
 {
     struct roce_verbs_qp *qp = container_of(ibv, struct roce_verbs_qp, verbs.qp);
+    struct roce_verbs_pd *pd = container_of(ibv->pd, struct roce_verbs_pd, ibv);
     struct roce_verbs_cq *cq = container_of(ibv->send_cq, struct roce_verbs_cq, ibv);
     struct roce_verbs_context *context = provider_context(ibv->context);
     const struct roce_native_queue_config *config = &context->config;
     struct ibv_send_wr *next = wr;
     int error = 0;
 
+    if (pd->scope)
+        pthread_rwlock_rdlock(&pd->region_lock);
     pthread_mutex_lock(&ibv->send_cq->mutex);
     struct roce_native_sq *sq = qp_sq(qp);
     if (!sq) {
@@ -885,7 +973,7 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
             break;
         }
         uint32_t slot = posted % ROCE_NATIVE_QUEUE_DEPTH;
-        error = prepare_native_write(&sq->entries[slot], second ? &second[slot] : NULL, next, qp);
+        error = prepare_native_write(&sq->entries[slot], second ? &second[slot] : NULL, next, qp, slot);
         if (error)
             break;
         sq->status[slot] = ROCE_NATIVE_WC_SUCCESS;
@@ -893,8 +981,12 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
         ++posted;
     }
     if (posted != first) {
-        if (!atomic_compare_exchange_strong_explicit(&sq->posted, &first, posted,
+        uint32_t expected = first;
+        if (!atomic_compare_exchange_strong_explicit(&sq->posted, &expected, posted,
                                                      memory_order_release, memory_order_relaxed)) {
+            if (config->flags & ROCE_NATIVE_QUEUE_MULTI_MR)
+                for (uint32_t i = first; i < posted; ++i)
+                    release_sources(qp, i);
             error = ESHUTDOWN;
             next = wr;
         } else {
@@ -906,6 +998,8 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
     }
 unlock:
     pthread_mutex_unlock(&ibv->send_cq->mutex);
+    if (pd->scope)
+        pthread_rwlock_unlock(&pd->region_lock);
     if (bad_wr)
         *bad_wr = next;
     return error;
@@ -946,15 +1040,17 @@ static int poll_sender(struct roce_verbs_qp *qp, int count, struct ibv_wc *wc)
         return -EIO;
 
     int done = 0;
+    bool multi_mr = provider_context(qp->verbs.qp.context)->config.flags & ROCE_NATIVE_QUEUE_MULTI_MR;
     while (qp->reaped < retired) {
         uint32_t index = qp->reaped % ROCE_NATIVE_QUEUE_DEPTH;
-        if (!visible_completion(qp, sq, index)) {
-            ++qp->reaped;
-            continue;
-        }
-        if (done == count)
+        bool visible = visible_completion(qp, sq, index);
+        if (visible && done == count)
             break;
+        if (multi_mr)
+            release_sources(qp, index);
         ++qp->reaped;
+        if (!visible)
+            continue;
         enum ibv_wc_status status = completion_status(sq->status[index]);
         wc[done++] = (struct ibv_wc) {
             .wr_id = sq->entries[index].wr_id, .status = status, .opcode = IBV_WC_RDMA_WRITE,
@@ -1041,7 +1137,9 @@ static struct verbs_context *alloc_context(struct ibv_device *device, int comman
     }
     const char *socket = secure_getenv("ROCE_DPDK_MR_SOCKET");
     const char *require_netlink = secure_getenv("ROCE_DPDK_MR_REQUIRE_NETLINK");
+    const char *scoped_mrs = secure_getenv("ROCE_DPDK_MR_PD_SCOPE");
     context->require_netlink = require_netlink && strcmp(require_netlink, "1") == 0;
+    context->scoped_mrs = scoped_mrs && strcmp(scoped_mrs, "1") == 0;
     if (socket && *socket) {
         context->mr_socket = strdup(socket);
         if (!context->mr_socket) {

@@ -7,6 +7,8 @@
 enum {
     ROCE_MR_IPC_VERSION = 1,
     ROCE_MR_IPC_TICKET_VERSION = 2,
+    ROCE_MR_IPC_SCOPED_VERSION = 3,
+    ROCE_MR_IPC_SCOPED_TICKET_VERSION = 4,
     ROCE_MR_IPC_MAX_REGISTRATIONS = 64,
     ROCE_MR_IPC_WRITE = 1u << 0,
     ROCE_MR_IPC_REMOTE_WRITE = 1u << 1,
@@ -20,7 +22,13 @@ struct roce_mr_request {
     uint64_t offset;
     uint64_t length;
     uint64_t mapped_length;
+    uint64_t scope;
 };
+
+static inline int roce_mr_uses_ticket(uint32_t version)
+{
+    return version == ROCE_MR_IPC_TICKET_VERSION || version == ROCE_MR_IPC_SCOPED_TICKET_VERSION;
+}
 
 struct roce_mr_reply {
     int32_t error;
