@@ -16,7 +16,6 @@ struct roce_app_native_qp {
 
 int roce_app_create_native_qp(struct ibv_pd *pd, uint32_t depth, bool receiver,
                               struct roce_app_native_qp *resources);
-int roce_app_configure_native_qp(struct roce_app_native_qp *resources, int queue_fd, bool receiver);
 int roce_app_destroy_native_qp(struct roce_app_native_qp *resources);
 
 /* early_qp is optional and must be configured on queue_fd. The caller retains its ownership. */

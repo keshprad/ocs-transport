@@ -8,8 +8,9 @@ LAB = src/roce_lab.c
 LAB_HEADERS = src/roce_lab.h
 MR = src/roce_mr_server.c src/roce_mr_ipc.c src/roce_mr_netlink.c
 MR_HEADERS = src/roce_mr_server.h src/roce_mr_ipc.h src/roce_fd.h src/roce_mr_netlink.h kernel/roce_mr_uapi.h
-CMA = src/roce_rdmacm.c src/roce_cma_ipc.c
-CMA_HEADERS = src/roce_cma_ipc.h
+CMA = src/roce_rdmacm.c src/roce_cma_ipc.c src/roce_native_connection.c
+CMA_HEADERS = src/roce_cma_ipc.h src/roce_rdmacm_private.h src/roce_native_connection.h \
+              src/roce_native_queue.h src/roce_doorbell.h $(LAB_HEADERS) $(CORE_HEADERS)
 APP = src/roce_app.c src/roce_app_native.c src/roce_app_rdmacm.c $(MR) $(CMA)
 APP_HEADERS = src/roce_app.h src/roce_app_native.h src/roce_app_rdmacm.h src/roce_doorbell.h \
               src/roce_native_queue.h $(MR_HEADERS) $(CMA_HEADERS)
@@ -42,8 +43,8 @@ roce_app_write: src/roce_app_write.c $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADER
 	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CMA_CFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
 
 libroce_rdmacm.so: $(CMA) $(CMA_HEADERS) src/roce_mr_ipc.c src/roce_mr_ipc.h src/roce_fd.h
-	$(CC) $(CPPFLAGS) $(CMA_CFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) \
-		-fPIC -shared $(LDFLAGS) -Wl,-z,defs -o $@ $(filter %.c,$^) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(VERBS_CFLAGS) $(CMA_CFLAGS) $(CFLAGS) -pthread -std=gnu11 $(WARNINGS) \
+		-fPIC -shared $(LDFLAGS) -Wl,-z,defs -o $@ $(filter %.c,$^) $(VERBS_LIBS) $(LDLIBS)
 
 tests/test_roce: tests/test_roce.c $(CORE) $(CORE_HEADERS)
 tests/test_roce_cm_wire: tests/test_roce_cm_wire.c src/roce_cm_wire.c src/roce_cm_wire.h src/roce_wire.c src/roce_wire.h ../common/roce_icrc.h

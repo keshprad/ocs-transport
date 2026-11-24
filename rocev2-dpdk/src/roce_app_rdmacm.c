@@ -1,12 +1,15 @@
 #include "roce_app_rdmacm.h"
+#include "roce_app_native.h"
 #include "roce_cm_lab_offer.h"
 #include "roce_lab.h"
+#include "roce_rdmacm_private.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <rdma/rdma_cma.h>
+#include <stdio.h>
 #include <string.h>
 
 enum { CM_TIMEOUT_MS = ROCE_LAB_TIMEOUT * 1000 };
@@ -93,7 +96,7 @@ static bool expect_event(struct roce_app_rdmacm *cm, enum rdma_cm_event_type exp
         if (expected == RDMA_CM_EVENT_CONNECT_REQUEST) {
             if (event->listen_id == cm->listener && match_private(event, request_private, sizeof(request_private)))
                 error = 0;
-        } else if (expected != RDMA_CM_EVENT_CONNECT_RESPONSE ||
+        } else if ((expected != RDMA_CM_EVENT_CONNECT_RESPONSE && !(sender && expected == RDMA_CM_EVENT_ESTABLISHED)) ||
                    match_private(event, reply_private, sizeof(reply_private))) {
             error = 0;
         }
@@ -107,22 +110,16 @@ static bool expect_event(struct roce_app_rdmacm *cm, enum rdma_cm_event_type exp
     return !error;
 }
 
-static bool connect_active(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
-                           uint32_t qpn, uint64_t deadline)
+static bool resolve_active(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
+                           uint64_t deadline)
 {
     struct sockaddr_in local = ipv4_address(address->local_ipv4, 0);
     struct sockaddr_in peer = ipv4_address(address->peer_ipv4, address->service_port);
-    struct rdma_conn_param parameters = {
-        .private_data = request_private, .private_data_len = sizeof(request_private),
-        .qp_num = qpn, .retry_count = ROCE_LAB_RETRIES,
-    };
     return !rdma_create_id(cm->channel, &cm->id, NULL, RDMA_PS_TCP) &&
            !rdma_resolve_addr(cm->id, (struct sockaddr *)&local, (struct sockaddr *)&peer, CM_TIMEOUT_MS) &&
            expect_event(cm, RDMA_CM_EVENT_ADDR_RESOLVED, address, true, deadline) &&
            !rdma_resolve_route(cm->id, CM_TIMEOUT_MS) &&
-           expect_event(cm, RDMA_CM_EVENT_ROUTE_RESOLVED, address, true, deadline) &&
-           !rdma_connect(cm->id, &parameters) &&
-           expect_event(cm, RDMA_CM_EVENT_CONNECT_RESPONSE, address, true, deadline);
+           expect_event(cm, RDMA_CM_EVENT_ROUTE_RESOLVED, address, true, deadline);
 }
 
 static bool connect_passive(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
@@ -140,10 +137,12 @@ static uint64_t event_deadline(void)
 }
 
 bool roce_app_rdmacm_connect(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
-                             uint32_t local_qpn, bool sender, int (*prepare_qp)(void *), void *context)
+                             struct ibv_pd *pd, struct roce_app_native_qp *resources,
+                             bool sender, int (*prepare_qp)(void *), void *context)
 {
+    bool owned = !prepare_qp;
     if (!cm || !address || !address->local_ipv4 || !address->peer_ipv4 || !address->service_port ||
-        address->reserved || local_qpn <= 1 || local_qpn >= ROCE_PSN_MASK || !prepare_qp) {
+        address->reserved || !pd || !resources || !resources->cq || owned == !!resources->qp) {
         errno = EINVAL;
         return false;
     }
@@ -154,30 +153,61 @@ bool roce_app_rdmacm_connect(struct roce_app_rdmacm *cm, const struct roce_cma_l
     cm->channel = rdma_create_event_channel();
     if (!cm->channel)
         return false;
+    int error = roce_rdmacm_use_context(cm->channel, pd->context);
+    if (error) {
+        errno = error;
+        return false;
+    }
 
     int flags = fcntl(cm->channel->fd, F_GETFL);
     uint64_t deadline = event_deadline();
-    if (flags >= 0 && !fcntl(cm->channel->fd, F_SETFL, flags | O_NONBLOCK) &&
-        (sender ? connect_active(cm, address, local_qpn, deadline) : connect_passive(cm, address, deadline))) {
-        int error = prepare_qp(context);
+    if (flags < 0 || fcntl(cm->channel->fd, F_SETFL, flags | O_NONBLOCK) ||
+        !(sender ? resolve_active(cm, address, deadline) : connect_passive(cm, address, deadline)))
+        return false;
+
+    if (owned) {
+        struct ibv_qp_init_attr init = {
+            .send_cq = resources->cq, .recv_cq = resources->cq, .qp_type = IBV_QPT_RC,
+            .cap = { .max_send_wr = (uint32_t)resources->cq->cqe, .max_send_sge = 1 },
+        };
+        if (rdma_create_qp(cm->id, pd, &init))
+            return false;
+        resources->qp = cm->id->qp;
+        printf("Application created CM-owned verbs QP %06x\n", resources->qp->qp_num);
+    }
+    struct rdma_conn_param parameters = {
+        .private_data = sender ? request_private : reply_private,
+        .private_data_len = sender ? sizeof(request_private) : sizeof(reply_private),
+        .qp_num = owned ? 0 : resources->qp->qp_num, .retry_count = ROCE_LAB_RETRIES,
+    };
+    if (sender && rdma_connect(cm->id, &parameters))
+        return false;
+    if (!owned) {
+        if (sender && !expect_event(cm, RDMA_CM_EVENT_CONNECT_RESPONSE, address, true, deadline))
+            return false;
+        error = prepare_qp(context);
         if (error) {
             errno = error;
-        } else if (sender) {
-            if (!rdma_establish(cm->id))
-                return true;
-        } else {
-            struct rdma_conn_param parameters = {
-                .private_data = reply_private, .private_data_len = sizeof(reply_private), .qp_num = local_qpn,
-            };
-            if (!rdma_accept(cm->id, &parameters) &&
-                expect_event(cm, RDMA_CM_EVENT_ESTABLISHED, address, false, deadline))
-                return true;
+            return false;
         }
+        if (sender)
+            return !rdma_establish(cm->id);
     }
-    int error = errno ? errno : EIO;
-    roce_app_rdmacm_destroy(cm);
-    errno = error;
-    return false;
+    if (!sender && rdma_accept(cm->id, &parameters))
+        return false;
+    if (owned && !sender && resources->qp->state != IBV_QPS_RTS) {
+        errno = EPROTO;
+        return false;
+    }
+    return expect_event(cm, RDMA_CM_EVENT_ESTABLISHED, address, sender, deadline);
+}
+
+int roce_app_rdmacm_destroy_qp(struct roce_app_rdmacm *cm)
+{
+    if (!cm->id || !cm->id->qp)
+        return 0;
+    rdma_destroy_qp(cm->id);
+    return cm->id->qp ? (errno ? errno : EIO) : 0;
 }
 
 int roce_app_rdmacm_disconnect(void *opaque)

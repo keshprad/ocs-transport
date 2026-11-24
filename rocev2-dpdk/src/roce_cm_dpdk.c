@@ -2,6 +2,9 @@
 #include "roce_app.h"
 #include "roce_cm_lab_offer.h"
 
+#include <errno.h>
+#include <unistd.h>
+
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_pause.h>
@@ -83,6 +86,49 @@ void roce_cm_transmit(uint16_t port, struct rte_mempool *pool, struct roce_cm_se
     rte_pktmbuf_free(mbuf);
 }
 
+static bool prepare_application(struct roce_cma_service *cma, struct roce_app_memory *application,
+                                const struct roce_lab_options *options, struct roce_lab_offer *local,
+                                const struct roce_lab_offer *peer, struct roce_cm_session *session,
+                                const uint8_t *private_data, uint8_t private_length)
+{
+    cma->peer_qpn = session->peer_qpn;
+    if (!options->sender && cma->owned_qp) {
+        /* The passive application supplies its new QPN in ACCEPT. */
+        if (!roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
+                                       private_data, private_length))
+            return false;
+        local->qpn = cma->local_qpn;
+    }
+
+    int queue_fd = -1;
+    if (!roce_app_offer_native(application, options, local, peer, false, cma->owned_qp ? &queue_fd : NULL))
+        return false;
+    bool ready;
+    if (options->sender) {
+        ready = roce_cma_service_response(cma, private_data, private_length, queue_fd) &&
+                roce_cm_session_establish(session);
+    } else if (cma->owned_qp) {
+        ready = roce_cma_service_configure_qp(cma, queue_fd) &&
+                roce_cm_session_set_local_qpn(session, local->qpn);
+    } else {
+        /* An external QP is configured through the application socket before ACCEPT. */
+        ready = roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
+                                         private_data, private_length);
+    }
+    if (queue_fd >= 0) {
+        int error = errno;
+        close(queue_fd);
+        errno = error;
+    }
+    if (!ready || options->sender)
+        return ready;
+
+    const struct roce_cma_message *parameters = &cma->app_parameters;
+    session->config.private_length = roce_cm_lab_offer_encode(session->local_private_data, options, local,
+                                                              parameters->private_data, parameters->private_length);
+    return session->config.private_length != 0;
+}
+
 bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                           const struct roce_lab_options *options, struct roce_lab_offer *local,
                           const struct roce_address *destination, struct roce_lab_offer *peer,
@@ -96,6 +142,8 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
         return false;
     if (cma && !roce_cma_service_prepare(cma))
         return false;
+    if (cma && options->sender)
+        local->qpn = cma->local_qpn;
     uint8_t private_data[ROCE_CM_LAB_PRIVATE_SIZE];
     const struct roce_cma_message *parameters = cma ? &cma->app_parameters : NULL;
     size_t private_length = roce_cm_lab_offer_encode(private_data, options, local,
@@ -107,6 +155,7 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
     const struct roce_cm_session_config config = {
         .initiator = options->sender,
         .manual_establish = cma && options->sender,
+        .defer_local_qpn = cma && cma->owned_qp && !options->sender,
         .tid = ((uint64_t)nonce[0] << 32 | nonce[1]) | 1,
         .local_comm_id = comm_id ? comm_id : 1,
         .local = local->data, .peer = *destination,
@@ -136,6 +185,9 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                 (!options->sender && session->mtu != mtu_code(RTE_MIN(options->pmtu, peer->pmtu))))
                 return false;
             local->psn = session->send_psn;
+            if (cma && !prepare_application(cma, application, options, local, peer, session,
+                                            cma_private, cma_private_length))
+                return false;
             if (!options->sender) {
                 responder = (struct roce_responder) {
                     .qp = { .local = local->data, .peer = peer->data, .local_qpn = local->qpn,
@@ -145,31 +197,16 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                     .expected = peer->psn,
                 };
             }
-            if (cma) {
-                cma->peer_qpn = session->peer_qpn;
-                if (!roce_app_offer_native(application, options, local, peer, false))
-                    return false;
-            }
-            if (cma && options->sender) {
-                if (!roce_cma_service_response(cma, cma_private, cma_private_length) ||
-                    !roce_cm_session_establish(session))
-                    return false;
-            } else if (cma) {
-                /* A passive CM ID accepts the request before the first REP. */
-                if (!roce_cma_service_request(cma, session->config.cma_source_port, session->peer_qpn,
-                                               cma_private, cma_private_length))
-                    return false;
-                session->config.private_length = roce_cm_lab_offer_encode(session->local_private_data, options, local,
-                                                                                 parameters->private_data,
-                                                                                 parameters->private_length);
-                if (!session->config.private_length)
-                    return false;
-            }
             valid_peer = true;
         }
         roce_cm_transmit(port, pool, session, now);
-        if (session->phase == ROCE_CM_ESTABLISHED)
-            return options->sender || !cma || roce_cma_service_event(cma, ROCE_CMA_ESTABLISHED, 0, NULL, 0);
+        if (session->phase == ROCE_CM_ESTABLISHED) {
+            if (!cma || (options->sender && !cma->owned_qp))
+                return true;
+            return roce_cma_service_event(cma, ROCE_CMA_ESTABLISHED, 0,
+                                          options->sender ? cma_private : NULL,
+                                          options->sender ? cma_private_length : 0);
+        }
         if (session->phase != ROCE_CM_PENDING)
             return false;
         rte_pause();

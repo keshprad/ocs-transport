@@ -49,13 +49,12 @@ ROCE_DPDK_MR_REQUIRE_NETLINK=1 python3 rocev2-dpdk/tests/check_app_memif.py \
 ```
 
 The memif check runs native copy and scatter/gather with one QP using
-standard librdmacm event and connection calls. The application checks
-peer addresses and private data during establishment, polls native
-WRITE completions, and observes disconnect. With four available CPUs
-it also runs four QPs across two workers using the TCP lab setup.
-The workers exchange each application's QPN over CM. The application
-test checks that both negotiated QPNs match the QPs created before
-connection setup. The provider binds the negotiated settings to those
-same QPs before either app completes the handshake. [librdmacm adapter](../README.md#in-band-connection-setup)
+standard librdmacm event and connection calls. It covers the CM-owned
+and external QP flows. The application checks peer addresses, private
+data, and both negotiated QPNs, polls every WRITE completion, and
+observes disconnect. The CM-owned runs post 521 WRITEs per QP to
+verify queue reuse after two full laps. With four available CPUs it
+also runs four QPs across two workers using the TCP lab setup.
+[librdmacm adapter](../README.md#in-band-connection-setup)
 
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

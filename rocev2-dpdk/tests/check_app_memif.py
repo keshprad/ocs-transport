@@ -48,7 +48,7 @@ def expect_success(child, *markers):
 
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
-          provider=None, post_batch=None, native_queues=False, rdmacm=False):
+          provider=None, post_batch=None, native_queues=False, rdmacm=False, external_qp=False):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -72,6 +72,7 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         rx_env = {**os.environ, "ROCE_DPDK_MR_SOCKET": rx_mr[1], "RDMAV_DRIVERS": provider} if provider else None
         if rdmacm:
             rx_env["ROCE_DPDK_CM_SOCKET"] = rx_cma[1]
+            rx_env["ROCE_DPDK_CM_EXTERNAL_QP"] = "1" if external_qp else "0"
         rx_app = process(stack, [APPLICATION, str(rx_path), *app_options], env=rx_env)
         expect_ready(rx, "control listener ready")
 
@@ -87,6 +88,7 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         tx_env = {**os.environ, "ROCE_DPDK_MR_SOCKET": tx_mr[1], "RDMAV_DRIVERS": provider} if provider else None
         if rdmacm:
             tx_env["ROCE_DPDK_CM_SOCKET"] = tx_cma[1]
+            tx_env["ROCE_DPDK_CM_EXTERNAL_QP"] = "1" if external_qp else "0"
         tx_app = process(stack, [APPLICATION, str(tx_path), *app_options], env=tx_env)
 
         total = size * writes * qps
@@ -108,7 +110,8 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
             assert tx_qps and rx_qps, tx_log + rx_log
             assert tx_qps.groups() == rx_qps.groups()[::-1], tx_log + rx_log
             for qps, app_log in ((tx_qps, tx_app_log), (rx_qps, rx_app_log)):
-                created = f"Application created verbs QP {qps[1]} before CM"
+                created = (f"Application created verbs QP {qps[1]} before CM" if external_qp else
+                           f"Application created CM-owned verbs QP {qps[1]}")
                 assert created in app_log.split("Application librdmacm established", 1)[0], app_log
 
 
@@ -124,11 +127,11 @@ def main():
         raise RuntimeError("application test needs two available CPUs")
     if args.verbs_provider:
         check(cpus, 8195, 3, 1, 1, None, cm=True, provider=args.verbs_provider,
-              post_batch=1, native_queues=True, rdmacm=True)
+              post_batch=1, native_queues=True, rdmacm=True, external_qp=True)
         check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
-              post_batch=1, native_queues=True, rdmacm=True)
+              post_batch=1, native_queues=True, rdmacm=True, external_qp=True)
         for gather in (False, True):
-            check(cpus, 257, 521, 1, 1, None, scatter_gather=gather, cm=True,
+            check(cpus, 8195, 521, 1, 1, None, scatter_gather=gather, cm=True,
                   provider=args.verbs_provider, post_batch=31, native_queues=True, rdmacm=True)
         if len(cpus) >= 4:
             check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=1, native_queues=True)

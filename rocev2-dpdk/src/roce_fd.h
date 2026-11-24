@@ -7,13 +7,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static inline bool roce_send_fd(int socket, void *bytes, size_t length, int fd)
+static inline bool roce_send_fd(int socket, const void *bytes, size_t length, int fd)
 {
     union {
         struct cmsghdr align;
         unsigned char bytes[CMSG_SPACE(sizeof(fd))];
     } control = {0};
-    struct iovec data = { .iov_base = bytes, .iov_len = length };
+    struct iovec data = { .iov_base = (void *)bytes, .iov_len = length };
     struct msghdr message = {
         .msg_iov = &data, .msg_iovlen = 1,
         .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes),
@@ -33,7 +33,8 @@ static inline bool roce_send_fd(int socket, void *bytes, size_t length, int fd)
     return sent == (ssize_t)length;
 }
 
-static inline bool roce_receive_optional_fd(int socket, void *bytes, size_t length, int *fd_out)
+static inline bool roce_receive_optional_fd_flags(int socket, void *bytes, size_t length,
+                                                  int *fd_out, int flags)
 {
     union {
         struct cmsghdr align;
@@ -46,7 +47,7 @@ static inline bool roce_receive_optional_fd(int socket, void *bytes, size_t leng
     };
     ssize_t received;
     do {
-        received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
+        received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC | flags);
     } while (received < 0 && errno == EINTR);
     if (received < 0)
         return false;
@@ -75,6 +76,11 @@ static inline bool roce_receive_optional_fd(int socket, void *bytes, size_t leng
         close(descriptor);
     errno = received == 0 ? ECONNRESET : EPROTO;
     return false;
+}
+
+static inline bool roce_receive_optional_fd(int socket, void *bytes, size_t length, int *fd_out)
+{
+    return roce_receive_optional_fd_flags(socket, bytes, length, fd_out, 0);
 }
 
 static inline int roce_receive_fd(int socket, void *bytes, size_t length)

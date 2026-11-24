@@ -118,14 +118,17 @@ To exercise the standard librdmacm calls, add `--rdmacm-socket CM_PATH`
 on each worker and export `ROCE_DPDK_CM_SOCKET="$CM_PATH"` for its local
 application. Use a distinct path from the application and MR sockets.
 Enable `--verbs-queues` on the requester and configure an MR socket on
-both endpoints. Each application creates its CQ and RC QP through
-libibverbs and moves it to INIT before setup. Each passes its local QPN
-to the worker and to librdmacm. The applications bind the negotiated queue
-mapping to the same QPs and move them to RTR and RTS before accepting the
-connection on the passive side or calling `rdma_establish()` on the active
-side. The passive application receives `ESTABLISHED` on RTU or when the
-first validated WRITE confirms the connection. The worker preserves RC
-packets that share the RX burst with establishment.
+both endpoints. The app supplies a provider PD and polling CQs. The
+active app calls `rdma_create_qp()` after address and route resolution,
+and the passive app calls it on the child ID from `CONNECT_REQUEST`.
+The resulting QPNs travel over the local CM socket in `CONNECT` and
+`ACCEPT`. The worker returns the negotiated queue mapping to the adapter
+as a file descriptor. The adapter moves the QP to RTR and RTS before
+permitting REP on the passive side or RTU on the active side. The active
+app receives `ESTABLISHED` with the REP private data. The passive app
+receives `ESTABLISHED` on RTU or when the first validated WRITE confirms
+the connection. The worker preserves RC packets that share the RX burst
+with establishment.
 The worker authenticates the CM socket against the application process
 and sends the CM packets on DPDK queue 0. The requester asks the worker
 to disconnect after posting its last WRITE. The worker sends DREQ after
@@ -134,9 +137,12 @@ step. The reply sender keeps polling QP1 during the bounded replay window.
 
 This profile supports a single IPv4 RC QP and up to 23 bytes of application
 private data in the lab REQ and REP. The receiver QP accepts plain RDMA
-WRITEs into its MR. Applications manage the QPs separately from their CM
-IDs. `make libroce_rdmacm.so` builds the adapter for
-explicit linking. The `roce_app_write` lab client already includes it.
+WRITEs into its MR. Use `rdma_destroy_qp()` to release the CM-owned QP after
+draining completions and before destroying its ID. The application owns
+its PD and CQs. `ROCE_DPDK_CM_EXTERNAL_QP=1` selects the lab's external-QP
+flow for testing `CONNECT_RESPONSE` and `rdma_establish()`.
+`make libroce_rdmacm.so` builds the adapter for explicit linking. The
+`roce_app_write` lab client already includes it.
 See the [provider test](provider/README.md) for the combined CM, native
 queue, and kernel MR run.
 

@@ -2,9 +2,12 @@
 
 #include "roce_cma_ipc.h"
 #include "roce_mr_ipc.h"
+#include "roce_native_connection.h"
+#include "roce_rdmacm_private.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <rdma/rdma_cma.h>
 #include <stddef.h>
@@ -12,6 +15,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 enum cm_state {
@@ -23,8 +27,10 @@ enum cm_state {
     CM_ROUTE_READY,
     CM_LISTENING,
     CM_REQUEST,
+    CM_ACCEPTING,
     CM_CONNECTING,
     CM_RESPONSE,
+    CM_ESTABLISHING,
     CM_ESTABLISHED,
     CM_DISCONNECTING,
     CM_CLOSED,
@@ -32,7 +38,9 @@ enum cm_state {
 
 struct cm_id {
     struct rdma_cm_id public;
+    struct ibv_qp *owned_qp;
     enum cm_state state;
+    uint32_t peer_qpn;
     unsigned events;
     bool destroying;
 };
@@ -43,6 +51,8 @@ struct cm_channel {
     pthread_cond_t changed;
     struct cm_id *primary;
     struct cm_id *child;
+    struct ibv_context *verbs;
+    bool owns_verbs;
     bool started;
     bool reading;
     bool stopped;
@@ -74,6 +84,32 @@ static struct cm_id *cm_id(struct rdma_cm_id *id)
 static bool valid_qpn(uint32_t qp_num)
 {
     return qp_num > 1 && qp_num < UINT32_C(0xffffff);
+}
+
+int roce_rdmacm_use_context(struct rdma_event_channel *public, struct ibv_context *context)
+{
+    if (!public || !context || !context->device || strcmp(ibv_get_device_name(context->device), "roce_dpdk0"))
+        return EINVAL;
+
+    struct cm_channel *channel = cm_channel(public);
+    pthread_mutex_lock(&channel->mutex);
+    int error = 0;
+    if (channel->stopped || channel->primary || channel->child || channel->verbs)
+        error = EBUSY;
+    else
+        channel->verbs = context;
+    pthread_mutex_unlock(&channel->mutex);
+    return error;
+}
+
+static void associate_verbs(struct cm_channel *channel, struct cm_id *id)
+{
+    if (!channel->verbs) {
+        channel->verbs = roce_native_open_device();
+        channel->owns_verbs = channel->verbs != NULL;
+    }
+    /* An external-QP connection can proceed without a local verbs context. */
+    id->public.verbs = channel->verbs;
 }
 
 struct rdma_event_channel *rdma_create_event_channel(void)
@@ -143,6 +179,8 @@ void rdma_destroy_event_channel(struct rdma_event_channel *public)
     pthread_mutex_unlock(&channel->mutex);
 
     close(public->fd);
+    if (channel->owns_verbs)
+        ibv_close_device(channel->verbs);
     pthread_cond_destroy(&channel->changed);
     pthread_mutex_destroy(&channel->mutex);
     free(channel);
@@ -192,7 +230,7 @@ int rdma_destroy_id(struct rdma_cm_id *public)
     struct cm_id *id = cm_id(public);
     struct cm_channel *channel = cm_channel(public->channel);
     pthread_mutex_lock(&channel->mutex);
-    if (id->destroying) {
+    if (id->destroying || id->owned_qp) {
         pthread_mutex_unlock(&channel->mutex);
         return fail(EBUSY);
     }
@@ -210,6 +248,68 @@ int rdma_destroy_id(struct rdma_cm_id *public)
     return 0;
 }
 
+int rdma_create_qp(struct rdma_cm_id *public, struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
+{
+    if (!public || !public->channel || !attr)
+        return fail(EINVAL);
+    if (!pd || !attr->send_cq || !attr->recv_cq || attr->qp_type != IBV_QPT_RC)
+        return fail(EOPNOTSUPP);
+
+    struct cm_id *id = cm_id(public);
+    struct cm_channel *channel = cm_channel(public->channel);
+    pthread_mutex_lock(&channel->mutex);
+    int error;
+    if (id->destroying || channel->stopped) {
+        error = ESHUTDOWN;
+    } else if (public->qp || id->owned_qp ||
+               (id->state != CM_ADDR_READY && id->state != CM_ROUTE_READY && id->state != CM_REQUEST)) {
+        error = EINVAL;
+    } else if (!public->verbs) {
+        error = ENODEV;
+    } else if (pd->context != public->verbs || attr->send_cq->context != public->verbs ||
+               attr->recv_cq->context != public->verbs) {
+        error = EINVAL;
+    } else {
+        struct ibv_qp *qp = ibv_create_qp(pd, attr);
+        error = qp ? roce_native_init_qp(qp, id->state == CM_REQUEST) : errno;
+        if (!qp) {
+            if (!error)
+                error = EIO;
+        } else if (error) {
+            ibv_destroy_qp(qp);
+        } else {
+            public->pd = pd;
+            public->qp = id->owned_qp = qp;
+        }
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    return error ? fail(error) : 0;
+}
+
+void rdma_destroy_qp(struct rdma_cm_id *public)
+{
+    if (!public || !public->channel) {
+        errno = EINVAL;
+        return;
+    }
+    struct cm_id *id = cm_id(public);
+    struct cm_channel *channel = cm_channel(public->channel);
+    pthread_mutex_lock(&channel->mutex);
+    int error;
+    if (id->state == CM_ACCEPTING) {
+        error = EBUSY;
+    } else if (!id->owned_qp || public->qp != id->owned_qp) {
+        error = EINVAL;
+    } else {
+        error = ibv_destroy_qp(id->owned_qp);
+        if (!error)
+            public->qp = id->owned_qp = NULL;
+    }
+    pthread_mutex_unlock(&channel->mutex);
+    if (error)
+        errno = error;
+}
+
 static const struct sockaddr_in *ipv4_address(const struct sockaddr *address)
 {
     return address && address->sa_family == AF_INET ? (const struct sockaddr_in *)address : NULL;
@@ -223,6 +323,14 @@ static struct roce_cma_message command(uint32_t type, const struct sockaddr_in *
         .local_ipv4 = ntohl(local->sin_addr.s_addr), .peer_ipv4 = ntohl(peer->sin_addr.s_addr),
         .local_port = ntohs(local->sin_port), .peer_port = ntohs(peer->sin_port),
     };
+}
+
+static bool same_route(const struct rdma_cm_id *id, const struct roce_cma_message *message)
+{
+    const struct sockaddr_in *local = &id->route.addr.src_sin;
+    const struct sockaddr_in *peer = &id->route.addr.dst_sin;
+    return message->local_ipv4 == ntohl(local->sin_addr.s_addr) && message->local_port == ntohs(local->sin_port) &&
+           message->peer_ipv4 == ntohl(peer->sin_addr.s_addr) && message->peer_port == ntohs(peer->sin_port);
 }
 
 static int send_command(struct cm_channel *channel, struct cm_id *id,
@@ -292,7 +400,8 @@ static int simple_command(struct rdma_cm_id *public, uint32_t type, enum cm_stat
     struct cm_channel *channel = cm_channel(public->channel);
     pthread_mutex_lock(&channel->mutex);
     struct roce_cma_message message = command(type, &public->route.addr.src_sin, &public->route.addr.dst_sin);
-    int error = id->state == from ? send_command(channel, id, &message, to) : EINVAL;
+    int error = id->state == from && (type != ROCE_CMA_ESTABLISH || !public->qp) ?
+        send_command(channel, id, &message, to) : EINVAL;
     pthread_mutex_unlock(&channel->mutex);
     return error ? fail(error) : 0;
 }
@@ -308,27 +417,135 @@ int rdma_listen(struct rdma_cm_id *id, int backlog)
     return backlog < 0 ? fail(EINVAL) : simple_command(id, ROCE_CMA_LISTEN, CM_BOUND, CM_LISTENING);
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now))
+        return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int receive_qp_configuration(int socket, struct roce_cma_message *message, int *fd)
+{
+    int64_t now = monotonic_ms();
+    if (now < 0)
+        return errno;
+    const int64_t deadline = now + 30000;
+    while (now < deadline) {
+        struct pollfd wait = { .fd = socket, .events = POLLIN };
+        int ready = poll(&wait, 1, (int)(deadline - now));
+        if (ready > 0) {
+            int received = roce_cma_receive_fd(socket, message, true, fd);
+            if (received)
+                return received == 1 ? 0 : -received;
+        } else if (ready < 0 && errno != EINTR) {
+            return errno;
+        }
+        now = monotonic_ms();
+        if (now < 0)
+            return errno;
+    }
+    return ETIMEDOUT;
+}
+
+static int configure_owned_qp(struct cm_id *id, int fd, bool receiver)
+{
+    int error = roce_native_configure_qp(id->owned_qp, fd, receiver);
+    if (error)
+        return error;
+
+    struct ibv_qp_attr attributes;
+    struct ibv_qp_init_attr init;
+    error = ibv_query_qp(id->owned_qp, &attributes, IBV_QP_DEST_QPN | IBV_QP_AV, &init);
+    if (error)
+        return error;
+    union ibv_gid gid = { .raw = { [10] = 0xff, [11] = 0xff } };
+    const struct in_addr *peer = &id->public.route.addr.dst_sin.sin_addr;
+    memcpy(gid.raw + 12, &peer->s_addr, sizeof(peer->s_addr));
+    return attributes.dest_qp_num == id->peer_qpn && attributes.ah_attr.is_global &&
+           !memcmp(gid.raw, attributes.ah_attr.grh.dgid.raw, sizeof(gid.raw)) ? 0 : EPROTO;
+}
+
+static int accept_owned_qp(struct cm_channel *channel, struct cm_id *id)
+{
+    /* Reserve the event socket for this private exchange without changing its flags. */
+    channel->reading = true;
+    pthread_mutex_unlock(&channel->mutex);
+    struct roce_cma_message response;
+    int fd = -1;
+    int error = receive_qp_configuration(channel->public.fd, &response, &fd);
+    pthread_mutex_lock(&channel->mutex);
+    channel->reading = false;
+    pthread_cond_broadcast(&channel->changed);
+
+    if (!error) {
+        if ((response.type == ROCE_CMA_CONNECT_ERROR || response.type == ROCE_CMA_REJECTED) &&
+            response.status && fd < 0)
+            error = response.status;
+        else if (response.type != ROCE_CMA_CONFIGURE_QP || response.status || response.private_length ||
+                 response.qp_num != id->peer_qpn || !same_route(&id->public, &response) || fd < 0)
+            error = EPROTO;
+        else
+            error = configure_owned_qp(id, fd, true);
+    }
+    if (fd >= 0)
+        close(fd);
+    if (!error) {
+        struct rdma_cm_id *public = &id->public;
+        struct roce_cma_message ready = command(ROCE_CMA_QP_READY, &public->route.addr.src_sin,
+                                                &public->route.addr.dst_sin);
+        ready.qp_num = id->owned_qp->qp_num;
+        error = send_command(channel, id, &ready, CM_CONNECTING);
+    }
+    if (error) {
+        id->state = CM_CLOSED;
+        stop_channel(channel);
+    }
+    return error;
+}
+
 static int connection_command(struct rdma_cm_id *public, const struct rdma_conn_param *params,
                               uint32_t type, enum cm_state from)
 {
-    if (!public || !public->channel || !params)
+    if (!public || !public->channel)
         return fail(EINVAL);
-    if (public->qp || params->responder_resources || params->initiator_depth || params->srq)
+    if (params && (params->responder_resources || params->initiator_depth))
         return fail(EOPNOTSUPP);
-    if (params->private_data_len > ROCE_CMA_PRIVATE_MAX || (params->private_data_len && !params->private_data))
+    if (params && (params->private_data_len > ROCE_CMA_PRIVATE_MAX ||
+                   (params->private_data_len && !params->private_data)))
         return fail(EINVAL);
 
     struct cm_id *id = cm_id(public);
     struct cm_channel *channel = cm_channel(public->channel);
     pthread_mutex_lock(&channel->mutex);
+    int error;
+    bool owned = id->owned_qp != NULL;
+    bool accepting = owned && type == ROCE_CMA_ACCEPT;
+    if (public->qp != id->owned_qp || (!owned && params && params->srq)) {
+        error = EOPNOTSUPP;
+        goto unlock;
+    }
+    if ((!owned && !params) || id->state != from) {
+        error = EINVAL;
+        goto unlock;
+    }
+    if (accepting && channel->reading) {
+        error = EBUSY;
+        goto unlock;
+    }
+
     struct roce_cma_message message = command(type, &public->route.addr.src_sin, &public->route.addr.dst_sin);
-    message.qp_num = params->qp_num;
-    if (params->private_data_len) {
+    message.qp_num = owned ? id->owned_qp->qp_num : params->qp_num;
+    message.flags = owned ? ROCE_CMA_QP_OWNED : 0;
+    if (params && params->private_data_len) {
         message.private_length = params->private_data_len;
         memcpy(message.private_data, params->private_data, message.private_length);
     }
-    int error = id->state == from && valid_qpn(message.qp_num) ?
-        send_command(channel, id, &message, CM_CONNECTING) : EINVAL;
+    error = valid_qpn(message.qp_num) ?
+        send_command(channel, id, &message, accepting ? CM_ACCEPTING : CM_CONNECTING) : EINVAL;
+    if (!error && accepting)
+        error = accept_owned_qp(channel, id);
+unlock:
     pthread_mutex_unlock(&channel->mutex);
     return error ? fail(error) : 0;
 }
@@ -345,8 +562,6 @@ int rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *params)
 
 int rdma_establish(struct rdma_cm_id *id)
 {
-    if (!id || id->qp)
-        return fail(EINVAL);
     return simple_command(id, ROCE_CMA_ESTABLISH, CM_RESPONSE, CM_ESTABLISHED);
 }
 
@@ -360,12 +575,18 @@ int rdma_disconnect(struct rdma_cm_id *public)
     int error = 0;
     if (id->destroying) {
         error = ESHUTDOWN;
-    } else if (id->state == CM_ESTABLISHED) {
-        struct roce_cma_message message = command(ROCE_CMA_DISCONNECT, &public->route.addr.src_sin,
-                                                  &public->route.addr.dst_sin);
-        error = send_command(channel, id, &message, CM_DISCONNECTING);
-    } else if (id->state != CM_DISCONNECTING && id->state != CM_CLOSED) {
+    } else if (id->state != CM_ESTABLISHED && id->state != CM_DISCONNECTING && id->state != CM_CLOSED) {
         error = EINVAL;
+    } else {
+        if (id->owned_qp && id->owned_qp->state != IBV_QPS_ERR) {
+            struct ibv_qp_attr attr = { .qp_state = IBV_QPS_ERR };
+            error = ibv_modify_qp(id->owned_qp, &attr, IBV_QP_STATE);
+        }
+        if (!error && id->state == CM_ESTABLISHED) {
+            struct roce_cma_message message = command(ROCE_CMA_DISCONNECT, &public->route.addr.src_sin,
+                                                      &public->route.addr.dst_sin);
+            error = send_command(channel, id, &message, CM_DISCONNECTING);
+        }
     }
     pthread_mutex_unlock(&channel->mutex);
     return error ? fail(error) : 0;
@@ -425,16 +646,39 @@ static int connect_request(struct cm_channel *channel, struct cm_event *event,
         return ENOMEM;
     }
     child->state = CM_REQUEST;
+    child->peer_qpn = message->qp_num;
     child->public.route.addr.src_sin = listener->public.route.addr.src_sin;
     update_route(&child->public, message);
+    associate_verbs(channel, child);
     channel->child = child;
     prepare_event(event, child, listener, RDMA_CM_EVENT_CONNECT_REQUEST, message);
     return 0;
 }
 
-static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
-                          const struct roce_cma_message *message)
+static void owned_connect_response(struct cm_channel *channel, struct cm_id *id, struct cm_event *event,
+                                   const struct roce_cma_message *message, int fd)
 {
+    struct rdma_cm_id *public = &id->public;
+    id->peer_qpn = message->qp_num;
+    int error = fd >= 0 && same_route(public, message) ? configure_owned_qp(id, fd, false) : EPROTO;
+    if (!error) {
+        struct roce_cma_message establish = command(ROCE_CMA_ESTABLISH, &public->route.addr.src_sin,
+                                                    &public->route.addr.dst_sin);
+        error = send_command(channel, id, &establish, CM_ESTABLISHING);
+    }
+    if (error) {
+        struct roce_cma_message failure = { .status = error };
+        id->state = CM_CLOSED;
+        stop_channel(channel);
+        prepare_event(event, id, NULL, RDMA_CM_EVENT_CONNECT_ERROR, &failure);
+    }
+}
+
+static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
+                          const struct roce_cma_message *message, int fd)
+{
+    if (message->flags || (fd >= 0 && message->type != ROCE_CMA_CONNECT_RESPONSE))
+        return EPROTO;
     if (message->type == ROCE_CMA_CONNECT_REQUEST)
         return connect_request(channel, event, message);
     struct cm_id *id = channel->child ? channel->child : channel->primary;
@@ -450,8 +694,10 @@ static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
             return EPROTO;
         type = message->status ? RDMA_CM_EVENT_ADDR_ERROR : RDMA_CM_EVENT_ADDR_RESOLVED;
         next = message->status ? CM_BOUND : CM_ADDR_READY;
-        if (!message->status)
+        if (!message->status) {
             update_route(&id->public, message);
+            associate_verbs(channel, id);
+        }
         break;
     case ROCE_CMA_ROUTE_RESOLVED:
     case ROCE_CMA_ROUTE_ERROR:
@@ -465,12 +711,20 @@ static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
     case ROCE_CMA_CONNECT_RESPONSE:
         if (id == channel->child || id->state != CM_CONNECTING || message->status || !valid_qpn(message->qp_num))
             return EPROTO;
+        if (id->owned_qp) {
+            owned_connect_response(channel, id, event, message, fd);
+            return 0;
+        }
+        if (fd >= 0)
+            return EPROTO;
         type = RDMA_CM_EVENT_CONNECT_RESPONSE;
         next = CM_RESPONSE;
         update_route(&id->public, message);
         break;
     case ROCE_CMA_ESTABLISHED:
-        if (id != channel->child || id->state != CM_CONNECTING || message->status || !valid_qpn(message->qp_num))
+        if ((id == channel->child ? id->state != CM_CONNECTING : id->state != CM_ESTABLISHING) ||
+            message->status || !valid_qpn(message->qp_num) ||
+            (id->owned_qp && (message->qp_num != id->peer_qpn || !same_route(&id->public, message))))
             return EPROTO;
         type = RDMA_CM_EVENT_ESTABLISHED;
         next = CM_ESTABLISHED;
@@ -479,6 +733,7 @@ static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
     case ROCE_CMA_REJECTED:
     case ROCE_CMA_CONNECT_ERROR:
         if ((id->state != CM_CONNECTING && id->state != CM_RESPONSE && id->state != CM_REQUEST &&
+             id->state != CM_ESTABLISHING &&
              id->state != CM_LISTENING) || !message->status)
             return EPROTO;
         type = message->type == ROCE_CMA_REJECTED ? RDMA_CM_EVENT_REJECTED : RDMA_CM_EVENT_CONNECT_ERROR;
@@ -486,7 +741,7 @@ static int dispatch_event(struct cm_channel *channel, struct cm_event *event,
         break;
     case ROCE_CMA_DISCONNECTED:
         if (id->state != CM_ESTABLISHED && id->state != CM_DISCONNECTING &&
-            id->state != CM_CONNECTING && id->state != CM_REQUEST)
+            id->state != CM_ESTABLISHING && id->state != CM_CONNECTING && id->state != CM_REQUEST)
             return EPROTO;
         type = RDMA_CM_EVENT_DISCONNECTED;
         next = CM_CLOSED;
@@ -518,20 +773,23 @@ int rdma_get_cm_event(struct rdma_event_channel *public, struct rdma_cm_event **
         error = EINVAL;
     if (!error) {
         channel->reading = true;
-        pthread_mutex_unlock(&channel->mutex);
-
-        struct roce_cma_message message;
-        int received = roce_cma_receive(public->fd, &message, false);
-
-        pthread_mutex_lock(&channel->mutex);
+        while (!error && !event->id) {
+            pthread_mutex_unlock(&channel->mutex);
+            struct roce_cma_message message;
+            int fd = -1;
+            int received = roce_cma_receive_fd(public->fd, &message, false, &fd);
+            pthread_mutex_lock(&channel->mutex);
+            if (channel->stopped)
+                error = ECANCELED;
+            else if (received == 1)
+                error = dispatch_event(channel, event, &message, fd);
+            else
+                error = received < 0 ? -received : EAGAIN;
+            if (fd >= 0)
+                close(fd);
+        }
         channel->reading = false;
         pthread_cond_broadcast(&channel->changed);
-        if (channel->stopped)
-            error = ECANCELED;
-        else if (received == 1)
-            error = dispatch_event(channel, event, &message);
-        else
-            error = received < 0 ? -received : EAGAIN;
     }
     pthread_mutex_unlock(&channel->mutex);
     if (error) {

@@ -162,7 +162,7 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. The CM applications create CQs and RC QPs before setup. Provider checks cover unmatched QPN and wrong-PD rejection, successful rebinding after a rejected configuration, and `EBUSY` for referenced MR, PD and CQ resources. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification and completion | Worker queues consume shared WQEs from native `ibv_post_send()` and publish individual results for `ibv_poll_cq()`. The provider fixture verifies partial linked-list posting, CQ capacity, queue closure and error WC mapping. With Netlink required, the exact Spark-04-kernel guest verified native copy and scatter/gather on one QP and native copy on four QPs across two workers. Each QP posted one WRITE at a time and returned all three signaled completions. |
 | Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The requester chains worker-owned headers and trailer around the application payload. Independent wire vectors cover PMTU 4096. The RC peer verifies sequence NAK and timeout retries. With standard verbs registration on both ends, a four-process memif test verified 24,585 bytes in both copy and scatter/gather modes before deregistration. RX copies into the MR before acknowledging. The DPDK 23.11.7 mlx5 patch builds, and the worker resolves its DMA-BUF map/unmap APIs. Physical ConnectX-7 DMA from native MRs remains unverified. |
-| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It verifies that duplicate REP waits for `rdma_establish()` before sending RTU. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. TCP carries the lab's WRITE completion and verification. Stock librdmacm verified WRITE and disconnect in both directions with Linux RXE and physical ConnectX-7 at MTUs 1500 and 4200. CM-managed QPs on the DPDK provider remain pending. |
+| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs, DREP replay, and the REP and RTU gates. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. CM-owned QPs use `rdma_create_qp()` with a provider PD and polling CQs. The worker hands back the queue FD, waits for QP readiness, and sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. The exact Spark-04 kernel guest exercised CM-owned and external QPs. TCP carries the lab's WRITE completion and verification. Stock librdmacm verified WRITE and disconnect in both directions with Linux RXE and physical ConnectX-7 at MTUs 1500 and 4200. |
 
 The registration socket carries the request, the correlation cookie
 and the assigned keys. The kernel resolves the Unix peer and binds the
@@ -257,6 +257,15 @@ WRITE, then 4,269,595 and 17,078,380 bytes with nine packets per WRITE at
 PMTU 1024. Both runs used required Generic Netlink handoff and had zero
 RC retries. The worker retires scatter/gather WRITEs in QP order after
 the RC ACK and release of that slot's PMD references.
+
+The exact Spark-04 kernel guest also verified `rdma_create_qp()` on the
+active ID and the passive child. Its trace matched each app's actual QPN
+to both workers' views, checked the queue FD at both ends, and observed
+both QPs in RTS before the adapter authorized REP or RTU. The active
+`ESTABLISHED` event preserved all 20 bytes of the test's REP private data.
+Copy and scatter/gather each completed 521 multipacket WRITEs with all
+completions in order. Both external-QP controls completed three WRITEs.
+All four profiles verified every byte with zero RC retries.
 
 The native-MR staging archives include a matched patched DPDK 23.11.7
 runtime, worker and application, ABI-34 provider and unsigned modules for

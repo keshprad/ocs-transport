@@ -25,6 +25,11 @@ static bool address_matches(const struct roce_address *expected, const struct ro
     return expected->ipv4 == received->ipv4 && !memcmp(expected->mac, received->mac, ROCE_MAC_LEN);
 }
 
+static bool valid_qpn(uint32_t qpn)
+{
+    return qpn > 1 && qpn < ROCE_PSN_MASK;
+}
+
 bool roce_cm_session_init(struct roce_cm_session *session,
                           const struct roce_cm_session_config *config)
 {
@@ -32,7 +37,9 @@ bool roce_cm_session_init(struct roce_cm_session *session,
         return false;
 
     size_t capacity = config->initiator ? ROCE_CMA_IPV4_REQ_USER_SIZE : ROCE_CM_REP_PRIVATE_SIZE;
-    if (config->connection.local_qpn <= 1 || config->connection.local_qpn >= ROCE_PSN_MASK ||
+    bool valid_local_qpn = config->defer_local_qpn ? !config->initiator && !config->connection.local_qpn :
+                           valid_qpn(config->connection.local_qpn);
+    if (!valid_local_qpn ||
         config->connection.starting_psn > ROCE_PSN_MASK ||
         config->connection.ece_vendor_id > 0xffffff || config->connection.rnr_retry_count > 7 ||
         !config->service_id || !config->udp_source || !config->retry_ns ||
@@ -55,6 +62,16 @@ bool roce_cm_session_init(struct roce_cm_session *session,
     if (config->private_length)
         memcpy(initialized.local_private_data, config->private_data, config->private_length);
     *session = initialized;
+    return true;
+}
+
+bool roce_cm_session_set_local_qpn(struct roce_cm_session *session, uint32_t qpn)
+{
+    if (!session || session->phase != ROCE_CM_PENDING || !session->config.defer_local_qpn ||
+        !session->received_peer || !valid_qpn(qpn))
+        return false;
+    session->config.connection.local_qpn = qpn;
+    session->config.defer_local_qpn = false;
     return true;
 }
 
@@ -139,7 +156,7 @@ static enum roce_cm_type next_message(struct roce_cm_session *session, uint64_t 
     }
     if (session->config.initiator && session->received_peer)
         return session->rtu_allowed && session->send_pending ? ROCE_CM_RTU : 0;
-    if (session->phase == ROCE_CM_ESTABLISHED ||
+    if (session->phase == ROCE_CM_ESTABLISHED || session->config.defer_local_qpn ||
         (!session->config.initiator && !session->received_peer))
         return 0;
 

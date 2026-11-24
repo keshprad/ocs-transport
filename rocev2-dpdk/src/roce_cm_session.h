@@ -14,6 +14,7 @@ enum roce_cm_phase {
 struct roce_cm_session_config {
     bool initiator;
     bool manual_establish; /* An initiator waits for the application before sending RTU. */
+    bool defer_local_qpn; /* A passive CM ID creates its QP after receiving REQ. */
     uint64_t tid; /* Initiator's transaction ID. Passive sessions learn it from REQ. */
     uint32_t local_comm_id;
     struct roce_address local;
@@ -62,6 +63,9 @@ struct roce_cm_session {
 
 bool roce_cm_session_init(struct roce_cm_session *session,
                           const struct roce_cm_session_config *config);
+
+/* Permit REP after a passive CM-owned QP is ready for the validated REQ. */
+bool roce_cm_session_set_local_qpn(struct roce_cm_session *session, uint32_t qpn);
 
 /* Authorize RTU after a valid REP on an initiator awaiting application approval. */
 bool roce_cm_session_establish(struct roce_cm_session *session);

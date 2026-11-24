@@ -5,6 +5,8 @@
 
 struct rdma_event_channel;
 struct rdma_cm_id;
+struct ibv_pd;
+struct roce_app_native_qp;
 
 /* Initialize to zero before use. The session owns its channel and IDs. */
 struct roce_app_rdmacm {
@@ -16,7 +18,9 @@ struct roce_app_rdmacm {
 };
 
 bool roce_app_rdmacm_connect(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
-                             uint32_t local_qpn, bool sender, int (*prepare_qp)(void *), void *context);
+                             struct ibv_pd *pd, struct roce_app_native_qp *resources,
+                             bool sender, int (*prepare_qp)(void *), void *context);
+int roce_app_rdmacm_destroy_qp(struct roce_app_rdmacm *cm);
 int roce_app_rdmacm_disconnect(void *opaque);
 bool roce_app_rdmacm_finish(struct roce_app_rdmacm *cm);
 void roce_app_rdmacm_destroy(struct roce_app_rdmacm *cm);

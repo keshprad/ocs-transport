@@ -826,7 +826,7 @@ static bool connect_application(struct roce_app_memory *application, const struc
 {
     if (!datapath->native_queues || application->native)
         return !datapath->cm_peer.ipv4 || roce_app_connected(application, options);
-    return roce_app_offer_native(application, options, local, peer, true);
+    return roce_app_offer_native(application, options, local, peer, true, NULL);
 }
 
 int main(int argc, char **argv)

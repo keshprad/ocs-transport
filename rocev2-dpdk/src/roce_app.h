@@ -45,7 +45,7 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
 bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_options *options);
 bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab_options *options,
                            const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
-                           bool announce_established);
+                           bool announce_established, int *queue_fd);
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_detach(struct roce_app_memory *memory);

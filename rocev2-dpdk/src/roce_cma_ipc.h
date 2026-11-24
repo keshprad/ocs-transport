@@ -5,9 +5,10 @@
 #include <stdint.h>
 
 enum {
-    ROCE_CMA_IPC_VERSION = 2,
+    ROCE_CMA_IPC_VERSION = 3,
     /* The lab REQ has 56 user bytes, of which 32 carry the MR offer. */
     ROCE_CMA_PRIVATE_MAX = 23,
+    ROCE_CMA_QP_OWNED = 1u << 0,
 };
 
 enum roce_cma_message_type {
@@ -18,6 +19,7 @@ enum roce_cma_message_type {
     ROCE_CMA_ACCEPT,
     ROCE_CMA_ESTABLISH,
     ROCE_CMA_DISCONNECT,
+    ROCE_CMA_QP_READY,
     ROCE_CMA_ADDR_RESOLVED = 16,
     ROCE_CMA_ADDR_ERROR,
     ROCE_CMA_ROUTE_RESOLVED,
@@ -28,6 +30,7 @@ enum roce_cma_message_type {
     ROCE_CMA_REJECTED,
     ROCE_CMA_CONNECT_ERROR,
     ROCE_CMA_DISCONNECTED,
+    ROCE_CMA_CONFIGURE_QP,
 };
 
 /* Native byte order on the authenticated local Unix socket. */
@@ -41,7 +44,9 @@ struct roce_cma_message {
     uint16_t local_port;
     uint16_t peer_port;
     uint8_t private_length;
+    uint8_t flags;
     uint8_t private_data[ROCE_CMA_PRIVATE_MAX];
+    uint8_t reserved[3];
 };
 
 struct roce_cma_lab_address {
@@ -54,5 +59,7 @@ struct roce_cma_lab_address {
 /* Send returns 0 or a positive errno. Receive returns 1, 0, or a negative errno. */
 int roce_cma_send(int socket, const struct roce_cma_message *message);
 int roce_cma_receive(int socket, struct roce_cma_message *message, bool nonblocking);
+int roce_cma_send_fd(int socket, const struct roce_cma_message *message, int fd);
+int roce_cma_receive_fd(int socket, struct roce_cma_message *message, bool nonblocking, int *fd);
 
 #endif

@@ -141,6 +141,33 @@ static void check_explicit_establishment(void)
     assert(pair.active.phase == ROCE_CM_ESTABLISHED && pair.passive.phase == ROCE_CM_ESTABLISHED);
 }
 
+static void check_deferred_passive_qpn(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    const uint32_t qpn = passive.connection.local_qpn;
+    passive.connection.local_qpn = 0;
+    assert(!roce_cm_session_init(&pair.passive, &passive));
+    passive.defer_local_qpn = true;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    assert(!roce_cm_session_set_local_qpn(&pair.passive, qpn));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    assert(!roce_cm_session_prepare(&pair.passive, 0, pair.rep, sizeof(pair.rep)));
+    assert(!roce_cm_session_set_local_qpn(&pair.passive, 1));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(roce_cm_session_set_local_qpn(&pair.passive, qpn));
+    assert(!roce_cm_session_set_local_qpn(&pair.passive, qpn + 1));
+    send_at(&pair.passive, RETRY_NS, pair.rep);
+    assert(receive_at(&pair.active, RETRY_NS, pair.rep));
+    assert(pair.active.peer_qpn == qpn);
+    send_at(&pair.active, RETRY_NS, pair.rtu);
+    assert(receive_at(&pair.passive, RETRY_NS, pair.rtu));
+    assert(pair.passive.phase == ROCE_CM_ESTABLISHED);
+}
+
 static void check_loss(void)
 {
     struct test_pair pair;
@@ -412,6 +439,7 @@ int main(void)
 {
     check_lab_offer();
     check_explicit_establishment();
+    check_deferred_passive_qpn();
     check_loss();
     check_identity();
     check_retry_limit();
