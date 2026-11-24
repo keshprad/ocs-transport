@@ -338,6 +338,15 @@ instructions enabled uses the hardware IEEE CRC32 operation for iCRC.
 Use `CPPFLAGS=-DOCS_ROCE_PORTABLE_CRC` for a clean build of the
 portable comparison.
 
+For a Cortex-X925 comparison, build the optional four-lane iCRC with
+CRC32 and PMULL enabled. It folds complete 1 KiB blocks and uses scalar
+CRC32 for the remainder. `OCS_ROCE_PORTABLE_CRC` still selects the portable
+implementation. [Arm CRC32 and PMULL intrinsics](https://arm-software.github.io/acle/neon_intrinsics/advsimd.html)
+
+```sh
+make -B CPPFLAGS=-DOCS_ROCE_PMULL_ICRC CFLAGS='-O3 -g -march=armv8-a+crc+aes'
+```
+
 ### Initial performance controls
 
 On November 23, 2026, both Spark-04/Spark-02 lab rails reported 100 Gbit/s

@@ -53,6 +53,7 @@ def decode(frame):
 
 
 def main():
+    jumbo_payload = bytes(range(256)) * 16
     for index, opcode in enumerate(OPCODES):
         expected = fixture(opcode)
         result = subprocess.check_output([CLI, str(index)])
@@ -60,13 +61,21 @@ def main():
         gathered = subprocess.check_output([CLI, str(index), "split"])
         assert gathered == expected, (hex(opcode), gathered.hex(), expected.hex())
         jumbo = subprocess.check_output([CLI, str(index), "split-jumbo"])
-        assert jumbo == fixture(opcode, payload=bytes(range(256)) * 16), hex(opcode)
+        assert jumbo == fixture(opcode, payload=jumbo_payload), hex(opcode)
         header = (opcode, 0x123456, 0xABCDEF, int(opcode != 0x11))
         reth = (0xFEDCBA9876543210, 0x10A0B0C0, 5) if opcode in (0x0A, 0x06) else (0, 0, 0)
         aeth = (0x60, 0xC0FFEE, 0) if opcode == 0x11 else (0, 0, len(PAYLOAD))
         for frame in (expected, fixture(opcode, tos=0x2B, ttl=31), expected + bytes(8)):
             result = decode(frame)
             assert result.returncode == 0 and tuple(map(int, result.stdout.split())) == header + reth + aeth
+        if opcode != 0x11:
+            jumbo_result = decode(jumbo)
+            assert jumbo_result.returncode == 0
+            jumbo_reth = reth[:2] + (len(jumbo_payload) if reth[2] else 0,)
+            assert tuple(map(int, jumbo_result.stdout.split())) == header + jumbo_reth + (0, 0, len(jumbo_payload))
+            damaged_payload = bytearray(jumbo)
+            damaged_payload[-5] ^= 1
+            assert decode(damaged_payload).returncode == 1, hex(opcode)
         for length in range(len(expected)):
             assert decode(expected[:length]).returncode == 1, (hex(opcode), length)
         for offset in (14, 16, 20, 23, 24, 36, 39, 42, len(expected) - 1):

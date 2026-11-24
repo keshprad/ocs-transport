@@ -324,6 +324,29 @@ four runs verified the data and all eight requester completions with
 zero RC retries. The Spark runner records polling faults, attach
 time, DMA setup and prefault time separately for the physical comparison.
 
+The optional Arm PMULL iCRC produces the same IEEE checksum as scalar
+CRC32. Independent jumbo vectors verify the encoded bytes and reject
+payload corruption on decode. A local Spark-04 Cortex-X925 packet
+microbenchmark cycled through 64 payload buffers and measured thread CPU
+time, with 140,000 packets per sample and seven alternating samples.
+
+| Packet operation | 1024-byte payload, scalar → PMULL | 4096-byte payload, scalar → PMULL |
+| --- | ---: | ---: |
+| Scatter/gather header and trailer encoding | 59.8 → 49.4 ns | 159.3 → 139.2 ns |
+| Copy TX encoding | 67.4 → 66.0 ns | 207.7 → 188.0 ns |
+| RX decode and CPU memcpy | 70.4 → 63.2 ns | 190.9 → 174.0 ns |
+
+Scatter/gather encoding was essentially flat on Cortex-A725 in the same
+microbenchmark. The data-plane sweep can compare both builds on the
+physical link. [Arm CRC32 and PMULL intrinsics](https://arm-software.github.io/acle/neon_intrinsics/advsimd.html)
+
+The opt-in build passed the RoCEv2 and MRC regressions. The exact
+Spark-04 kernel guest exposed PMULL to the worker and verified both
+copy and scatter/gather with Netlink-backed MRs. It verified
+4,269,595 bytes in each single-QP CM run and 17,078,380 bytes in each
+four-QP run, with 521 ordered completions per QP. The scalar and
+portable builds passed the same independent jumbo wire vectors.
+
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
 memif port teardown. Backtraces located that diagnostic in
 `memif_free_regions()` during both port stop and EAL interrupt handling. The affected trials
