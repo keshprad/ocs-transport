@@ -217,6 +217,16 @@ The requester had acknowledged and retired two of three WRITEs before
 processing the final ACK. Each run returned three ordered successful
 libibverbs completions after their covering ACKs.
 
+Two exact Spark-04-kernel guest trials verified terminal error status and
+teardown with native scatter/gather queues. A cumulative remote-access
+NAK for the second WRITE produced `SUCCESS`, `REM_ACCESS_ERR` and
+`WR_FLUSH_ERR` in order. With the first WRITE acknowledged and later ACKs
+withheld, seven retries produced `SUCCESS`, `RETRY_EXC_ERR` and
+`WR_FLUSH_ERR`. Both apps in each trial destroyed their QPs and CQs,
+deregistered their MRs and deallocated their PDs before exit. Required
+Netlink registration and all module unloads passed.
+[Linux RXE completion handling](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/sw/rxe/rxe_comp.c)
+
 On November 24, 2026, the Spark-04 requester mapped a 12,288-byte
 application memfd buffer for mlx5 scatter/gather DMA. The Spark-02
 application verified the 8,195-byte WRITE over nine packets at PMTU 1024.

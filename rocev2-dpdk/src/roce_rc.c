@@ -52,7 +52,7 @@ bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
 bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
                          struct roce_packet *packet)
 {
-    if (r->failed || staged >= r->total - r->next)
+    if (r->failure || staged >= r->total - r->next)
         return false;
     uint32_t index = r->next + staged;
     if (index - r->acked >= r->window)
@@ -104,7 +104,7 @@ static void advance(struct roce_requester *r, uint32_t next, uint64_t now)
 static void retry(struct roce_requester *r, uint64_t now)
 {
     if (!r->retries_left) {
-        r->failed = true;
+        r->failure = ROCE_REQUESTER_RETRY_EXCEEDED;
         return;
     }
     --r->retries_left;
@@ -116,7 +116,7 @@ static void retry(struct roce_requester *r, uint64_t now)
 void roce_requester_feedback(struct roce_requester *r,
                              const struct roce_packet *packet, uint64_t now)
 {
-    if (r->failed || packet->opcode != ROCE_ACK || !for_qp(packet, &r->qp))
+    if (r->failure || packet->opcode != ROCE_ACK || !for_qp(packet, &r->qp))
         return;
     /* Only PSNs in the current outstanding window can acknowledge data. */
     uint32_t delta = (packet->psn - r->initial_psn - r->acked) & ROCE_PSN_MASK;
@@ -130,13 +130,15 @@ void roce_requester_feedback(struct roce_requester *r,
         advance(r, index, now);
         retry(r, now);
     } else if (packet->syndrome >= ROCE_NAK_INVALID && packet->syndrome <= ROCE_NAK_OPERATION) {
-        r->failed = true;
+        /* A fatal NAK stops at the affected WRITE's packet. Earlier WRITEs can complete. */
+        advance(r, index, now);
+        r->failure = (enum roce_requester_failure)packet->syndrome;
     }
 }
 
 void roce_requester_poll_timer(struct roce_requester *r, uint64_t now, uint64_t timeout)
 {
-    if (!r->failed && r->acked < r->sent && now - r->last_progress >= timeout)
+    if (!r->failure && r->acked < r->sent && now - r->last_progress >= timeout)
         retry(r, now);
 }
 

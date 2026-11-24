@@ -533,6 +533,25 @@ static void publish_completions(struct write_worker *worker)
     }
 }
 
+static void record_requester_failure(const struct write_worker *worker, uint32_t index)
+{
+    const struct roce_requester *requester = &worker->states[index].requester;
+    fprintf(stderr, "QP %06x WRITE failed after %u retries (%u/%u packets acknowledged)\n",
+            requester->qp.local_qpn, requester->retries, requester->acked, requester->total);
+    uint32_t write = requester->acked / requester->packets_per_write;
+    if (!worker->run->native || write >= worker->posted[index])
+        return;
+
+    static const uint8_t status[] = {
+        [ROCE_REQUESTER_RETRY_EXCEEDED] = ROCE_NATIVE_WC_RETRY_EXCEEDED,
+        [ROCE_REQUESTER_REMOTE_INVALID] = ROCE_NATIVE_WC_REMOTE_INVALID,
+        [ROCE_REQUESTER_REMOTE_ACCESS] = ROCE_NATIVE_WC_REMOTE_ACCESS,
+        [ROCE_REQUESTER_REMOTE_OPERATION] = ROCE_NATIVE_WC_REMOTE_OPERATION,
+    };
+    struct roce_native_sq *sq = &worker->run->native->qps[worker->first_qp + index];
+    sq->status[write % ROCE_NATIVE_QUEUE_DEPTH] = status[requester->failure];
+}
+
 static bool poll_worker(struct write_worker *worker, uint64_t now)
 {
     struct write_run *run = worker->run;
@@ -542,29 +561,30 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
         fprintf(stderr, "application work rejected on worker %u\n", worker->queue);
         return false;
     }
-    if (!receive_packets(worker, now))
-        return false;
+    bool received = receive_packets(worker, now);
     publish_completions(worker);
-    if (worker->completed == worker->qps && !worker->finished) {
+    if (received && worker->completed == worker->qps && !worker->finished) {
         worker->finished = true;
         if (run->options->report_bandwidth)
             worker->finished_ns = roce_now_ns();
         atomic_fetch_add_explicit(&run->finished_workers, 1, memory_order_relaxed);
     }
     if (!run->sender || worker->finished)
-        return true;
+        return received;
 
     uint32_t outstanding = 0;
     for (uint32_t i = 0; i < worker->qps; ++i) {
         struct roce_requester *requester = &worker->states[i].requester;
-        roce_requester_poll_timer(requester, now, RETRY_NS);
-        if (requester->failed) {
-            fprintf(stderr, "QP %06x WRITE failed after %u retries (%u/%u packets acknowledged)\n",
-                    requester->qp.local_qpn, requester->retries, requester->acked, requester->total);
+        if (received)
+            roce_requester_poll_timer(requester, now, RETRY_NS);
+        if (requester->failure) {
+            record_requester_failure(worker, i);
             return false;
         }
         outstanding += requester->sent - requester->acked;
     }
+    if (!received)
+        return false;
     uint32_t window = run->options->queue_window;
     uint32_t credit = window ? window - RTE_MIN(window, outstanding) : run->options->tx_burst;
     for (uint32_t i = 0; i < worker->qps; ++i) {
@@ -1241,7 +1261,7 @@ cleanup_port:
         result = 1;
     }
     if (result)
-        roce_app_flush_native(&application, &options);
+        roce_app_abort(&application, &options);
 cleanup_buffers:
     rte_free(tx_refs);
     if (cma)

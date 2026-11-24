@@ -840,6 +840,10 @@ static enum ibv_wc_status completion_status(uint8_t status)
         return IBV_WC_LOC_PROT_ERR;
     case ROCE_NATIVE_WC_REMOTE_ACCESS:
         return IBV_WC_REM_ACCESS_ERR;
+    case ROCE_NATIVE_WC_REMOTE_INVALID:
+        return IBV_WC_REM_INV_REQ_ERR;
+    case ROCE_NATIVE_WC_REMOTE_OPERATION:
+        return IBV_WC_REM_OP_ERR;
     case ROCE_NATIVE_WC_RETRY_EXCEEDED:
         return IBV_WC_RETRY_EXC_ERR;
     case ROCE_NATIVE_WC_FLUSHED:

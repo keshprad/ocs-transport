@@ -47,7 +47,7 @@ bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab
                            const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
                            bool announce_established, int *queue_fd);
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options);
-void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options);
+void roce_app_abort(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_detach(struct roce_app_memory *memory);
 bool roce_app_write(const char *path, const char *registration_device);
 

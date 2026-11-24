@@ -20,6 +20,8 @@ enum roce_native_wc_status {
     ROCE_NATIVE_WC_REMOTE_ACCESS,
     ROCE_NATIVE_WC_RETRY_EXCEEDED,
     ROCE_NATIVE_WC_FLUSHED,
+    ROCE_NATIVE_WC_REMOTE_INVALID,
+    ROCE_NATIVE_WC_REMOTE_OPERATION,
 };
 
 struct roce_native_queue_config {

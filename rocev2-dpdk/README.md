@@ -90,6 +90,12 @@ completions to reuse slots during longer runs. With scatter/gather it
 refills as credits arrive and drains the final completions after the
 worker retires the last TX descriptors.
 
+The native requester reports a fatal NAK on the affected WRITE and retry
+exhaustion on the first outstanding WRITE. Earlier covered WRITEs complete
+successfully and later posted WRITEs are flushed. On transfer failure, the
+worker releases its registration lease after draining the port and keeps
+the registration service available for application deregistration.
+
 For physical `--scatter-gather` with native registration, apply the
 [mlx5 patch](dpdk/dpdk-23.11.7-mlx5-dmabuf.patch) to DPDK 23.11.7 and use
 the matching common and net mlx5 PMDs built with `-Dibverbs_link=shared`.

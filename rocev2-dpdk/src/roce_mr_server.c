@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/vfs.h>
+#include <time.h>
 #include <unistd.h>
 
 struct roce_mr_registration {
@@ -37,6 +38,7 @@ struct roce_mr_server {
     struct roce_mr_netlink netlink;
     pthread_t thread;
     pthread_mutex_t mutex;
+    pthread_cond_t changed;
     size_t page_size;
     bool stopping;
     struct roce_mr_registration regions[ROCE_MR_IPC_MAX_REGISTRATIONS];
@@ -307,12 +309,14 @@ static void *server_loop(void *opaque)
                                roce_mr_netlink_receive(&server->netlink, &notice) == 1; ++i)
                 import_ticket(server, &notice);
         }
+        pthread_cond_broadcast(&server->changed);
         pthread_mutex_unlock(&server->mutex);
     }
     pthread_mutex_lock(&server->mutex);
     server->stopping = true;
     for (size_t i = 0; i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i)
         disconnect(&server->regions[i]);
+    pthread_cond_broadcast(&server->changed);
     pthread_mutex_unlock(&server->mutex);
     return NULL;
 }
@@ -345,9 +349,13 @@ struct roce_mr_server *roce_mr_server_start(const char *path)
         server->netlink.fd = -1;
     int error = pthread_mutex_init(&server->mutex, NULL);
     if (!error) {
-        error = pthread_create(&server->thread, NULL, server_loop, server);
-        if (!error)
-            return server;
+        error = pthread_cond_init(&server->changed, NULL);
+        if (!error) {
+            error = pthread_create(&server->thread, NULL, server_loop, server);
+            if (!error)
+                return server;
+            pthread_cond_destroy(&server->changed);
+        }
         pthread_mutex_destroy(&server->mutex);
     }
     close(server->wakeup);
@@ -415,6 +423,24 @@ void roce_mr_release(struct roce_mr_lease *lease)
     *lease = (struct roce_mr_lease) {0};
 }
 
+int roce_mr_wait_deregistered(struct roce_mr_server *server, uint32_t lkey, unsigned int timeout_seconds)
+{
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline))
+        return errno;
+    deadline.tv_sec += timeout_seconds;
+
+    int error = 0;
+    pthread_mutex_lock(&server->mutex);
+    while (!available_key(server, lkey)) {
+        error = pthread_cond_clockwait(&server->changed, &server->mutex, CLOCK_MONOTONIC, &deadline);
+        if (error)
+            break;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return error;
+}
+
 int roce_mr_server_stop(struct roce_mr_server *server)
 {
     pthread_mutex_lock(&server->mutex);
@@ -428,6 +454,7 @@ int roce_mr_server_stop(struct roce_mr_server *server)
     pthread_mutex_unlock(&server->mutex);
     eventfd_write(server->wakeup, 1);
     pthread_join(server->thread, NULL);
+    pthread_cond_destroy(&server->changed);
     pthread_mutex_destroy(&server->mutex);
     close(server->listener);
     close(server->wakeup);

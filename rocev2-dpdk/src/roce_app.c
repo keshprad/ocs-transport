@@ -412,10 +412,24 @@ static bool finish_native(struct roce_native_work *work, const struct roce_lab_o
     return valid;
 }
 
-void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options)
+void roce_app_abort(struct roce_app_memory *memory, const struct roce_lab_options *options)
 {
+    if (memory->socket < 0)
+        return;
+    struct roce_mr_server *registrations = memory->mr.server;
+    uint32_t lkey = memory->mr.lkey;
+    if (registrations) {
+        roce_mr_release(&memory->mr);
+        memory->buffer = NULL;
+    }
     if (options->sender && memory->native)
         finish_native(memory->native, options, false);
+    shutdown(memory->socket, SHUT_RDWR);
+    if (registrations) {
+        int error = roce_mr_wait_deregistered(registrations, lkey, ROCE_LAB_TIMEOUT);
+        if (error)
+            fprintf(stderr, "application MR deregistration after failed WRITE: %s\n", strerror(error));
+    }
 }
 
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options)

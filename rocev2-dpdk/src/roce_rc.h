@@ -23,6 +23,14 @@ struct roce_region {
     uint64_t size;
 };
 
+enum roce_requester_failure {
+    ROCE_REQUESTER_OK,
+    ROCE_REQUESTER_RETRY_EXCEEDED,
+    ROCE_REQUESTER_REMOTE_INVALID = ROCE_NAK_INVALID,
+    ROCE_REQUESTER_REMOTE_ACCESS = ROCE_NAK_ACCESS,
+    ROCE_REQUESTER_REMOTE_OPERATION = ROCE_NAK_OPERATION,
+};
+
 struct roce_requester {
     struct roce_qp qp;
     struct roce_region remote;
@@ -38,7 +46,7 @@ struct roce_requester {
     unsigned int retries;
     unsigned int retries_left;
     unsigned int retry_limit;
-    bool failed;
+    enum roce_requester_failure failure;
 };
 
 struct roce_responder {

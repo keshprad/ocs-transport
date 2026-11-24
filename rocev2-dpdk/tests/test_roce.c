@@ -82,7 +82,7 @@ static void test_sequence_nak_and_lost_final_ack(void)
     assert(roce_responder_receive(&rx, &retry, &ack));
     assert(destination[256] == (uint8_t)(original ^ 1) && rx.msn == 1);
     roce_requester_feedback(&tx, &ack, 9);
-    assert(tx.acked == tx.total && !tx.failed);
+    assert(tx.acked == tx.total && tx.failure == ROCE_REQUESTER_OK);
 }
 
 static void test_window_timeout_and_address_validation(void)
@@ -117,10 +117,10 @@ static void test_window_timeout_and_address_validation(void)
     roce_requester_feedback(&tx, &ack, 107);
     assert(tx.acked == 32 && tx.last_progress == 101);
     roce_requester_poll_timer(&tx, 111, 10);
-    assert(tx.retries == 1 && !tx.failed && tx.next == 32);
+    assert(tx.retries == 1 && tx.failure == ROCE_REQUESTER_OK && tx.next == 32);
     transmit(&tx, 111);
     roce_requester_poll_timer(&tx, 121, 10);
-    assert(tx.failed);
+    assert(tx.failure == ROCE_REQUESTER_RETRY_EXCEEDED && tx.acked == 32);
 }
 
 static void test_single_packet_and_access_errors(void)
@@ -157,7 +157,43 @@ static void test_single_packet_and_access_errors(void)
         assert(memcmp(snapshot, destination, sizeof(snapshot)) == 0);
     }
     roce_requester_feedback(&tx, &ack, 0);
-    assert(tx.failed && tx.acked == 0);
+    assert(tx.failure == ROCE_REQUESTER_REMOTE_INVALID && tx.acked == 0);
+}
+
+static void test_fatal_nak_progress(void)
+{
+    enum { WRITE_SIZE = 259, WRITES = 3 };
+    const uint8_t source[WRITE_SIZE * WRITES] = {0};
+    const struct roce_region remote = { .address = 1000, .rkey = 77, .size = WRITE_SIZE };
+    const uint32_t start = ROCE_PSN_MASK - 1;
+    const enum roce_requester_failure errors[] = {
+        ROCE_REQUESTER_REMOTE_INVALID, ROCE_REQUESTER_REMOTE_ACCESS, ROCE_REQUESTER_REMOTE_OPERATION,
+    };
+    for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); ++i) {
+        struct roce_requester tx;
+        assert(roce_requester_init(&tx, &send_qp, start, remote, source, 2, ROCE_SEND_WINDOW_DEFAULT, WRITES));
+        while (tx.next < tx.total)
+            transmit(&tx, 0);
+        struct roce_packet feedback = {
+            .src = send_qp.peer, .dst = send_qp.local, .qpn = send_qp.local_qpn,
+            .opcode = ROCE_ACK, .pkey = ROCE_PKEY, .syndrome = (uint8_t)errors[i],
+            .psn = (start + tx.total) & ROCE_PSN_MASK,
+        };
+        roce_requester_feedback(&tx, &feedback, 1);
+        assert(tx.failure == ROCE_REQUESTER_OK && tx.acked == 0);
+
+        /* The second WRITE failed after its first segment. */
+        feedback.psn = (start + 3) & ROCE_PSN_MASK;
+        roce_requester_feedback(&tx, &feedback, 2);
+        assert(tx.failure == errors[i] && tx.acked == 3);
+        assert(tx.acked / tx.packets_per_write == 1);
+        struct roce_packet packet;
+        assert(!roce_requester_next(&tx, 0, &packet));
+        feedback.psn = (start + tx.total - 1) & ROCE_PSN_MASK;
+        feedback.syndrome = ROCE_ACK_NO_CREDIT;
+        roce_requester_feedback(&tx, &feedback, 3);
+        assert(tx.failure == errors[i] && tx.acked == 3);
+    }
 }
 
 static void test_short_tx_burst(void)
@@ -226,6 +262,7 @@ int main(void)
     test_sequence_nak_and_lost_final_ack();
     test_window_timeout_and_address_validation();
     test_single_packet_and_access_errors();
+    test_fatal_nak_progress();
     test_short_tx_burst();
     test_pipelined_writes();
     puts("RoCEv2 RC state tests passed");
