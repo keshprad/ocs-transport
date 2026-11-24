@@ -21,6 +21,13 @@ When all slots are reserved,
 posting returns `ENOMEM` with `bad_wr` pointing to the first unaccepted WR.
 The provider releases a CQ only after its last associated QP is destroyed.
 
+A verbs context can bind a fresh worker queue descriptor after its last
+bound QP is destroyed. The context keeps its PDs, MRs and empty CQs
+available for reuse with the same registration service. Each new queue
+descriptor has its own QPNs and WR sequence. In a partially allocated
+binding, ordinary QP creation still uses the remaining slots until the
+application binds a fresh descriptor.
+
 Set `IBV_SEND_SIGNALED` on individual WRs or `sq_sig_all` on the QP to
 request successful completions. Failed and flushed WRs always produce a
 completion. To confirm successful unsignaled work before reusing a buffer,

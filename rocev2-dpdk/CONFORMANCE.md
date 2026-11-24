@@ -181,6 +181,16 @@ time to cover possible errors. Asynchronous CQ notifications and overrun
 events remain outside the polling profile.
 [IBTA Volume 1 §§10.2.6, 10.8.5](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
 
+With Netlink handoff required, the Spark-04-kernel provider fixture
+reused an open context, PD, MR and polling CQs across separate native queue
+bindings. It rejected a replacement while a QP was attached, kept the old
+WR counters intact during a WRITE on the new queue, and replaced a
+binding with unused slots after its last QP was destroyed. A disconnected
+application's MR could no longer be acquired. The broker kept the key
+reserved until the worker's final lease released the mapping. The same
+build passed a CM-owned scatter/gather transfer with four ordered
+1,024-byte WRITEs and clean resource teardown.
+
 Selective WRITE signaling keeps the per-WR flag in the provider. The
 worker retires all WRs after the covering ACK and TX reference release.
 The fixture verified that successful unsignaled work releases posting

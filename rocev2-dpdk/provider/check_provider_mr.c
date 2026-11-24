@@ -129,6 +129,18 @@ static void check_wc(const struct ibv_wc *wc, const struct ibv_qp *qp, uint64_t 
         assert(wc->opcode == IBV_WC_RDMA_WRITE && wc->byte_len == 32);
 }
 
+static struct roce_native_work *map_test_work(const struct roce_native_queue_config *config, int *fd)
+{
+    *fd = memfd_create("roce-provider-work", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    assert(*fd >= 0 && !ftruncate(*fd, sizeof(struct roce_native_work)));
+    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0);
+    assert(work != MAP_FAILED);
+    work->config = *config;
+    assert(roce_doorbell_init(&work->doorbells[0]));
+    assert(!fcntl(*fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL));
+    return work;
+}
+
 static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
 {
     enum { QPS = 3, WRITES = 3, WRITE_SIZE = 32 };
@@ -138,18 +150,14 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     assert(pd);
     struct ibv_mr *mr = ibv_reg_mr_iova(pd, buffer, length, iova, 0);
     assert(mr);
-    int fd = memfd_create("roce-provider-shared-cq", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    assert(fd >= 0 && !ftruncate(fd, sizeof(struct roce_native_work)));
-    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    assert(work != MAP_FAILED);
-    work->config = (struct roce_native_queue_config) {
+    struct roce_native_queue_config config = {
         .version = ROCE_NATIVE_QUEUE_VERSION, .qps = QPS, .workers = 1, .writes = WRITES,
         .write_size = WRITE_SIZE, .local_qpn = 3000, .peer_qpn = 4000, .local_psn = 5000, .peer_psn = 6000,
         .pmtu = 1024, .local_lkey = mr->lkey, .remote_rkey = 42,
         .local_ipv4 = 0xc0000201, .peer_ipv4 = 0xc0000202, .local_address = iova, .remote_address = 0x100000,
     };
-    assert(roce_doorbell_init(&work->doorbells[0]));
-    assert(!fcntl(fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL));
+    int fd;
+    struct roce_native_work *work = map_test_work(&config, &fd);
     assert(!roce_native_bind_work(context, fd));
     struct ibv_device_attr limits;
     assert(!ibv_query_device(context, &limits) && limits.max_cqe == QPS * ROCE_NATIVE_QUEUE_DEPTH);
@@ -158,7 +166,8 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
 
     struct ibv_cq *send_cq = ibv_create_cq(context, 4, NULL, NULL, 0);
     struct ibv_cq *recv_cq = ibv_create_cq(context, 1, NULL, NULL, 0);
-    assert(send_cq && recv_cq);
+    struct ibv_cq *spare_cq = ibv_create_cq(context, 1, NULL, NULL, 0);
+    assert(send_cq && recv_cq && spare_cq);
     struct ibv_qp *qps[QPS];
     struct ibv_send_wr writes[QPS][WRITES];
     struct ibv_sge segments[QPS][WRITES];
@@ -184,6 +193,13 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     }
 
     struct ibv_send_wr *bad;
+    config.local_qpn += QPS;
+    config.qps = 2;
+    config.writes = 1;
+    int next_fd;
+    struct roce_native_work *next = map_test_work(&config, &next_fd);
+    assert(roce_native_bind_work(context, next_fd) == EBUSY);
+
     writes[0][1].next = NULL;
     assert(!ibv_post_send(qps[0], writes[0], &bad) && !bad);
     assert(ibv_post_send(qps[1], writes[1], &bad) == ENOMEM && bad == &writes[1][2]);
@@ -227,8 +243,39 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     check_wc(&wc[0], qps[1], 2, IBV_WC_WR_FLUSH_ERR);
     assert(!ibv_poll_cq(send_cq, 2, wc));
     assert(!ibv_destroy_qp(qps[1]) && ibv_destroy_cq(recv_cq) == EBUSY);
-    assert(!ibv_destroy_qp(qps[2]) && !ibv_destroy_cq(send_cq) && !ibv_destroy_cq(recv_cq));
+    assert(!ibv_destroy_qp(qps[2]));
+    assert(!ibv_create_cq(context, 1, NULL, NULL, 0) && errno == ENOSPC);
+    assert(!ibv_destroy_cq(spare_cq));
+    assert(!roce_native_bind_work(context, next_fd));
+
+    struct ibv_qp_init_attr next_init = {
+        .send_cq = send_cq, .recv_cq = recv_cq, .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = 1, .max_send_sge = 1 }, .sq_sig_all = 1,
+    };
+    struct ibv_qp *next_qp = ibv_create_qp(pd, &next_init);
+    assert(next_qp && next_qp->qp_num == config.local_qpn);
+    assert(!roce_native_init_qp(next_qp, false) && !roce_native_connect_qp(next_qp, &config, 0));
+    writes[0][0].next = NULL;
+    assert(!ibv_post_send(next_qp, writes[0], &bad) && !bad);
+    assert(atomic_load(&work->qps[0].posted) == 3 && atomic_load(&next->qps[0].posted) == 1);
+    atomic_store_explicit(&next->qps[0].retired, 1, memory_order_release);
+    assert(ibv_poll_cq(send_cq, 1, wc) == 1);
+    check_wc(&wc[0], next_qp, 1, IBV_WC_SUCCESS);
+    assert(!ibv_destroy_qp(next_qp));
+    assert(roce_native_bind_work(context, next_fd) == EBUSY);
+
+    /* A fresh descriptor can replace a binding with unused slots. */
+    config.local_qpn += config.qps;
+    config.qps = 1;
+    int final_fd;
+    struct roce_native_work *final = map_test_work(&config, &final_fd);
+    assert(!roce_native_bind_work(context, final_fd));
+    struct ibv_qp *final_qp = ibv_create_qp(pd, &next_init);
+    assert(final_qp && final_qp->qp_num == config.local_qpn);
+    assert(!ibv_destroy_qp(final_qp) && !ibv_destroy_cq(send_cq) && !ibv_destroy_cq(recv_cq));
     assert(!ibv_dereg_mr(mr) && !ibv_dealloc_pd(pd) && !ibv_close_device(context));
+    assert(!munmap(final, sizeof(*final)) && !close(final_fd));
+    assert(!munmap(next, sizeof(*next)) && !close(next_fd));
     assert(!munmap(work, sizeof(*work)) && !close(fd));
 }
 
@@ -263,6 +310,7 @@ static void client(int fd)
     assert(!ibv_reg_mr(pd, buffer, length, IBV_ACCESS_REMOTE_WRITE) && errno == EINVAL);
     struct ibv_mr *mr = ibv_reg_mr_iova(pd, buffer, length, iova, access);
     assert(mr && mr->addr == buffer && mr->lkey && mr->rkey && mr->lkey != mr->rkey);
+    check_early_qp(pd, mr, iova);
     check_early_qp(pd, mr, iova);
     share_keys(fd, mr, iova);
 
@@ -320,7 +368,9 @@ static void check(struct roce_mr_server *server, int fd, pid_t child)
     assert(error == ENOENT);
     assert(lease.buffer[0] == 0xa5 && lease.buffer[lease.length - 1] == 0x4c);
     assert(roce_mr_server_stop(server) == EBUSY);
+    assert(roce_mr_wait_deregistered(server, keys.lkey, 0) == ETIMEDOUT);
     roce_mr_release(&lease);
+    assert(!roce_mr_wait_deregistered(server, keys.lkey, 0));
 }
 
 int main(int argc, char **argv)
@@ -357,5 +407,6 @@ int main(int argc, char **argv)
     puts("Early QP lifetime, protected binding and receive-only queues verified");
     puts("Shared CQ credits, QP completion identity and resource lifetimes verified");
     puts("Selective WRITE signaling and unsignaled error completions verified");
+    puts("Reused the verbs context, PD, MR and CQs across native queue sessions");
     return 0;
 }

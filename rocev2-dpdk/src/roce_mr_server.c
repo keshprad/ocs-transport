@@ -51,13 +51,13 @@ static void release_mapping(struct roce_mr_registration *region)
         close(region->mapping_fd);
         region->mapping = NULL;
     }
+    region->lkey = 0;
+    region->rkey = 0;
 }
 
 static void disconnect(struct roce_mr_registration *region)
 {
     region->owner = 0;
-    region->lkey = 0;
-    region->rkey = 0;
     region->ticket_cookie = 0;
     if (!region->leases)
         release_mapping(region);
@@ -237,10 +237,8 @@ static void deregister_mapping(struct roce_mr_registration *region)
     }
 
     const struct roce_mr_reply reply = { .error = region->leases ? EBUSY : 0 };
-    if (!reply.error) {
-        region->lkey = region->rkey = 0;
+    if (!reply.error)
         release_mapping(region);
-    }
     if (roce_mr_ipc_send_reply(region->socket, &reply) || !reply.error)
         disconnect(region);
 }
@@ -417,8 +415,10 @@ void roce_mr_release(struct roce_mr_lease *lease)
     struct roce_mr_server *server = lease->server;
     struct roce_mr_registration *region = lease->registration;
     pthread_mutex_lock(&server->mutex);
-    if (!--region->leases && region->socket < 0)
+    if (!--region->leases && region->socket < 0) {
         release_mapping(region);
+        pthread_cond_broadcast(&server->changed);
+    }
     pthread_mutex_unlock(&server->mutex);
     *lease = (struct roce_mr_lease) {0};
 }

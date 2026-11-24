@@ -26,7 +26,7 @@ int roce_mr_acquire(struct roce_mr_server *server, pid_t owner, uint32_t lkey, u
                    struct roce_mr_lease *lease);
 int roce_mr_export_dmabuf(const struct roce_mr_lease *lease);
 void roce_mr_release(struct roce_mr_lease *lease);
-/* The service remains available while the client deregisters or disconnects. */
+/* Wait until the registration and any leases have released the key. */
 int roce_mr_wait_deregistered(struct roce_mr_server *server, uint32_t lkey, unsigned int timeout_seconds);
 /* Returns EBUSY while work still holds a lease. */
 int roce_mr_server_stop(struct roce_mr_server *server);

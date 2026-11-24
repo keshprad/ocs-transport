@@ -28,6 +28,7 @@ struct roce_verbs_context {
     struct roce_native_queue_config config;
     struct roce_verbs_qp *early_qp;
     uint32_t next_qp;
+    uint32_t bound_qps;
     uint32_t cq_count;
     char *mr_socket;
     bool require_netlink;
@@ -116,15 +117,25 @@ static struct roce_verbs_mr *queue_mr(const struct roce_verbs_pd *pd,
     return NULL;
 }
 
-/* The caller holds the context mutex for the early QP and its PD's MR list. */
+static void unmap_queue_work(struct roce_verbs_context *context)
+{
+    if (context->work)
+        munmap(context->work, sizeof(*context->work));
+    context->work = NULL;
+    context->next_qp = 0;
+}
+
+/* The caller holds the context mutex for the binding, QPs and MR list. */
 static int bind_queue_work(struct roce_verbs_context *context, struct roce_native_work *work,
                            const struct roce_native_queue_config *config)
 {
-    if (context->work)
+    if (context->bound_qps)
         return EBUSY;
 
     struct roce_verbs_qp *qp = context->early_qp;
     if (!qp) {
+        /* A new session may replace an unused or partially used binding. */
+        unmap_queue_work(context);
         context->config = *config;
         context->work = work;
         return 0;
@@ -143,6 +154,7 @@ static int bind_queue_work(struct roce_verbs_context *context, struct roce_nativ
     context->work = work;
     context->early_qp = NULL;
     context->next_qp = 1;
+    context->bound_qps = 1;
     qp->region = mr;
     ++mr->qp_refs;
     pthread_mutex_unlock(&ibv->send_cq->mutex);
@@ -176,17 +188,19 @@ int roce_dpdk_bind_queues(struct ibv_context *ibv, int fd)
     error = EOPNOTSUPP;
     if (!atomic_is_lock_free(&work->qps[0].posted) || !atomic_is_lock_free(&work->doorbells[0].slots[0]))
         goto unmap;
+
+    struct roce_verbs_context *context = provider_context(ibv);
+    pthread_mutex_lock(&ibv->mutex);
     error = EBUSY;
     for (uint32_t i = 0; i < config.qps; ++i)
         if (atomic_load_explicit(&work->qps[i].posted, memory_order_acquire) ||
             atomic_load_explicit(&work->qps[i].admitted, memory_order_acquire) ||
             atomic_load_explicit(&work->qps[i].acknowledged, memory_order_acquire) ||
             atomic_load_explicit(&work->qps[i].retired, memory_order_acquire))
-            goto unmap;
+            goto unlock;
 
-    struct roce_verbs_context *context = provider_context(ibv);
-    pthread_mutex_lock(&ibv->mutex);
     error = bind_queue_work(context, work, &config);
+unlock:
     pthread_mutex_unlock(&ibv->mutex);
     if (!error)
         return 0;
@@ -480,7 +494,7 @@ static struct ibv_cq *create_cq(struct ibv_context *ibv, int cqe, struct ibv_com
         error = EOPNOTSUPP;
     else if (cqe <= 0 || (uint32_t)cqe > qp_capacity * ROCE_NATIVE_QUEUE_DEPTH)
         error = EINVAL;
-    else if (context->cq_count == 2 * qp_capacity)
+    else if (context->cq_count >= 2 * qp_capacity)
         error = ENOSPC;
     else
         ++context->cq_count;
@@ -533,6 +547,7 @@ static int attach_qp(struct roce_verbs_qp *qp, struct ibv_pd *ibv_pd,
                 goto unlock;
             }
             ++qp->region->qp_refs;
+            ++context->bound_qps;
             qp->index = context->next_qp++;
             qp->verbs.qp.qp_num = context->config.local_qpn + qp->index;
         } else {
@@ -661,10 +676,13 @@ static int destroy_qp(struct ibv_qp *ibv)
         --send_cq->attachments;
         if (recv_cq != send_cq)
             --recv_cq->attachments;
-        if (qp->region)
+        if (qp->region) {
             --qp->region->qp_refs;
-        else
+            if (!--context->bound_qps && context->next_qp == context->config.qps)
+                unmap_queue_work(context);
+        } else {
             context->early_qp = NULL;
+        }
         atomic_fetch_sub_explicit(&pd->references, 1, memory_order_release);
     }
     pthread_mutex_unlock(&send_cq->ibv.mutex);
@@ -954,8 +972,7 @@ static int poll_cq(struct ibv_cq *ibv, int count, struct ibv_wc *wc)
 static void free_context(struct ibv_context *ibv)
 {
     struct roce_verbs_context *context = provider_context(ibv);
-    if (context->work)
-        munmap(context->work, sizeof(*context->work));
+    unmap_queue_work(context);
     verbs_uninit_context(&context->verbs);
     free(context->mr_socket);
     free(context);

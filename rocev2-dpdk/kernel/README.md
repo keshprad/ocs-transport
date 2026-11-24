@@ -9,11 +9,12 @@ access to the application account explicitly.
    `ROCE_MR_REGISTER`. The module pins only pages in the caller's
    address space and charges them against the registering address
    space's `RLIMIT_MEMLOCK` as a long-term pin.
-2. The returned descriptor refers to that one region. The application
-   passes it to the worker over a Unix socket with `SCM_RIGHTS`. The
-   worker checks the ABI version, length and write permission via
-   `ROCE_MR_GET_INFO` before mapping it with `MAP_SHARED`, offset zero
-   and the registered length.
+2. The returned descriptor refers to that one region. The libibverbs
+   provider exports a one-time Generic Netlink ticket to the worker.
+   The direct registration tool can pass the descriptor over a Unix
+   socket with `SCM_RIGHTS`. The worker checks the ABI version, length
+   and write permission via `ROCE_MR_GET_INFO` before mapping it with
+   `MAP_SHARED`, offset zero and the registered length.
 3. The application keeps the region alive through work completion.
    The kernel retains the pins until every mapping and descriptor of
    the region is released. Read-only registrations cannot be upgraded
@@ -21,10 +22,11 @@ access to the application account explicitly.
 
 The mapped alias uses special PTEs to give the worker CPU access to
 anonymous folios. Linux GUP rejects that alias for a second pin. The
-descriptor handoff uses the Unix socket. Generic Netlink registration
-events provide an alternative handoff. Verbs memory registration remains
-a follow-up milestone.
-[Linux GUP design](https://docs.kernel.org/core-api/pin_user_pages.html)
+worker's registration service stops granting leases when the app's
+registration socket closes. A lease retains its mapping and reserves
+the key until the worker releases it.
+[Linux GUP design](https://docs.kernel.org/core-api/pin_user_pages.html),
+[Native libibverbs provider](../provider/README.md)
 
 On kernels built with `CONFIG_DMA_SHARED_BUFFER`,
 `ioctl(mapping_fd, ROCE_MR_EXPORT_DMABUF, 0)` returns a close-on-exec
@@ -38,8 +40,8 @@ coordinate access and retain the registration through work completion.
 
 Linux RDMA core requests bidirectional DMA for `ibv_reg_dmabuf_mr`.
 Register writable memory with `ROCE_MR_ACCESS_LOCAL_WRITE` for that path.
-The DPDK 23.11.7 mlx5 PMD still needs DMA-BUF import support to use these
-exports for packet scatter/gather.
+The DPDK 23.11.7 mlx5 patch imports these exports for packet scatter/gather.
+[DPDK worker setup](../README.md#native-verbs-memory-registration)
 [Linux RDMA DMA-BUF importer](https://github.com/torvalds/linux/blob/v6.17/drivers/infiniband/core/umem_dmabuf.c)
 
 Once the module is loaded and the device is available to the test
