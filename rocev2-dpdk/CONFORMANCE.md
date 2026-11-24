@@ -284,6 +284,14 @@ registration path. A local PMTU 1024 memif transfer through the staged
 launchers verified 8 MiB and eight WRITEs over 8,192 packets with zero
 retries. The physical Spark performance sweep is pending.
 
+Two matched 8 MiB runs on the exact Spark-04 kernel in QEMU put one
+read per application MR page before transport setup. Prefaulting
+2,048 pages took 63–66 ms per worker. It removed 2,048 sender and
+2,047–2,048 receiver minor faults from the polling interval. The
+four runs verified the data and all eight requester completions with
+zero RC retries. The Spark runner records polling faults, attach
+time, DMA setup and prefault time separately for the physical comparison.
+
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
 memif port teardown. Backtraces located that diagnostic in
 `memif_free_regions()` during both port stop and EAL interrupt handling. The affected trials

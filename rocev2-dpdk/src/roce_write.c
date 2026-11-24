@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "roce_app.h"
 #include "roce_cm_dpdk.h"
 #include "roce_doorbell.h"
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -53,6 +55,7 @@ struct datapath_options {
     bool report_bandwidth;
     bool scatter_gather;
     bool native_queues;
+    bool prefault_app;
 };
 
 struct tx_memory_ref {
@@ -86,6 +89,13 @@ struct write_run {
     atomic_bool failed;
 };
 
+struct poll_usage {
+    uint64_t cpu_ns;
+    uint64_t minor_faults;
+    uint64_t major_faults;
+    bool has_faults;
+};
+
 struct write_worker {
     struct write_run *run;
     uint16_t queue;
@@ -99,8 +109,8 @@ struct write_worker {
     uint32_t posted[ROCE_LAB_MAX_QPS];
     uint32_t completions[ROCE_LAB_MAX_QPS];
     bool finished;
-    uint64_t cpu_started;
-    uint64_t cpu_ns;
+    struct poll_usage initial_usage;
+    struct poll_usage usage;
     uint64_t finished_ns;
     union write_qp states[ROCE_LAB_MAX_QPS];
 } __rte_cache_aligned;
@@ -202,24 +212,55 @@ static bool send_requests(struct write_worker *worker,
     return true;
 }
 
-static uint64_t thread_cpu_ns(void)
+static struct poll_usage thread_usage(void)
 {
     struct timespec ts = {0};
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
-    return (uint64_t)ts.tv_sec * NS_PER_SEC + (uint64_t)ts.tv_nsec;
+    struct poll_usage usage = { .cpu_ns = (uint64_t)ts.tv_sec * NS_PER_SEC + (uint64_t)ts.tv_nsec };
+    struct rusage counters;
+    if (!getrusage(RUSAGE_THREAD, &counters) && counters.ru_minflt >= 0 && counters.ru_majflt >= 0) {
+        usage.minor_faults = (uint64_t)counters.ru_minflt;
+        usage.major_faults = (uint64_t)counters.ru_majflt;
+        usage.has_faults = true;
+    }
+    return usage;
 }
 
-static void report_bandwidth(bool sender, uint64_t bytes, uint64_t started, uint64_t elapsed, uint64_t cpu,
-                             const struct datapath_options *options)
+static bool prefault_application(const uint8_t *buffer, size_t bytes)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return false;
+
+    const volatile uint8_t *alias = buffer;
+    const size_t page = (size_t)page_size;
+    const size_t first_boundary = page - (uintptr_t)buffer % page;
+    const uint64_t start = roce_now_ns();
+    size_t pages = 1;
+    (void)alias[0];
+    for (size_t offset = first_boundary; offset < bytes; offset += page) {
+        (void)alias[offset];
+        ++pages;
+    }
+    fprintf(stderr, "APP_PREFAULT bytes=%zu pages=%zu elapsed_ns=%" PRIu64 "\n",
+            bytes, pages, roce_now_ns() - start);
+    return true;
+}
+
+static void report_bandwidth(bool sender, uint64_t bytes, uint64_t started, uint64_t elapsed,
+                             const struct poll_usage *usage, const struct datapath_options *options)
 {
     if (!elapsed)
         return;
     printf("BANDWIDTH role=%s payload_bytes=%" PRIu64 " elapsed_ns=%" PRIu64
            " thread_cpu_ns=%" PRIu64 " payload_gbps=%.3f poll_cores=%.3f writes=%u qps=%u workers=%u"
            " start_ns=%" PRIu64,
-           sender ? "tx" : "rx", bytes, elapsed, cpu,
-           (double)bytes * 8.0 / (double)elapsed, (double)cpu / (double)elapsed,
+           sender ? "tx" : "rx", bytes, elapsed, usage->cpu_ns,
+           (double)bytes * 8.0 / (double)elapsed, (double)usage->cpu_ns / (double)elapsed,
            options->writes, options->qps, options->workers, started);
+    if (usage->has_faults)
+        printf(" poll_minor_faults=%" PRIu64 " poll_major_faults=%" PRIu64,
+               usage->minor_faults, usage->major_faults);
     if (sender)
         printf(" send_window=%u tx_burst=%u", options->send_window, options->tx_burst);
     if (sender && options->queue_window)
@@ -544,10 +585,20 @@ static bool all_workers_finished(const struct write_run *run)
     return atomic_load_explicit(&run->finished_workers, memory_order_relaxed) == run->options->workers;
 }
 
-static void sample_cpu(struct write_worker *worker)
+static void sample_usage(struct write_worker *worker)
 {
-    if (worker->run->options->report_bandwidth && !worker->cpu_ns)
-        worker->cpu_ns = thread_cpu_ns() - worker->cpu_started;
+    if (!worker->run->options->report_bandwidth || worker->usage.cpu_ns)
+        return;
+    struct poll_usage usage = thread_usage();
+    const struct poll_usage *initial = &worker->initial_usage;
+    usage.cpu_ns -= initial->cpu_ns;
+    usage.has_faults = usage.has_faults && initial->has_faults &&
+                       usage.minor_faults >= initial->minor_faults && usage.major_faults >= initial->major_faults;
+    if (usage.has_faults) {
+        usage.minor_faults -= initial->minor_faults;
+        usage.major_faults -= initial->major_faults;
+    }
+    worker->usage = usage;
 }
 
 static int run_worker(void *arg)
@@ -560,7 +611,8 @@ static int run_worker(void *arg)
     if (state != WRITE_RUNNING)
         return 0;
 
-    worker->cpu_started = run->options->report_bandwidth ? thread_cpu_ns() : 0;
+    if (run->options->report_bandwidth)
+        worker->initial_usage = thread_usage();
     while (atomic_load_explicit(&run->state, memory_order_relaxed) == WRITE_RUNNING) {
         if (!poll_worker(worker, roce_now_ns())) {
             atomic_store_explicit(&run->failed, true, memory_order_relaxed);
@@ -570,10 +622,10 @@ static int run_worker(void *arg)
         if (run->sender && worker->finished)
             break;
         if (worker->finished && all_workers_finished(run))
-            sample_cpu(worker);
+            sample_usage(worker);
         rte_pause();
     }
-    sample_cpu(worker);
+    sample_usage(worker);
     return 0;
 }
 
@@ -604,7 +656,7 @@ static bool wait_for_completion(int fd, struct write_worker *main_worker, uint64
                 return true;
         } else {
             if (main_worker->finished && all_workers_finished(run))
-                sample_cpu(main_worker);
+                sample_usage(main_worker);
         }
         rte_pause();
     }
@@ -616,12 +668,16 @@ static bool verify_result(int fd, int application, const struct write_worker *wo
 {
     const struct write_run *run = workers[0].run;
     const struct datapath_options *options = run->options;
-    uint64_t finished = started, cpu = 0, retries = 0;
+    uint64_t finished = started, retries = 0;
+    struct poll_usage usage = { .has_faults = true };
     for (uint32_t i = 0; i < options->workers; ++i) {
         const struct write_worker *worker = &workers[i];
         if (worker->finished_ns > finished)
             finished = worker->finished_ns;
-        cpu += worker->cpu_ns;
+        usage.cpu_ns += worker->usage.cpu_ns;
+        usage.minor_faults += worker->usage.minor_faults;
+        usage.major_faults += worker->usage.major_faults;
+        usage.has_faults = usage.has_faults && worker->usage.has_faults;
         for (uint32_t j = 0; j < worker->qps; ++j) {
             if (run->sender) {
                 retries += worker->states[j].requester.retries;
@@ -651,7 +707,7 @@ static bool verify_result(int fd, int application, const struct write_worker *wo
         printf("WRITE verified: %" PRIu64 " bytes, %" PRIu64 " packets\n", bytes, packets);
     }
     if (options->report_bandwidth)
-        report_bandwidth(run->sender, bytes, started, finished - started, cpu, options);
+        report_bandwidth(run->sender, bytes, started, finished - started, &usage, options);
     return true;
 }
 
@@ -712,10 +768,11 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
         ready = roce_lab_ready(fd);
     if (ready) {
         started = roce_now_ns();
-        workers[0].cpu_started = options->report_bandwidth ? thread_cpu_ns() : 0;
+        if (options->report_bandwidth)
+            workers[0].initial_usage = thread_usage();
         atomic_store_explicit(&run.state, WRITE_RUNNING, memory_order_release);
         completed = wait_for_completion(fd, &workers[0], started);
-        sample_cpu(&workers[0]);
+        sample_usage(&workers[0]);
     } else {
         fprintf(stderr, "control readiness exchange%s failed\n", options->start_gate ? " or start gate" : "");
     }
@@ -754,6 +811,8 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
     for (int i = 0; i < argc; ++i) {
         if (strcmp(argv[i], "--report-bw") == 0) {
             options->report_bandwidth = true;
+        } else if (strcmp(argv[i], "--prefault-app") == 0) {
+            options->prefault_app = true;
         } else if (strcmp(argv[i], "--scatter-gather") == 0) {
             options->scatter_gather = true;
         } else if (strcmp(argv[i], "--verbs-queues") == 0) {
@@ -846,7 +905,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues]"
+                        " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--prefault-app]"
                         " [--scatter-gather] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
     }
@@ -865,6 +924,10 @@ int main(int argc, char **argv)
     }
     if (datapath.app_post_batch && (!options.sender || !datapath.app_socket)) {
         fprintf(stderr, "an application-backed requester uses the application post batch\n");
+        goto cleanup_eal;
+    }
+    if (datapath.prefault_app && !datapath.app_socket) {
+        fprintf(stderr, "prefaulting requires an application-backed buffer\n");
         goto cleanup_eal;
     }
     if (datapath.native_queues && (!datapath.mr_socket || !options.sender)) {
@@ -1006,13 +1069,18 @@ int main(int argc, char **argv)
             .in_band_cm = in_band, .scatter_gather = datapath.scatter_gather,
             .native_queues = datapath.native_queues, .rdmacm = cma != NULL,
         };
+        uint64_t attached = datapath.report_bandwidth ? roce_now_ns() : 0;
         if (!roce_app_attach(datapath.app_socket, &options, &configuration, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
         buffer = application.buffer;
+        if (datapath.report_bandwidth)
+            fprintf(stderr, "APP_ATTACH bytes=%" PRIu64 " elapsed_ns=%" PRIu64 "\n",
+                    bytes, roce_now_ns() - attached);
     }
     if (datapath.scatter_gather && !memif) {
+        uint64_t mapping_start = datapath.report_bandwidth ? roce_now_ns() : 0;
         dma_address = dmabuf_map ? application.mr.mapping : buffer;
         dma_length = dmabuf_map ? application.mr.mapped_length : application.length;
         long page_size = sysconf(_SC_PAGESIZE);
@@ -1040,6 +1108,13 @@ int main(int argc, char **argv)
         dma_mapped = true;
         printf("Application %s region mapped for scatter/gather TX (%zu bytes)\n",
                dmabuf_map ? "DMA-BUF" : "DMA", dma_length);
+        if (datapath.report_bandwidth)
+            fprintf(stderr, "APP_DMA_SETUP bytes=%zu elapsed_ns=%" PRIu64 "\n",
+                    dma_length, roce_now_ns() - mapping_start);
+    }
+    if (datapath.prefault_app && !prefault_application(buffer, (size_t)bytes)) {
+        fprintf(stderr, "could not prefault the application buffer\n");
+        goto cleanup_port;
     }
     struct rte_eth_stats initial_stats = {0};
     bool measure_stats = datapath.report_bandwidth && rte_eth_stats_get(port, &initial_stats) == 0;

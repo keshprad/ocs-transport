@@ -10,7 +10,7 @@ import shutil
 import tempfile
 
 from check_spark_bandwidth import (
-    APP_DESTINATION_ROOT, APP_FILES, APP_PROFILES, Endpoint, unit_argv, unit_environment,
+    APP_DESTINATION_ROOT, APP_FILES, APP_PROFILES, PREFAULT_PROFILES, Endpoint, unit_argv, unit_environment,
 )
 from stage_spark_cm import APP_LAUNCHER
 
@@ -265,12 +265,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("revision", help="revision of the pinned RoCEv2 application and worker")
     parser.add_argument("--inputs", type=Path, required=True, help="directory with spark-02 and spark-04 inputs")
-    parser.add_argument("--profile", action="append", choices=APP_PROFILES, help="profile to stage (default: all)")
+    parser.add_argument("--profile", action="append", choices=APP_PROFILES | PREFAULT_PROFILES,
+                        help="profile to stage (default: all profiles without prefaulting)")
+    parser.add_argument("--include-prefault", action="store_true",
+                        help="also stage prefault variants of the selected profiles")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{7,40}", args.revision):
         parser.error("revision must be a 7- to 40-character Git commit ID")
+    profiles = tuple(args.profile or APP_PROFILES)
+    if args.include_prefault:
+        profiles += tuple(f"{name}-prefault" for name in profiles if name in APP_PROFILES)
     try:
-        print(stage(args.revision, args.inputs, tuple(dict.fromkeys(args.profile or APP_PROFILES))))
+        print(stage(args.revision, args.inputs, tuple(dict.fromkeys(profiles))))
     except (OSError, ValueError) as error:
         parser.error(str(error))
 

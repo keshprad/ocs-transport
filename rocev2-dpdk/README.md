@@ -479,6 +479,13 @@ the DMA-BUF for the entire payload. The service writes the first mlx5 RX
 error syndrome per queue to the journal if the PMD enters queue recovery.
 [mlx5 PMD runtime options](https://doc.dpdk.org/guides-23.11/nics/mlx5.html#runtime-configuration)
 
+The worker reports minor and major faults during polling. Setup diagnostics
+report the elapsed time for application attach and DMA mapping separately.
+With `--prefault-app`, the worker reads one byte per registered page before
+the control exchange and reports the upfront cost. To compare both paths,
+stage the updated worker with `--include-prefault` and add
+`--compare-prefault` to the application bandwidth command.
+
 ### Physical dual-rail sweep
 
 The native runner accepts a local perftest 6.30 binary and checks the

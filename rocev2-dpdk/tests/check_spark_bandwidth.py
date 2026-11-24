@@ -3,7 +3,7 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -57,6 +57,7 @@ class Profile:
     ethernet_mtu: int | None = None
     payload: int = PAYLOAD
     app_mode: str | None = None
+    prefault_app: bool = False
 
     @property
     def writes(self):
@@ -115,7 +116,11 @@ APP_PROFILES = {
     for mtu_index, (mtu, pmtu) in enumerate(((1500, 1024), (4200, 4096)))
     for index, (name, profile) in enumerate(APP_SHAPES.items())
 }
-ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES
+PREFAULT_PROFILES = {
+    f"{name}-prefault": replace(profile, port=profile.port + len(APP_PROFILES), prefault_app=True)
+    for name, profile in APP_PROFILES.items()
+}
+ALL_PROFILES = PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES | PREFAULT_PROFILES
 
 
 @dataclass(frozen=True)
@@ -166,6 +171,8 @@ def unit_argv(endpoint, destination, runtime):
         argv += ["--start-gate", str(GATE_PORT)]
     if profile.native_mr:
         argv += ["--mr-socket", str(profile.runtime_dir / "registration.sock")]
+    if profile.prefault_app:
+        argv.append("--prefault-app")
     if profile.app_mode and endpoint.role == "tx":
         argv += ["--app-post-batch", str(APP_POST_BATCH)]
         if profile.native_mr:
@@ -413,6 +420,24 @@ def wait_endpoint(commands, endpoint, invocation, deadline, *, ready=False):
     raise CycleError(f"{endpoint.label}: timed out waiting for {phase} ({invocation})")
 
 
+def app_setup_timings(endpoint, messages):
+    timings = {}
+    for stage, tag in (("attach", "APP_ATTACH"), ("dma", "APP_DMA_SETUP"), ("prefault", "APP_PREFAULT")):
+        lines = [message for message in messages if message.startswith(f"{tag} ")]
+        require(len(lines) <= 1, f"{endpoint.label}: repeated {tag} result")
+        if lines:
+            fields = dict(field.split("=", 1) for field in lines[0].split()[1:])
+            require(fields.get("bytes") == str(endpoint.settings.payload) and fields.get("elapsed_ns", "").isdigit(),
+                    f"{endpoint.label}: invalid {tag} result")
+            timings[stage] = {key: int(value) for key, value in fields.items()}
+    require(("prefault" in timings) == endpoint.settings.prefault_app,
+            f"{endpoint.label}: application prefault result differs from the profile")
+    if endpoint.settings.prefault_app:
+        require(timings["prefault"].get("pages", 0) > 0 and "attach" in timings,
+                f"{endpoint.label}: incomplete application prefault timing")
+    return timings
+
+
 def parse_result(endpoint, messages):
     lines = [line for line in messages if line.startswith("BANDWIDTH ")]
     require(len(lines) == 1, f"{endpoint.label}: expected one bandwidth result")
@@ -439,6 +464,11 @@ def parse_result(endpoint, messages):
             f"{endpoint.label}: inconsistent bandwidth or CPU counters")
     if profile.aggregate:
         require(int(fields.get("start_ns", "0")) > 0, f"{endpoint.label}: missing monotonic start")
+    fault_counters = ("poll_minor_faults", "poll_major_faults")
+    if profile.prefault_app or any(key in fields for key in fault_counters):
+        require(all(fields.get(key, "").isdigit() for key in fault_counters),
+                f"{endpoint.label}: incomplete polling fault counts")
+        fields.update((key, int(fields[key])) for key in fault_counters)
 
     if endpoint.role == "tx":
         pattern = rf"WRITE complete: {payload} bytes, {profile.packets} packets, ([0-9]+) retries, peer verified"
@@ -457,6 +487,9 @@ def parse_result(endpoint, messages):
         require(len(processes) == 1 and processes[0][1] != processes[0][2],
                 f"{endpoint.label}: missing separate worker and application process IDs")
         fields.update(worker_pid=int(processes[0][1]), app_pid=int(processes[0][2]))
+        timings = app_setup_timings(endpoint, messages)
+        if timings:
+            fields["memory_setup"] = timings
         if endpoint.role == "tx":
             suffix = " via libibverbs" if profile.native_mr else ""
             completion = f"Application observed {profile.writes} WRITE completions per QP{suffix}"
@@ -606,7 +639,7 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
             profile_result.update(ethernet_mtu=config.ethernet_mtu, pmtu=config.pmtu)
         if config.app_mode:
             profile_result.update(app_mode=config.app_mode, payload_bytes=config.payload,
-                                  app_post_batch=min(APP_POST_BATCH, config.writes))
+                                  app_post_batch=min(APP_POST_BATCH, config.writes), prefault_app=config.prefault_app)
         report["profiles"][profile] = profile_result
         for sample in range(1, samples + 1):
             try:
@@ -644,6 +677,8 @@ def main():
                            help="compare the same WRITE profiles at Ethernet MTUs 1500 and 4200")
     selection.add_argument("--app-bench", action="append", choices=APP_MODES,
                            help="repeat to select separate-process application profiles at both MTUs")
+    parser.add_argument("--compare-prefault", action="store_true",
+                        help="include matching application profiles that prefault the worker's memory alias")
     parser.add_argument("--profile", action="append", choices=APP_SHAPES,
                         help="repeat to select profiles; smoke is an 8 MiB application check")
     parser.add_argument("--mtu", type=int, choices=(1500, 4200),
@@ -672,12 +707,15 @@ def main():
     selected = tuple(dict.fromkeys(args.profile or PROFILES))
     if "smoke" in selected and not args.app_bench:
         parser.error("--profile smoke requires --app-bench")
+    if args.compare_prefault and not args.app_bench:
+        parser.error("--compare-prefault requires --app-bench")
     mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
     if args.aggregate:
         profiles = tuple(AGGREGATE_PROFILES)
     elif args.app_bench:
-        profiles = tuple(f"app-{mode}-mtu-{mtu}-{name}" for mtu in mtus
-                         for mode in dict.fromkeys(args.app_bench) for name in selected)
+        variants = ("", "-prefault") if args.compare_prefault else ("",)
+        profiles = tuple(f"app-{mode}-mtu-{mtu}-{name}{suffix}" for mtu in mtus
+                         for mode in dict.fromkeys(args.app_bench) for name in selected for suffix in variants)
     elif args.burst_style_bench:
         profiles = tuple(f"mtu-{mtu}-{name}" for mtu in mtus for name in selected)
     else:
