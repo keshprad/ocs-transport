@@ -15,14 +15,15 @@ import time
 BINARY = Path(__file__).resolve().parents[1] / "roce_write"
 
 
-def command(cpu, directory, role, size, port, ip, pmtu):
+def command(cpu, directory, role, size, port, ip, pmtu, *, mac=None):
     driver_role = "server" if role == "rx" else "client"
     cpus = (cpu,) if isinstance(cpu, int) else cpu
     lcores = ",".join(f"{index}@{core}" for index, core in enumerate(cpus))
+    mac_option = f",mac={mac}" if mac else ""
     return [
         str(BINARY), f"--lcores={lcores}", "--no-huge", "--no-pci", "--no-telemetry",
         f"--file-prefix=roce-{directory.name}-{role}",
-        f"--vdev=net_memif0,role={driver_role},socket={directory / 'link'},socket-abstract=no",
+        f"--vdev=net_memif0,role={driver_role},socket={directory / 'link'},socket-abstract=no{mac_option}",
         "--", role, str(size), "127.0.0.1", str(port), ip, str(pmtu), "net_memif0",
     ]
 

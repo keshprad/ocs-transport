@@ -3,5 +3,6 @@
 /roce_app_write
 /tests/test_roce
 /tests/test_roce_cm_wire
+/tests/test_roce_cm_session
 /tests/roce_wire_cli
 /tests/test_doorbell

@@ -59,6 +59,20 @@ WRITE and the local TX queues release their references. The kernel-pinned
 registration path has a DMA-BUF export and still needs mlx5 PMD
 integration for physical scatter/gather.
 
+### In-band connection setup
+
+For a single-QP DPDK-to-DPDK lab run, pass `--cm-peer IPV4 MAC` to each
+worker with the other endpoint's data-plane addresses. The worker sends
+standard REQ, REP and RTU messages over DPDK. The sender's path MTU
+must fit the receiver's configured path MTU. The lab's CM private data
+carries the WRITE buffer address, key and workload. The existing TCP
+socket synchronizes the test and returns the verification result.
+
+With `--app-socket`, the application issues its connect or listen request
+over the local Unix socket. The requester gets its doorbell queue after
+the worker reports establishment. `make check-app` exercises this path
+alongside scatter/gather TX and CPU receive placement.
+
 ## Build and verify
 
 Build with a C compiler, pkg-config, DPDK with the desired PMD, and

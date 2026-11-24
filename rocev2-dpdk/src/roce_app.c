@@ -24,6 +24,10 @@ enum {
     APP_MEMFD = 1,
     APP_PINNED = 2,
     APP_DOORBELL = 3,
+    APP_USE_CM = 1u << 0,
+    APP_CONNECT = 'A',
+    APP_LISTEN = 'L',
+    APP_ESTABLISHED = 'E',
     APP_SEALS = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL,
 };
 
@@ -34,7 +38,7 @@ struct app_workload {
     uint32_t qps;
     uint32_t workers;
     uint32_t writes;
-    uint32_t reserved;
+    uint32_t flags;
 };
 
 static const size_t doorbell_bytes = ROCE_LAB_MAX_QPS * sizeof(struct roce_doorbell);
@@ -242,7 +246,7 @@ bool roce_app_take_writes(struct roce_doorbell *doorbell, uint32_t first, uint32
 }
 
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
-                     bool dma_writable, struct roce_app_memory *memory)
+                     bool dma_writable, bool in_band_cm, struct roce_app_memory *memory)
 {
     uint64_t bytes = (uint64_t)options->size * options->writes * options->qps;
     size_t length = mapping_length(bytes);
@@ -256,9 +260,18 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
     const struct app_workload workload = {
         .bytes = bytes, .version = APP_VERSION, .sender = options->sender,
         .qps = options->qps, .workers = options->workers, .writes = options->writes,
+        .flags = in_band_cm ? APP_USE_CM : 0,
     };
     if (!configure_peer(socket) || send(socket, &workload, sizeof(workload), MSG_NOSIGNAL) != sizeof(workload))
         goto disconnect;
+    if (in_band_cm) {
+        char command;
+        if (recv(socket, &command, sizeof(command), MSG_TRUNC) != sizeof(command) ||
+            command != (options->sender ? APP_CONNECT : APP_LISTEN)) {
+            errno = EPROTO;
+            goto disconnect;
+        }
+    }
 
     uint8_t kind;
     int fd = receive_mapping(socket, &kind);
@@ -281,7 +294,7 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
     if (buffer == MAP_FAILED)
         goto disconnect;
     struct roce_doorbell *doorbells = NULL;
-    if (options->sender) {
+    if (options->sender && !in_band_cm) {
         doorbells = offer_doorbells(socket, options->workers);
         if (!doorbells) {
             int error = errno;
@@ -302,6 +315,16 @@ disconnect:
         errno = error;
         return false;
     }
+}
+
+bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_options *options)
+{
+    if (!roce_lab_send(memory->socket, APP_ESTABLISHED))
+        return false;
+    if (!options->sender)
+        return true;
+    memory->doorbells = offer_doorbells(memory->socket, options->workers);
+    return memory->doorbells != NULL;
 }
 
 void roce_app_detach(struct roce_app_memory *memory)
@@ -388,12 +411,15 @@ bool roce_app_write(const char *path, const char *registration_device)
     struct app_workload workload;
     if (!configure_peer(socket) ||
         recv(socket, &workload, sizeof(workload), MSG_TRUNC) != sizeof(workload) ||
-        workload.version != APP_VERSION || workload.sender > 1 || workload.reserved ||
+        workload.version != APP_VERSION || workload.sender > 1 || (workload.flags & ~APP_USE_CM) ||
         !workload.qps || workload.qps > ROCE_LAB_MAX_QPS || !workload.workers ||
         workload.workers > workload.qps || !workload.writes || workload.writes > ROCE_PSN_MASK) {
         errno = EPROTO;
         goto disconnect;
     }
+    bool in_band_cm = (workload.flags & APP_USE_CM) != 0;
+    if (in_band_cm && !roce_lab_send(socket, workload.sender ? APP_CONNECT : APP_LISTEN))
+        goto disconnect;
     size_t length = mapping_length(workload.bytes);
     if (!length) {
         errno = EINVAL;
@@ -415,10 +441,13 @@ bool roce_app_write(const char *path, const char *registration_device)
     if (registration_device)
         region = pin_mapping(registration_device, buffer, length, workload.sender);
     if (region >= 0 && send_mapping(socket, region, registration_device ? APP_PINNED : APP_MEMFD)) {
-        bool posted = workload.sender ? post_writes(socket, &workload) :
+        bool connected = !in_band_cm || roce_lab_receive(socket, APP_ESTABLISHED, false) == 1;
+        if (connected && in_band_cm)
+            puts("Application CM established");
+        bool done = connected && (workload.sender ? post_writes(socket, &workload) :
             roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
-            roce_lab_send(socket, 'V');
-        if (posted) {
+            roce_lab_send(socket, 'V'));
+        if (done) {
             success = roce_lab_receive(socket, 'C', false) == 1;
             if (success)
                 printf("Application %s %zu bytes\n", workload.sender ? "completed" : "verified", bytes);

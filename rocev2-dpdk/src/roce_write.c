@@ -1,7 +1,10 @@
 #include "roce_app.h"
+#include "roce_cm_dpdk.h"
 #include "roce_doorbell.h"
 #include "roce_lab.h"
 #include "../../mrc-dpdk/src/dpdk_io.h"
+
+#include <arpa/inet.h>
 
 #include <rte_dev.h>
 #include <rte_eal.h>
@@ -38,6 +41,7 @@ struct datapath_options {
     uint32_t start_gate;
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     const char *app_socket;
+    struct roce_address cm_peer;
     bool report_bandwidth;
     bool scatter_gather;
 };
@@ -580,6 +584,16 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             options->report_bandwidth = true;
         } else if (strcmp(argv[i], "--scatter-gather") == 0) {
             options->scatter_gather = true;
+        } else if (strcmp(argv[i], "--cm-peer") == 0) {
+            struct in_addr ip;
+            struct rte_ether_addr mac;
+            if (argc - i <= 2 || options->cm_peer.ipv4 ||
+                inet_pton(AF_INET, argv[i + 1], &ip) != 1 || !ip.s_addr ||
+                rte_ether_unformat_addr(argv[i + 2], &mac) || !rte_is_valid_assigned_ether_addr(&mac))
+                return false;
+            options->cm_peer.ipv4 = ntohl(ip.s_addr);
+            memcpy(options->cm_peer.mac, mac.addr_bytes, ROCE_MAC_LEN);
+            i += 2;
         } else if (strcmp(argv[i], "--tx-burst") == 0) {
             if (++i == argc || !roce_parse_uint(argv[i], MAX_TX_BURST, &options->tx_burst) ||
                 !options->tx_burst)
@@ -637,11 +651,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
-                        " [--scatter-gather]\n");
+                        " [--scatter-gather] [--cm-peer IPV4 MAC]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
         fprintf(stderr, "only a requester uses the start gate\n");
+        goto cleanup_eal;
+    }
+    if (datapath.cm_peer.ipv4 && (datapath.qps != 1 || datapath.cm_peer.ipv4 == options.data_ip)) {
+        fprintf(stderr, "in-band lab CM requires one QP and a distinct peer address\n");
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -724,8 +742,10 @@ int main(int argc, char **argv)
         tx_refs[i].shared.free_cb = release_tx_reference;
         rte_mbuf_ext_refcnt_set(&tx_refs[i].shared, 1);
     }
+    bool in_band = datapath.cm_peer.ipv4 != 0;
     if (datapath.app_socket) {
-        if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif, &application)) {
+        if (!roce_app_attach(datapath.app_socket, &options, datapath.scatter_gather && !memif,
+                             in_band, &application)) {
             perror("application memory registration");
             goto cleanup_port;
         }
@@ -770,11 +790,18 @@ int main(int argc, char **argv)
         perror("control socket");
         goto cleanup_port;
     }
-    if (roce_lab_exchange(fd, &options, &local, &peer)) {
+    bool connected = in_band ?
+        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer) :
+        roce_lab_exchange(fd, &options, &local, &peer);
+    if (!connected) {
+        fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");
+    } else if (in_band && application.socket >= 0 && !roce_app_connected(&application, &options)) {
+        perror("application establishment");
+    } else {
+        if (in_band)
+            printf("RoCEv2 CM established local_qpn=%06x peer_qpn=%06x\n", local.qpn, peer.qpn);
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
                      options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL);
-    } else {
-        fprintf(stderr, "control setup failed\n");
     }
     if (result || measure_stats) {
         struct rte_eth_stats stats;
