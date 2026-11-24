@@ -1,0 +1,604 @@
+Subject: [PATCH] net/mlx5: map external DMA-BUF memory in the port PD
+
+Based on the DPDK 23.11.7 release tarball.
+https://fast.dpdk.org/rel/dpdk-23.11.7.tar.xz
+SHA256 fa3d0380d34f8d84f2b705076bb3826823962cf141c79a1703b3acb0257ca56d
+
+Register DMA-BUF ranges through libibverbs in the Ethernet PMD's PD.
+Use the caller's CPU alias as the HCA IOVA and as the MR cache key.
+Remove exact DMA-BUF ranges under the cache writer lock and invalidate
+per-queue cached keys. Legacy external DMA map/unmap continues to use
+ordinary verbs MRs, with cross-type overlap rejected.
+
+Apply in the extracted source tree with git apply. On Linux, build with
+Meson -Dibverbs_link=shared and link both mlx5 PMD libraries from that
+build. The dlopen configuration keeps the existing mlx5 glue ABI and
+its DMA-BUF map entry point reports ENOTSUP.
+
+---
+ drivers/common/mlx5/linux/meson.build         |   2 +
+ drivers/common/mlx5/linux/mlx5_common_verbs.c |  38 +++++
+ drivers/common/mlx5/mlx5_common.c             | 193 +++++++++++++++++++-------
+ drivers/common/mlx5/mlx5_common.h             |   9 ++
+ drivers/common/mlx5/mlx5_common_mr.c          |  48 +++++--
+ drivers/common/mlx5/mlx5_common_mr.h          |   8 ++
+ drivers/common/mlx5/version.map               |   2 +
+ drivers/net/mlx5/mlx5.c                       |  42 ++++++
+ drivers/net/mlx5/rte_pmd_mlx5.h               |  48 +++++++
+ drivers/net/mlx5/version.map                  |   2 +
+ 10 files changed, 331 insertions(+), 61 deletions(-)
+diff --git a/drivers/common/mlx5/linux/meson.build b/drivers/common/mlx5/linux/meson.build
+index b3a6454..0176c37 100644
+--- a/drivers/common/mlx5/linux/meson.build
++++ b/drivers/common/mlx5/linux/meson.build
+@@ -215,6 +215,8 @@ has_sym_args = [
+             'mlx5dv_dr_domain_allow_duplicate_rules' ],
+         [ 'HAVE_MLX5_IBV_REG_MR_IOVA', 'infiniband/verbs.h',
+             'ibv_reg_mr_iova' ],
++        [ 'HAVE_MLX5_IBV_REG_DMABUF_MR', 'infiniband/verbs.h',
++            'ibv_reg_dmabuf_mr' ],
+         [ 'HAVE_MLX5_IBV_IMPORT_CTX_PD_AND_MR', 'infiniband/verbs.h',
+             'ibv_import_device' ],
+         [ 'HAVE_MLX5DV_DR_ACTION_CREATE_DEST_ROOT_TABLE', 'infiniband/mlx5dv.h',
+diff --git a/drivers/common/mlx5/linux/mlx5_common_verbs.c b/drivers/common/mlx5/linux/mlx5_common_verbs.c
+index cf2f7ec..be4d02f 100644
+--- a/drivers/common/mlx5/linux/mlx5_common_verbs.c
++++ b/drivers/common/mlx5/linux/mlx5_common_verbs.c
+@@ -127,6 +127,44 @@ mlx5_common_verbs_reg_mr(void *pd, void *addr, size_t length,
+ 	return 0;
+ }
+ 
++int
++mlx5_common_verbs_reg_dmabuf_mr(void *pd, void *addr, size_t len, int fd,
++			      uint64_t offset, struct mlx5_pmd_mr *pmd_mr)
++{
++#if defined(HAVE_MLX5_IBV_REG_DMABUF_MR) && !defined(RTE_IBVERBS_LINK_DLOPEN)
++	struct ibv_mr *mr;
++
++	errno = 0;
++	mr = ibv_reg_dmabuf_mr(pd, offset, len, (uintptr_t)addr, fd,
++			     IBV_ACCESS_LOCAL_WRITE);
++	if (mr == NULL)
++		return errno == 0 ? -EIO : -errno;
++	*pmd_mr = (struct mlx5_pmd_mr) {
++		.lkey = mr->lkey,
++		.addr = addr,
++		.len = len,
++		.obj = mr,
++	};
++	return 0;
++#else
++	RTE_SET_USED(pd);
++	RTE_SET_USED(addr);
++	RTE_SET_USED(len);
++	RTE_SET_USED(fd);
++	RTE_SET_USED(offset);
++	RTE_SET_USED(pmd_mr);
++	return -ENOTSUP;
++#endif
++}
++
++int
++mlx5_common_verbs_dereg_mr_checked(struct mlx5_pmd_mr *pmd_mr)
++{
++	int ret = mlx5_glue->dereg_mr(pmd_mr->obj);
++
++	return ret > 0 ? -ret : ret;
++}
++
+ /**
+  * Deregister mr. Given the mlx5 pmd MR - deregister the MR
+  *
+diff --git a/drivers/common/mlx5/mlx5_common.c b/drivers/common/mlx5/mlx5_common.c
+index ca8543e..5188515 100644
+--- a/drivers/common/mlx5/mlx5_common.c
++++ b/drivers/common/mlx5/mlx5_common.c
+@@ -1068,6 +1068,74 @@ mlx5_common_dev_remove(struct rte_device *eal_dev)
+ 	return ret;
+ }
+ 
++static bool
++mlx5_external_mr_conflict(struct mlx5_mr_share_cache *cache,
++			 const struct mlx5_mr *mr)
++{
++	uintptr_t start = (uintptr_t)mr->pmd_mr.addr;
++	uintptr_t end = start + mr->pmd_mr.len;
++	struct mlx5_mr *other;
++
++	LIST_FOREACH(other, &cache->mr_list, mr) {
++		uintptr_t other_start = (uintptr_t)other->pmd_mr.addr;
++
++		if ((mr->dmabuf || other->dmabuf) && other->ms_n &&
++		    start < other_start + other->pmd_mr.len && other_start < end)
++			return true;
++	}
++	return false;
++}
++
++static int
++mlx5_external_mr_insert(struct mlx5_common_device *dev, struct mlx5_mr *mr)
++{
++	struct mlx5_mr_share_cache *cache = &dev->mr_scache;
++	struct mlx5_mr_btree *bt = &cache->cache;
++	int ret;
++
++try_insert:
++	rte_rwlock_write_lock(&cache->rwlock);
++	if (mlx5_external_mr_conflict(cache, mr)) {
++		rte_rwlock_write_unlock(&cache->rwlock);
++		return -EEXIST;
++	}
++	if (bt->len == bt->size) {
++		uint32_t size = bt->size + 1;
++
++		MLX5_ASSERT(size > bt->size);
++		/*
++		 * Avoid deadlock (numbers show the sequence of events):
++		 *    mlx5_mr_create_primary():
++		 *        1) take EAL memory lock
++		 *        3) take MR lock
++		 *    this function:
++		 *        2) take MR lock
++		 *        4) take EAL memory lock while allocating the new cache
++		 * Releasing the MR lock before step 4
++		 * allows another thread to execute step 3.
++		 */
++		rte_rwlock_write_unlock(&cache->rwlock);
++		ret = mlx5_mr_expand_cache(cache, size, dev->dev->numa_node);
++		if (ret < 0)
++			return ret;
++		goto try_insert;
++	}
++	ret = mlx5_mr_insert_cache(cache, mr);
++	if (ret == 0)
++		LIST_INSERT_HEAD(&cache->mr_list, mr, mr);
++	rte_rwlock_write_unlock(&cache->rwlock);
++	return ret == 0 ? 0 : -ENOSPC;
++}
++
++static void
++mlx5_external_mr_remove(struct mlx5_mr_share_cache *cache, struct mlx5_mr *mr)
++{
++	LIST_REMOVE(mr, mr);
++	mlx5_mr_rebuild_cache(cache);
++	/* Writer unlock publishes the invalidation to the per-queue caches. */
++	++cache->dev_gen;
++}
++
+ /**
+  * Callback to DMA map external memory to a device.
+  *
+@@ -1087,12 +1155,11 @@ int
+ mlx5_common_dev_dma_map(struct rte_device *rte_dev, void *addr,
+ 			uint64_t iova __rte_unused, size_t len)
+ {
+-	struct mlx5_common_device *dev;
+-	struct mlx5_mr_btree *bt;
++	struct mlx5_common_device *dev = to_mlx5_device(rte_dev);
+ 	struct mlx5_mr *mr;
++	int ret;
+ 
+-	dev = to_mlx5_device(rte_dev);
+-	if (!dev) {
++	if (dev == NULL) {
+ 		DRV_LOG(WARNING,
+ 			"Unable to find matching mlx5 device to device %s",
+ 			rte_dev->name);
+@@ -1101,45 +1168,17 @@ mlx5_common_dev_dma_map(struct rte_device *rte_dev, void *addr,
+ 	}
+ 	mr = mlx5_create_mr_ext(dev->pd, (uintptr_t)addr, len,
+ 				SOCKET_ID_ANY, dev->mr_scache.reg_mr_cb);
+-	if (!mr) {
++	if (mr == NULL) {
+ 		DRV_LOG(WARNING, "Device %s unable to DMA map", rte_dev->name);
+ 		rte_errno = EINVAL;
+ 		return -1;
+ 	}
+-try_insert:
+-	rte_rwlock_write_lock(&dev->mr_scache.rwlock);
+-	bt = &dev->mr_scache.cache;
+-	if (bt->len == bt->size) {
+-		uint32_t size;
+-		int ret;
+-
+-		size = bt->size + 1;
+-		MLX5_ASSERT(size > bt->size);
+-		/*
+-		 * Avoid deadlock (numbers show the sequence of events):
+-		 *    mlx5_mr_create_primary():
+-		 *        1) take EAL memory lock
+-		 *        3) take MR lock
+-		 *    this function:
+-		 *        2) take MR lock
+-		 *        4) take EAL memory lock while allocating the new cache
+-		 * Releasing the MR lock before step 4
+-		 * allows another thread to execute step 3.
+-		 */
+-		rte_rwlock_write_unlock(&dev->mr_scache.rwlock);
+-		ret = mlx5_mr_expand_cache(&dev->mr_scache, size,
+-					   rte_dev->numa_node);
+-		if (ret < 0) {
+-			mlx5_mr_free(mr, dev->mr_scache.dereg_mr_cb);
+-			rte_errno = ret;
+-			return -1;
+-		}
+-		goto try_insert;
++	ret = mlx5_external_mr_insert(dev, mr);
++	if (ret < 0) {
++		mlx5_mr_free(mr, dev->mr_scache.dereg_mr_cb);
++		rte_errno = -ret;
++		return -1;
+ 	}
+-	LIST_INSERT_HEAD(&dev->mr_scache.mr_list, mr, mr);
+-	/* Insert to the global cache table. */
+-	mlx5_mr_insert_cache(&dev->mr_scache, mr);
+-	rte_rwlock_write_unlock(&dev->mr_scache.rwlock);
+ 	return 0;
+ }
+ 
+@@ -1174,32 +1213,80 @@ mlx5_common_dev_dma_unmap(struct rte_device *rte_dev, void *addr,
+ 		rte_errno = ENODEV;
+ 		return -1;
+ 	}
+-	rte_rwlock_read_lock(&dev->mr_scache.rwlock);
++	rte_rwlock_write_lock(&dev->mr_scache.rwlock);
+ 	mr = mlx5_mr_lookup_list(&dev->mr_scache, &entry, (uintptr_t)addr);
+-	if (!mr) {
+-		rte_rwlock_read_unlock(&dev->mr_scache.rwlock);
++	if (mr == NULL || mr->dmabuf) {
++		rte_rwlock_write_unlock(&dev->mr_scache.rwlock);
+ 		DRV_LOG(WARNING,
+ 			"Address 0x%" PRIxPTR " wasn't registered to device %s",
+ 			(uintptr_t)addr, rte_dev->name);
+ 		rte_errno = EINVAL;
+ 		return -1;
+ 	}
+-	LIST_REMOVE(mr, mr);
+-	DRV_LOG(DEBUG, "MR(%p) is removed from list.", (void *)mr);
++	mlx5_external_mr_remove(&dev->mr_scache, mr);
++	rte_rwlock_write_unlock(&dev->mr_scache.rwlock);
+ 	mlx5_mr_free(mr, dev->mr_scache.dereg_mr_cb);
+-	mlx5_mr_rebuild_cache(&dev->mr_scache);
+-	/*
+-	 * No explicit wmb is needed after updating dev_gen due to
+-	 * store-release ordering in unlock that provides the
+-	 * implicit barrier at the software visible level.
+-	 */
+-	++dev->mr_scache.dev_gen;
+-	DRV_LOG(DEBUG, "Broadcasting local cache flush, gen=%d.",
+-		dev->mr_scache.dev_gen);
+-	rte_rwlock_read_unlock(&dev->mr_scache.rwlock);
+ 	return 0;
+ }
+ 
++#ifdef RTE_EXEC_ENV_LINUX
++int
++mlx5_common_dev_dmabuf_map(struct mlx5_common_device *dev, void *addr,
++			  size_t len, int fd, uint64_t offset)
++{
++	const struct rte_memseg_list *msl;
++	struct mlx5_mr *mr;
++	int ret;
++
++	if (addr == NULL || !len || len > UINTPTR_MAX - (uintptr_t)addr ||
++	    fd < 0 || len > UINT64_MAX - offset) {
++		rte_errno = EINVAL;
++		return -rte_errno;
++	}
++	msl = rte_mem_virt2memseg_list(addr);
++	if (msl != NULL && !msl->external) {
++		rte_errno = EINVAL;
++		return -rte_errno;
++	}
++	mr = mlx5_create_mr_dmabuf(dev->pd, addr, len, fd, offset);
++	if (mr == NULL)
++		return -rte_errno;
++	ret = mlx5_external_mr_insert(dev, mr);
++	if (ret < 0) {
++		mlx5_mr_free(mr, dev->mr_scache.dereg_mr_cb);
++		rte_errno = -ret;
++	}
++	return ret;
++}
++
++int
++mlx5_common_dev_dmabuf_unmap(struct mlx5_common_device *dev, void *addr,
++			    size_t len)
++{
++	struct mlx5_mr_share_cache *cache = &dev->mr_scache;
++	struct mr_cache_entry entry;
++	struct mlx5_mr *mr;
++	int ret;
++
++	rte_rwlock_write_lock(&cache->rwlock);
++	mr = mlx5_mr_lookup_list(cache, &entry, (uintptr_t)addr);
++	if (mr == NULL || !mr->dmabuf || mr->pmd_mr.addr != addr ||
++	    mr->pmd_mr.len != len) {
++		ret = -EINVAL;
++	} else {
++		ret = mlx5_common_verbs_dereg_mr_checked(&mr->pmd_mr);
++		if (ret == 0)
++			mlx5_external_mr_remove(cache, mr);
++	}
++	rte_rwlock_write_unlock(&cache->rwlock);
++	if (ret == 0)
++		mlx5_free(mr);
++	else
++		rte_errno = -ret;
++	return ret;
++}
++#endif
++
+ void
+ mlx5_class_driver_register(struct mlx5_class_driver *driver)
+ {
+diff --git a/drivers/common/mlx5/mlx5_common.h b/drivers/common/mlx5/mlx5_common.h
+index b5acb89..226b8fd 100644
+--- a/drivers/common/mlx5/mlx5_common.h
++++ b/drivers/common/mlx5/mlx5_common.h
+@@ -517,6 +517,15 @@ struct mlx5_common_device {
+ 	struct mlx5_common_dev_config config; /* Device configuration. */
+ };
+ 
++#ifdef RTE_EXEC_ENV_LINUX
++__rte_internal
++int mlx5_common_dev_dmabuf_map(struct mlx5_common_device *dev, void *addr,
++			      size_t len, int fd, uint64_t offset);
++__rte_internal
++int mlx5_common_dev_dmabuf_unmap(struct mlx5_common_device *dev, void *addr,
++				size_t len);
++#endif
++
+ /**
+  * Indicates whether PD and CTX are imported from another process,
+  * or created by this process.
+diff --git a/drivers/common/mlx5/mlx5_common_mr.c b/drivers/common/mlx5/mlx5_common_mr.c
+index 192c9b4..d743dba 100644
+--- a/drivers/common/mlx5/mlx5_common_mr.c
++++ b/drivers/common/mlx5/mlx5_common_mr.c
+@@ -1165,6 +1165,21 @@ mlx5_mr_flush_local_cache(struct mlx5_mr_ctrl *mr_ctrl)
+ 		(void *)mr_ctrl, mr_ctrl->cur_gen);
+ }
+ 
++static struct mlx5_mr *
++mlx5_alloc_mr_ext(int socket_id)
++{
++	struct mlx5_mr *mr;
++
++	mr = mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO,
++			 RTE_ALIGN_CEIL(sizeof(*mr), RTE_CACHE_LINE_SIZE),
++			 RTE_CACHE_LINE_SIZE, socket_id);
++	if (mr != NULL) {
++		mr->ms_n = 1;
++		mr->ms_bmp_n = 1;
++	}
++	return mr;
++}
++
+ /**
+  * Creates a memory region for external memory, that is memory which is not
+  * part of the DPDK memory segments.
+@@ -1185,11 +1200,9 @@ struct mlx5_mr *
+ mlx5_create_mr_ext(void *pd, uintptr_t addr, size_t len, int socket_id,
+ 		   mlx5_reg_mr_t reg_mr_cb)
+ {
+-	struct mlx5_mr *mr = NULL;
++	struct mlx5_mr *mr;
+ 
+-	mr = mlx5_malloc(MLX5_MEM_RTE | MLX5_MEM_ZERO,
+-			 RTE_ALIGN_CEIL(sizeof(*mr), RTE_CACHE_LINE_SIZE),
+-			 RTE_CACHE_LINE_SIZE, socket_id);
++	mr = mlx5_alloc_mr_ext(socket_id);
+ 	if (mr == NULL)
+ 		return NULL;
+ 	reg_mr_cb(pd, (void *)addr, len, &mr->pmd_mr);
+@@ -1200,10 +1213,6 @@ mlx5_create_mr_ext(void *pd, uintptr_t addr, size_t len, int socket_id,
+ 		mlx5_free(mr);
+ 		return NULL;
+ 	}
+-	mr->msl = NULL; /* Mark it is external memory. */
+-	mr->ms_bmp = NULL;
+-	mr->ms_n = 1;
+-	mr->ms_bmp_n = 1;
+ 	DRV_LOG(DEBUG,
+ 		"MR CREATED (%p) for external memory %p:\n"
+ 		"  [0x%" PRIxPTR ", 0x%" PRIxPTR "),"
+@@ -1214,6 +1223,29 @@ mlx5_create_mr_ext(void *pd, uintptr_t addr, size_t len, int socket_id,
+ 	return mr;
+ }
+ 
++#ifdef RTE_EXEC_ENV_LINUX
++struct mlx5_mr *
++mlx5_create_mr_dmabuf(void *pd, void *addr, size_t len, int fd, uint64_t offset)
++{
++	struct mlx5_mr *mr = mlx5_alloc_mr_ext(SOCKET_ID_ANY);
++	int ret;
++
++	if (mr == NULL) {
++		rte_errno = ENOMEM;
++		return NULL;
++	}
++	ret = mlx5_common_verbs_reg_dmabuf_mr(pd, addr, len, fd, offset,
++					    &mr->pmd_mr);
++	if (ret < 0) {
++		mlx5_free(mr);
++		rte_errno = -ret;
++		return NULL;
++	}
++	mr->dmabuf = true;
++	return mr;
++}
++#endif
++
+ /**
+  * Callback for memory free event. Iterate freed memsegs and check whether it
+  * belongs to an existing MR. If found, clear the bit from bitmap of MR. As a
+diff --git a/drivers/common/mlx5/mlx5_common_mr.h b/drivers/common/mlx5/mlx5_common_mr.h
+index 8789d40..4f87709 100644
+--- a/drivers/common/mlx5/mlx5_common_mr.h
++++ b/drivers/common/mlx5/mlx5_common_mr.h
+@@ -46,6 +46,7 @@ struct mlx5_mr {
+ 	int ms_n; /* Number of memsegs in use. */
+ 	uint32_t ms_bmp_n; /* Number of bits in memsegs bit-mask. */
+ 	struct rte_bitmap *ms_bmp; /* Bit-mask of memsegs belonged to MR. */
++	bool dmabuf; /* External MR registered through DMA-BUF. */
+ };
+ 
+ /* Cache entry for Memory Region. */
+@@ -233,6 +234,13 @@ mlx5_mr_lookup_list(struct mlx5_mr_share_cache *share_cache,
+ struct mlx5_mr *
+ mlx5_create_mr_ext(void *pd, uintptr_t addr, size_t len, int socket_id,
+ 		   mlx5_reg_mr_t reg_mr_cb);
++#ifdef RTE_EXEC_ENV_LINUX
++struct mlx5_mr *mlx5_create_mr_dmabuf(void *pd, void *addr, size_t len, int fd,
++				    uint64_t offset);
++int mlx5_common_verbs_reg_dmabuf_mr(void *pd, void *addr, size_t len, int fd,
++				  uint64_t offset, struct mlx5_pmd_mr *pmd_mr);
++int mlx5_common_verbs_dereg_mr_checked(struct mlx5_pmd_mr *pmd_mr);
++#endif
+ void mlx5_mr_free(struct mlx5_mr *mr, mlx5_dereg_mr_t dereg_mr_cb);
+ __rte_internal
+ uint32_t
+diff --git a/drivers/common/mlx5/version.map b/drivers/common/mlx5/version.map
+index ca734dc..5c0d997 100644
+--- a/drivers/common/mlx5/version.map
++++ b/drivers/common/mlx5/version.map
+@@ -160,6 +160,8 @@ INTERNAL {
+ 	mlx5_mp_req_mempool_reg;
+ 	mlx5_mr_mempool2mr_bh;
+ 	mlx5_mr_mempool_populate_cache;
++	mlx5_common_dev_dmabuf_map; # WINDOWS_NO_EXPORT
++	mlx5_common_dev_dmabuf_unmap; # WINDOWS_NO_EXPORT
+ 
+ 	mlx5_os_interrupt_handler_create; # WINDOWS_NO_EXPORT
+ 	mlx5_os_interrupt_handler_destroy; # WINDOWS_NO_EXPORT
+diff --git a/drivers/net/mlx5/mlx5.c b/drivers/net/mlx5/mlx5.c
+index 5974760..cb4376e 100644
+--- a/drivers/net/mlx5/mlx5.c
++++ b/drivers/net/mlx5/mlx5.c
+@@ -2431,6 +2431,48 @@ mlx5_dev_close(struct rte_eth_dev *dev)
+ 	return 0;
+ }
+ 
++#ifdef RTE_EXEC_ENV_LINUX
++static struct mlx5_common_device *
++mlx5_dmabuf_port(uint16_t port_id)
++{
++	struct rte_eth_dev *dev;
++
++	if (!rte_eth_dev_is_valid_port(port_id)) {
++		rte_errno = ENODEV;
++		return NULL;
++	}
++	dev = &rte_eth_devices[port_id];
++	if (dev->dev_ops != &mlx5_dev_ops ||
++	    rte_eal_process_type() != RTE_PROC_PRIMARY ||
++	    rte_eal_iova_mode() != RTE_IOVA_VA) {
++		rte_errno = ENOTSUP;
++		return NULL;
++	}
++	return MLX5_SH(dev)->cdev;
++}
++
++int
++rte_pmd_mlx5_dmabuf_map(uint16_t port_id, void *addr, size_t len, int fd,
++			uint64_t offset)
++{
++	struct mlx5_common_device *dev = mlx5_dmabuf_port(port_id);
++
++	if (dev == NULL)
++		return -rte_errno;
++	return mlx5_common_dev_dmabuf_map(dev, addr, len, fd, offset);
++}
++
++int
++rte_pmd_mlx5_dmabuf_unmap(uint16_t port_id, void *addr, size_t len)
++{
++	struct mlx5_common_device *dev = mlx5_dmabuf_port(port_id);
++
++	if (dev == NULL)
++		return -rte_errno;
++	return mlx5_common_dev_dmabuf_unmap(dev, addr, len);
++}
++#endif
++
+ const struct eth_dev_ops mlx5_dev_ops = {
+ 	.dev_configure = mlx5_dev_configure,
+ 	.dev_start = mlx5_dev_start,
+diff --git a/drivers/net/mlx5/rte_pmd_mlx5.h b/drivers/net/mlx5/rte_pmd_mlx5.h
+index ee5c4a0..4de3619 100644
+--- a/drivers/net/mlx5/rte_pmd_mlx5.h
++++ b/drivers/net/mlx5/rte_pmd_mlx5.h
+@@ -5,6 +5,7 @@
+ #ifndef RTE_PMD_PRIVATE_MLX5_H_
+ #define RTE_PMD_PRIVATE_MLX5_H_
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #include <rte_byteorder.h>
+@@ -250,6 +251,53 @@ int rte_pmd_mlx5_flow_engine_set_mode(enum rte_pmd_mlx5_flow_engine_mode mode, u
+ __rte_experimental
+ int rte_pmd_mlx5_external_sq_disable(uint16_t port_id, uint32_t sq_num);
+ 
++#ifdef RTE_EXEC_ENV_LINUX
++/**
++ * Register DMA-BUF-backed external memory for mlx5 mbuf DMA.
++ *
++ * Call in the primary process with IOVA mode VA. The caller supplies the
++ * CPU virtual address of a mapping of the same bytes as the DMA-BUF range.
++ * The export must permit the bidirectional DMA requested by Linux RDMA.
++ * Keep the CPU mapping live and prevent overlapping registrations until
++ * unmap completes. The verbs registration retains the backing DMA-BUF.
++ * The libibverbs dlopen glue build returns -ENOTSUP for this method.
++ *
++ * @param port_id
++ *   mlx5 Ethernet port. The registration is shared by ports using its PD.
++ * @param addr
++ *   Start of the external CPU mapping used in mbufs and as its HCA IOVA.
++ * @param len
++ *   Number of bytes to register.
++ * @param fd
++ *   DMA-BUF descriptor.
++ * @param offset
++ *   Byte offset into the DMA-BUF matching addr, with the same in-page offset.
++ * @return
++ *   0 on success, a negative errno value otherwise and rte_errno is set.
++ */
++__rte_experimental
++int rte_pmd_mlx5_dmabuf_map(uint16_t port_id, void *addr, size_t len, int fd,
++			   uint64_t offset);
++
++/**
++ * Release a DMA-BUF registration for the exact address and length.
++ *
++ * The caller must drain all queues using the buffer and prevent new
++ * submissions before unmap. Serialize with port close and device removal.
++ *
++ * @param port_id
++ *   The mlx5 port used to register the buffer.
++ * @param addr
++ *   Start address supplied to the map call.
++ * @param len
++ *   Length supplied to the map call.
++ * @return
++ *   0 on success, a negative errno value otherwise and rte_errno is set.
++ */
++__rte_experimental
++int rte_pmd_mlx5_dmabuf_unmap(uint16_t port_id, void *addr, size_t len);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/drivers/net/mlx5/version.map b/drivers/net/mlx5/version.map
+index 3561a1d..e710316 100644
+--- a/drivers/net/mlx5/version.map
++++ b/drivers/net/mlx5/version.map
+@@ -18,4 +18,6 @@ EXPERIMENTAL {
+ 	# added in 23.03
+ 	rte_pmd_mlx5_flow_engine_set_mode;
+ 	rte_pmd_mlx5_external_sq_disable;
++	rte_pmd_mlx5_dmabuf_map; # WINDOWS_NO_EXPORT
++	rte_pmd_mlx5_dmabuf_unmap; # WINDOWS_NO_EXPORT
+ };
