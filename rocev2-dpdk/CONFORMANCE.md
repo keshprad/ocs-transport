@@ -251,10 +251,12 @@ The exact Spark-04 kernel guest verified native queue reuse beyond the
 256-entry ring. The single-QP CM runs transferred 521 WRITEs in both copy
 and scatter/gather mode. The out-of-band runs transferred 521 WRITEs per
 QP across four QPs and two workers. The trace checked every posted WR ID
-against its successful CQ entry as the ring wrapped twice. The 133,897-byte
-and 535,588-byte workloads verified with zero retries and required
-Generic Netlink handoff. The worker retires scatter/gather WRITEs in QP
-order after the RC ACK and release of that slot's PMD references.
+against its successful CQ entry as the ring wrapped twice. The two
+configurations verified 133,897 and 535,588 bytes with one packet per
+WRITE, then 4,269,595 and 17,078,380 bytes with nine packets per WRITE at
+PMTU 1024. Both runs used required Generic Netlink handoff and had zero
+RC retries. The worker retires scatter/gather WRITEs in QP order after
+the RC ACK and release of that slot's PMD references.
 
 The native-MR staging archives include a matched patched DPDK 23.11.7
 runtime, worker and application, ABI-34 provider and unsigned modules for
