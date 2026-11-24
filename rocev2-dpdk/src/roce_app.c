@@ -121,16 +121,9 @@ static int accept_client(const char *path)
         return -1;
     puts("application listener ready");
     fflush(stdout);
-    struct pollfd wait = { .fd = listener, .events = POLLIN };
-    int ready;
-    do {
-        ready = poll(&wait, 1, ROCE_LAB_TIMEOUT * 1000);
-    } while (ready < 0 && errno == EINTR);
     int fd = -1;
-    if (ready > 0)
+    if (roce_lab_wait(listener, POLLIN))
         fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
-    else if (!ready)
-        errno = ETIMEDOUT;
     int error = errno;
     close(listener);
     unlink(path);
@@ -146,6 +139,29 @@ static bool send_mapping(int socket, int fd, uint8_t kind)
 static int receive_mapping(int socket, uint8_t *kind)
 {
     return roce_receive_fd(socket, kind, sizeof(*kind));
+}
+
+static bool send_app_message(int socket, const void *message, size_t length)
+{
+    ssize_t sent;
+    do {
+        sent = send(socket, message, length, MSG_NOSIGNAL);
+    } while (sent < 0 && errno == EINTR);
+    if (sent >= 0 && sent != (ssize_t)length)
+        errno = EPROTO;
+    return sent == (ssize_t)length;
+}
+
+static bool receive_app_message(int socket, void *message, size_t length)
+{
+    int fd;
+    if (!roce_receive_optional_fd(socket, message, length, &fd))
+        return false;
+    if (fd < 0)
+        return true;
+    close(fd);
+    errno = EPROTO;
+    return false;
 }
 
 static bool valid_mapping(int fd, uint8_t kind, size_t length, bool sender)
@@ -238,10 +254,8 @@ static bool receive_verbs_memory(struct roce_app_memory *memory, struct roce_mr_
                                  pid_t pid, size_t bytes, bool sender, bool dma_writable)
 {
     uint32_t lkey;
-    if (recv(memory->socket, &lkey, sizeof(lkey), MSG_TRUNC) != sizeof(lkey)) {
-        errno = EPROTO;
+    if (!receive_app_message(memory->socket, &lkey, sizeof(lkey)))
         return false;
-    }
     uint32_t access = sender ? 0 : ROCE_MR_IPC_WRITE | ROCE_MR_IPC_REMOTE_WRITE;
     if (dma_writable)
         access |= ROCE_MR_IPC_WRITE;
@@ -283,13 +297,13 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
                  (config->native_queues ? APP_NATIVE_QUEUES : 0) | (config->rdmacm ? APP_RDMACM : 0),
         .post_batch = config->post_batch,
     };
-    if (!configure_peer(socket, &pid) ||
-        send(socket, &workload, sizeof(workload), MSG_NOSIGNAL) != sizeof(workload))
+    if (!configure_peer(socket, &pid) || !send_app_message(socket, &workload, sizeof(workload)))
         goto disconnect;
     if (config->in_band_cm && !config->rdmacm) {
         char command;
-        if (recv(socket, &command, sizeof(command), MSG_TRUNC) != sizeof(command) ||
-            command != (options->sender ? APP_CONNECT : APP_LISTEN)) {
+        if (!receive_app_message(socket, &command, sizeof(command)))
+            goto disconnect;
+        if (command != (options->sender ? APP_CONNECT : APP_LISTEN)) {
             errno = EPROTO;
             goto disconnect;
         }
@@ -300,11 +314,13 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         receive_local_memory(&attached, length, options->sender, config->dma_writable);
     if (!received)
         goto disconnect;
-    if (config->rdmacm &&
-        (recv(socket, &attached.qpn, sizeof(attached.qpn), MSG_TRUNC) != sizeof(attached.qpn) ||
-         attached.qpn == 1 || attached.qpn >= ROCE_PSN_MASK)) {
-        errno = EPROTO;
-        goto disconnect;
+    if (config->rdmacm) {
+        if (!receive_app_message(socket, &attached.qpn, sizeof(attached.qpn)))
+            goto disconnect;
+        if (attached.qpn == 1 || attached.qpn >= ROCE_PSN_MASK) {
+            errno = EPROTO;
+            goto disconnect;
+        }
     }
     if (options->sender && !config->in_band_cm && !config->native_queues) {
         attached.work = offer_work(socket, options);
@@ -669,9 +685,9 @@ bool roce_app_write(const char *path, const char *registration_device)
     int region = -1;
     struct roce_app_rdmacm cma = {0};
     struct app_workload workload;
-    if (!configure_peer(socket, NULL) ||
-        recv(socket, &workload, sizeof(workload), MSG_TRUNC) != sizeof(workload) ||
-        workload.version != APP_VERSION || workload.sender > 1 ||
+    if (!configure_peer(socket, NULL) || !receive_app_message(socket, &workload, sizeof(workload)))
+        goto disconnect;
+    if (workload.version != APP_VERSION || workload.sender > 1 ||
         (workload.flags & ~(APP_USE_CM | APP_USE_VERBS_MR | APP_WRITE_DMA_ALIAS | APP_SCATTER_GATHER |
                              APP_NATIVE_QUEUES | APP_RDMACM)) ||
         workload.reserved || !workload.post_batch || workload.post_batch > workload.writes ||
@@ -734,10 +750,10 @@ bool roce_app_write(const char *path, const char *registration_device)
                 offered = !error;
             }
         }
-        offered = offered && send(socket, &verbs.mr->lkey, sizeof(verbs.mr->lkey), MSG_NOSIGNAL) == sizeof(verbs.mr->lkey);
+        offered = offered && send_app_message(socket, &verbs.mr->lkey, sizeof(verbs.mr->lkey));
         if (offered && rdmacm) {
             uint32_t qpn = owned_qp ? 0 : queue.resources.qp->qp_num;
-            offered = send(socket, &qpn, sizeof(qpn), MSG_NOSIGNAL) == sizeof(qpn);
+            offered = send_app_message(socket, &qpn, sizeof(qpn));
         }
     } else {
         if (registration_device)
@@ -751,7 +767,7 @@ bool roce_app_write(const char *path, const char *registration_device)
         bool connected = true;
         if (rdmacm) {
             struct roce_cma_lab_address addresses;
-            connected = recv(socket, &addresses, sizeof(addresses), MSG_TRUNC) == sizeof(addresses) &&
+            connected = receive_app_message(socket, &addresses, sizeof(addresses)) &&
                         roce_app_rdmacm_connect(&cma, &addresses, verbs.pd, &queue.resources,
                                                 workload.sender, owned_qp ? NULL : prepare_cm_queue, &queue);
             if (connected && owned_qp && workload.sender) {

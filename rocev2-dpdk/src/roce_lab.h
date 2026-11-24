@@ -28,6 +28,7 @@ struct roce_lab_offer {
 bool roce_parse_uint(const char *arg, uint32_t max, uint32_t *value);
 bool roce_lab_parse(char **argv, struct roce_lab_options *options);
 bool roce_lab_random(uint32_t *value);
+bool roce_lab_wait(int fd, short events);
 int roce_lab_open(const struct roce_lab_options *options);
 bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
                        const struct roce_lab_offer *local, struct roce_lab_offer *peer);

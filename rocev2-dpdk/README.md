@@ -54,6 +54,11 @@ and references the application payload as a separate TX segment. The CPU still
 reads the payload to compute the iCRC. The receiving worker copies into the
 application mapping before acknowledging the WRITE.
 
+For software jumbo tests, connect two DPDK `net_tap` interfaces with a
+private Linux bridge. Pass `--tap-mtu 4200` and PMTU `4096` on each worker.
+The TAP PMD transmits the mbuf chain with `writev()` using the mapped
+application payload. [DPDK TAP PMD](https://doc.dpdk.org/guides-23.11/nics/tap.html)
+
 On a physical port this mode currently supports mlx5 in IOVA-as-VA mode
 with either memfd backing or a registered MR and a DMA-BUF-capable PMD.
 The mlx5 driver registers a writable service alias for DMA. The application
@@ -469,6 +474,12 @@ One-QP trials at both MTUs completed with zero retries and about one
 polling core per endpoint. Each jumbo attempt with 16 QPs ended in
 retry exhaustion and Spark-04 logged mlx5 RX queue errors. The cause
 of those driver errors remains open.
+
+On November 24, the same build again verified 16 GiB for one QP at each
+MTU, with requester rates of 28.928 Gbit/s at 1500 and 41.492 Gbit/s at
+4200. The four-worker MTU 4200 repeat recorded five requester RX errors
+and ended in retry exhaustion. Both hosts' physical CRC, oversize and
+discard counters stayed at zero, and both interface MTUs returned to 1500.
 
 ### Separate application and worker bandwidth
 

@@ -332,6 +332,18 @@ Copy and scatter/gather each completed 521 multipacket WRITEs with all
 completions in order. Both external-QP controls completed three WRITEs.
 All four profiles verified every byte with zero RC retries.
 
+Stock DPDK `net_tap` also exercised native scatter/gather with both
+Linux TAP interfaces and their bridge at MTU 4200. The worker used
+PMTU 4096, and a capture showed 4,170-byte Ethernet WRITE frames.
+On the exact Spark-04 kernel with required Netlink, one CM-owned QP
+verified 4,269,595 bytes and all 521 completions with one RC retry.
+Four QPs across two workers verified 17,078,380 bytes and 2,084 ordered
+completions in both copy and scatter/gather, with 44 and 48 retries
+respectively. The guest used a one-packet send window and
+TX burst. The Unix application negotiation and TCP control waits also
+completed on a bridge carrying IPv6 traffic that interrupted earlier
+builds with TAP receive signals. [DPDK TAP PMD](https://doc.dpdk.org/guides-23.11/nics/tap.html)
+
 The native-MR staging archives include a matched patched DPDK 23.11.7
 runtime, worker and application, ABI-34 provider and unsigned modules for
 each Spark's exact kernel. They passed archive checksums, dynamic loader
@@ -347,7 +359,11 @@ completions, receiver verification and the expected mlx5 mapping in
 scatter/gather modes. The signed-module modes require the Generic Netlink
 registration path. A local PMTU 1024 memif transfer through the staged
 launchers verified 8 MiB and eight WRITEs over 8,192 packets with zero
-retries. The physical Spark performance sweep is pending.
+retries. The `8b075bb` services on Spark-04 and Spark-02 verified 8 MiB
+with distinct worker and application PIDs at each MTU. The mlx5 requester
+mapped the full application memfd for scatter/gather. Requester throughput
+was 25.454 Gbit/s at MTU 1500 and 32.239 Gbit/s at MTU 4200, with zero RC
+retries. These smoke transfers used eight 1 MiB WRITEs per trial.
 
 Two matched 8 MiB runs on the exact Spark-04 kernel in QEMU put one
 read per application MR page before transport setup. Prefaulting

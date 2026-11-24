@@ -52,11 +52,22 @@ bool roce_lab_random(uint32_t *value)
     return getentropy(value, sizeof(*value)) == 0;
 }
 
-static bool wait_event(int fd, short events)
+bool roce_lab_wait(int fd, short events)
 {
     struct pollfd wait = { .fd = fd, .events = events };
-    int result = poll(&wait, 1, ROCE_LAB_TIMEOUT * 1000);
-    if (result == 0)
+    const uint64_t second = UINT64_C(1000000000);
+    uint64_t now = roce_now_ns();
+    uint64_t deadline = now + ROCE_LAB_TIMEOUT * second;
+    int result = 0;
+    while (now < deadline) {
+        uint64_t remaining = deadline - now;
+        const struct timespec timeout = { .tv_sec = remaining / second, .tv_nsec = remaining % second };
+        result = ppoll(&wait, 1, &timeout, NULL);
+        if (result >= 0 || errno != EINTR)
+            break;
+        now = roce_now_ns();
+    }
+    if (!result || (result < 0 && errno == EINTR))
         errno = ETIMEDOUT;
     return result == 1;
 }
@@ -74,7 +85,7 @@ int roce_lab_open(const struct roce_lab_options *options)
         if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
             goto fail;
         if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-            if (errno != EINPROGRESS || !wait_event(fd, POLLOUT))
+            if (errno != EINPROGRESS || !roce_lab_wait(fd, POLLOUT))
                 goto fail;
             int error;
             socklen_t length = sizeof(error);
@@ -95,7 +106,7 @@ int roce_lab_open(const struct roce_lab_options *options)
             goto fail;
         puts("control listener ready");
         fflush(stdout);
-        if (!wait_event(fd, POLLIN))
+        if (!roce_lab_wait(fd, POLLIN))
             goto fail;
         int connected = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
         if (connected < 0)

@@ -47,6 +47,7 @@ struct datapath_options {
     uint32_t workers;
     uint32_t start_gate;
     uint32_t app_post_batch;
+    uint32_t tap_mtu;
     unsigned int lcores[ROCE_LAB_MAX_QPS];
     const char *app_socket;
     const char *mr_socket;
@@ -858,6 +859,10 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             options->scatter_gather = true;
         } else if (strcmp(argv[i], "--verbs-queues") == 0) {
             options->native_queues = true;
+        } else if (strcmp(argv[i], "--tap-mtu") == 0) {
+            if (++i == argc || options->tap_mtu ||
+                !roce_parse_uint(argv[i], UINT16_MAX - RTE_ETHER_HDR_LEN, &options->tap_mtu) || !options->tap_mtu)
+                return false;
         } else if (strcmp(argv[i], "--cm-peer") == 0) {
             struct in_addr ip;
             struct rte_ether_addr mac;
@@ -947,7 +952,7 @@ int main(int argc, char **argv)
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
                         " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--prefault-app]"
-                        " [--scatter-gather] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
+                        " [--scatter-gather] [--tap-mtu N] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
@@ -1019,10 +1024,19 @@ int main(int argc, char **argv)
     uint16_t required_mtu = (uint16_t)(ROCE_MAX_FRAME - ROCE_MAX_PMTU + options.pmtu -
                                        RTE_ETHER_HDR_LEN);
     bool memif = strcmp(info.driver_name, "net_memif") == 0;
+    bool tap = strcmp(info.driver_name, "net_tap") == 0;
+    bool mlx5 = strcmp(info.driver_name, "mlx5_pci") == 0;
+    bool dma_gather = datapath.scatter_gather && mlx5;
+    if (datapath.tap_mtu && !tap) {
+        fprintf(stderr, "--tap-mtu requires a net_tap port\n");
+        goto cleanup_eal;
+    }
+    if (datapath.tap_mtu)
+        mtu = (uint16_t)datapath.tap_mtu;
     if (datapath.scatter_gather &&
         (!options.sender || !datapath.app_socket || !(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
-         (!memif && (strcmp(info.driver_name, "mlx5_pci") != 0 || rte_eal_iova_mode() != RTE_IOVA_VA)))) {
-        fprintf(stderr, "scatter/gather requires an application-backed sender and memif or mlx5 with IOVA=VA\n");
+         (!memif && !tap && !mlx5) || (dma_gather && rte_eal_iova_mode() != RTE_IOVA_VA))) {
+        fprintf(stderr, "scatter/gather requires an application-backed sender and memif, TAP, or mlx5 with IOVA=VA\n");
         goto cleanup_eal;
     }
     if (mtu < required_mtu && !memif) {
@@ -1075,8 +1089,16 @@ int main(int argc, char **argv)
         tx_refs[i].shared.free_cb = release_tx_reference;
         rte_mbuf_ext_refcnt_set(&tx_refs[i].shared, 1);
     }
+    if (datapath.tap_mtu) {
+        /* Configuring the DPDK MTU does not update the Linux TAP interface. */
+        err = rte_eth_dev_set_mtu(port, mtu);
+        if (err) {
+            fprintf(stderr, "could not set TAP MTU %u: %s\n", mtu, strerror(-err));
+            goto cleanup_port;
+        }
+    }
     bool in_band = datapath.cm_peer.ipv4 != 0;
-    if (datapath.scatter_gather && datapath.mr_socket && !memif) {
+    if (dma_gather && datapath.mr_socket) {
         /* Use the same PMD instance that owns the port and its protection domain. */
         mlx5_pmd = dlopen("librte_net_mlx5.so.24", RTLD_NOW | RTLD_NOLOAD);
         if (mlx5_pmd) {
@@ -1106,7 +1128,7 @@ int main(int argc, char **argv)
         const struct roce_app_config configuration = {
             .registrations = registrations,
             .post_batch = post_batch,
-            .dma_writable = datapath.scatter_gather && !memif,
+            .dma_writable = dma_gather,
             .in_band_cm = in_band, .scatter_gather = datapath.scatter_gather,
             .native_queues = datapath.native_queues, .rdmacm = cma != NULL,
         };
@@ -1120,7 +1142,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "APP_ATTACH bytes=%" PRIu64 " elapsed_ns=%" PRIu64 "\n",
                     bytes, roce_now_ns() - attached);
     }
-    if (datapath.scatter_gather && !memif) {
+    if (dma_gather) {
         uint64_t mapping_start = datapath.report_bandwidth ? roce_now_ns() : 0;
         dma_address = dmabuf_map ? application.mr.mapping : buffer;
         dma_length = dmabuf_map ? application.mr.mapped_length : application.length;
