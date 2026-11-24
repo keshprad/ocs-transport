@@ -324,6 +324,13 @@ four runs verified the data and all eight requester completions with
 zero RC retries. The Spark runner records polling faults, attach
 time, DMA setup and prefault time separately for the physical comparison.
 
+Application transfer timing was verified through the staged launcher on
+Spark-04 memif. The exact Spark-04 kernel guest also verified one timing
+record per application in native copy and scatter/gather, with 521
+successful WRITEs per run and no retries. The same builds emitted no
+timing records when disabled. During in-band CM the responder's application
+elapsed time includes the disconnect replay wait before worker completion.
+
 The optional Arm PMULL iCRC produces the same IEEE checksum as scalar
 CRC32. Independent jumbo vectors verify the encoded bytes and reject
 payload corruption on decode. A local Spark-04 Cortex-X925 packet

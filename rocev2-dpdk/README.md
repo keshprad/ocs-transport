@@ -510,6 +510,12 @@ error syndrome per queue to the journal if the PMD enters queue recovery.
 
 The worker reports minor and major faults during polling. Setup diagnostics
 report the elapsed time for application attach and DMA mapping separately.
+The application bandwidth launcher also records elapsed time and process CPU
+time in `application_transfer`, including producer threads and receiver byte
+verification. The interval starts after memory registration and any in-band
+connection setup, and ends when the application observes completion. It can
+include time waiting for the worker's completion signal. For manual runs,
+set `ROCE_DPDK_APP_BW=1` on the application.
 With `--prefault-app`, the worker reads one byte per registered page before
 the control exchange and reports the upfront cost. To compare both paths,
 stage the updated worker with `--include-prefault` and add

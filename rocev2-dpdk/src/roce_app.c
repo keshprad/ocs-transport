@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
+#include <inttypes.h>
 #include <linux/magic.h>
 #include <poll.h>
 #include <pthread.h>
@@ -24,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/vfs.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -647,6 +649,20 @@ static bool post_native_writes(struct ibv_pd *pd, int socket, const struct app_w
     return success;
 }
 
+struct app_usage {
+    uint64_t wall_ns;
+    uint64_t cpu_ns;
+};
+
+static struct app_usage app_usage(void)
+{
+    struct timespec cpu;
+    struct app_usage usage = { .wall_ns = roce_now_ns() };
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu) == 0)
+        usage.cpu_ns = (uint64_t)cpu.tv_sec * UINT64_C(1000000000) + (uint64_t)cpu.tv_nsec;
+    return usage;
+}
+
 bool roce_app_write(const char *path, const char *registration_device)
 {
     int socket = open_socket(path, false);
@@ -731,6 +747,9 @@ bool roce_app_write(const char *path, const char *registration_device)
             region = pin_mapping(registration_device, buffer, length, workload.sender);
         offered = region >= 0 && send_mapping(socket, region, registration_device ? APP_PINNED : APP_MEMFD);
     }
+    const char *app_bw = secure_getenv("ROCE_DPDK_APP_BW");
+    bool report_bandwidth = app_bw && !strcmp(app_bw, "1");
+    struct app_usage start = {0}, end = {0};
     if (offered) {
         bool connected = true;
         if (rdmacm) {
@@ -750,6 +769,8 @@ bool roce_app_write(const char *path, const char *registration_device)
         if (connected && in_band_cm)
             puts(rdmacm ? "Application librdmacm established" : "Application CM established");
         if (connected) {
+            if (report_bandwidth)
+                start = app_usage();
             if (native_queues)
                 success = post_native_writes(verbs.pd, socket, &workload, rdmacm ? &cma : NULL,
                                              rdmacm ? &queue : NULL);
@@ -758,6 +779,8 @@ bool roce_app_write(const char *path, const char *registration_device)
             else
                 success = roce_lab_receive(socket, 'D', false) == 1 && roce_lab_verify(buffer, bytes) &&
                           roce_lab_send(socket, 'V') && roce_lab_receive(socket, 'C', false) == 1;
+            if (report_bandwidth && success)
+                end = app_usage();
         }
         if (success && rdmacm) {
             success = roce_app_rdmacm_finish(&cma);
@@ -789,8 +812,14 @@ bool roce_app_write(const char *path, const char *registration_device)
         saved_errno = errno;
         success = false;
     }
-    if (success)
+    if (success) {
+        if (start.cpu_ns && end.cpu_ns >= start.cpu_ns && end.wall_ns > start.wall_ns)
+            printf("APP_TRANSFER role=%s payload_bytes=%zu start_ns=%" PRIu64
+                   " elapsed_ns=%" PRIu64 " process_cpu_ns=%" PRIu64 "\n",
+                   workload.sender ? "tx" : "rx", bytes, start.wall_ns,
+                   end.wall_ns - start.wall_ns, end.cpu_ns - start.cpu_ns);
         printf("Application %s %zu bytes\n", workload.sender ? "completed" : "verified", bytes);
+    }
     if (!error)
         munmap(buffer, length);
     else if (saved_errno == 0)

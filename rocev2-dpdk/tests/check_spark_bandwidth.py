@@ -438,6 +438,17 @@ def app_setup_timings(endpoint, messages):
     return timings
 
 
+def app_transfer_timing(endpoint, messages):
+    lines = [message for message in messages if message.startswith("APP_TRANSFER ")]
+    require(len(lines) <= 1, f"{endpoint.label}: repeated application transfer timing")
+    if not lines:
+        return None  # Bundles staged before application timing are still usable.
+    match = re.fullmatch(rf"APP_TRANSFER role={endpoint.role} payload_bytes={endpoint.settings.payload} "
+                         r"start_ns=([1-9][0-9]*) elapsed_ns=([1-9][0-9]*) process_cpu_ns=([0-9]+)", lines[0])
+    require(match, f"{endpoint.label}: invalid application transfer timing")
+    return dict(zip(("start_ns", "elapsed_ns", "process_cpu_ns"), map(int, match.groups())))
+
+
 def parse_result(endpoint, messages):
     lines = [line for line in messages if line.startswith("BANDWIDTH ")]
     require(len(lines) == 1, f"{endpoint.label}: expected one bandwidth result")
@@ -490,6 +501,9 @@ def parse_result(endpoint, messages):
         timings = app_setup_timings(endpoint, messages)
         if timings:
             fields["memory_setup"] = timings
+        transfer = app_transfer_timing(endpoint, messages)
+        if transfer is not None:
+            fields["application_transfer"] = transfer
         if endpoint.role == "tx":
             suffix = " via libibverbs" if profile.native_mr else ""
             completion = f"Application observed {profile.writes} WRITE completions per QP{suffix}"

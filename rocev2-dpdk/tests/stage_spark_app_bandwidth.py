@@ -82,7 +82,7 @@ def render_launcher():
     cleanup = '    if [[ -n $worker ]]; then kill "$worker" 2>/dev/null || :; fi'
     if any(APP_LAUNCHER.count(block) != 1 for block in (launch, worker, cleanup)):
         raise ValueError("The shared application launcher no longer has its expected process blocks")
-    application = '''        /usr/bin/setpriv --ambient-caps=-all --inh-caps=-all \\
+    application = '''        ROCE_DPDK_APP_BW=1 /usr/bin/setpriv --ambient-caps=-all --inh-caps=-all \\
             /usr/bin/taskset --cpu-list 10-13 ./roce_app_write "$socket" &
         application=$!
         printf 'APP_PROCESSES worker_pid=%s app_pid=%s\\n' "$worker" "$application"'''
