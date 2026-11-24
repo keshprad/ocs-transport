@@ -78,9 +78,9 @@ RDMAV_DRIVERS="$PROVIDER_DIR/libroce_dpdk" ROCE_DPDK_MR_SOCKET="$MR_PATH" \
 ```
 
 Add `--verbs-queues` to the requester to use stock libibverbs queue
-operations. After the worker negotiates a connection, the lab client
-binds its queue mapping to the provider, creates a CQ and RC QP for
-each lane, and submits WRITEs with `ibv_post_send()`. It retrieves
+operations. The lab client binds the worker queue mapping to the
+provider and submits WRITEs with `ibv_post_send()`. In the TCP lab setup,
+it creates the CQ and RC QP for each lane after negotiation. It retrieves
 individual WR IDs and statuses with `ibv_poll_cq()`. The current lab
 shape supports up to 256 signaled one-SGE WRITEs per QP and a distinct
 completion queue for each QP. The worker checks the registered source
@@ -112,19 +112,22 @@ alongside scatter/gather TX and CPU receive placement.
 To exercise the standard librdmacm calls, add `--rdmacm-socket CM_PATH`
 on each worker and export `ROCE_DPDK_CM_SOCKET="$CM_PATH"` for its local
 application. Use a distinct path from the application and MR sockets.
-Enable `--verbs-queues` on the requester. The application resolves the
-configured IPv4 peer, connects or accepts using a worker-assigned QPN,
-and consumes pollable librdmacm events. The active application receives
-`CONNECT_RESPONSE` and calls `rdma_establish()` before the worker sends
-RTU. The passive application receives `ESTABLISHED` when RTU arrives.
+Enable `--verbs-queues` on the requester and configure an MR socket on
+both endpoints. Each application creates its CQ and RC QP through
+libibverbs and moves it to INIT before setup. Each passes its local QPN
+to the worker and to librdmacm. The applications bind the negotiated queue
+mapping to the same QPs and move them to RTR and RTS before accepting the
+connection on the passive side or calling `rdma_establish()` on the active
+side. The passive application receives `ESTABLISHED` when RTU arrives.
 The worker authenticates the CM socket against the application process
 and sends the CM packets on DPDK queue 0. The requester asks the worker
 to disconnect after posting its last WRITE. The worker sends DREQ after
 the transfer and delivers `DISCONNECTED` after the DREP exchange.
 
 This profile supports a single IPv4 RC QP and up to 23 bytes of application
-private data in the lab REQ and REP. It uses the negotiated queue mapping
-for verbs QP creation. `make libroce_rdmacm.so` builds the adapter for
+private data in the lab REQ and REP. The receiver QP accepts plain RDMA
+WRITEs into its MR. Applications manage the QPs separately from their CM
+IDs. `make libroce_rdmacm.so` builds the adapter for
 explicit linking. The `roce_app_write` lab client already includes it.
 See the [provider test](provider/README.md) for the combined CM, native
 queue, and kernel MR run.

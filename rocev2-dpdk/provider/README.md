@@ -4,9 +4,11 @@
 It uses the standard uverbs context, device queries, port queries
 and protection-domain commands. With `ROCE_DPDK_MR_SOCKET` set before
 opening the device, the provider also supports `ibv_reg_mr()` and
-`ibv_dereg_mr()` through the worker's registration socket. The CQ and
-QP operations are available after the negotiated queue mapping is bound
-to the context. The lab requester enables this with `--verbs-queues`.
+`ibv_dereg_mr()` through the worker's registration socket. An MR-enabled
+context can create CQs and one RC QP before connection negotiation. The
+provider retains the QP's PD and CQs at creation and takes its MR
+reference when binding the worker's queue mapping. The lab requester
+enables native posting with `--verbs-queues`.
 The provider supports RC QP setup and query, signaled one-SGE
 RDMA WRITE posting and CQ polling. The supplied PD must own the source
 MR for the lane. The QP retains both that MR and its CQs until destroy.
@@ -51,8 +53,9 @@ standard librdmacm event and connection calls. The application checks
 peer addresses and private data during establishment, polls native
 WRITE completions, and observes disconnect. With four available CPUs
 it also runs four QPs across two workers using the TCP lab setup.
-The lab client supplies the local queue mapping after connection
-negotiation. The optional [librdmacm adapter](../README.md#in-band-connection-setup)
-uses the worker-assigned QPN for connect and accept.
+The workers exchange each application's QPN over CM. The application
+test checks that both negotiated QPNs match the QPs created before
+connection setup. The provider binds the negotiated settings to those
+same QPs before either app completes the handshake. [librdmacm adapter](../README.md#in-band-connection-setup)
 
 [Kernel setup](../kernel/README.md#verbs-device-discovery)

@@ -5,6 +5,7 @@ import argparse
 from contextlib import ExitStack
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import subprocess
@@ -43,6 +44,7 @@ def expect_success(child, *markers):
     stdout, stderr = child.communicate(timeout=15)
     assert child.returncode == 0 and all(marker in stdout for marker in markers), stdout + stderr
     print(stdout.strip())
+    return stdout
 
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
@@ -89,15 +91,25 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
 
         total = size * writes * qps
         cm_marker = ("RoCEv2 CM established", "RoCEv2 CM disconnected") if cm else ()
-        expect_success(tx, f"WRITE complete: {total} bytes", *cm_marker)
-        expect_success(rx, f"WRITE verified: {total} bytes", *cm_marker)
+        tx_log = expect_success(tx, f"WRITE complete: {total} bytes", *cm_marker)
+        rx_log = expect_success(rx, f"WRITE verified: {total} bytes", *cm_marker)
         app_marker = ("Application CM established",) if cm else ()
         if rdmacm:
             app_marker = ("Application librdmacm established", "Application librdmacm disconnected")
         completion_suffix = " via libibverbs" if native_queues else ""
-        expect_success(tx_app, f"Application completed {total} bytes",
-                       f"Application observed {writes} WRITE completions per QP{completion_suffix}", *app_marker)
-        expect_success(rx_app, f"Application verified {total} bytes", *app_marker)
+        tx_app_log = expect_success(tx_app, f"Application completed {total} bytes",
+                                    f"Application observed {writes} WRITE completions per QP{completion_suffix}",
+                                    *app_marker)
+        rx_app_log = expect_success(rx_app, f"Application verified {total} bytes", *app_marker)
+        if rdmacm:
+            pattern = r"RoCEv2 CM established local_qpn=([0-9a-f]{6}) peer_qpn=([0-9a-f]{6})"
+            tx_qps = re.search(pattern, tx_log)
+            rx_qps = re.search(pattern, rx_log)
+            assert tx_qps and rx_qps, tx_log + rx_log
+            assert tx_qps.groups() == rx_qps.groups()[::-1], tx_log + rx_log
+            for qps, app_log in ((tx_qps, tx_app_log), (rx_qps, rx_app_log)):
+                created = f"Application created verbs QP {qps[1]} before CM"
+                assert created in app_log.split("Application librdmacm established", 1)[0], app_log
 
 
 def main():

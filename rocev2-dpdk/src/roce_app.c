@@ -25,7 +25,7 @@
 #include <unistd.h>
 
 enum {
-    APP_VERSION = 3,
+    APP_VERSION = 4,
     APP_MEMFD = 1,
     APP_PINNED = 2,
     APP_DOORBELL = 3,
@@ -296,6 +296,12 @@ bool roce_app_attach(const char *path, const struct roce_lab_options *options,
         receive_local_memory(&attached, length, options->sender, config->dma_writable);
     if (!received)
         goto disconnect;
+    if (config->rdmacm &&
+        (recv(socket, &attached.qpn, sizeof(attached.qpn), MSG_TRUNC) != sizeof(attached.qpn) ||
+         attached.qpn <= 1 || attached.qpn >= ROCE_PSN_MASK)) {
+        errno = EPROTO;
+        goto disconnect;
+    }
     if (options->sender && !config->in_band_cm && !config->native_queues) {
         attached.work = offer_work(socket, options);
         if (!attached.work)
@@ -317,24 +323,38 @@ bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_op
 {
     if (!roce_lab_send(memory->socket, APP_ESTABLISHED))
         return false;
-    if (!options->sender)
+    if (!options->sender || memory->native)
         return true;
     memory->work = offer_work(memory->socket, options);
     return memory->work != NULL;
 }
 
-bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_native_queue_config *config)
+bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab_options *options,
+                           const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
+                           bool announce_established)
 {
+    const struct roce_native_queue_config config = {
+        .version = ROCE_NATIVE_QUEUE_VERSION,
+        .qps = options->qps, .workers = options->workers, .writes = options->writes,
+        .write_size = options->size,
+        .local_qpn = local->qpn, .peer_qpn = peer->qpn,
+        .local_psn = local->psn, .peer_psn = peer->psn,
+        .pmtu = local->pmtu < peer->pmtu ? local->pmtu : peer->pmtu,
+        .local_lkey = memory->mr.lkey, .remote_rkey = peer->region.rkey,
+        .local_ipv4 = local->data.ipv4, .peer_ipv4 = peer->data.ipv4,
+        .flags = options->sender ? 0 : ROCE_NATIVE_QUEUE_RECEIVE_ONLY,
+        .local_address = local->region.address, .remote_address = peer->region.address,
+    };
     int fd = create_shared_file("roce-native-queues", sizeof(struct roce_native_work));
     if (fd < 0)
         return false;
     struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     bool valid = work != MAP_FAILED;
     if (valid)
-        work->config = *config;
-    for (uint32_t i = 0; valid && i < config->workers; ++i)
+        work->config = config;
+    for (uint32_t i = 0; valid && i < config.workers; ++i)
         valid = roce_doorbell_init(&work->doorbells[i]);
-    for (uint32_t i = 0; valid && i < config->qps; ++i) {
+    for (uint32_t i = 0; valid && i < config.qps; ++i) {
         struct roce_native_sq *sq = &work->qps[i];
         atomic_init(&sq->posted, 0);
         atomic_init(&sq->admitted, 0);
@@ -344,7 +364,7 @@ bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_nat
     }
     if (work != MAP_FAILED && !valid)
         errno = ENOTSUP;
-    bool sent = valid && roce_lab_send(memory->socket, APP_ESTABLISHED) &&
+    bool sent = valid && (!announce_established || roce_lab_send(memory->socket, APP_ESTABLISHED)) &&
                 send_mapping(memory->socket, fd, ROCE_NATIVE_QUEUE_FD);
     int error = errno;
     close(fd);
@@ -387,13 +407,13 @@ static bool finish_native(struct roce_native_work *work, const struct roce_lab_o
 
 void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options)
 {
-    if (memory->native)
+    if (options->sender && memory->native)
         finish_native(memory->native, options, false);
 }
 
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options)
 {
-    if (memory->native && !finish_native(memory->native, options, true)) {
+    if (options->sender && memory->native && !finish_native(memory->native, options, true)) {
         errno = EPROTO;
         return false;
     }
@@ -577,19 +597,40 @@ static int release_verbs_memory(const struct app_verbs *verbs)
     return error;
 }
 
-static bool post_native_writes(struct ibv_pd *pd, int socket, const struct app_workload *workload,
-                                struct roce_app_rdmacm *cma)
+struct app_cm_queue {
+    struct roce_app_native_qp resources;
+    int socket;
+    int fd;
+    bool receiver;
+};
+
+static int prepare_cm_queue(void *opaque)
 {
+    struct app_cm_queue *queue = opaque;
     uint8_t kind;
-    int fd = receive_mapping(socket, &kind);
+    queue->fd = receive_mapping(queue->socket, &kind);
+    if (queue->fd < 0)
+        return errno;
+    if (kind != ROCE_NATIVE_QUEUE_FD)
+        return EPROTO;
+    return roce_app_configure_native_qp(&queue->resources, queue->fd, queue->receiver);
+}
+
+static bool post_native_writes(struct ibv_pd *pd, int socket, const struct app_workload *workload,
+                                struct roce_app_rdmacm *cma, struct app_cm_queue *queue)
+{
+    uint8_t kind = ROCE_NATIVE_QUEUE_FD;
+    int fd = queue ? queue->fd : receive_mapping(socket, &kind);
     if (fd < 0)
         return false;
     bool success = kind == ROCE_NATIVE_QUEUE_FD &&
         roce_app_run_native_verbs(pd, fd, socket, workload->post_batch,
                                   (workload->flags & APP_SCATTER_GATHER) != 0,
-                                  cma ? roce_app_rdmacm_disconnect : NULL, cma);
+                                  cma ? roce_app_rdmacm_disconnect : NULL, cma,
+                                  queue ? &queue->resources : NULL);
     int error = errno;
-    close(fd);
+    if (!queue)
+        close(fd);
     errno = error;
     return success;
 }
@@ -619,7 +660,8 @@ bool roce_app_write(const char *path, const char *registration_device)
     bool native_queues = (workload.flags & APP_NATIVE_QUEUES) != 0;
     bool rdmacm = (workload.flags & APP_RDMACM) != 0;
     if ((verbs_mr && registration_device) || (native_queues && (!verbs_mr || !workload.sender)) ||
-        (rdmacm && (!in_band_cm || (workload.sender && !native_queues)))) {
+        (rdmacm && (!in_band_cm || !verbs_mr || workload.qps != 1 || workload.writes > ROCE_NATIVE_QUEUE_DEPTH ||
+                    (workload.sender && !native_queues)))) {
         errno = EINVAL;
         goto disconnect;
     }
@@ -644,11 +686,23 @@ bool roce_app_write(const char *path, const char *registration_device)
     size_t bytes = (size_t)workload.bytes;
     roce_lab_fill(buffer, bytes, workload.sender);
     struct app_verbs verbs = {0};
+    struct app_cm_queue queue = { .socket = socket, .fd = -1, .receiver = !workload.sender };
     bool offered;
     if (verbs_mr) {
         offered = register_verbs_memory(&verbs, buffer, bytes, workload.sender,
-                                        (workload.flags & APP_WRITE_DMA_ALIAS) != 0) &&
-                  send(socket, &verbs.mr->lkey, sizeof(verbs.mr->lkey), MSG_NOSIGNAL) == sizeof(verbs.mr->lkey);
+                                        (workload.flags & APP_WRITE_DMA_ALIAS) != 0);
+        if (offered && rdmacm) {
+            int error = roce_app_create_native_qp(verbs.pd, workload.writes, queue.receiver, &queue.resources);
+            if (error)
+                errno = error;
+            else
+                printf("Application created verbs QP %06x before CM\n", queue.resources.qp->qp_num);
+            offered = !error;
+        }
+        offered = offered && send(socket, &verbs.mr->lkey, sizeof(verbs.mr->lkey), MSG_NOSIGNAL) == sizeof(verbs.mr->lkey);
+        if (offered && rdmacm)
+            offered = send(socket, &queue.resources.qp->qp_num, sizeof(queue.resources.qp->qp_num), MSG_NOSIGNAL) ==
+                      sizeof(queue.resources.qp->qp_num);
     } else {
         if (registration_device)
             region = pin_mapping(registration_device, buffer, length, workload.sender);
@@ -659,7 +713,8 @@ bool roce_app_write(const char *path, const char *registration_device)
         if (rdmacm) {
             struct roce_cma_lab_address addresses;
             connected = recv(socket, &addresses, sizeof(addresses), MSG_TRUNC) == sizeof(addresses) &&
-                        roce_app_rdmacm_connect(&cma, &addresses, workload.sender);
+                        roce_app_rdmacm_connect(&cma, &addresses, queue.resources.qp->qp_num, workload.sender,
+                                                prepare_cm_queue, &queue);
         }
         if (connected && (in_band_cm || native_queues))
             connected = roce_lab_receive(socket, APP_ESTABLISHED, false) == 1;
@@ -667,7 +722,8 @@ bool roce_app_write(const char *path, const char *registration_device)
             puts(rdmacm ? "Application librdmacm established" : "Application CM established");
         if (connected) {
             if (native_queues)
-                success = post_native_writes(verbs.pd, socket, &workload, rdmacm ? &cma : NULL);
+                success = post_native_writes(verbs.pd, socket, &workload, rdmacm ? &cma : NULL,
+                                             rdmacm ? &queue : NULL);
             else if (workload.sender)
                 success = post_writes(socket, &workload);
             else
@@ -683,7 +739,13 @@ bool roce_app_write(const char *path, const char *registration_device)
             errno = EPROTO;
     }
     int saved_errno = errno;
-    int error = release_verbs_memory(&verbs);
+    if (!success)
+        shutdown(socket, SHUT_RDWR);
+    int error = roce_app_destroy_native_qp(&queue.resources);
+    if (queue.fd >= 0)
+        close(queue.fd);
+    if (!error)
+        error = release_verbs_memory(&verbs);
     if (success && error) {
         saved_errno = error;
         success = false;

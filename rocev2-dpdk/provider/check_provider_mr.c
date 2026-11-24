@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
 #include "../src/roce_mr_ipc.h"
 #include "../src/roce_mr_server.h"
+#include "../src/roce_native_queue.h"
 
 #include <assert.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
@@ -43,6 +45,81 @@ static void share_keys(int fd, const struct ibv_mr *mr, uint64_t iova)
     send_value(fd, &keys, sizeof(keys));
 }
 
+static void check_early_qp(struct ibv_pd *pd, struct ibv_mr *mr, uint64_t iova)
+{
+    struct ibv_context *context = pd->context;
+    struct ibv_pd *other = ibv_alloc_pd(context);
+    struct ibv_cq *cq = ibv_create_cq(context, 1, NULL, NULL, 0);
+    assert(other && cq);
+    struct ibv_qp_init_attr init = {
+        .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = 1, .max_send_sge = 1 },
+    };
+    struct ibv_qp *qp = ibv_create_qp(other, &init);
+    assert(qp && ibv_dealloc_pd(other) == EBUSY && ibv_destroy_cq(cq) == EBUSY);
+    assert(!ibv_destroy_qp(qp));
+    qp = ibv_create_qp(pd, &init);
+    assert(qp && qp->qp_num > 1 && qp->qp_num < ROCE_PSN_MASK);
+    uint32_t qpn = qp->qp_num;
+    struct ibv_qp_attr attr = {
+        .qp_state = IBV_QPS_INIT, .port_num = 1, .qp_access_flags = IBV_ACCESS_REMOTE_WRITE,
+    };
+    assert(!ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
+    assert(!ibv_query_qp(qp, &attr, IBV_QP_STATE, &init) && attr.qp_state == IBV_QPS_INIT);
+    struct ibv_wc wc;
+    assert(!ibv_poll_cq(cq, 1, &wc));
+
+    void *provider = dlopen("libroce_dpdk-rdmav34.so", RTLD_NOLOAD | RTLD_NOW);
+    assert(provider);
+    int (*bind_queues)(struct ibv_context *, int) = dlsym(provider, "roce_dpdk_bind_queues");
+    assert(bind_queues);
+    int fd = memfd_create("roce-provider-qp-test", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    assert(fd >= 0 && !ftruncate(fd, sizeof(struct roce_native_work)));
+    struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    assert(work != MAP_FAILED);
+    work->config = (struct roce_native_queue_config) {
+        .version = ROCE_NATIVE_QUEUE_VERSION, .qps = 1, .workers = 1, .writes = 1, .write_size = 32,
+        .local_qpn = qpn == 2 ? 3 : 2, .peer_qpn = 4000, .local_psn = 5000, .peer_psn = 6000,
+        .pmtu = 1024, .local_lkey = mr->lkey, .local_ipv4 = 0xc0000201, .peer_ipv4 = 0xc0000202,
+        .local_address = iova, .flags = ROCE_NATIVE_QUEUE_RECEIVE_ONLY,
+    };
+    assert(roce_doorbell_init(&work->doorbells[0]));
+    assert(!fcntl(fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL));
+    assert(bind_queues(context, fd) == EINVAL);
+    work->config.local_qpn = qpn;
+    int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    struct ibv_mr *wrong_pd = ibv_reg_mr_iova(other, mr->addr, mr->length, iova, access);
+    assert(wrong_pd && wrong_pd->lkey != mr->lkey);
+    work->config.local_lkey = wrong_pd->lkey;
+    assert(bind_queues(context, fd) == EACCES);
+    assert(!ibv_dereg_mr(wrong_pd) && !ibv_dealloc_pd(other));
+    work->config.local_lkey = mr->lkey;
+
+    attr = (struct ibv_qp_attr) {
+        .qp_state = IBV_QPS_RTR, .path_mtu = IBV_MTU_1024,
+        .dest_qp_num = work->config.peer_qpn, .rq_psn = work->config.peer_psn,
+        .ah_attr = { .port_num = 1, .is_global = 1, .grh.dgid.raw = { [10] = 0xff, 0xff, 192, 0, 2, 2 } },
+    };
+    int rtr = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+              IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    assert(ibv_modify_qp(qp, &attr, rtr) == EAGAIN);
+    assert(!bind_queues(context, fd) && qp->qp_num == qpn);
+    assert(ibv_dereg_mr(mr) == EBUSY);
+    assert(!ibv_modify_qp(qp, &attr, rtr));
+    attr = (struct ibv_qp_attr) { .qp_state = IBV_QPS_RTS, .sq_psn = work->config.local_psn };
+    int rts = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+              IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
+    assert(!ibv_modify_qp(qp, &attr, rts));
+    struct ibv_sge sge = { .addr = iova, .length = work->config.write_size, .lkey = mr->lkey };
+    struct ibv_send_wr wr = { .sg_list = &sge, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE,
+                              .send_flags = IBV_SEND_SIGNALED };
+    struct ibv_send_wr *bad = NULL;
+    assert(ibv_post_send(qp, &wr, &bad) == EOPNOTSUPP && bad == &wr);
+    assert(!atomic_load(&work->qps[0].posted) && !ibv_poll_cq(cq, 1, &wc));
+    assert(!ibv_destroy_qp(qp) && !ibv_destroy_cq(cq));
+    assert(!munmap(work, sizeof(*work)) && !close(fd) && !dlclose(provider));
+}
+
 static void client(int fd)
 {
     struct ibv_device **devices = ibv_get_device_list(NULL);
@@ -73,6 +150,7 @@ static void client(int fd)
     assert(!ibv_reg_mr(pd, buffer, length, IBV_ACCESS_REMOTE_WRITE) && errno == EINVAL);
     struct ibv_mr *mr = ibv_reg_mr_iova(pd, buffer, length, iova, access);
     assert(mr && mr->addr == buffer && mr->lkey && mr->rkey && mr->lkey != mr->rkey);
+    check_early_qp(pd, mr, iova);
     share_keys(fd, mr, iova);
 
     expect(fd, 'B');
@@ -163,5 +241,6 @@ int main(int argc, char **argv)
     assert(roce_mr_server_stop(server) == 0);
     assert(rmdir(directory) == 0);
     puts("libibverbs MR registration, access, deregistration and worker leases verified");
+    puts("Early QP lifetime, protected binding and receive-only queues verified");
     return 0;
 }

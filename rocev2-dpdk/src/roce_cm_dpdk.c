@@ -1,4 +1,5 @@
 #include "roce_cm_dpdk.h"
+#include "roce_app.h"
 
 #include <arpa/inet.h>
 
@@ -107,7 +108,8 @@ static void transmit_cm(uint16_t port, struct rte_mempool *pool, struct roce_cm_
 bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
                           const struct roce_lab_options *options, const struct roce_lab_offer *local,
                           const struct roce_address *destination, struct roce_lab_offer *peer,
-                          struct roce_cm_session *session, struct roce_cma_service *cma)
+                          struct roce_cm_session *session, struct roce_cma_service *cma,
+                          struct roce_app_memory *application)
 {
     uint32_t comm_id, nonce[2];
     if (!roce_lab_random(&comm_id) || !roce_lab_random(&nonce[0]) || !roce_lab_random(&nonce[1]))
@@ -150,8 +152,11 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool, int control,
                 return false;
             if (cma && !load_cma_private(session, &cma_private_length))
                 return false;
-            if (cma)
+            if (cma) {
                 cma->peer_qpn = session->peer_qpn;
+                if (!roce_app_offer_native(application, options, local, peer, false))
+                    return false;
+            }
             if (cma && options->sender) {
                 if (!roce_cma_service_response(cma, cma_private, cma_private_length) ||
                     !roce_cm_session_establish(session))

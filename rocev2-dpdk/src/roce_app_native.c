@@ -30,8 +30,7 @@ struct native_run {
 struct native_qp {
     struct native_run *run;
     const struct roce_native_sq *shared;
-    struct ibv_cq *cq;
-    struct ibv_qp *qp;
+    struct roce_app_native_qp resources;
     uint32_t index;
     uint32_t completed;
     int error;
@@ -49,16 +48,18 @@ static enum ibv_mtu verbs_mtu(uint32_t pmtu)
     return 0;
 }
 
-static bool valid_config(const struct roce_native_queue_config *config, uint32_t post_batch)
+static bool valid_config(const struct roce_native_queue_config *config, bool receiver)
 {
     if (config->version != ROCE_NATIVE_QUEUE_VERSION || !config->qps ||
         config->qps > ROCE_LAB_MAX_QPS || !config->workers || config->workers > config->qps ||
-        !config->writes || config->writes > ROCE_NATIVE_QUEUE_DEPTH ||
-        !post_batch || post_batch > config->writes || !config->write_size || !verbs_mtu(config->pmtu) ||
+        !config->writes || config->writes > ROCE_PSN_MASK || !config->write_size ||
+        config->flags != (receiver ? ROCE_NATIVE_QUEUE_RECEIVE_ONLY : 0) || !verbs_mtu(config->pmtu) ||
         config->local_qpn < 2 || config->local_qpn > ROCE_PSN_MASK - config->qps ||
         config->peer_qpn < 2 || config->peer_qpn > ROCE_PSN_MASK - config->qps ||
         config->local_psn > ROCE_PSN_MASK || config->peer_psn > ROCE_PSN_MASK ||
-        !config->local_lkey || !config->remote_rkey || !config->local_ipv4 || !config->peer_ipv4)
+        !config->local_lkey || !config->local_ipv4 || !config->peer_ipv4)
+        return false;
+    if (receiver ? config->qps != 1 : config->writes > ROCE_NATIVE_QUEUE_DEPTH || !config->remote_rkey)
         return false;
 
     uint64_t bytes = (uint64_t)config->qps * config->writes * config->write_size;
@@ -66,7 +67,8 @@ static bool valid_config(const struct roce_native_queue_config *config, uint32_t
            bytes - 1 <= UINT64_MAX - config->remote_address;
 }
 
-static const struct roce_native_work *map_native_work(int fd, struct native_run *run)
+static const struct roce_native_work *map_native_work(int fd, bool receiver,
+                                                     struct roce_native_queue_config *config)
 {
     const int required_seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
     int seals = fcntl(fd, F_GET_SEALS);
@@ -82,10 +84,10 @@ static const struct roce_native_work *map_native_work(int fd, struct native_run 
     const struct roce_native_work *work = mmap(NULL, sizeof(*work), PROT_READ, MAP_SHARED, fd, 0);
     if (work == MAP_FAILED)
         return MAP_FAILED;
-    run->config = work->config;
-    if (valid_config(&run->config, run->post_batch)) {
+    *config = work->config;
+    if (valid_config(config, receiver)) {
         uint32_t i = 0;
-        for (; i < run->config.qps; ++i) {
+        for (; i < config->qps; ++i) {
             const struct roce_native_sq *sq = &work->qps[i];
             if (!atomic_is_lock_free(&sq->admitted) ||
                 atomic_load_explicit(&sq->posted, memory_order_acquire) ||
@@ -93,7 +95,7 @@ static const struct roce_native_work *map_native_work(int fd, struct native_run 
                 atomic_load_explicit(&sq->retired, memory_order_acquire))
                 break;
         }
-        if (i == run->config.qps)
+        if (i == config->qps)
             return work;
     }
     munmap((void *)work, sizeof(*work));
@@ -109,52 +111,127 @@ static union ibv_gid peer_gid(uint32_t ipv4)
     return gid;
 }
 
-static int prepare_qp(struct ibv_pd *pd, struct native_qp *state)
+int roce_app_destroy_native_qp(struct roce_app_native_qp *resources)
 {
-    const struct roce_native_queue_config *config = &state->run->config;
-    state->cq = ibv_create_cq(pd->context, (int)config->writes, NULL, NULL, 0);
-    if (!state->cq)
+    if (!resources)
+        return EINVAL;
+    if (resources->qp) {
+        int error = ibv_destroy_qp(resources->qp);
+        if (error)
+            return error;
+        resources->qp = NULL;
+    }
+    if (resources->cq) {
+        int error = ibv_destroy_cq(resources->cq);
+        if (error)
+            return error;
+        resources->cq = NULL;
+    }
+    return 0;
+}
+
+int roce_app_create_native_qp(struct ibv_pd *pd, uint32_t depth, bool receiver,
+                              struct roce_app_native_qp *resources)
+{
+    if (!pd || !pd->context || !resources || !depth || depth > ROCE_NATIVE_QUEUE_DEPTH)
+        return EINVAL;
+    if (resources->qp || resources->cq)
+        return EBUSY;
+    resources->cq = ibv_create_cq(pd->context, (int)depth, NULL, NULL, 0);
+    if (!resources->cq)
         return errno ? errno : EIO;
     struct ibv_qp_init_attr init = {
-        .send_cq = state->cq, .recv_cq = state->cq, .qp_type = IBV_QPT_RC,
-        .cap = { .max_send_wr = config->writes, .max_send_sge = 1 },
+        .send_cq = resources->cq, .recv_cq = resources->cq, .qp_type = IBV_QPT_RC,
+        .cap = { .max_send_wr = depth, .max_send_sge = 1 },
     };
-    state->qp = ibv_create_qp(pd, &init);
-    if (!state->qp)
-        return errno ? errno : EIO;
-    if (state->qp->qp_num != config->local_qpn + state->index)
-        return EPROTO;
-
-    struct ibv_qp_attr attr = { .qp_state = IBV_QPS_INIT, .port_num = 1 };
-    int error = ibv_modify_qp(state->qp, &attr,
+    resources->qp = ibv_create_qp(pd, &init);
+    int error;
+    if (resources->qp) {
+        struct ibv_qp_attr attr = {
+            .qp_state = IBV_QPS_INIT, .port_num = 1,
+            .qp_access_flags = receiver ? IBV_ACCESS_REMOTE_WRITE : 0,
+        };
+        error = ibv_modify_qp(resources->qp, &attr,
                               IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    } else
+        error = errno ? errno : EIO;
     if (error)
-        return error;
-    attr = (struct ibv_qp_attr) {
+        roce_app_destroy_native_qp(resources);
+    return error;
+}
+
+static int connect_native_qp(struct ibv_qp *qp, const struct roce_native_queue_config *config,
+                             uint32_t index)
+{
+    if (qp->qp_num != config->local_qpn + index)
+        return EPROTO;
+    struct ibv_qp_attr attr = {
         .qp_state = IBV_QPS_RTR, .path_mtu = verbs_mtu(config->pmtu),
-        .dest_qp_num = config->peer_qpn + state->index,
-        .rq_psn = roce_native_psn(config->peer_psn, state->index), .min_rnr_timer = 12,
+        .dest_qp_num = config->peer_qpn + index,
+        .rq_psn = roce_native_psn(config->peer_psn, index), .min_rnr_timer = 12,
         .ah_attr = {
             .port_num = 1, .is_global = 1,
             .grh = { .dgid = peer_gid(config->peer_ipv4), .hop_limit = 64 },
         },
     };
-    error = ibv_modify_qp(state->qp, &attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-                          IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
-                          IBV_QP_MIN_RNR_TIMER);
+    int error = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                              IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+                              IBV_QP_MIN_RNR_TIMER);
     if (error)
         return error;
     attr = (struct ibv_qp_attr) {
-        .qp_state = IBV_QPS_RTS, .sq_psn = roce_native_psn(config->local_psn, state->index),
+        .qp_state = IBV_QPS_RTS, .sq_psn = roce_native_psn(config->local_psn, index),
         .timeout = 14, .retry_cnt = ROCE_LAB_RETRIES,
     };
-    return ibv_modify_qp(state->qp, &attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+    return ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+}
+
+static int bind_native_work(struct ibv_context *context, int queue_fd)
+{
+    void *provider = dlopen("libroce_dpdk-rdmav34.so", RTLD_NOLOAD | RTLD_NOW);
+    if (!provider)
+        return ENOTSUP;
+    typedef int (*bind_queues_fn)(struct ibv_context *, int);
+    bind_queues_fn bind_queues = (bind_queues_fn)dlsym(provider, "roce_dpdk_bind_queues");
+    int error = bind_queues ? bind_queues(context, queue_fd) : ENOTSUP;
+    if (dlclose(provider) && !error)
+        error = EIO;
+    return error;
+}
+
+static bool valid_native_qp(const struct roce_app_native_qp *resources)
+{
+    return resources && resources->qp && resources->cq &&
+           resources->qp->send_cq == resources->cq && resources->qp->recv_cq == resources->cq;
+}
+
+int roce_app_configure_native_qp(struct roce_app_native_qp *resources, int queue_fd, bool receiver)
+{
+    if (!valid_native_qp(resources) || resources->qp->state != IBV_QPS_INIT)
+        return EINVAL;
+    struct ibv_qp_attr attr;
+    struct ibv_qp_init_attr init;
+    int error = ibv_query_qp(resources->qp, &attr, IBV_QP_ACCESS_FLAGS, &init);
+    if (error)
+        return error;
+    if (!!(attr.qp_access_flags & IBV_ACCESS_REMOTE_WRITE) != receiver)
+        return EINVAL;
+    struct roce_native_queue_config config;
+    const struct roce_native_work *work = map_native_work(queue_fd, receiver, &config);
+    if (work == MAP_FAILED)
+        return errno;
+    if (munmap((void *)work, sizeof(*work)))
+        return errno;
+    if (config.qps != 1 || resources->qp->qp_num != config.local_qpn)
+        return EPROTO;
+    error = bind_native_work(resources->qp->context, queue_fd);
+    return error ? error : connect_native_qp(resources->qp, &config, 0);
 }
 
 static uint64_t write_id(const struct native_qp *state, uint32_t ordinal)
 {
-    return (uint64_t)state->qp->qp_num << 32 | (ordinal + 1);
+    return (uint64_t)state->resources.qp->qp_num << 32 | (ordinal + 1);
 }
 
 static int post_batch(struct native_qp *state, uint32_t first, uint32_t count)
@@ -177,7 +254,7 @@ static int post_batch(struct native_qp *state, uint32_t first, uint32_t count)
         };
     }
     struct ibv_send_wr *bad = NULL;
-    return ibv_post_send(state->qp, writes, &bad);
+    return ibv_post_send(state->resources.qp, writes, &bad);
 }
 
 static int wait_for_worker(const struct native_run *run)
@@ -198,7 +275,7 @@ static int poll_through(struct native_qp *state, uint32_t target)
     struct ibv_wc completions[NATIVE_COMPLETION_BATCH];
     int wait_error = 0;
     while (state->completed < target) {
-        int count = ibv_poll_cq(state->cq, NATIVE_COMPLETION_BATCH, completions);
+        int count = ibv_poll_cq(state->resources.cq, NATIVE_COMPLETION_BATCH, completions);
         if (count < 0)
             return EIO;
         if ((uint32_t)count > target - state->completed || count > NATIVE_COMPLETION_BATCH)
@@ -214,7 +291,7 @@ static int poll_through(struct native_qp *state, uint32_t target)
             const struct ibv_wc *wc = &completions[i];
             if (wc->status != IBV_WC_SUCCESS)
                 return EIO;
-            if (wc->opcode != IBV_WC_RDMA_WRITE || wc->qp_num != state->qp->qp_num ||
+            if (wc->opcode != IBV_WC_RDMA_WRITE || wc->qp_num != state->resources.qp->qp_num ||
                 wc->wr_id != write_id(state, state->completed))
                 return EPROTO;
             ++state->completed;
@@ -293,11 +370,29 @@ static int finish_writes(struct native_run *run, struct native_qp *queues)
         if (error)
             return error;
         struct ibv_wc unexpected;
-        int count = ibv_poll_cq(queues[i].cq, 1, &unexpected);
+        int count = ibv_poll_cq(queues[i].resources.cq, 1, &unexpected);
         if (count)
             return count < 0 ? EIO : EPROTO;
     }
     return 0;
+}
+
+static void abort_native_qp(struct native_qp *state, uint64_t deadline)
+{
+    if (!state->resources.qp)
+        return;
+    struct ibv_qp_attr attr = { .qp_state = IBV_QPS_ERR };
+    ibv_modify_qp(state->resources.qp, &attr, IBV_QP_STATE);
+    uint32_t posted = roce_native_posted_count(atomic_load_explicit(&state->shared->posted, memory_order_acquire));
+    while (posted && roce_now_ns() < deadline) {
+        uint32_t retired = atomic_load_explicit(&state->shared->retired, memory_order_acquire);
+        struct ibv_wc discarded[NATIVE_COMPLETION_BATCH];
+        int completed = ibv_poll_cq(state->resources.cq, NATIVE_COMPLETION_BATCH, discarded);
+        if (completed < 0 || (!completed && retired == posted))
+            break;
+        if (!completed)
+            usleep(1000);
+    }
 }
 
 static int release_queues(struct native_qp *queues, uint32_t count, bool aborting)
@@ -306,25 +401,9 @@ static int release_queues(struct native_qp *queues, uint32_t count, bool abortin
     int first_error = 0;
     while (count) {
         struct native_qp *state = &queues[--count];
-        int error = 0;
-        if (state->qp) {
-            if (aborting) {
-                struct ibv_qp_attr attr = { .qp_state = IBV_QPS_ERR };
-                ibv_modify_qp(state->qp, &attr, IBV_QP_STATE);
-            }
-            error = ibv_destroy_qp(state->qp);
-            while (aborting && error == EBUSY && roce_now_ns() < deadline) {
-                struct ibv_wc discarded[NATIVE_COMPLETION_BATCH];
-                int completed = ibv_poll_cq(state->cq, NATIVE_COMPLETION_BATCH, discarded);
-                if (completed < 0)
-                    break;
-                if (!completed)
-                    usleep(1000);
-                error = ibv_destroy_qp(state->qp);
-            }
-        }
-        if (!error && state->cq)
-            error = ibv_destroy_cq(state->cq);
+        if (aborting)
+            abort_native_qp(state, deadline);
+        int error = roce_app_destroy_native_qp(&state->resources);
         if (!first_error && error)
             first_error = error;
     }
@@ -333,7 +412,8 @@ static int release_queues(struct native_qp *queues, uint32_t count, bool abortin
 
 bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
                                uint32_t post_batch, bool scatter_gather,
-                               int (*submitted)(void *), void *context)
+                               int (*submitted)(void *), void *context,
+                               struct roce_app_native_qp *early_qp)
 {
     if (!pd || !pd->context) {
         shutdown(app_socket, SHUT_RDWR);
@@ -343,7 +423,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     struct native_run run = { .socket = app_socket, .post_batch = post_batch,
                               .scatter_gather = scatter_gather };
     atomic_init(&run.stopped, false);
-    const struct roce_native_work *work = map_native_work(queue_fd, &run);
+    const struct roce_native_work *work = map_native_work(queue_fd, false, &run.config);
     if (work == MAP_FAILED) {
         int error = errno;
         shutdown(app_socket, SHUT_RDWR);
@@ -352,13 +432,31 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     }
 
     struct native_qp queues[ROCE_LAB_MAX_QPS] = {0};
-    void *provider = dlopen("libroce_dpdk-rdmav34.so", RTLD_NOLOAD | RTLD_NOW);
-    typedef int (*bind_queues_fn)(struct ibv_context *, int);
-    bind_queues_fn bind_queues = provider ? (bind_queues_fn)dlsym(provider, "roce_dpdk_bind_queues") : NULL;
-    int error = bind_queues ? bind_queues(pd->context, queue_fd) : ENOTSUP;
-    for (uint32_t i = 0; !error && i < run.config.qps; ++i) {
-        queues[i] = (struct native_qp) { .run = &run, .shared = &work->qps[i], .index = i };
-        error = prepare_qp(pd, &queues[i]);
+    int error = 0;
+    if (!post_batch || post_batch > run.config.writes) {
+        error = EPROTO;
+    } else if (early_qp) {
+        uint32_t need = scatter_gather ? run.config.writes : post_batch;
+        if (run.config.qps != 1 || !valid_native_qp(early_qp) || early_qp->qp->pd != pd ||
+            early_qp->qp->state != IBV_QPS_RTS || early_qp->qp->qp_num != run.config.local_qpn ||
+            early_qp->cq->cqe < (int)need) {
+            error = EPROTO;
+        } else {
+            queues[0] = (struct native_qp) { .run = &run, .shared = &work->qps[0], .resources = *early_qp };
+            struct ibv_qp_attr attr;
+            struct ibv_qp_init_attr init;
+            error = ibv_query_qp(early_qp->qp, &attr, IBV_QP_CAP, &init);
+            if (!error && init.cap.max_send_wr < need)
+                error = EINVAL;
+        }
+    } else {
+        error = bind_native_work(pd->context, queue_fd);
+        for (uint32_t i = 0; !error && i < run.config.qps; ++i) {
+            queues[i] = (struct native_qp) { .run = &run, .shared = &work->qps[i], .index = i };
+            error = roce_app_create_native_qp(pd, run.config.writes, false, &queues[i].resources);
+            if (!error)
+                error = connect_native_qp(queues[i].resources.qp, &run.config, i);
+        }
     }
     run.deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
     if (!error)
@@ -370,9 +468,11 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     if (error)
         shutdown(app_socket, SHUT_RDWR);
 
-    int cleanup = release_queues(queues, run.config.qps, error != 0);
-    if (provider && dlclose(provider) && !cleanup)
-        cleanup = EIO;
+    int cleanup = 0;
+    if (!early_qp)
+        cleanup = release_queues(queues, run.config.qps, error != 0);
+    else if (error)
+        abort_native_qp(&queues[0], roce_now_ns() + UINT64_C(1000000000));
     if (munmap((void *)work, sizeof(*work)) && !cleanup)
         cleanup = errno;
     if (error || cleanup) {

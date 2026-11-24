@@ -159,10 +159,10 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | --- | --- | --- |
 | Figure 5(a), §4.1 | Separate application and DPDK worker processes | `make check-app` verifies an 8,195-byte WRITE and 3,145,764 bytes across four QPs and two workers. Each endpoint uses an application-owned shared buffer. The receiving application checks every byte before peer verification. |
 | Figure 5(a), §4.1 | Kernel registration and worker mappings | `/dev/roce_mr` pins caller pages and sends a single-use Generic Netlink ticket bound to the worker. The worker imports a CPU mapping and can export its lease as a DMA-BUF. The exact Spark-04 kernel guest verified process authorization, retry after FD exhaustion, duplicate import rejection, cancellation, and expiry. The provider lifecycle and both copy and scatter/gather WRITE tests passed with Netlink required. The same binaries passed on the older kernel module using SCM_RIGHTS. |
-| Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. Native CQ and RC QP creation and destroy pass for the negotiated lab lanes. The provider fixture verifies wrong-PD rejection and `EBUSY` for attached MR, PD and CQ resources. |
+| Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. The CM applications create CQs and RC QPs before setup. Provider checks cover unmatched QPN and wrong-PD rejection, successful rebinding after a rejected configuration, and `EBUSY` for referenced MR, PD and CQ resources. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification and completion | Worker queues consume shared WQEs from native `ibv_post_send()` and publish individual results for `ibv_poll_cq()`. The provider fixture verifies partial linked-list posting, CQ capacity, queue closure and error WC mapping. With Netlink required, the exact Spark-04-kernel guest verified native copy and scatter/gather on one QP and native copy on four QPs across two workers. Each QP posted one WRITE at a time and returned all three signaled completions. |
 | Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The requester chains worker-owned headers and trailer around the application payload. Independent wire vectors cover PMTU 4096. The RC peer verifies sequence NAK and timeout retries. With standard verbs registration on both ends, a four-process memif test verified 24,585 bytes in both copy and scatter/gather modes before deregistration. RX copies into the MR before acknowledging. The DPDK 23.11.7 mlx5 patch builds, and the worker resolves its DMA-BUF map/unmap APIs. Physical ConnectX-7 DMA from native MRs remains unverified. |
-| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It also verifies that duplicate REP cannot send RTU before `rdma_establish()` authorizes it. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. The lab uses a worker-assigned QPN, a private MR offer and TCP test synchronization and verification. CM-managed verbs QPs and native CM interoperability remain pending. |
+| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It also verifies that duplicate REP cannot send RTU before `rdma_establish()` authorizes it. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. The lab uses application-created external QPs, a private MR offer and TCP test synchronization and verification. CM-managed verbs QPs and native CM interoperability remain pending. |
 
 The registration socket carries the request, the correlation cookie
 and the assigned keys. The kernel resolves the Unix peer and binds the
@@ -185,12 +185,14 @@ Spark-02 `7.0.0-1025-nvidia` headers.
 With Netlink ticket handoff required, the guest ran the Figure 9 CM
 sequence in both single-QP copy and scatter/gather tests. Each transferred
 24,585 bytes in 27 packets with zero RC retries and three successful
-libibverbs completions. Both application processes observed connection
-setup and disconnect. A separate four-QP, two-worker run verified
+libibverbs completions. The trace showed each application creating its
+QP and passing that QPN into CM. The same QPs moved to RTR and RTS before
+`rdma_accept()` or `rdma_establish()` and were destroyed after
+`DISCONNECTED`. A separate four-QP, two-worker run verified
 98,340 bytes and three completions per QP using TCP lab setup. All
 endpoints exited successfully and both kernel modules unloaded.
 
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
-memif port teardown. A backtrace located that diagnostic in
-`memif_free_regions()` via `memif_dev_stop()`. The affected trials
+memif port teardown. Backtraces located that diagnostic in
+`memif_free_regions()` during both port stop and EAL interrupt handling. The affected trials
 reported zero RC retries and verified all bytes and completions.

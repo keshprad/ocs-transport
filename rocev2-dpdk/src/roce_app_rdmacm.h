@@ -16,7 +16,7 @@ struct roce_app_rdmacm {
 };
 
 bool roce_app_rdmacm_connect(struct roce_app_rdmacm *cm, const struct roce_cma_lab_address *address,
-                             bool sender);
+                             uint32_t local_qpn, bool sender, int (*prepare_qp)(void *), void *context);
 int roce_app_rdmacm_disconnect(void *opaque);
 bool roce_app_rdmacm_finish(struct roce_app_rdmacm *cm);
 void roce_app_rdmacm_destroy(struct roce_app_rdmacm *cm);

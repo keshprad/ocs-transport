@@ -613,7 +613,7 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
 {
     struct write_run run = { .options = options, .pool = pool, .port = port, .sender = lab->sender,
                              .state = WRITE_WAITING, .work = application->work,
-                             .native = application->native, .local_iova = local->region.address,
+                             .native = lab->sender ? application->native : NULL, .local_iova = local->region.address,
                              .local_lkey = application->mr.lkey,
                              .application_socket = application->socket,
                              .tx_refs = tx_refs };
@@ -770,20 +770,9 @@ static bool connect_application(struct roce_app_memory *application, const struc
                                 const struct datapath_options *datapath, const struct roce_lab_offer *local,
                                 const struct roce_lab_offer *peer)
 {
-    if (!datapath->native_queues)
+    if (!datapath->native_queues || application->native)
         return !datapath->cm_peer.ipv4 || roce_app_connected(application, options);
-    const struct roce_native_queue_config config = {
-        .version = ROCE_NATIVE_QUEUE_VERSION,
-        .qps = options->qps, .workers = options->workers, .writes = options->writes,
-        .write_size = options->size,
-        .local_qpn = local->qpn, .peer_qpn = peer->qpn,
-        .local_psn = local->psn, .peer_psn = peer->psn,
-        .pmtu = RTE_MIN(local->pmtu, peer->pmtu),
-        .local_lkey = application->mr.lkey, .remote_rkey = peer->region.rkey,
-        .local_ipv4 = local->data.ipv4, .peer_ipv4 = peer->data.ipv4,
-        .local_address = local->region.address, .remote_address = peer->region.address,
-    };
-    return roce_app_offer_native(application, &config);
+    return roce_app_offer_native(application, options, local, peer, true);
 }
 
 int main(int argc, char **argv)
@@ -831,11 +820,12 @@ int main(int argc, char **argv)
         goto cleanup_eal;
     }
     if (datapath.rdmacm_socket &&
-        (!datapath.app_socket || !datapath.cm_peer.ipv4 ||
+        (!datapath.app_socket || !datapath.mr_socket || !datapath.cm_peer.ipv4 ||
+         datapath.writes > ROCE_NATIVE_QUEUE_DEPTH ||
          (options.sender && !datapath.native_queues) ||
          strcmp(datapath.rdmacm_socket, datapath.app_socket) == 0 ||
-         (datapath.mr_socket && strcmp(datapath.rdmacm_socket, datapath.mr_socket) == 0))) {
-        fprintf(stderr, "librdmacm needs a separate socket, in-band CM and native queues on the requester\n");
+         strcmp(datapath.rdmacm_socket, datapath.mr_socket) == 0)) {
+        fprintf(stderr, "librdmacm needs separate app, MR and CM sockets, and native queues on the requester\n");
         goto cleanup_eal;
     }
     unsigned int lcore;
@@ -1008,7 +998,7 @@ int main(int argc, char **argv)
         .region = { .address = UINT64_C(0x100000000), .size = options.size },
     }, peer;
     memcpy(local.data.mac, mac.addr_bytes, ROCE_MAC_LEN);
-    if (!roce_lab_random(&local.psn) || !roce_lab_random(&local.qpn) ||
+    if (!roce_lab_random(&local.psn) || (!cma && !roce_lab_random(&local.qpn)) ||
         (!registrations && !roce_lab_random(&local.region.rkey)))
         goto cleanup_port;
     if (registrations) {
@@ -1016,14 +1006,14 @@ int main(int argc, char **argv)
         local.region.rkey = application.mr.rkey;
     }
     local.psn &= ROCE_PSN_MASK;
-    local.qpn = 2 + local.qpn % (ROCE_PSN_MASK - options.qps - 1);
+    local.qpn = cma ? application.qpn : 2 + local.qpn % (ROCE_PSN_MASK - options.qps - 1);
 
     if (cma) {
         const struct roce_cma_lab_address addresses = {
             .local_ipv4 = local.data.ipv4, .peer_ipv4 = datapath.cm_peer.ipv4,
-            .local_qpn = local.qpn, .service_port = options.control_port,
+            .service_port = options.control_port,
         };
-        if (!roce_cma_service_attach(cma, application.socket, &addresses, options.sender)) {
+        if (!roce_cma_service_attach(cma, application.socket, &addresses, local.qpn, options.sender)) {
             perror("librdmacm session attachment");
             goto cleanup_port;
         }
@@ -1035,7 +1025,7 @@ int main(int argc, char **argv)
     }
     struct roce_cm_session cm = {0};
     bool connected = in_band ?
-        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer, &cm, cma) :
+        roce_cm_lab_exchange(port, pool, fd, &options, &local, &datapath.cm_peer, &peer, &cm, cma, &application) :
         roce_lab_exchange(fd, &options, &local, &peer);
     if (!connected) {
         fprintf(stderr, "%s setup failed\n", in_band ? "RoCEv2 CM" : "control");

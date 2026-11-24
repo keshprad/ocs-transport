@@ -10,6 +10,7 @@ struct roce_cma_service {
     bool sender;
     uint16_t local_port;
     uint16_t peer_port;
+    uint32_t local_qpn;
     uint32_t peer_qpn;
     struct roce_cma_lab_address address;
     struct roce_cma_message app_parameters;
@@ -17,7 +18,7 @@ struct roce_cma_service {
 
 bool roce_cma_service_listen(struct roce_cma_service *service, const char *path);
 bool roce_cma_service_attach(struct roce_cma_service *service, int app_socket,
-                             const struct roce_cma_lab_address *address, bool sender);
+                             const struct roce_cma_lab_address *address, uint32_t local_qpn, bool sender);
 bool roce_cma_service_prepare(struct roce_cma_service *service);
 bool roce_cma_service_request(struct roce_cma_service *service, uint16_t peer_port, uint32_t peer_qpn,
                               const uint8_t *private_data, uint8_t private_length);

@@ -5,10 +5,24 @@
 #include <stdint.h>
 
 struct ibv_pd;
+struct ibv_cq;
+struct ibv_qp;
 
-/* The caller owns the PD and descriptors. Failure signals the worker by shutting down the app socket. */
+/* Initialize to zero before creating the QP. The caller owns both handles. */
+struct roce_app_native_qp {
+    struct ibv_cq *cq;
+    struct ibv_qp *qp;
+};
+
+int roce_app_create_native_qp(struct ibv_pd *pd, uint32_t depth, bool receiver,
+                              struct roce_app_native_qp *resources);
+int roce_app_configure_native_qp(struct roce_app_native_qp *resources, int queue_fd, bool receiver);
+int roce_app_destroy_native_qp(struct roce_app_native_qp *resources);
+
+/* early_qp is optional and must be configured on queue_fd. The caller retains its ownership. */
 bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
                                uint32_t post_batch, bool scatter_gather,
-                               int (*submitted)(void *), void *context);
+                               int (*submitted)(void *), void *context,
+                               struct roce_app_native_qp *early_qp);
 
 #endif

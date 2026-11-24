@@ -5,9 +5,10 @@
 #include "roce_lab.h"
 
 enum {
-    ROCE_NATIVE_QUEUE_VERSION = 1,
+    ROCE_NATIVE_QUEUE_VERSION = 2,
     ROCE_NATIVE_QUEUE_DEPTH = 256,
     ROCE_NATIVE_QUEUE_FD = 4,
+    ROCE_NATIVE_QUEUE_RECEIVE_ONLY = 1u << 0,
 };
 
 #define ROCE_NATIVE_SQ_CLOSED (UINT32_C(1) << 31)
@@ -36,6 +37,7 @@ struct roce_native_queue_config {
     uint32_t remote_rkey;
     uint32_t local_ipv4;
     uint32_t peer_ipv4;
+    uint32_t flags;
     uint64_t local_address;
     uint64_t remote_address;
 };
@@ -75,7 +77,7 @@ static inline uint32_t roce_native_psn(uint32_t base, uint32_t index)
 }
 
 struct ibv_context;
-/* Associate a provider context with QPs already negotiated by its service. */
+/* Associate negotiated transport parameters with the context's queue resources. */
 int roce_dpdk_bind_queues(struct ibv_context *context, int fd);
 
 #endif

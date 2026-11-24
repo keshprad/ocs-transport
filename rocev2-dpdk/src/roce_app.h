@@ -24,6 +24,7 @@ struct roce_app_memory {
     int socket;
     uint8_t *buffer;
     size_t length;
+    uint32_t qpn;
     struct roce_app_work *work;
     struct roce_native_work *native;
     struct roce_mr_lease mr;
@@ -42,7 +43,9 @@ struct roce_app_config {
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
                      const struct roce_app_config *config, struct roce_app_memory *memory);
 bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_options *options);
-bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_native_queue_config *config);
+bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab_options *options,
+                           const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
+                           bool announce_established);
 bool roce_app_complete(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_flush_native(struct roce_app_memory *memory, const struct roce_lab_options *options);
 void roce_app_detach(struct roce_app_memory *memory);

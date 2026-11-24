@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 enum {
-    ROCE_CMA_IPC_VERSION = 1,
+    ROCE_CMA_IPC_VERSION = 2,
     /* The lab REQ has 56 user bytes, of which 32 carry the MR offer. */
     ROCE_CMA_PRIVATE_MAX = 23,
 };
@@ -47,7 +47,6 @@ struct roce_cma_message {
 struct roce_cma_lab_address {
     uint32_t local_ipv4;
     uint32_t peer_ipv4;
-    uint32_t local_qpn;
     uint16_t service_port;
     uint16_t reserved;
 };

@@ -34,7 +34,7 @@ static bool same_peer(int cm_socket, int app_socket)
 }
 
 bool roce_cma_service_attach(struct roce_cma_service *service, int app_socket,
-                             const struct roce_cma_lab_address *address, bool sender)
+                             const struct roce_cma_lab_address *address, uint32_t local_qpn, bool sender)
 {
     if (send(app_socket, address, sizeof(*address), MSG_NOSIGNAL) != sizeof(*address))
         return false;
@@ -58,7 +58,8 @@ bool roce_cma_service_attach(struct roce_cma_service *service, int app_socket,
 
     service->address = *address;
     service->sender = sender;
-    service->local_port = sender ? UINT16_C(0xc000) | (address->local_qpn & UINT16_C(0x3fff)) : address->service_port;
+    service->local_qpn = local_qpn;
+    service->local_port = sender ? UINT16_C(0xc000) | (local_qpn & UINT16_C(0x3fff)) : address->service_port;
     service->peer_port = sender ? address->service_port : 0;
     return true;
 }
@@ -138,7 +139,7 @@ bool roce_cma_service_prepare(struct roce_cma_service *service)
     if (!roce_cma_service_event(service, ROCE_CMA_ROUTE_RESOLVED, 0, NULL, 0) ||
         !command(service, &message, ROCE_CMA_CONNECT))
         return false;
-    if (!matches_peer(service, &message) || message.qp_num != service->address.local_qpn) {
+    if (!matches_peer(service, &message) || message.qp_num != service->local_qpn) {
         errno = EINVAL;
         return false;
     }
@@ -155,7 +156,7 @@ bool roce_cma_service_request(struct roce_cma_service *service, uint16_t peer_po
     if (!roce_cma_service_event(service, ROCE_CMA_CONNECT_REQUEST, 0, private_data, private_length) ||
         !command(service, &message, ROCE_CMA_ACCEPT))
         return false;
-    if (!matches_peer(service, &message) || message.qp_num != service->address.local_qpn) {
+    if (!matches_peer(service, &message) || message.qp_num != service->local_qpn) {
         errno = EINVAL;
         return false;
     }
