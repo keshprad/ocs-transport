@@ -1,4 +1,5 @@
 #include "roce_cm_session.h"
+#include "roce_cm_lab_offer.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -6,6 +7,32 @@
 #include <string.h>
 
 enum { RETRY_NS = 1000000 };
+
+static void check_lab_offer(void)
+{
+    const uint8_t private[] = {0x1, 0, 0x2};
+    struct roce_lab_options sender = { .sender = true, .size = 8195, .writes = 3 };
+    struct roce_lab_options receiver = { .size = sender.size, .writes = sender.writes };
+    const struct roce_lab_offer local = {
+        .pmtu = 1024, .region = { .address = UINT64_C(0x1234567876543210), .rkey = 0x81828384 },
+    };
+    /* Linux returns the fixed-width CM area, padded after the transmitted bytes. */
+    uint8_t buffer[ROCE_CM_REP_PRIVATE_SIZE] = {0};
+    struct roce_lab_offer peer = { .qpn = 37 };
+    const uint8_t *extra;
+    uint8_t extra_length;
+    assert(roce_cm_lab_offer_encode(buffer, &sender, &local, private, sizeof(private)) ==
+           ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private));
+    assert(!roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE + sizeof(private), &receiver, &peer, NULL, NULL));
+    assert(!roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, NULL, NULL));
+    assert(roce_cm_lab_offer_decode(buffer, sizeof(buffer), &receiver, &peer, &extra, &extra_length));
+    assert(extra_length == sizeof(private) && !memcmp(extra, private, sizeof(private)));
+    assert(peer.qpn == 37 && peer.pmtu == local.pmtu && peer.region.address == local.region.address &&
+           peer.region.rkey == local.region.rkey && peer.region.size == sender.size);
+    assert(roce_cm_lab_offer_encode(buffer, &sender, &local, NULL, 0) == ROCE_CM_LAB_OFFER_SIZE);
+    assert(roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE, &receiver, &peer, &extra, &extra_length));
+    assert(!extra && !extra_length);
+}
 
 struct test_pair {
     struct roce_cm_session active;
@@ -140,7 +167,7 @@ static void check_loss(void)
     assert(roce_cma_decode_ipv4(&cma, request.private_data, request.private_length));
     assert(cma.source_port == 30001 && cma.source_ipv4 == 0xc0000201 && cma.destination_ipv4 == 0xc0000202);
     assert(receive_at(&pair.passive, now, pair.req));
-    assert(pair.passive.peer_qpn == 0x80401 && pair.passive.peer_psn == 0xffffff);
+    assert(pair.passive.peer_qpn == 0x80401 && pair.passive.send_psn == 0xffffff);
     assert(pair.passive.mtu == 3 && pair.passive.peer_private_length == 56);
     assert(!memcmp(pair.passive.peer_private_data, "\x14\0\x27", 3));
     assert(!pair.passive.peer_private_data[3] && !pair.passive.peer_private_data[55]);
@@ -151,7 +178,7 @@ static void check_loss(void)
     assert(receive_at(&pair.passive, now, pair.req));
     send_at(&pair.passive, now, pair.rep);
     assert(receive_at(&pair.active, now, pair.rep));
-    assert(pair.active.peer_qpn == 0x80402 && pair.active.peer_psn == 0x123456);
+    assert(pair.active.peer_qpn == 0x80402 && pair.active.send_psn == 0x123456);
     assert(pair.active.mtu == 3 && pair.active.peer_private_length == 196);
     assert(!memcmp(pair.active.peer_private_data, "\xa2\0\x81", 3));
     assert(pair.active.phase == ROCE_CM_PENDING && pair.passive.phase == ROCE_CM_PENDING);
@@ -383,6 +410,7 @@ static void check_disconnect_timeout(void)
 
 int main(void)
 {
+    check_lab_offer();
     check_explicit_establishment();
     check_loss();
     check_identity();

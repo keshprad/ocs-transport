@@ -192,7 +192,8 @@ static bool decode_packet(struct roce_packet *packet, const uint8_t *frame, size
     if (payload_length > ROCE_MAX_PMTU || (opcode == ROCE_ACK && (payload_length || pad)))
         return false;
     const uint8_t *ext = bth + BTH;
-    if (cm && (payload_length != ROCE_CM_MAD_SIZE || pad || (bth[8] & 0x80) ||
+    /* QP1 uses UD, so the AckReq bit has no effect. Linux RXE can set it on GSI. */
+    if (cm && (payload_length != ROCE_CM_MAD_SIZE || pad ||
                read_be(bth + 5, 3) != CM_QPN || read_be(ext, 4) != cm_qkey ||
                read_be(ext + 5, 3) != CM_QPN))
         return false;

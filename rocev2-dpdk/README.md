@@ -136,6 +136,23 @@ explicit linking. The `roce_app_write` lab client already includes it.
 See the [provider test](provider/README.md) for the combined CM, native
 queue, and kernel MR run.
 
+To pair a DPDK worker with a stock RDMA peer, use `--cm-peer IPV4` on
+`roce_verbs_write` and `--cm-peer IPV4 MAC` on the DPDK worker. Each option
+takes the other endpoint's data-plane address. The native executable
+links to system librdmacm and creates its QP through `rdma_create_qp()`.
+It verifies a plain RC WRITE and disconnects through the system CM.
+
+```sh
+./roce_verbs_write rx 8195 "$CONTROL_IP" "$PORT" "$LOCAL_DATA_IP" 1024 \
+    "$RDMA_DEVICE" "$RDMA_PORT" "$GID_INDEX" --cm-peer "$DPDK_DATA_IP"
+```
+
+Use `tx` to test in the other direction. Both endpoints need the same
+WRITE size and an IPv4 RoCEv2 path that negotiates the configured PMTU.
+This test exchanges the benchmark MR offer as application private data.
+The native peer also accepts that offer when the DPDK side uses the
+application provider and the Unix-socket CM adapter.
+
 ## Build and verify
 
 Build with a C compiler, pkg-config, DPDK with the desired PMD, and

@@ -18,7 +18,7 @@ struct roce_cm_port {
 };
 
 bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
-                          const struct roce_lab_options *options, const struct roce_lab_offer *local,
+                          const struct roce_lab_options *options, struct roce_lab_offer *local,
                           const struct roce_address *destination, struct roce_lab_offer *peer,
                           struct roce_cm_port *cm, struct roce_cma_service *cma,
                           struct roce_app_memory *application);

@@ -253,7 +253,7 @@ static bool peer_matches(const struct roce_cm_session *session, const struct roc
 {
     return session->tid == message->tid && session->peer_comm_id == message->local_comm_id &&
            session->peer_qpn == message->connection.local_qpn &&
-           session->peer_psn == message->connection.starting_psn &&
+           session->send_psn == message->connection.starting_psn &&
            session->peer_private_length == private_length &&
            !memcmp(session->peer_private_data, private_data, private_length);
 }
@@ -264,7 +264,7 @@ static void cache_peer(struct roce_cm_session *session, const struct roce_cm_mes
     session->tid = message->tid;
     session->peer_comm_id = message->local_comm_id;
     session->peer_qpn = message->connection.local_qpn;
-    session->peer_psn = message->connection.starting_psn;
+    session->send_psn = message->connection.starting_psn;
     memcpy(session->peer_private_data, private_data, private_length);
     session->peer_private_length = private_length;
     session->received_peer = true;

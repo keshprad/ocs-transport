@@ -21,7 +21,7 @@ struct roce_lab_offer {
     struct roce_address data;
     struct roce_region region;
     uint32_t qpn;
-    uint32_t psn;
+    uint32_t psn; /* Starting transmit PSN for this endpoint. */
     uint16_t pmtu;
 };
 

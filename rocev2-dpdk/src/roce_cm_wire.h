@@ -42,7 +42,7 @@ struct roce_cm_path {
 struct roce_cm_connection {
     uint64_t local_ca_guid;
     uint32_t local_qpn;
-    uint32_t starting_psn;
+    uint32_t starting_psn; /* Receive PSN advertised to the peer. */
     uint32_t ece_vendor_id;
     uint32_t ece_attr_mod;
     uint8_t responder_resources;

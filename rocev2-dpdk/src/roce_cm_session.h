@@ -33,7 +33,7 @@ struct roce_cm_session_config {
 struct roce_cm_session {
     enum roce_cm_phase phase;
     uint32_t peer_qpn;
-    uint32_t peer_psn;
+    uint32_t send_psn; /* PSN requested by the peer in REQ or REP. */
     uint8_t mtu;
     /* Received fixed-width user area, including its zero-fill. */
     uint8_t peer_private_data[ROCE_CM_REP_PRIVATE_SIZE];

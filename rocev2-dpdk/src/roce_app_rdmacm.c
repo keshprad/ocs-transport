@@ -1,4 +1,5 @@
 #include "roce_app_rdmacm.h"
+#include "roce_cm_lab_offer.h"
 #include "roce_lab.h"
 
 #include <arpa/inet.h>
@@ -10,8 +11,8 @@
 
 enum { CM_TIMEOUT_MS = ROCE_LAB_TIMEOUT * 1000 };
 
-static const char request_private[] = "roce-dpdk-client\0v1";
-static const char reply_private[] = "roce-dpdk-server\0v1";
+static const char request_private[] = ROCE_CM_LAB_REQUEST_TAG;
+static const char reply_private[] = ROCE_CM_LAB_REPLY_TAG;
 _Static_assert(sizeof(request_private) <= ROCE_CMA_PRIVATE_MAX, "CM request private data fits");
 _Static_assert(sizeof(reply_private) <= ROCE_CMA_PRIVATE_MAX, "CM reply private data fits");
 

@@ -1027,7 +1027,7 @@ int main(int argc, char **argv)
         .region = { .address = UINT64_C(0x100000000), .size = options.size },
     }, peer;
     memcpy(local.data.mac, mac.addr_bytes, ROCE_MAC_LEN);
-    if (!roce_lab_random(&local.psn) || (!cma && !roce_lab_random(&local.qpn)) ||
+    if ((!in_band && !roce_lab_random(&local.psn)) || (!cma && !roce_lab_random(&local.qpn)) ||
         (!registrations && !roce_lab_random(&local.region.rkey)))
         goto cleanup_port;
     if (registrations) {

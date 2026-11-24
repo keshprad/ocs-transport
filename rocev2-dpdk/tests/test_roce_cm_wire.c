@@ -306,7 +306,6 @@ static void check_cm_frame(void)
         {49, 0x02, {0x17, 0xe1, 0xea, 0x08}}, /* Destination QP. */
         {61, 0x02, {0x10, 0xe1, 0x53, 0x71}}, /* Source QP. */
         {57, 0x01, {0xf1, 0x26, 0xc9, 0x5b}}, /* Q_Key. */
-        {50, 0x80, {0x8b, 0x6f, 0x12, 0x14}}, /* ACK request. */
         {43, 0x10, {0x3e, 0x83, 0xb7, 0xe8}}, /* Pad count. */
     };
     static const struct {
@@ -359,6 +358,15 @@ static void check_cm_frame(void)
     assert(!roce_cm_frame_encode(frame, sizeof(expected) - 1, &source));
     source.psn = 0x1000000;
     assert(!roce_cm_frame_encode(frame, sizeof(frame), &source));
+
+    /* Stock Linux GSI may set AckReq on a QP1 UD packet. */
+    static const uint8_t gsi_icrc[] = {0x8b, 0x6f, 0x12, 0x14};
+    memcpy(frame, expected, sizeof(expected));
+    frame[50] = 0x80;
+    assert(!roce_cm_frame_decode(&decoded, frame, sizeof(expected)));
+    memcpy(frame + 318, gsi_icrc, sizeof(gsi_icrc));
+    assert(roce_cm_frame_decode(&decoded, frame, sizeof(expected)));
+    assert(roce_cm_decode(&message, decoded.mad, ROCE_CM_MAD_SIZE) && message.type == ROCE_CM_RTU);
 
     for (size_t length = 0; length < sizeof(expected); ++length)
         assert(!roce_cm_frame_decode(&decoded, expected, length));
