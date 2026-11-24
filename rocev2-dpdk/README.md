@@ -560,22 +560,34 @@ constant across the two trials. The launcher records the actual RX mode
 per queue and the packet-pool chunk count. The hugepage service releases
 its temporary reservation on exit. [DPDK hugepage requirements](https://doc.dpdk.org/guides-23.11/linux_gsg/sys_reqs.html#use-of-hugepages-in-the-linux-environment)
 
+On November 24, 2026, the `8c5058a` four-worker, 16-QP memfd
+scatter/gather profile at MTU 4200 verified 16 GiB per run. With 2 MiB
+packet-pool backing, median requester payload goodput was 98.012 Gbit/s
+across three runs (98.010–98.019 Gbit/s). Both endpoints reported zero
+NIC errors or misses, and there were zero requester retries. With 4 KiB
+packet-pool backing, two attempts hit mlx5 requester RX syndrome `0x04`
+and exhausted retries. Both variants used the mlx5 Vector Neon RX path.
+[Jumbo page-backing results](CONFORMANCE.md#spark-04-to-spark-02-jumbo-page-backing)
+
 ### DPDK and hardware RoCEv2 comparison
 
 The earlier hardware benchmarks measured about 92.6 Gbit/s per path,
 185.17–185.18 Gbit/s across two paths in one direction, and 370.16 Gbit/s
 across both paths and both directions. These are the 1 MiB results from
-`spark-7e64` with `spark-28a3` and `spark-4ed9` with `spark-016e`.
-Each path used one QP at Ethernet MTU 1500 and RoCE PMTU 1024.
-Both pairs reported 200 Gbit/s link speed.
+Spark-04 (`spark-7e64`) with Spark-01 (`spark-28a3`) and from
+Spark-02 (`spark-4ed9`) with Spark-03 (`spark-016e`). Both runs used the
+two PCIe functions for the right QSFP port at each endpoint. Each path
+used one QP at Ethernet MTU 1500 and RoCE PMTU 1024. The archived
+endpoint metadata records `speed_mbps=200000` for each interface.
 [Earlier two-path hardware benchmarks](../summary.md),
 [first pair link metadata](../results/20261110T021852Z-4cacd141-client/endpoints.json),
 [second pair link metadata](../results/20261112T023026Z-7a1c5c7f-client/endpoints.json)
 
 The table uses requester payload rates from Spark-04 to Spark-02 on
 their first path, which reported 100 Gbit/s. Each successful DPDK trial
-verified 16 GiB of 1 MiB WRITEs. The ConnectX-7 control used the same WRITE size and
-perftest 6.30 with four-second measurement windows as described below.
+verified 16 GiB of 1 MiB WRITEs. The ConnectX-7 control used the same
+WRITE size and perftest 6.30 with four-second measurement windows as
+described below.
 MTUs 1500 and 4200 used PMTUs 1024 and 4096 respectively.
 
 | DPDK build and mode | QPs | Polling workers per endpoint | DPDK MTU 1500 Gbit/s | DPDK MTU 4200 Gbit/s | Hardware MTU 1500 Gbit/s | DPDK share at 1500 |
@@ -585,20 +597,25 @@ MTUs 1500 and 4200 used PMTUs 1024 and 4096 respectively.
 | `8b075bb` separate processes, memfd scatter/gather | 16 | 2 | 37.165 | Failed | 92.320 | 40.3% |
 | `8b075bb` separate processes, memfd scatter/gather | 16 | 4 | 84.577 | Failed | 92.320 | 91.6% |
 | `3a6a1ca` standalone DPDK | 16 | 4 | 90.506 | — | 92.320 | 98.0% |
+| `8c5058a` separate processes, prefaulted memfd scatter/gather | 16 | 4 | 84.272 | 98.012 | 92.320 | 91.3% |
 
 The rates are three-trial medians. Rows marked failed stopped after the
-first unsuccessful trial for that MTU. The fastest four-worker `8b075bb`
-trial reached 85.795 Gbit/s. The earlier 134.99 Gbit/s result used
-local memif on Spark-04.
+first unsuccessful trial for that MTU. The `8c5058a` jumbo result used
+2 MiB packet-pool backing. The matched hardware control used MTU 1500.
+The fastest four-worker `8b075bb` trial reached 85.795 Gbit/s. The earlier
+134.99 Gbit/s result used local memif on Spark-04.
 
 The standalone DPDK run reached 92.568 Gbit/s with both logical paths
 active in one direction on Spark-04 → Spark-02. The two paths use the
 left QSFP port on Spark-04 and the right QSFP port on Spark-02. All four
 interfaces reported 100,000 Mb/s in sysfs during the DPDK and matched
-hardware tests. The hardware control reached 92.340 Gbit/s. On a
-follow-up, `ethtool` reported 100,000 Mb/s and auto-negotiation on
-while both ends advertised 200 Gbit/s modes. The cause of the reported
-speed difference remains unverified. A DPDK sweep at a reported
+hardware tests. The hardware control reached 92.340 Gbit/s. On
+November 24, 2026, `ethtool` and sysfs again reported 100,000 Mb/s at
+both endpoints of the app benchmark (`enp1s0f0np0` on Spark-04 and
+`enp1s0f1np1` on Spark-02). Both interfaces advertised 200 Gbit/s modes
+with auto-negotiation enabled. The measurements establish the reported
+speed of that connection at test time. The reason it came up at
+100 Gbit/s remains unverified. A DPDK sweep with the link reporting
 200 Gbit/s is pending in both one-way and bidirectional modes.
 [Physical dual-rail sweep](#physical-dual-rail-sweep)
 

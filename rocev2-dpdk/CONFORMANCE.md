@@ -491,6 +491,46 @@ four-queue jumbo pool with 10,239 buffers in one backing chunk. The
 helper rejected mismatched mounts and competing reservations, kept the
 pages while EAL was active, and restored the pool to zero on exit.
 
+### Spark-04 to Spark-02 jumbo page backing
+
+On November 24, 2026, both hosts ran the installed `8c5058a` memfd
+scatter/gather profile at Ethernet MTU 4200 and RoCE PMTU 4096. Each
+endpoint used four workers, 16 QPs, 1 MiB WRITEs, prefaulted application
+mappings, and Vector Neon RX on all four queues. The benchmark link
+reported 100,000 Mb/s at both ends.
+
+Both attempts with ordinary 4 KiB backing allocated the packet pool in
+two chunks. The Spark-04 requester recorded five and four mlx5 RX errors
+respectively, including syndrome `0x04`, and exhausted RC retries. With
+2 MiB backing, the pool occupied one chunk at each endpoint. Each run
+verified all 16 GiB and 4,194,304 data packets with zero RC retries, NIC
+errors or misses. These trials show that changing the packet-pool backing
+resolved the failure for this workload. The underlying registration or
+descriptor failure in the 4 KiB case remains unverified.
+
+| Requester Gbit/s | Responder Gbit/s | Spark-04 journal invocation | Spark-02 journal invocation |
+| ---: | ---: | --- | --- |
+| 98.012 | 98.000 | `cd636aa436f042a295cc80cf65efcfed` | `dfd4ec8756d24e65b9dc4bc64412c9d4` |
+| 98.019 | 98.028 | `6107af619a8c433e844396eb72fa5537` | `86da4f1c5a764857909a68de6efa7fdf` |
+| 98.010 | 98.010 | `ffb5253a115b45a0be7cfea802baed2d` | `c93f15e291ab4aaab3bc2ab202157ac8` |
+
+Median goodput was 98.012 Gbit/s at the requester and 98.010 Gbit/s at
+the responder, measured over the roughly 1.40-second DPDK transfer.
+The receiver application's timed interval also included setup waits and
+full-buffer verification and had a median of 31.28 seconds. Both hosts
+released all 64 temporary 2 MiB pages and returned to Ethernet MTU 1500.
+
+Three MTU 1500 trials of the same prefaulted build with ordinary packet
+backing verified 16 GiB each at 83.410, 84.272 and 84.542 Gbit/s. The
+requester recorded 15, 0 and 0 retries. Both endpoints had zero NIC
+errors. The responder recorded 592 misses in the first trial and zero
+in the repeats. The median is 91.3% of the 92.320 Gbit/s native
+16-QP result on the same path at MTU 1500. The median sender and receiver
+journal invocation IDs are `1390e60312d24588b5e67f6bcd23899c` and
+`1eebdfda86bb430e89c55252d429c6c6`.
+
+### Additional datapath measurements
+
 On the four-worker MTU 1500 profile, one prefaulted trial measured
 84.899 Gbit/s with zero misses and retries. Receiver polling faults
 fell from 4,194,308 in the default median trial to six in that run.
