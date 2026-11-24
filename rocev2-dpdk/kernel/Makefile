@@ -1,5 +1,8 @@
 ifneq ($(KERNELRELEASE),)
 obj-m := roce_mr.o
+ifneq ($(filter y m,$(CONFIG_INFINIBAND_USER_ACCESS)),)
+obj-m += roce_uverbs.o
+endif
 else
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PKG_CONFIG ?= pkg-config

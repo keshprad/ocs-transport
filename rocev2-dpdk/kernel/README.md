@@ -52,3 +52,28 @@ With `libibverbs` development files and access to an RDMA device, run
 This test imports a writable export after releasing both the application
 VMA and CPU mapping descriptor, then verifies rejection of a read-only
 export by the bidirectional RDMA importer.
+
+## Verbs device discovery
+
+Kernels with `CONFIG_INFINIBAND_USER_ACCESS` also build `roce_uverbs.ko`.
+This module registers a software RDMA device through `ib_core` with no
+associated NIC. The device appears as `roce_dpdk0` on a fresh host. Its
+name starts with `roce_dpdk`, its `node_desc` is `RoCEv2 DPDK`, and its
+uverbs ABI version is `1`. The module uses `RDMA_DRIVER_UNKNOWN` pending
+an assigned driver ID. Stock libibverbs selects a matching userspace
+provider before it presents the device to applications.
+
+Standard uverbs commands provide a context, device and port queries,
+and protection domains. The single Ethernet port reports `DOWN`, an
+empty GID table, and no associated network device. Device queries report
+zero CQ, QP and verbs MR capacity. RDMA core rejects unsupported transport
+resource commands. The separate `/dev/roce_mr` interface handles pinned
+memory and DMA-BUF export.
+
+After installation with `ib_uverbs` available, use `rdma dev show` and
+`rdma link show` to verify RDMA core registration and the down port.
+The matching `/sys/class/infiniband_verbs/uverbsN/ibdev` should contain
+`roce_dpdk0`, with `abi_version` equal to `1`. With the matching libibverbs
+provider installed, `ibv_devinfo -d roce_dpdk0` opens the context and queries
+the device and port. The [provider's verbs probe](../provider/README.md)
+checks protection-domain lifetimes and rejection of CQ and MR creation.
