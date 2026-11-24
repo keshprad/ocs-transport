@@ -659,8 +659,10 @@ bool roce_app_write(const char *path, const char *registration_device)
     bool verbs_mr = (workload.flags & APP_USE_VERBS_MR) != 0;
     bool native_queues = (workload.flags & APP_NATIVE_QUEUES) != 0;
     bool rdmacm = (workload.flags & APP_RDMACM) != 0;
-    if ((verbs_mr && registration_device) || (native_queues && (!verbs_mr || !workload.sender)) ||
-        (rdmacm && (!in_band_cm || !verbs_mr || workload.qps != 1 || workload.writes > ROCE_NATIVE_QUEUE_DEPTH ||
+    if ((verbs_mr && registration_device) ||
+        (native_queues && (!verbs_mr || !workload.sender ||
+                           workload.post_batch > roce_native_queue_capacity(workload.writes))) ||
+        (rdmacm && (!in_band_cm || !verbs_mr || workload.qps != 1 ||
                     (workload.sender && !native_queues)))) {
         errno = EINVAL;
         goto disconnect;
@@ -692,7 +694,8 @@ bool roce_app_write(const char *path, const char *registration_device)
         offered = register_verbs_memory(&verbs, buffer, bytes, workload.sender,
                                         (workload.flags & APP_WRITE_DMA_ALIAS) != 0);
         if (offered && rdmacm) {
-            int error = roce_app_create_native_qp(verbs.pd, workload.writes, queue.receiver, &queue.resources);
+            uint32_t depth = roce_native_queue_capacity(workload.writes);
+            int error = roce_app_create_native_qp(verbs.pd, depth, queue.receiver, &queue.resources);
             if (error)
                 errno = error;
             else

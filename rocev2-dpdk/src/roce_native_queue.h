@@ -71,6 +71,11 @@ static inline uint32_t roce_native_posted_count(uint32_t posted)
     return posted & ~ROCE_NATIVE_SQ_CLOSED;
 }
 
+static inline uint32_t roce_native_queue_capacity(uint32_t writes)
+{
+    return writes < ROCE_NATIVE_QUEUE_DEPTH ? writes : ROCE_NATIVE_QUEUE_DEPTH;
+}
+
 static inline uint32_t roce_native_psn(uint32_t base, uint32_t index)
 {
     return (base + index * UINT32_C(0x100001)) & ROCE_PSN_MASK;

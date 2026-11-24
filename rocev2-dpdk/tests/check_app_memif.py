@@ -127,6 +127,9 @@ def main():
               post_batch=1, native_queues=True, rdmacm=True)
         check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True, provider=args.verbs_provider,
               post_batch=1, native_queues=True, rdmacm=True)
+        for gather in (False, True):
+            check(cpus, 257, 521, 1, 1, None, scatter_gather=gather, cm=True,
+                  provider=args.verbs_provider, post_batch=31, native_queues=True, rdmacm=True)
         if len(cpus) >= 4:
             check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=1, native_queues=True)
         return

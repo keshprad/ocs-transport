@@ -14,6 +14,7 @@
 #include <rte_flow.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
+#include <rte_malloc.h>
 #include <rte_mbuf.h>
 #include <rte_memory.h>
 #include <rte_pause.h>
@@ -156,11 +157,21 @@ static struct rte_mbuf *encode_gathered_packet(struct rte_mempool *pool,
     return header;
 }
 
-static bool send_requests(const struct write_worker *worker,
-                          struct roce_requester *requester, uint32_t posted_packets,
+static struct rte_mbuf_ext_shared_info *write_tx_reference(const struct write_worker *worker,
+                                                          uint32_t index, uint32_t sequence)
+{
+    const struct write_run *run = worker->run;
+    uint32_t slot = run->native ? (worker->first_qp + index) * ROCE_NATIVE_QUEUE_DEPTH +
+                                    sequence % ROCE_NATIVE_QUEUE_DEPTH : worker->queue;
+    return &run->tx_refs[slot].shared;
+}
+
+static bool send_requests(struct write_worker *worker,
+                          uint32_t index, uint32_t posted_packets,
                           uint32_t credit, uint64_t now)
 {
     const struct write_run *run = worker->run;
+    struct roce_requester *requester = &worker->states[index].requester;
     uint32_t budget = RTE_MIN(posted_packets - requester->next,
                               credit + (requester->sent - requester->next));
     uint32_t limit = RTE_MIN(budget, run->options->tx_burst);
@@ -171,10 +182,12 @@ static bool send_requests(const struct write_worker *worker,
         /* A full queue window must still generate an ACK before another send. */
         if (run->options->queue_window && count + 1u == budget)
             packet.ack_requested = true;
-        if (run->tx_refs && packet.payload_length)
-            packets[count] = encode_gathered_packet(run->pool, &run->tx_refs[worker->queue].shared, &packet);
-        else
+        if (run->tx_refs && packet.payload_length) {
+            uint32_t sequence = (requester->next + count) / requester->packets_per_write;
+            packets[count] = encode_gathered_packet(run->pool, write_tx_reference(worker, index, sequence), &packet);
+        } else {
             packets[count] = encode_packet(run->pool, &packet);
+        }
         if (!packets[count])
             break;
         ++count;
@@ -444,20 +457,33 @@ static void publish_completions(struct write_worker *worker)
     const struct write_run *run = worker->run;
     if (!run->work && !run->native)
         return;
-    bool drained = !run->tx_refs || rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) == 1;
-    if (!run->native && !drained)
+    if (!run->native && run->tx_refs && rte_mbuf_ext_refcnt_read(&run->tx_refs[worker->queue].shared) != 1)
         return;
+    bool polled_tx = false;
     for (uint32_t i = 0; i < worker->qps; ++i) {
         const struct roce_requester *requester = &worker->states[i].requester;
         uint32_t completed = requester->acked / requester->packets_per_write;
         if (run->native) {
             struct roce_native_sq *sq = &run->native->qps[worker->first_qp + i];
             atomic_store_explicit(&sq->acknowledged, completed, memory_order_relaxed);
-            if (!drained || completed == worker->completions[i])
+            uint32_t retired = worker->completions[i];
+            for (; retired < completed; ++retired) {
+                if (run->tx_refs) {
+                    struct rte_mbuf_ext_shared_info *shared = write_tx_reference(worker, i, retired);
+                    if (rte_mbuf_ext_refcnt_read(shared) != 1 && !polled_tx) {
+                        /* mlx5 can reap signaled TX completions even while the SQ has no new work. */
+                        rte_eth_tx_descriptor_status(run->port, worker->queue, 0);
+                        polled_tx = true;
+                    }
+                    if (rte_mbuf_ext_refcnt_read(shared) != 1)
+                        break;
+                }
+                sq->status[retired % ROCE_NATIVE_QUEUE_DEPTH] = ROCE_NATIVE_WC_SUCCESS;
+            }
+            if (retired == worker->completions[i])
                 continue;
-            for (uint32_t seq = worker->completions[i]; seq < completed; ++seq)
-                sq->status[seq % ROCE_NATIVE_QUEUE_DEPTH] = ROCE_NATIVE_WC_SUCCESS;
-            atomic_store_explicit(&sq->retired, completed, memory_order_release);
+            atomic_store_explicit(&sq->retired, retired, memory_order_release);
+            completed = retired;
         } else if (completed != worker->completions[i]) {
             atomic_store_explicit(&run->work->qps[worker->first_qp + i].completed, completed,
                                   memory_order_release);
@@ -507,7 +533,7 @@ static bool poll_worker(struct write_worker *worker, uint64_t now)
             worker->posted[next] * requester->packets_per_write : requester->total;
         if (++worker->next == worker->qps)
             worker->next = 0;
-        if (send_requests(worker, requester, posted_packets, credit, now))
+        if (send_requests(worker, next, posted_packets, credit, now))
             break;
     }
     return true;
@@ -841,15 +867,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "an application-backed requester uses the application post batch\n");
         goto cleanup_eal;
     }
-    if (datapath.native_queues &&
-        (!datapath.mr_socket || !options.sender || datapath.writes > ROCE_NATIVE_QUEUE_DEPTH)) {
-        fprintf(stderr, "native requester queues require an MR socket and at most %u WRITEs per QP\n",
-                ROCE_NATIVE_QUEUE_DEPTH);
+    if (datapath.native_queues && (!datapath.mr_socket || !options.sender)) {
+        fprintf(stderr, "native requester queues require a requester MR socket\n");
         goto cleanup_eal;
     }
     if (datapath.rdmacm_socket &&
         (!datapath.app_socket || !datapath.mr_socket || !datapath.cm_peer.ipv4 ||
-         datapath.writes > ROCE_NATIVE_QUEUE_DEPTH ||
          (options.sender && !datapath.native_queues) ||
          strcmp(datapath.rdmacm_socket, datapath.app_socket) == 0 ||
          strcmp(datapath.rdmacm_socket, datapath.mr_socket) == 0)) {
@@ -916,7 +939,11 @@ int main(int argc, char **argv)
     struct roce_mr_server *registrations = NULL;
     void *mlx5_pmd = NULL;
     uint8_t *buffer = datapath.app_socket ? NULL : malloc((size_t)bytes);
-    if (!pool || (!datapath.app_socket && !buffer)) {
+    uint32_t tx_ref_count = datapath.scatter_gather ?
+        (datapath.native_queues ? options.qps * ROCE_NATIVE_QUEUE_DEPTH : options.workers) : 0;
+    struct tx_memory_ref *tx_refs = tx_ref_count ?
+        rte_zmalloc(NULL, tx_ref_count * sizeof(*tx_refs), RTE_CACHE_LINE_SIZE) : NULL;
+    if (!pool || (!datapath.app_socket && !buffer) || (tx_ref_count && !tx_refs)) {
         fprintf(stderr, "packet pool or host buffer allocation failed\n");
         goto cleanup_buffers;
     }
@@ -929,7 +956,6 @@ int main(int argc, char **argv)
         roce_lab_fill(buffer, (size_t)bytes, options.sender);
 
     struct rte_ether_addr mac;
-    struct tx_memory_ref tx_refs[ROCE_LAB_MAX_QPS] = {0};
     bool dma_registered = false, dma_mapped = false;
     void *dma_address = NULL;
     size_t dma_length = 0;
@@ -941,7 +967,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "could not open DPDK port %u: %s\n", port, strerror(-err));
         goto cleanup_buffers;
     }
-    for (uint32_t i = 0; datapath.scatter_gather && i < options.workers; ++i) {
+    for (uint32_t i = 0; i < tx_ref_count; ++i) {
         tx_refs[i].shared.free_cb = release_tx_reference;
         rte_mbuf_ext_refcnt_set(&tx_refs[i].shared, 1);
     }
@@ -970,10 +996,12 @@ int main(int argc, char **argv)
         goto cleanup_port;
     }
     if (datapath.app_socket) {
+        uint32_t post_batch = datapath.app_post_batch ? RTE_MIN(datapath.app_post_batch, options.writes) : options.writes;
+        if (datapath.native_queues)
+            post_batch = RTE_MIN(post_batch, roce_native_queue_capacity(options.writes));
         const struct roce_app_config configuration = {
             .registrations = registrations,
-            .post_batch = datapath.app_post_batch ? RTE_MIN(datapath.app_post_batch, options.writes) :
-                options.writes,
+            .post_batch = post_batch,
             .dma_writable = datapath.scatter_gather && !memif,
             .in_band_cm = in_band, .scatter_gather = datapath.scatter_gather,
             .native_queues = datapath.native_queues, .rdmacm = cma != NULL,
@@ -1066,7 +1094,7 @@ int main(int argc, char **argv)
         if (in_band)
             printf("RoCEv2 CM established local_qpn=%06x peer_qpn=%06x\n", local.qpn, peer.qpn);
         result = run(fd, port, pool, &local, &peer, &options, buffer, &application,
-                     options.workers > 1 && !memif, &datapath, datapath.scatter_gather ? tx_refs : NULL,
+                     options.workers > 1 && !memif, &datapath, tx_refs,
                      in_band ? &cm : NULL);
         if (!result && in_band) {
             if (roce_cm_lab_close(port, pool, &cm, cma)) {
@@ -1106,9 +1134,9 @@ cleanup_port:
             fprintf(stderr, "could not stop scatter/gather port: %s\n", rte_strerror(-err));
             return 1;
         }
-        for (uint32_t i = 0; i < options.workers; ++i) {
+        for (uint32_t i = 0; i < tx_ref_count; ++i) {
             if (rte_mbuf_ext_refcnt_read(&tx_refs[i].shared) != 1) {
-                fprintf(stderr, "worker %u still has application buffers in its TX queue\n", i);
+                fprintf(stderr, "TX reference %u still retains application buffers\n", i);
                 return 1;
             }
         }
@@ -1140,6 +1168,7 @@ cleanup_port:
     if (result)
         roce_app_flush_native(&application, &options);
 cleanup_buffers:
+    rte_free(tx_refs);
     if (cma)
         roce_cma_service_close(cma);
     if (mlx5_pmd)

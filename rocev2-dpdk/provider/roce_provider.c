@@ -803,9 +803,11 @@ static int post_send(struct ibv_qp *ibv, struct ibv_send_wr *wr, struct ibv_send
             error = ENOMEM;
             break;
         }
-        error = prepare_native_write(&sq->entries[posted % ROCE_NATIVE_QUEUE_DEPTH], next, qp, posted);
+        uint32_t slot = posted % ROCE_NATIVE_QUEUE_DEPTH;
+        error = prepare_native_write(&sq->entries[slot], next, qp, posted);
         if (error)
             break;
+        sq->status[slot] = ROCE_NATIVE_WC_SUCCESS;
         ++posted;
     }
     if (posted != first) {

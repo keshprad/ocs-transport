@@ -57,9 +57,10 @@ application mapping before acknowledging the WRITE.
 On a physical port this mode currently supports mlx5 in IOVA-as-VA mode
 with either memfd backing or a registered MR and a DMA-BUF-capable PMD.
 The mlx5 driver registers a writable service alias for DMA. The application
-must keep the submitted bytes stable
-until completion, which the worker reports after the peer verifies the
-WRITE and the local TX queues release their references.
+keeps each submitted buffer stable until its completion. For native queues,
+the worker requires both an RC acknowledgement and release of the PMD's
+references to that WRITE's payload. The benchmark verifies the received
+bytes before it reports the transfer complete.
 
 ### Native verbs memory registration
 
@@ -82,9 +83,12 @@ operations. The lab client binds the worker queue mapping to the
 provider and submits WRITEs with `ibv_post_send()`. In the TCP lab setup,
 it creates the CQ and RC QP for each lane after negotiation. It retrieves
 individual WR IDs and statuses with `ibv_poll_cq()`. The current lab
-shape supports up to 256 signaled one-SGE WRITEs per QP and a distinct
+shape supports up to 256 outstanding signaled one-SGE WRITEs per QP and a distinct
 completion queue for each QP. The worker checks the registered source
-range and negotiated destination before packet submission.
+range and negotiated destination before packet submission. The app polls
+completions to reuse slots during longer runs. With scatter/gather it
+refills as credits arrive and drains the final completions after the
+worker retires the last TX descriptors.
 
 For physical `--scatter-gather` with native registration, apply the
 [mlx5 patch](dpdk/dpdk-23.11.7-mlx5-dmabuf.patch) to DPDK 23.11.7 and use
@@ -252,6 +256,7 @@ python3 tests/check_spark_cm.py --bundle "$bundle" \
 ```
 
 The runner checks the installed binaries, unit files, live GID, and link.
+It resolves the native peer's ARP neighbor while the DPDK port is idle.
 It temporarily switches the dedicated Spark-02 port to native RoCE and
 restores the original port mode and MTUs after the test. It requires CM
 establishment, disconnect, and an 8,195-byte verified WRITE in each

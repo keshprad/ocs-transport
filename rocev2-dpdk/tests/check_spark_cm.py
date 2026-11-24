@@ -5,6 +5,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 import re
 import shlex
@@ -408,12 +409,29 @@ def validate_result(endpoint, messages, native):
     return result
 
 
+def resolve_native_neighbor(commands, link):
+    _, _, dpdk_interface, dpdk_address = PORTS["tx"]
+    dpdk_mac = commands.run(LOCAL, "cat", f"/sys/class/net/{dpdk_interface}/address").strip()
+    interface = link["interface"]
+    try:
+        # Resolve the neighbor while Linux still receives ARP on the DPDK port.
+        commands.run(PEER, "ping", "-n", "-I", interface, "-c", "1", "-W", "2", dpdk_address, timeout=5)
+    except CycleError:
+        # An ICMP reply is optional once ARP has obtained the expected MAC.
+        pass
+    neighbors = json.loads(commands.run(PEER, "ip", "-j", "neigh", "show", "to", dpdk_address, "dev", interface))
+    valid_states = {"REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT"}
+    require(any(entry.get("lladdr") == dpdk_mac and valid_states.intersection(entry.get("state", ()))
+                for entry in neighbors), f"{PEER}: no usable ARP neighbor for {dpdk_address} on {interface}")
+
+
 def run_trial(commands, sockets, endpoint, workspace, binary, link, output):
     stem = f"{endpoint.role}-{endpoint.mtu}"
     native_log = output / f"{stem}-native.txt"
     dpdk_log = output / f"{stem}-dpdk.txt"
     for host in (LOCAL, PEER):
         require_idle(commands, host)
+    resolve_native_neighbor(commands, link)
     invocation = None
     with verification_tunnel(commands, sockets, endpoint), ExitStack() as resources:
         try:

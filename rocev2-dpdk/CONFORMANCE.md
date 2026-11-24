@@ -162,7 +162,7 @@ is a design and benchmarking reference. The IBTA clauses govern interoperability
 | Figure 5(a), §4.1 | Standard verbs contexts and resources | Stock libibverbs found `roce_dpdk0` in the Spark-04-kernel guest. The MR fixture verifies range and access validation, process-scoped keys, deregistration, and application exit with an outstanding worker lease. The CM applications create CQs and RC QPs before setup. Provider checks cover unmatched QPN and wrong-PD rejection, successful rebinding after a rejected configuration, and `EBUSY` for referenced MR, PD and CQ resources. |
 | Figure 5(b), §4.2, Appendix A.1 | WQE notification and completion | Worker queues consume shared WQEs from native `ibv_post_send()` and publish individual results for `ibv_poll_cq()`. The provider fixture verifies partial linked-list posting, CQ capacity, queue closure and error WC mapping. With Netlink required, the exact Spark-04-kernel guest verified native copy and scatter/gather on one QP and native copy on four QPs across two workers. Each QP posted one WRITE at a time and returned all three signaled completions. |
 | Figures 7–8, §§4.3–4.4 | Scatter/gather TX and CPU RX placement | The requester chains worker-owned headers and trailer around the application payload. Independent wire vectors cover PMTU 4096. The RC peer verifies sequence NAK and timeout retries. With standard verbs registration on both ends, a four-process memif test verified 24,585 bytes in both copy and scatter/gather modes before deregistration. RX copies into the MR before acknowledging. The DPDK 23.11.7 mlx5 patch builds, and the worker resolves its DMA-BUF map/unmap APIs. Physical ConnectX-7 DMA from native MRs remains unverified. |
-| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It verifies that duplicate REP waits for `rdma_establish()` before sending RTU. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. TCP carries the lab's WRITE completion and verification. The stock librdmacm and Linux RXE tests verified WRITE and disconnect in both directions. CM-managed QPs on the DPDK provider and physical ConnectX-7 CM interoperability remain pending. |
+| Figures 5(c) and 9, §4.7 | Standard RDMA CM over the DPDK datapath | `make check` verifies wire format, peer and transaction identity, TX backpressure, setup and disconnect retries, crossed DREQs and DREP replay. It verifies that duplicate REP waits for `rdma_establish()` before sending RTU. The single-QP lab adapter forwards standard librdmacm calls over an authenticated Unix socket. The worker sends REQ, REP, RTU, DREQ and DREP on DPDK queue 0. TCP carries the lab's WRITE completion and verification. Stock librdmacm verified WRITE and disconnect in both directions with Linux RXE and physical ConnectX-7 at MTUs 1500 and 4200. CM-managed QPs on the DPDK provider remain pending. |
 
 The registration socket carries the request, the correlation cookie
 and the assigned keys. The kernel resolves the Unix peer and binds the
@@ -230,11 +230,31 @@ required Generic Netlink to import kernel-pinned MRs.
 At MTU 4200 the harness set the actual DPDK and Linux TAP MTU before the
 test. The wire capture confirmed 4096-byte RC payloads in both directions.
 
-The physical CM runner stages the same `95afa13` executables used for the
-stock RXE trials. Its four fixed Spark-04 services cover both WRITE
-directions and MTUs. The staged launcher completed a separate
-application-backed memif transfer. The physical services still need the
-operator install before the runner can verify the ConnectX-7 peer.
+On November 24, 2026, the pinned `95afa13` build completed four
+ConnectX-7 CM trials between Spark-04 DPDK and Spark-02 stock librdmacm.
+Each established and disconnected over RoCEv2 CM and verified an
+8,195-byte WRITE. The DPDK requester mapped 12,288 bytes of application
+memfd memory for scatter/gather DMA and reported zero RC retries at both
+MTUs. The native requester reported successful verbs completion. The
+runner resolves Spark-02's ARP neighbor before mlx5 DPDK takes delivery
+of the data port's Ethernet traffic. It restored both MTUs to 1500 and
+the Spark-02 test port to raw Ethernet afterward.
+
+| Direction | Ethernet MTU | WRITE packets | Spark-04 invocation |
+| --- | ---: | ---: | --- |
+| DPDK → ConnectX-7 | 1500 | 9 | `f9b6e81cdefa4ff69a103458e628670a` |
+| ConnectX-7 → DPDK | 1500 | 9 | `25213dd90b1a40b29ad351b44f16083f` |
+| DPDK → ConnectX-7 | 4200 | 3 | `6c39e13378fc45e59c28f51c191f165d` |
+| ConnectX-7 → DPDK | 4200 | 3 | `6db99583152946a19e9318410c0f1766` |
+
+The exact Spark-04 kernel guest verified native queue reuse beyond the
+256-entry ring. The single-QP CM runs transferred 521 WRITEs in both copy
+and scatter/gather mode. The out-of-band runs transferred 521 WRITEs per
+QP across four QPs and two workers. The trace checked every posted WR ID
+against its successful CQ entry as the ring wrapped twice. The 133,897-byte
+and 535,588-byte workloads verified with zero retries and required
+Generic Netlink handoff. The worker retires scatter/gather WRITEs in QP
+order after the RC ACK and release of that slot's PMD references.
 
 The native-MR staging archives include a matched patched DPDK 23.11.7
 runtime, worker and application, ABI-34 provider and unsigned modules for

@@ -22,6 +22,7 @@ struct native_run {
     struct roce_native_queue_config config;
     uint64_t deadline;
     uint32_t post_batch;
+    uint32_t capacity;
     int socket;
     bool scatter_gather;
     _Atomic bool stopped;
@@ -59,7 +60,7 @@ static bool valid_config(const struct roce_native_queue_config *config, bool rec
         config->local_psn > ROCE_PSN_MASK || config->peer_psn > ROCE_PSN_MASK ||
         !config->local_lkey || !config->local_ipv4 || !config->peer_ipv4)
         return false;
-    if (receiver ? config->qps != 1 : config->writes > ROCE_NATIVE_QUEUE_DEPTH || !config->remote_rkey)
+    if (receiver ? config->qps != 1 : !config->remote_rkey)
         return false;
 
     uint64_t bytes = (uint64_t)config->qps * config->writes * config->write_size;
@@ -270,15 +271,16 @@ static int wait_for_worker(const struct native_run *run)
     return ready < 0 && errno != EINTR ? errno : 0;
 }
 
-static int poll_through(struct native_qp *state, uint32_t target)
+static int poll_completions(struct native_qp *state, uint32_t posted, bool drain)
 {
     struct ibv_wc completions[NATIVE_COMPLETION_BATCH];
+    uint32_t target = drain ? posted : state->completed + 1;
     int wait_error = 0;
     while (state->completed < target) {
         int count = ibv_poll_cq(state->resources.cq, NATIVE_COMPLETION_BATCH, completions);
         if (count < 0)
             return EIO;
-        if ((uint32_t)count > target - state->completed || count > NATIVE_COMPLETION_BATCH)
+        if ((uint32_t)count > posted - state->completed || count > NATIVE_COMPLETION_BATCH)
             return EPROTO;
         if (!count) {
             if (wait_error)
@@ -310,16 +312,28 @@ static int produce_batches(struct native_qp *state)
         uint32_t count = writes - posted;
         if (count > run->post_batch)
             count = run->post_batch;
-        int error = post_batch(state, posted, count);
+        int error;
+        if (run->scatter_gather) {
+            if (posted - state->completed == run->capacity) {
+                error = poll_completions(state, posted, false);
+                if (error)
+                    return error;
+            }
+            /* Refill as credits arrive so the PMD can keep processing TX. */
+            uint32_t available = run->capacity - (posted - state->completed);
+            if (count > available)
+                count = available;
+        }
+        error = post_batch(state, posted, count);
         if (error)
             return error;
         posted += count;
         if (!run->scatter_gather) {
-            error = poll_through(state, posted);
+            error = poll_completions(state, posted, true);
             if (error)
                 return error;
-        } else if (posted < writes) {
-            /* The DPDK worker may retain external buffers until the queue stops. */
+        } else if (writes <= run->capacity && posted < writes) {
+            /* Keep the admission check for a transfer that fits in one queue. */
             while (atomic_load_explicit(&state->shared->admitted, memory_order_acquire) < posted) {
                 error = wait_for_worker(run);
                 if (error && atomic_load_explicit(&state->shared->admitted, memory_order_acquire) < posted)
@@ -366,7 +380,7 @@ static int finish_writes(struct native_run *run, struct native_qp *queues)
     if (roce_lab_receive(run->socket, 'C', false) != 1)
         return EPROTO;
     for (uint32_t i = 0; i < run->config.qps; ++i) {
-        int error = poll_through(&queues[i], run->config.writes);
+        int error = poll_completions(&queues[i], run->config.writes, true);
         if (error)
             return error;
         struct ibv_wc unexpected;
@@ -432,11 +446,12 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
     }
 
     struct native_qp queues[ROCE_LAB_MAX_QPS] = {0};
+    run.capacity = roce_native_queue_capacity(run.config.writes);
     int error = 0;
-    if (!post_batch || post_batch > run.config.writes) {
+    if (!post_batch || post_batch > run.capacity) {
         error = EPROTO;
     } else if (early_qp) {
-        uint32_t need = scatter_gather ? run.config.writes : post_batch;
+        uint32_t need = scatter_gather ? run.capacity : post_batch;
         if (run.config.qps != 1 || !valid_native_qp(early_qp) || early_qp->qp->pd != pd ||
             early_qp->qp->state != IBV_QPS_RTS || early_qp->qp->qp_num != run.config.local_qpn ||
             early_qp->cq->cqe < (int)need) {
@@ -453,7 +468,7 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, int queue_fd, int app_socket,
         error = bind_native_work(pd->context, queue_fd);
         for (uint32_t i = 0; !error && i < run.config.qps; ++i) {
             queues[i] = (struct native_qp) { .run = &run, .shared = &work->qps[i], .index = i };
-            error = roce_app_create_native_qp(pd, run.config.writes, false, &queues[i].resources);
+            error = roce_app_create_native_qp(pd, run.capacity, false, &queues[i].resources);
             if (!error)
                 error = connect_native_qp(queues[i].resources.qp, &run.config, i);
         }
