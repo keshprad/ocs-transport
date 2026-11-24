@@ -230,6 +230,35 @@ directly, so it also serves as a native-to-native control.
 For a temporary test, restore the prior Spark-04 native RoCE setting by
 repeating the devlink commands with `value true` once the services are idle.
 
+### Spark-04 DPDK to Spark-02 stock CM
+
+For the in-band CM test, build all three executables and stage the fixed
+services from Spark-04. Pass the Git revision that identifies those builds.
+
+```sh
+bundle=$(python3 tests/stage_spark_cm.py "$REVISION")
+sudo /bin/bash "$bundle/install.sh"
+```
+
+Copy the bundle's `spark-02` directory to Spark-02 and run its `install.sh`
+with sudo. That installer grants the test only the three exact devlink
+commands for the dedicated first-rail PCI function. The paired bandwidth
+services already grant the required MTU commands for these interfaces.
+The stock librdmacm peer runs as the SSH user.
+
+```sh
+python3 tests/check_spark_cm.py --bundle "$bundle" \
+    --destination "/opt/ocs-roce-cm/$REVISION" --manage-peer-mode
+```
+
+The runner checks the installed binaries, unit files, live GID, and link.
+It temporarily switches the dedicated Spark-02 port to native RoCE and
+restores the original port mode and MTUs after the test. It requires CM
+establishment, disconnect, and an 8,195-byte verified WRITE in each
+direction at MTUs 1500 and 4200. The Spark-04 requester also reports mlx5
+scatter/gather DMA mapping of its memfd buffer. The runner saves the per-role
+logs and hashes to its result directory.
+
 ## Bandwidth probes
 
 For an initial DPDK-to-DPDK comparison, run `roce_write` at both ends with

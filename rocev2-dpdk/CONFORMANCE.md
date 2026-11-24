@@ -230,6 +230,19 @@ required Generic Netlink to import kernel-pinned MRs.
 At MTU 4200 the harness set the actual DPDK and Linux TAP MTU before the
 test. The wire capture confirmed 4096-byte RC payloads in both directions.
 
+The physical CM runner stages the same `95afa13` executables used for the
+stock RXE trials. Its four fixed Spark-04 services cover both WRITE
+directions and MTUs. The staged launcher completed a separate
+application-backed memif transfer. The physical services still need the
+operator install before the runner can verify the ConnectX-7 peer.
+
+The native-MR staging archives include a matched patched DPDK 23.11.7
+runtime, worker and application, ABI-34 provider and unsigned modules for
+each Spark's exact kernel. They passed archive checksums, dynamic loader
+relocations and PCI-disabled EAL startup. The worker's mlx5 DMA-BUF
+symbols resolved in that runtime. Both hosts require trusted module
+signatures before the physical DMA-BUF mapping test.
+
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
 memif port teardown. Backtraces located that diagnostic in
 `memif_free_regions()` during both port stop and EAL interrupt handling. The affected trials
