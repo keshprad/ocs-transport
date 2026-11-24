@@ -21,7 +21,7 @@ static void check_lab_offer(void)
     struct roce_lab_offer peer = { .qpn = 37 };
     const uint8_t *extra;
     uint8_t extra_length;
-    assert(roce_cm_lab_offer_encode(buffer, &sender, &local, private, sizeof(private)) ==
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &sender, &local, private, sizeof(private)) ==
            ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private));
     assert(!roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE + sizeof(private), &receiver, &peer, NULL, NULL));
     assert(!roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, NULL, NULL));
@@ -29,9 +29,26 @@ static void check_lab_offer(void)
     assert(extra_length == sizeof(private) && !memcmp(extra, private, sizeof(private)));
     assert(peer.qpn == 37 && peer.pmtu == local.pmtu && peer.region.address == local.region.address &&
            peer.region.rkey == local.region.rkey && peer.region.size == sender.size);
-    assert(roce_cm_lab_offer_encode(buffer, &sender, &local, NULL, 0) == ROCE_CM_LAB_OFFER_SIZE);
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &sender, &local, NULL, 0) == ROCE_CM_LAB_OFFER_SIZE);
     assert(roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE, &receiver, &peer, &extra, &extra_length));
     assert(!extra && !extra_length);
+
+    sender.multi_mr_targets = receiver.multi_mr_targets = true;
+    sender.qps = receiver.qps = 1;
+    struct roce_lab_offer reply = local;
+    reply.auxiliary = (struct roce_region) {.address = 0x47480000, .rkey = 0x12134567, .size = sender.size};
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &receiver, &reply, private, sizeof(private)) ==
+           ROCE_CM_LAB_REPLY_SIZE);
+    assert(roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, &extra, &extra_length));
+    assert(extra_length == sizeof(private) && !memcmp(extra, private, sizeof(private)));
+    assert(peer.auxiliary.address == reply.auxiliary.address && peer.auxiliary.rkey == reply.auxiliary.rkey &&
+           peer.auxiliary.size == reply.auxiliary.size);
+    assert(!roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_REPLY_SIZE - 1, &sender, &peer, NULL, NULL));
+    buffer[ROCE_CM_LAB_PRIVATE_SIZE] = 0;
+    assert(!roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, NULL, NULL));
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &sender, &local, private, sizeof(private)) ==
+           ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private));
+    assert(roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private), &receiver, &peer, NULL, NULL));
 }
 
 struct test_pair {

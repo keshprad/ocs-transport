@@ -371,6 +371,19 @@ free_server:
     return NULL;
 }
 
+static void lease_mapping(struct roce_mr_server *server, struct roce_mr_registration *region,
+                          struct roce_mr_lease *lease)
+{
+    ++region->leases;
+    *lease = (struct roce_mr_lease) {
+        .server = server, .registration = region,
+        .buffer = region->mapping + region->request.offset, .length = (size_t)region->request.length,
+        .mapping = region->mapping, .mapped_length = (size_t)region->request.mapped_length,
+        .iova = region->request.iova, .scope = region->request.scope,
+        .lkey = region->lkey, .rkey = region->rkey,
+    };
+}
+
 static int acquire_locked(struct roce_mr_server *server, pid_t owner, uint64_t scope, uint32_t lkey,
                           uint32_t access, struct roce_mr_lease *lease)
 {
@@ -383,14 +396,7 @@ static int acquire_locked(struct roce_mr_server *server, pid_t owner, uint64_t s
             error = EACCES;
             break;
         }
-        ++region->leases;
-        *lease = (struct roce_mr_lease) {
-            .server = server, .registration = region,
-            .buffer = region->mapping + region->request.offset, .length = (size_t)region->request.length,
-            .mapping = region->mapping, .mapped_length = (size_t)region->request.mapped_length,
-            .iova = region->request.iova, .scope = region->request.scope,
-            .lkey = region->lkey, .rkey = region->rkey,
-        };
+        lease_mapping(server, region, lease);
         error = 0;
         break;
     }
@@ -417,6 +423,53 @@ int roce_mr_acquire_related(const struct roce_mr_lease *anchor, uint32_t lkey, u
     int error = owner ? acquire_locked(server, owner, anchor->scope, lkey, access, lease) : ENOENT;
     pthread_mutex_unlock(&server->mutex);
     return error;
+}
+
+static uint8_t *write_address(uint8_t *buffer, uint64_t iova, uint64_t capacity,
+                              uint64_t address, uint32_t length)
+{
+    uint64_t offset = address - iova;
+    if (address < iova || offset > capacity || length > capacity - offset)
+        return NULL;
+    return buffer + offset;
+}
+
+uint8_t *roce_mr_resolve_write(void *ctx, uint32_t rkey, uint64_t address, uint32_t length)
+{
+    struct roce_mr_destination *destination = ctx;
+    const struct roce_mr_lease *anchor = destination->anchor;
+    if (!anchor || !anchor->registration || destination->active.server || !rkey)
+        return NULL;
+
+    /* A nonzero anchor rkey already grants remote write access for its retained mapping. */
+    if (rkey == anchor->rkey)
+        return write_address(anchor->buffer, anchor->iova, anchor->length, address, length);
+    if (!anchor->scope)
+        return NULL;
+
+    struct roce_mr_server *server = anchor->server;
+    uint8_t *target = NULL;
+    pthread_mutex_lock(&server->mutex);
+    pid_t owner = anchor->registration->owner;
+    for (size_t i = 0; owner && i < ROCE_MR_IPC_MAX_REGISTRATIONS; ++i) {
+        struct roce_mr_registration *region = &server->regions[i];
+        if (region->rkey != rkey || region->socket < 0 || !region->mapping || region->owner != owner ||
+            region->request.scope != anchor->scope || !(region->request.access & ROCE_MR_IPC_REMOTE_WRITE))
+            continue;
+        target = write_address(region->mapping + region->request.offset, region->request.iova,
+                               region->request.length, address, length);
+        if (target)
+            lease_mapping(server, region, &destination->active);
+        break;
+    }
+    pthread_mutex_unlock(&server->mutex);
+    return target;
+}
+
+void roce_mr_release_write(void *ctx)
+{
+    struct roce_mr_destination *destination = ctx;
+    roce_mr_release(&destination->active);
 }
 
 int roce_mr_export_dmabuf(const struct roce_mr_lease *lease)

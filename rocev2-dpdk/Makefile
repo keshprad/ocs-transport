@@ -49,7 +49,7 @@ libroce_rdmacm.so: $(CMA) $(CMA_HEADERS) src/roce_mr_ipc.c src/roce_mr_ipc.h src
 tests/test_roce: tests/test_roce.c $(CORE) $(CORE_HEADERS)
 tests/test_roce_cm_wire: tests/test_roce_cm_wire.c src/roce_cm_wire.c src/roce_cm_wire.h src/roce_wire.c src/roce_wire.h ../common/roce_icrc.h
 tests/test_roce_cm_session: tests/test_roce_cm_session.c $(CM) $(CM_HEADERS) $(CM_LAB) $(CM_LAB_HEADERS) \
-                           $(CORE) $(CORE_HEADERS) $(LAB_HEADERS)
+                           $(CORE) $(CORE_HEADERS) $(LAB) $(LAB_HEADERS)
 tests/test_roce_cma_ipc: tests/test_roce_cma_ipc.c src/roce_cma_ipc.c src/roce_cma_ipc.h src/roce_fd.h $(CM_HEADERS) $(CORE_HEADERS)
 tests/roce_wire_cli: tests/roce_wire_cli.c src/roce_wire.c src/roce_wire.h ../common/roce_icrc.h
 tests/test_doorbell: tests/test_doorbell.c src/roce_doorbell.h src/roce_native_queue.h $(LAB_HEADERS) $(CORE_HEADERS)

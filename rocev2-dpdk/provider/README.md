@@ -34,6 +34,11 @@ process to the QP's original MR. The application can deregister an
 additional MR after polling the completions for all WRs that reference
 it, with the QP still open.
 
+The `--multi-mr-targets` lab profile enables per-WR remote addresses and
+rkeys while retaining the existing local protections. The receiving
+worker checks that the rkey belongs to a remote-write MR in the QP's PD.
+The sender learns the two destination rkeys from the lab peer's offer.
+
 Multiple bound QPs can share one polling CQ. Completions carry the
 originating QPN and remain ordered within each send queue. The CQ reserves
 space for all accepted WRs across its QPs, including unsignaled WRs that

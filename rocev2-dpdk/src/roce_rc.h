@@ -49,13 +49,20 @@ struct roce_requester {
     enum roce_requester_failure failure;
 };
 
+/* Resolve the complete range at WRITE First or Only and retain it until release. */
+typedef uint8_t *(*roce_resolve_write_fn)(void *, uint32_t, uint64_t, uint32_t);
+typedef void (*roce_release_write_fn)(void *);
+
 struct roce_responder {
     struct roce_qp qp;
     struct roce_region region;
     uint8_t *buffer;
+    uint8_t *target;
+    roce_resolve_write_fn resolve;
+    roce_release_write_fn release;
+    void *target_context;
     uint32_t expected;
     uint32_t msn;
-    uint64_t offset;
     uint32_t remaining;
     uint64_t accepted;
     uint64_t bytes_received;
@@ -76,7 +83,7 @@ static inline bool roce_requester_can_stage(const struct roce_requester *r, uint
 /* Payload points to the first byte of a validated segment within an admitted WRITE. */
 void roce_requester_write_packet(const struct roce_requester *r, uint32_t index,
                                  uint32_t segment, const uint8_t *payload,
-                                 uint64_t remote_address, uint32_t length,
+                                 uint64_t remote_address, uint32_t rkey, uint32_t length,
                                  struct roce_packet *packet);
 /* Returns the zero-based WRITE index, or UINT32_MAX if no packet is sendable. */
 uint32_t roce_requester_stage(const struct roce_requester *r, uint32_t staged,
@@ -85,7 +92,9 @@ void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now)
 void roce_requester_feedback(struct roce_requester *r,
                              const struct roce_packet *packet, uint64_t now);
 void roce_requester_poll_timer(struct roce_requester *r, uint64_t now, uint64_t timeout);
-bool roce_responder_can_establish(const struct roce_responder *r, const struct roce_packet *packet);
+bool roce_responder_can_establish(struct roce_responder *r, const struct roce_packet *packet);
+/* Release a partially placed WRITE when stopping the QP. */
+void roce_responder_release_target(struct roce_responder *r);
 bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *packet,
                             struct roce_packet *feedback);
 

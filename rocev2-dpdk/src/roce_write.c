@@ -61,6 +61,7 @@ struct datapath_options {
     bool native_queues;
     bool two_sge_writes;
     bool multi_mr_writes;
+    bool multi_mr_targets;
     bool prefault_app;
 };
 
@@ -99,6 +100,7 @@ struct native_write {
     const uint8_t *source;
     const uint8_t *second;
     uint64_t remote;
+    uint32_t rkey;
     uint32_t first_packet;
     uint32_t end_packet;
     uint32_t length;
@@ -119,6 +121,8 @@ struct write_run {
     uint32_t local_lkey;
     struct tx_memory_ref *tx_refs;
     struct tx_regions *regions;
+    const struct roce_mr_lease *receive_anchor;
+    struct roce_mr_destination destinations[ROCE_LAB_MAX_QPS];
     uint16_t port;
     int application_socket;
     bool sender;
@@ -253,7 +257,8 @@ static uint32_t stage_native_write(struct write_worker *worker, uint32_t index, 
     uint32_t offset = segment * requester->qp.pmtu;
     const uint8_t *payload = offset < write->first_length ? write->source + offset :
         write->second + (offset - write->first_length);
-    roce_requester_write_packet(requester, packet_index, segment, payload, write->remote, write->length, packet);
+    roce_requester_write_packet(requester, packet_index, segment, payload, write->remote, write->rkey,
+                                write->length, packet);
     if (offset < write->first_length && packet->payload_length > write->first_length - offset) {
         packet->payload_tail = write->second;
         packet->payload_tail_length = (uint16_t)(packet->payload_length - (write->first_length - offset));
@@ -376,7 +381,7 @@ static bool init_qps(struct write_worker *worker, uint32_t first, uint16_t pmtu,
                      const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
                      uint8_t *buffer)
 {
-    const struct write_run *run = worker->run;
+    struct write_run *run = worker->run;
     const struct datapath_options *options = run->options;
     uint64_t qp_bytes = local->region.size * options->writes;
     for (uint32_t i = 0; i < worker->qps; ++i) {
@@ -404,6 +409,13 @@ static bool init_qps(struct write_worker *worker, uint32_t first, uint16_t pmtu,
                 .region = { .address = local->region.address + offset,
                             .rkey = local->region.rkey, .size = qp_bytes },
             };
+            if (run->receive_anchor) {
+                struct roce_responder *responder = &worker->states[i].responder;
+                run->destinations[index].anchor = run->receive_anchor;
+                responder->resolve = roce_mr_resolve_write;
+                responder->release = roce_mr_release_write;
+                responder->target_context = &run->destinations[index];
+            }
         }
     }
     return true;
@@ -639,9 +651,10 @@ static enum roce_native_wc_status validate_native_write(const struct write_worke
     uint64_t bytes = wqe->length;
     if (!bytes || bytes > ROCE_NATIVE_MAX_WRITE || second->length >= bytes)
         return ROCE_NATIVE_WC_LOCAL_LENGTH;
-    if (wqe->rkey != requester->remote.rkey ||
-        !roce_native_contains(requester->remote.address, requester->remote.size * worker->run->options->writes,
-                              wqe->remote_address, bytes))
+    if (!worker->run->options->multi_mr_targets &&
+        (wqe->rkey != requester->remote.rkey ||
+         !roce_native_contains(requester->remote.address, requester->remote.size * worker->run->options->writes,
+                               wqe->remote_address, bytes)))
         return ROCE_NATIVE_WC_REMOTE_ACCESS;
     return ROCE_NATIVE_WC_SUCCESS;
 }
@@ -683,7 +696,7 @@ static bool admit_native_qp(struct write_worker *worker, uint32_t index)
         /* Keep both PSN bounds even when the preceding slot has been reused. */
         struct native_write *write = &run->native_writes[qp][slot];
         *write = (struct native_write) {
-            .remote = wqe.remote_address, .length = wqe.length,
+            .remote = wqe.remote_address, .rkey = wqe.rkey, .length = wqe.length,
             .first_length = wqe.length - tail.length,
             .first_packet = packets, .end_packet = packets + count,
         };
@@ -1024,7 +1037,8 @@ static int run(int fd, uint16_t port, struct rte_mempool *pool,
                              .local_iova = local->region.address, .local_buffer = buffer,
                              .local_length = application->length, .local_lkey = application->mr.lkey,
                              .application_socket = application->socket,
-                             .tx_refs = tx_refs, .regions = regions, .cm = cm };
+                             .tx_refs = tx_refs, .regions = regions, .cm = cm,
+                             .receive_anchor = !lab->sender && lab->multi_mr_targets ? &application->mr : NULL };
     if (run.native) {
         run.native_writes = rte_zmalloc(NULL, options->qps * sizeof(*run.native_writes), RTE_CACHE_LINE_SIZE);
         if (!run.native_writes) {
@@ -1093,6 +1107,11 @@ stop_workers:
         if (rte_eal_wait_lcore(options->lcores[i]) != 0)
             result = 1;
 
+    if (run.receive_anchor)
+        for (uint32_t i = 0; i < options->workers; ++i)
+            for (uint32_t j = 0; j < workers[i].qps; ++j)
+                roce_responder_release_target(&workers[i].states[j].responder);
+
     if (!result) {
         uint64_t bytes = local->region.size * options->writes * options->qps;
         result = !verify_result(fd, application->socket, workers, started, buffer, bytes);
@@ -1131,6 +1150,8 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
         } else if (strcmp(argv[i], "--multi-mr-writes") == 0) {
             options->two_sge_writes = true;
             options->multi_mr_writes = true;
+        } else if (strcmp(argv[i], "--multi-mr-targets") == 0) {
+            options->multi_mr_targets = true;
         } else if (strcmp(argv[i], "--tap-mtu") == 0) {
             if (++i == argc || options->tap_mtu ||
                 !roce_parse_uint(argv[i], UINT16_MAX - RTE_ETHER_HDR_LEN, &options->tap_mtu) || !options->tap_mtu)
@@ -1201,9 +1222,11 @@ static bool connect_application(struct roce_app_memory *application, const struc
                                 const struct datapath_options *datapath, const struct roce_lab_offer *local,
                                 const struct roce_lab_offer *peer)
 {
-    if (!datapath->native_queues || application->native)
-        return !datapath->cm_peer.ipv4 || roce_app_connected(application, options);
-    return roce_app_offer_native(application, options, local, peer, true, NULL);
+    bool connected = !datapath->native_queues || application->native ?
+        !datapath->cm_peer.ipv4 || roce_app_connected(application, options) :
+        roce_app_offer_native(application, options, local, peer, true, NULL);
+    return connected && (!options->sender || !options->multi_mr_targets ||
+                         roce_app_send_auxiliary(application, options, peer));
 }
 
 int main(int argc, char **argv)
@@ -1224,6 +1247,7 @@ int main(int argc, char **argv)
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
                         " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--two-sge-writes] [--multi-mr-writes]"
+                        " [--multi-mr-targets]"
                         " [--prefault-app]"
                         " [--scatter-gather] [--tap-mtu N] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
@@ -1257,6 +1281,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "two-SGE WRITEs require a native requester and at least two bytes per WRITE\n");
         goto cleanup_eal;
     }
+    if (datapath.multi_mr_targets && (!datapath.mr_socket || datapath.writes < 2 ||
+                                      (options.sender && !datapath.native_queues))) {
+        fprintf(stderr, "multiple targets require application MRs, at least two WRITEs, and native requester queues\n");
+        goto cleanup_eal;
+    }
     if (datapath.rdmacm_socket &&
         (!datapath.app_socket || !datapath.mr_socket || !datapath.cm_peer.ipv4 ||
          (options.sender && !datapath.native_queues) ||
@@ -1279,6 +1308,7 @@ int main(int argc, char **argv)
     options.writes = datapath.writes;
     options.qps = datapath.qps;
     options.workers = datapath.workers;
+    options.multi_mr_targets = datapath.multi_mr_targets;
     uint64_t bytes = (uint64_t)options.size * options.writes * options.qps;
     if (bytes > SIZE_MAX) {
         fprintf(stderr, "total payload does not fit in a single host buffer\n");
@@ -1509,6 +1539,7 @@ int main(int argc, char **argv)
     if (registrations) {
         local.region.address = application.mr.iova;
         local.region.rkey = application.mr.rkey;
+        local.auxiliary = application.auxiliary;
     }
     local.psn &= ROCE_PSN_MASK;
     local.qpn = cma ? application.qpn : 2 + local.qpn % (ROCE_PSN_MASK - options.qps - 1);

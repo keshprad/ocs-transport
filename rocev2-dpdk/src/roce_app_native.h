@@ -26,7 +26,8 @@ static inline uint32_t roce_app_first_sge_length(uint32_t bytes)
 }
 
 /* early_qp is optional and must be configured on queue_fd. The caller retains its ownership. */
-bool roce_app_run_native_verbs(struct ibv_pd *pd, const struct ibv_mr *second_mr, int queue_fd, int app_socket,
+bool roce_app_run_native_verbs(struct ibv_pd *pd, const struct ibv_mr *second_mr, const uint8_t *target_record,
+                               int queue_fd, int app_socket,
                                uint32_t post_batch, bool scatter_gather,
                                int (*submitted)(void *), void *context,
                                struct roce_app_native_qp *early_qp);

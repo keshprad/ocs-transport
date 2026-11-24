@@ -416,6 +416,34 @@ static void check_shared_cq(void *buffer, size_t length, uint64_t iova)
     assert(!munmap(work, sizeof(*work)) && !close(fd));
 }
 
+static void check_scoped_write_client(int fd, struct ibv_pd *pd, const struct ibv_mr *anchor, uint64_t anchor_iova)
+{
+    size_t length = (size_t)sysconf(_SC_PAGESIZE);
+    uint8_t *bytes = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(bytes != MAP_FAILED);
+    struct ibv_pd *foreign_pd = ibv_alloc_pd(pd->context);
+    assert(foreign_pd);
+    uint64_t iova = UINT64_C(0x2100000);
+    int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    struct ibv_mr *related = ibv_reg_mr_iova(pd, bytes, length, iova, access);
+    struct ibv_mr *foreign = ibv_reg_mr_iova(foreign_pd, bytes, length, iova, access);
+    struct ibv_mr *readonly = ibv_reg_mr_iova(pd, bytes, length, iova, 0);
+    assert(related && foreign && readonly && !readonly->rkey);
+    share_keys(fd, anchor, anchor_iova);
+    share_keys(fd, related, iova);
+    share_keys(fd, foreign, iova);
+    share_keys(fd, readonly, iova);
+
+    expect(fd, 'B');
+    assert(ibv_dereg_mr(related) == EBUSY);
+    assert(bytes[length - 2] == 0x36 && bytes[length - 1] == 0x47);
+    send_value(fd, "B", 1);
+    expect(fd, 'R');
+    assert(!ibv_dereg_mr(related) && !ibv_dereg_mr(foreign) && !ibv_dereg_mr(readonly));
+    assert(!ibv_dealloc_pd(foreign_pd) && !munmap(bytes, length));
+    send_value(fd, "R", 1);
+}
+
 static void client(int fd)
 {
     assert(!setenv("ROCE_DPDK_MR_PD_SCOPE", "1", 1));
@@ -452,6 +480,7 @@ static void client(int fd)
     check_early_qp(pd, mr, iova);
     check_two_sge_queue(pd, mr, iova);
     check_multi_mr_queue(fd, pd, mr, iova);
+    check_scoped_write_client(fd, pd, mr, iova);
     share_keys(fd, mr, iova);
 
     expect(fd, 'B');
@@ -467,6 +496,46 @@ static void client(int fd)
     share_keys(fd, mr, (uintptr_t)(buffer + 1));
     expect(fd, 'X');
     _exit(0);
+}
+
+static void check_scoped_write_worker(struct roce_mr_server *server, int fd, pid_t child)
+{
+    struct mr_keys primary, related, foreign, readonly;
+    recv_value(fd, &primary, sizeof(primary));
+    recv_value(fd, &related, sizeof(related));
+    recv_value(fd, &foreign, sizeof(foreign));
+    recv_value(fd, &readonly, sizeof(readonly));
+
+    struct roce_mr_lease anchor = {0};
+    assert(!roce_mr_acquire(server, child, primary.lkey, ROCE_MR_IPC_REMOTE_WRITE, &anchor));
+    struct roce_mr_destination destination = { .anchor = &anchor };
+    assert(roce_mr_resolve_write(&destination, primary.rkey, primary.iova + primary.length - 1, 1) ==
+           anchor.buffer + primary.length - 1);
+    roce_mr_release_write(&destination);
+    assert(!roce_mr_resolve_write(&destination, primary.rkey, primary.iova - 1, 1));
+    assert(!roce_mr_resolve_write(&destination, primary.rkey, primary.iova + primary.length - 1, 2));
+    assert(!roce_mr_resolve_write(&destination, related.rkey, UINT64_MAX, 2));
+    assert(!roce_mr_resolve_write(&destination, related.rkey, related.iova + related.length - 1, 2));
+    assert(!roce_mr_resolve_write(&destination, foreign.rkey, foreign.iova, 1));
+    assert(!roce_mr_resolve_write(&destination, readonly.rkey, readonly.iova, 1));
+    assert(!roce_mr_resolve_write(&destination, readonly.lkey, readonly.iova, 1));
+    assert(!destination.active.server);
+
+    uint8_t *target = roce_mr_resolve_write(&destination, related.rkey, related.iova + related.length - 2, 2);
+    assert(target);
+    assert(!roce_mr_resolve_write(&destination, primary.rkey, primary.iova, 1));
+    target[0] = 0x36;
+    target[1] = 0x47;
+    send_value(fd, "B", 1);
+    expect(fd, 'B');
+    roce_mr_release_write(&destination);
+
+    send_value(fd, "R", 1);
+    expect(fd, 'R');
+    assert(!roce_mr_resolve_write(&destination, related.rkey, related.iova, 1));
+    assert(roce_mr_resolve_write(&destination, primary.rkey, primary.iova, 1) == anchor.buffer);
+    roce_mr_release_write(&destination);
+    roce_mr_release(&anchor);
 }
 
 static void check(struct roce_mr_server *server, int fd, pid_t child)
@@ -485,6 +554,8 @@ static void check(struct roce_mr_server *server, int fd, pid_t child)
     roce_mr_release(&secondary);
     roce_mr_release(&anchor);
     send_value(fd, "R", 1);
+
+    check_scoped_write_worker(server, fd, child);
 
     struct mr_keys keys;
     struct roce_mr_lease lease = {0};
@@ -559,6 +630,7 @@ int main(int argc, char **argv)
     assert(roce_mr_server_stop(server) == 0);
     assert(rmdir(directory) == 0);
     puts("libibverbs MR registration, access, deregistration and worker leases verified");
+    puts("Scoped remote WRITE placement, range protection and destination leases verified");
     puts("Early QP lifetime, protected binding and receive-only queues verified");
     puts("Shared CQ credits, QP completion identity and resource lifetimes verified");
     puts("Selective WRITE signaling and unsignaled error completions verified");

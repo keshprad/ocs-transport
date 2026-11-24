@@ -28,7 +28,7 @@ to check implementation behavior and run independent interoperability tests.
 | §§5.2, 9.2, 9.4.3, C9-18–20 | RC WRITE Only and First/Middle/Last segmentation, RETH placement, AETH response, and padding | **V** for nonempty plain WRITE. `WIRE` compares all five packet layouts. `RC` checks first, middle and unaligned last geometry and `MEMIF` verifies reassembly at the negotiated PMTU. |
 | §§9.7.1, 9.7.4–9.7.5, C9-105, C9-121–122 | PSN increments and wrap, gap NAK with expected PSN, duplicate ACK without replaying placement | **V** in `RC` and `PEER`. The live responder returns the missing PSN in its NAK and returns the same cumulative ACK and MSN for a duplicate after wrap. Byte verification detects any duplicate placement. |
 | §§9.7.2, 9.7.5.2, 9.7.6, 9.7.7.1, 9.9.2 | Cumulative ACK progress, MSN and error syndromes, timeout and bounded Go-Back-N retry | **P**. `RC` asserts cumulative progress, stale and unsent feedback rejection, MSN, access errors, and retry exhaustion. `PEER` confirms the live requester resumes from the missing PSN after a NAK, then retransmits from the same PSN when the final ACK is withheld. Only feedback applicable to plain WRITE with no receive credits is exercised. The endpoint defaults to a 32-packet window and 10 ms local timeout. `RC` also verifies that packet preparation and a partial TX burst advance only the PSNs accepted by the driver. |
-| §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for the configured host region. `RC` checks incorrect keys, below-base and overrun addresses, and inconsistent message lengths with no memory modification on first-packet rejection. |
+| §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for configured host regions, including multiple MRs in one PD. `RC` verifies access checks, duplicate handling and lease release. The broker fixture checks cross-PD and stale keys. Linux RXE observed a remote-access completion for an out-of-range WRITE. |
 | §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5 | CM Message Receipt Acknowledgment (MRA) format and retry deferral | **V** for the lab RC REQ and REP paths. `CM` verifies peer deferral, transaction matching, accepted TX, and replay. The DPDK worker sends MRA while waiting for slow application setup. The exact-kernel guest verifies that behavior with and without packet loss. |
 | §12.6.7, Table 108 | Reject an RC connection request and report the wire reason and private data | **V** for the lab REQ path. `CM` verifies the REJ MAD, transaction matching, retry replay, and TX acceptance. `CMA-IPC` verifies the private-data handoff and descriptor rules. |
 | A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **V** for the tested one-QP IPv4 host-memory WRITE. Two runs verified 8,195 bytes in each direction at PMTU 1024 with raw Ethernet on the DPDK function and native RoCE on the verbs peer. |
@@ -484,6 +484,27 @@ modules unloaded after the failure path. The final four-QP, two-worker
 run verified 98,340 bytes and 12 WCs with zero retries. Stock Linux RXE
 verified an 8,195-byte WRITE sent from two MRs at PMTU 4096 over TAP.
 Physical mlx5 DMA from both registered buffers remains to be measured.
+
+The `--multi-mr-targets` profile places successive WRITEs into two
+receiver MRs. The responder validates the entire RETH range on the first
+packet and retains the mapping through gaps and retransmissions. It
+releases the mapping after the last copy or during QP teardown. The
+provider fixture checks cross-PD, read-only, stale and out-of-range keys.
+The RC tests also verify that duplicates preserve the lease count and
+that a sequence gap keeps the active destination pinned.
+
+The exact Spark-04 kernel guest, with Generic Netlink handoff required,
+verified 24,585 bytes and three ordered completions in both copy and
+scatter/gather CM runs at PMTU 1024. Dropping the first packet addressed
+to the second MR recovered with one retry. Dropping its next packet on
+every attempt exhausted RC retry with ten of eighteen packets
+acknowledged. Both kernel modules unloaded after teardown. The TCP lab
+test with four QPs and two workers verified 98,340 bytes and 12
+completions with one retry. Stock Linux RXE sent three WRITEs totaling
+24,585 bytes at PMTU 4096. Changing the second WRITE to overrun its MR
+produced a remote-access completion. The receiver app checks the two
+buffers and confirms that alternate-target WRITEs leave the
+corresponding primary slots untouched.
 
 On the exact Spark-04 kernel, one-QP Netlink-backed copy and scatter/gather
 CM runs each verified 24,585 bytes and three completions at PMTU 1024.

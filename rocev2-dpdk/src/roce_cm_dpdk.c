@@ -11,6 +11,8 @@
 
 _Static_assert((int)ROCE_CM_LAB_PRIVATE_SIZE <= ROCE_CM_REQ_PRIVATE_SIZE - ROCE_CMA_IPV4_SIZE,
                "lab private data fits in a CM REQ");
+_Static_assert((int)ROCE_CM_LAB_REPLY_SIZE <= ROCE_CM_REP_PRIVATE_SIZE,
+               "auxiliary lab target fits in a CM REP");
 _Static_assert((int)ROCE_CMA_PRIVATE_MAX <= (int)ROCE_CM_LAB_MAX_APP_DATA,
                "application private data fits in the lab offer");
 
@@ -30,7 +32,7 @@ static uint64_t node_guid(const uint8_t mac[ROCE_MAC_LEN])
            UINT64_C(0xfffe000000) | (uint64_t)mac[3] << 16 | (uint64_t)mac[4] << 8 | mac[5];
 }
 
-static bool first_write(struct rte_mbuf *mbuf, const struct roce_responder *responder)
+static bool first_write(struct rte_mbuf *mbuf, struct roce_responder *responder)
 {
     uint8_t storage[ROCE_MAX_FRAME];
     uint32_t length = rte_pktmbuf_pkt_len(mbuf);
@@ -39,7 +41,7 @@ static bool first_write(struct rte_mbuf *mbuf, const struct roce_responder *resp
     return frame && roce_decode(&packet, frame, length) && roce_responder_can_establish(responder, &packet);
 }
 
-static void receive_cm(uint16_t port, struct roce_cm_port *cm, const struct roce_responder *responder,
+static void receive_cm(uint16_t port, struct roce_cm_port *cm, struct roce_responder *responder,
                         uint64_t now)
 {
     struct roce_cm_session *session = &cm->session;
@@ -150,7 +152,8 @@ static bool prepare_application(struct roce_cma_service *cma, struct roce_app_me
         return ready;
 
     const struct roce_cma_message *parameters = &cma->app_parameters;
-    session->config.private_length = roce_cm_lab_offer_encode(session->local_private_data, options, local,
+    session->config.private_length = roce_cm_lab_offer_encode(session->local_private_data,
+                                                              sizeof(session->local_private_data), options, local,
                                                               parameters->private_data, parameters->private_length);
     return session->config.private_length != 0;
 }
@@ -170,9 +173,9 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
         return false;
     if (cma && options->sender)
         local->qpn = cma->local_qpn;
-    uint8_t private_data[ROCE_CM_LAB_PRIVATE_SIZE];
+    uint8_t private_data[ROCE_CM_LAB_REPLY_SIZE];
     const struct roce_cma_message *parameters = cma ? &cma->app_parameters : NULL;
-    size_t private_length = roce_cm_lab_offer_encode(private_data, options, local,
+    size_t private_length = roce_cm_lab_offer_encode(private_data, sizeof(private_data), options, local,
                                                      parameters ? parameters->private_data : NULL,
                                                      parameters ? parameters->private_length : 0);
     if (!private_length)
@@ -199,6 +202,7 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
     uint64_t deadline = roce_now_ns() + ROCE_LAB_TIMEOUT * UINT64_C(1000000000);
     bool valid_peer = false;
     struct roce_responder responder;
+    struct roce_mr_destination destination_mr = { .anchor = &application->mr };
     uint8_t cma_private_length = 0;
     const uint8_t *cma_private = NULL;
     for (uint64_t now = roce_now_ns(); now < deadline; now = roce_now_ns()) {
@@ -248,6 +252,11 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                                 .size = (uint64_t)options->size * options->writes },
                     .expected = peer->psn,
                 };
+                if (options->multi_mr_targets) {
+                    responder.resolve = roce_mr_resolve_write;
+                    responder.release = roce_mr_release_write;
+                    responder.target_context = &destination_mr;
+                }
             }
             valid_peer = true;
             /* Application setup can block. Recheck the exchange deadline before TX. */

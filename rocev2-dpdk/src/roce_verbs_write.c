@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
+#include <inttypes.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <poll.h>
@@ -100,15 +101,20 @@ static bool allocate_write_resources(struct write_resources *resources, struct i
                                       struct rdma_cm_id *id, const struct roce_lab_options *options,
                                       struct roce_lab_offer *local)
 {
-    resources->buffer = malloc(options->size);
+    uint64_t bytes = (uint64_t)options->size * options->writes;
+    if (bytes > SIZE_MAX) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    resources->buffer = malloc((size_t)bytes);
     if (!resources->buffer)
         return false;
-    roce_lab_fill(resources->buffer, options->size, options->sender);
+    roce_lab_fill(resources->buffer, (size_t)bytes, options->sender);
     resources->pd = ibv_alloc_pd(context);
     resources->cq = ibv_create_cq(context, 1, NULL, NULL, 0);
     if (!resources->pd || !resources->cq)
         return false;
-    resources->mr = ibv_reg_mr(resources->pd, resources->buffer, options->size,
+    resources->mr = ibv_reg_mr(resources->pd, resources->buffer, (size_t)bytes,
                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!resources->mr)
         return false;
@@ -189,10 +195,10 @@ static bool connect_qp(struct ibv_qp *qp, uint8_t port, uint8_t gid_index,
 }
 
 static bool write_and_wait(struct ibv_qp *qp, struct ibv_cq *cq, const struct ibv_mr *mr,
-                           const struct roce_region *peer)
+                           size_t offset, const struct roce_region *peer)
 {
     struct ibv_sge sge = {
-        .addr = (uintptr_t)mr->addr, .length = peer->size, .lkey = mr->lkey,
+        .addr = (uintptr_t)mr->addr + offset, .length = peer->size, .lkey = mr->lkey,
     };
     struct ibv_send_wr wr = {
         .sg_list = &sge, .num_sge = 1, .opcode = IBV_WR_RDMA_WRITE, .send_flags = IBV_SEND_SIGNALED,
@@ -228,10 +234,21 @@ static bool verify_write(int fd, const struct roce_lab_options *options,
                          const struct write_resources *resources, const struct roce_lab_offer *peer)
 {
     if (options->sender) {
-        if (!write_and_wait(resources->qp, resources->cq, resources->mr, &peer->region) ||
-            !roce_lab_send(fd, 'D') || roce_lab_receive(fd, 'V', false) != 1)
+        for (uint32_t ordinal = 0; ordinal < options->writes; ++ordinal) {
+            uint64_t offset = (uint64_t)ordinal * options->size;
+            struct roce_region target = peer->region;
+            target.address += offset;
+            if (options->multi_mr_targets && (ordinal & 1)) {
+                target.rkey = peer->auxiliary.rkey;
+                target.address = peer->auxiliary.address + roce_lab_aux_offset(0, ordinal, options->writes, options->size);
+            }
+            if (!write_and_wait(resources->qp, resources->cq, resources->mr, (size_t)offset, &target))
+                return false;
+        }
+        if (!roce_lab_send(fd, 'D') || roce_lab_receive(fd, 'V', false) != 1)
             return false;
-        printf("WRITE complete: %u bytes, native verbs completion, peer verified\n", options->size);
+        printf("WRITE complete: %" PRIu64 " bytes, native verbs completion, peer verified\n",
+               (uint64_t)options->size * options->writes);
     } else {
         if (roce_lab_receive(fd, 'D', false) != 1 || !roce_lab_verify(resources->buffer, options->size) ||
             !roce_lab_send(fd, 'V'))
@@ -341,8 +358,8 @@ static bool open_cm_connection(struct rdma_cm_id *id, const struct roce_lab_opti
     static const char reply[] = ROCE_CM_LAB_REPLY_TAG;
     const char *tag = options->sender ? request : reply;
     uint8_t tag_length = options->sender ? sizeof(request) : sizeof(reply);
-    uint8_t data[ROCE_CM_LAB_PRIVATE_SIZE];
-    size_t length = roce_cm_lab_offer_encode(data, options, local, tag, tag_length);
+    uint8_t data[ROCE_CM_LAB_REPLY_SIZE];
+    size_t length = roce_cm_lab_offer_encode(data, sizeof(data), options, local, tag, tag_length);
     if (!length) {
         errno = EINVAL;
         return false;
@@ -476,18 +493,25 @@ int main(int argc, char **argv)
 {
     struct roce_lab_options options;
     uint32_t port, gid_index;
-    bool in_band = argc == 12;
-    struct in_addr cm_peer;
-    if ((argc != 10 && !in_band) || !roce_lab_parse(argv, &options) ||
+    struct in_addr cm_peer = {0};
+    if (argc < 10 || !roce_lab_parse(argv, &options) ||
         !roce_parse_uint(argv[8], UINT8_MAX, &port) || !port ||
-        !roce_parse_uint(argv[9], UINT8_MAX, &gid_index) ||
-        (in_band && (strcmp(argv[10], "--cm-peer") || inet_pton(AF_INET, argv[11], &cm_peer) != 1 ||
-                     !cm_peer.s_addr || ntohl(cm_peer.s_addr) == options.data_ip))) {
-        fprintf(stderr, "usage: roce_verbs_write tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU "
-                        "RDMA_DEVICE PORT GID_INDEX [--cm-peer IPV4]\n");
-        return 1;
+        !roce_parse_uint(argv[9], UINT8_MAX, &gid_index))
+        goto usage;
+    for (int i = 10; i < argc; ++i) {
+        if (!strcmp(argv[i], "--cm-peer") && !cm_peer.s_addr && i + 1 < argc) {
+            if (inet_pton(AF_INET, argv[++i], &cm_peer) != 1 || !cm_peer.s_addr ||
+                ntohl(cm_peer.s_addr) == options.data_ip)
+                goto usage;
+        } else if (!strcmp(argv[i], "--multi-mr-targets") && !options.multi_mr_targets && i + 1 < argc) {
+            if (!options.sender || !roce_parse_uint(argv[++i], ROCE_PSN_MASK, &options.writes) || options.writes < 2)
+                goto usage;
+            options.multi_mr_targets = true;
+        } else {
+            goto usage;
+        }
     }
-    if (in_band)
+    if (cm_peer.s_addr)
         return run_cm(&options, argv[7], (uint8_t)port, (uint8_t)gid_index, ntohl(cm_peer.s_addr));
 
     struct ibv_context *context = open_device(argv[7]);
@@ -529,4 +553,9 @@ cleanup_resources:
 cleanup_device:
     ibv_close_device(context);
     return result;
+
+usage:
+    fprintf(stderr, "usage: roce_verbs_write tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU "
+                    "RDMA_DEVICE PORT GID_INDEX [--cm-peer IPV4] [--multi-mr-targets WRITES]\n");
+    return 1;
 }

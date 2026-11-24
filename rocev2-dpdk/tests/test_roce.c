@@ -282,7 +282,7 @@ static void test_variable_write_packets(void)
             uint32_t index = tx.next;
             assert(roce_requester_can_stage(&tx, 0));
             roce_requester_write_packet(&tx, index, segment, source + offset + segment * send_qp.pmtu,
-                                        region.address + offset, lengths[wr], &packet);
+                                        region.address + offset, region.rkey, lengths[wr], &packet);
             assert(packet.opcode == opcodes[index] && packet.psn == ((start + index) & ROCE_PSN_MASK));
             assert(packet.write_length == lengths[wr] && packet.remote_address == region.address + offset);
             roce_requester_sent(&tx, 1, 1);
@@ -337,9 +337,76 @@ static void test_two_payload_spans(void)
     assert(!roce_encode(encoded, sizeof(encoded), &packet));
 }
 
+struct target_fixture {
+    uint8_t buffer[2][513];
+    unsigned acquired, released;
+    bool held;
+};
+
+static uint8_t *resolve_target(void *context, uint32_t rkey, uint64_t address, uint32_t length)
+{
+    struct target_fixture *fixture = context;
+    if (rkey < 1 || rkey > 2 || address != 0x1000u * rkey || length != sizeof(fixture->buffer[0]))
+        return NULL;
+    assert(!fixture->held);
+    fixture->held = true;
+    ++fixture->acquired;
+    return fixture->buffer[rkey - 1];
+}
+
+static void release_target(void *context)
+{
+    struct target_fixture *fixture = context;
+    assert(fixture->held);
+    fixture->held = false;
+    ++fixture->released;
+}
+
+static void test_registered_targets(void)
+{
+    struct target_fixture fixture = {0};
+    uint8_t source[513];
+    memset(source, 0x7c, sizeof(source));
+    struct roce_region first_region = { .address = 0x1000, .rkey = 1, .size = sizeof(source) };
+    struct roce_responder rx = responder(NULL, first_region, 0);
+    rx.resolve = resolve_target;
+    rx.release = release_target;
+    rx.target_context = &fixture;
+    struct roce_responder fresh = rx;
+    struct roce_requester tx;
+    assert(roce_requester_init(&tx, &send_qp, 0, first_region, source, 3, ROCE_SEND_WINDOW_DEFAULT, 1));
+    struct roce_packet first = transmit(&tx, 1), middle = transmit(&tx, 1), last = transmit(&tx, 1), ack;
+    first.rkey = 2;
+    first.remote_address = 0x2000;
+    assert(roce_responder_can_establish(&rx, &first) && !fixture.held && !rx.accepted);
+    assert(!roce_responder_receive(&rx, &first, &ack) && fixture.held);
+    assert(roce_responder_receive(&rx, &first, &ack) && ack.syndrome == ROCE_ACK_NO_CREDIT);
+    assert(roce_responder_receive(&rx, &last, &ack) && ack.syndrome == ROCE_NAK_SEQUENCE);
+    assert(fixture.acquired == 2 && fixture.released == 1);
+    assert(!roce_responder_receive(&rx, &middle, &ack) && fixture.held);
+    assert(roce_responder_receive(&rx, &last, &ack) && ack.syndrome == ROCE_ACK_NO_CREDIT);
+    assert(!fixture.held && fixture.released == 2 && !memcmp(fixture.buffer[1], source, sizeof(source)));
+    assert(!fixture.buffer[0][0]);
+
+    first.psn = 3;
+    first.rkey = 1;
+    first.remote_address = 0x1000;
+    assert(!roce_responder_receive(&rx, &first, &ack) && fixture.held);
+    roce_responder_release_target(&rx);
+    roce_responder_release_target(&rx);
+    assert(!fixture.held && fixture.released == 3);
+
+    rx = fresh;
+    first.psn = 0;
+    ++first.remote_address;
+    assert(roce_responder_receive(&rx, &first, &ack) && ack.syndrome == ROCE_NAK_ACCESS);
+    assert(rx.failed && !fixture.held && fixture.acquired == 3);
+}
+
 int main(void)
 {
     test_two_payload_spans();
+    test_registered_targets();
     test_sequence_nak_and_lost_final_ack();
     test_window_timeout_and_address_validation();
     test_single_packet_and_access_errors();

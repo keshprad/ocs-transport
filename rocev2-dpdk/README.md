@@ -116,6 +116,14 @@ descriptor release. The bundled requester registers both buffers with
 the provider. An application opening its own context enables scoped
 registration with `ROCE_DPDK_MR_PD_SCOPE=1` before opening the device.
 
+Use `--multi-mr-targets` on both endpoints to alternate WRITEs between
+two independently registered receive buffers. The profile uses application
+MRs and at least two WRITEs per QP. The DPDK requester also uses
+`--verbs-queues`. The receiver resolves and validates each rkey and its
+full WRITE range before copying the first packet, then retains the
+mapping through the last segment. The native `roce_verbs_write` requester
+accepts `--multi-mr-targets WRITES` for the same test against a DPDK receiver.
+
 Each native worker checks a shared notification counter before draining its
 doorbell ring. It scans the posted send-queue heads on overflow and
 periodically to recover from an interrupted notification. The shared ring

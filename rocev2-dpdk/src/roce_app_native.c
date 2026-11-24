@@ -19,6 +19,7 @@ enum { NATIVE_COMPLETION_BATCH = 32 };
 struct native_run {
     struct roce_native_queue_config config;
     const struct ibv_mr *second_mr;
+    struct roce_region auxiliary;
     uint64_t deadline;
     uint32_t post_batch;
     uint32_t capacity;
@@ -112,12 +113,17 @@ static int post_batch(struct native_qp *state, uint32_t first, uint32_t count)
             segments[i][0].addr += second_length;
             segments[i][0].length = first_length;
         }
+        bool alternate = state->run->auxiliary.rkey && ((first + i) & 1);
+        uint64_t target = alternate ? state->run->auxiliary.address +
+            roce_lab_aux_offset(state->index, first + i, config->writes, config->write_size) :
+            config->remote_address + offset;
         writes[i] = (struct ibv_send_wr) {
             .wr_id = write_id(state, first + i),
             .next = i + 1 < count ? &writes[i + 1] : NULL,
             .sg_list = segments[i], .num_sge = two_sges ? 2 : 1,
             .opcode = IBV_WR_RDMA_WRITE, .send_flags = IBV_SEND_SIGNALED,
-            .wr.rdma = { .remote_addr = config->remote_address + offset, .rkey = config->remote_rkey },
+            .wr.rdma = { .remote_addr = target,
+                         .rkey = alternate ? state->run->auxiliary.rkey : config->remote_rkey },
         };
     }
     struct ibv_send_wr *bad = NULL;
@@ -283,7 +289,8 @@ static int release_queues(struct native_qp *queues, uint32_t count, bool abortin
     return first_error;
 }
 
-bool roce_app_run_native_verbs(struct ibv_pd *pd, const struct ibv_mr *second_mr, int queue_fd, int app_socket,
+bool roce_app_run_native_verbs(struct ibv_pd *pd, const struct ibv_mr *second_mr, const uint8_t *target_record,
+                               int queue_fd, int app_socket,
                                uint32_t post_batch, bool scatter_gather,
                                int (*submitted)(void *), void *context,
                                struct roce_app_native_qp *early_qp)
@@ -307,8 +314,19 @@ bool roce_app_run_native_verbs(struct ibv_pd *pd, const struct ibv_mr *second_mr
     struct native_qp queues[ROCE_LAB_MAX_QPS] = {0};
     run.capacity = roce_native_queue_capacity(run.config.writes);
     int error = 0;
-    if (!post_batch || post_batch > run.capacity ||
+    if (target_record) {
+        struct roce_lab_offer offer = { .region.rkey = run.config.remote_rkey };
+        const struct roce_lab_options options = {
+            .size = run.config.write_size, .writes = run.config.writes, .qps = run.config.qps,
+        };
+        if (roce_lab_decode_auxiliary(target_record, &offer, &options))
+            run.auxiliary = offer.auxiliary;
+        else
+            error = EPROTO;
+    }
+    if (error || !post_batch || post_batch > run.capacity ||
         !!second_mr != !!(run.config.flags & ROCE_NATIVE_QUEUE_MULTI_MR) ||
+        !!target_record != !!(run.config.flags & ROCE_NATIVE_QUEUE_REMOTE_MRS) ||
         (second_mr && second_mr->pd != pd)) {
         error = EPROTO;
     } else if (early_qp) {

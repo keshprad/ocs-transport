@@ -30,6 +30,7 @@ struct roce_app_memory {
     uint32_t native_version;
     bool multi_mr_writes;
     struct roce_mr_lease mr;
+    struct roce_region auxiliary;
 };
 
 struct roce_app_config {
@@ -47,6 +48,8 @@ struct roce_app_config {
 bool roce_app_attach(const char *path, const struct roce_lab_options *options,
                      const struct roce_app_config *config, struct roce_app_memory *memory);
 bool roce_app_connected(struct roce_app_memory *memory, const struct roce_lab_options *options);
+bool roce_app_send_auxiliary(const struct roce_app_memory *memory, const struct roce_lab_options *options,
+                             const struct roce_lab_offer *peer);
 bool roce_app_offer_native(struct roce_app_memory *memory, const struct roce_lab_options *options,
                            const struct roce_lab_offer *local, const struct roce_lab_offer *peer,
                            bool announce_established, int *queue_fd);

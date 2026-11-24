@@ -905,8 +905,10 @@ static int prepare_native_write(struct roce_native_write *entry, struct roce_nat
     }
     uint64_t qp_bytes = (uint64_t)config->writes * config->write_size;
     uint64_t remote_base = config->remote_address + qp->index * qp_bytes;
-    if (bytes > ROCE_NATIVE_MAX_WRITE || wr->wr.rdma.rkey != config->remote_rkey ||
-        !roce_native_contains(remote_base, qp_bytes, wr->wr.rdma.remote_addr, bytes))
+    if (bytes > ROCE_NATIVE_MAX_WRITE ||
+        (!(config->flags & ROCE_NATIVE_QUEUE_REMOTE_MRS) &&
+         (wr->wr.rdma.rkey != config->remote_rkey ||
+          !roce_native_contains(remote_base, qp_bytes, wr->wr.rdma.remote_addr, bytes))))
         return EINVAL;
 
     *entry = (struct roce_native_write) {

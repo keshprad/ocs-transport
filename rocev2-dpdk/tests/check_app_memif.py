@@ -49,13 +49,15 @@ def expect_success(child, *markers):
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
           provider=None, post_batch=None, native_queues=False, rdmacm=False, external_qp=False,
-          source_option=None):
+          source_option=None, multiple_targets=False):
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
             port = unused.getsockname()[1]
         directory = Path(directory)
         options = ["--report-bw", "--writes", str(writes), "--qps", str(qps), "--workers", str(workers)]
+        if multiple_targets:
+            options.append("--multi-mr-targets")
         app_options = ["--kernel-mr", device] if device else []
         tx_mac = "02:00:c0:00:02:01" if cm else None
         rx_mac = "02:00:c0:00:02:02" if cm else None
@@ -108,7 +110,8 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         tx_app_log = expect_success(tx_app, f"Application completed {total} bytes",
                                     f"Application observed {writes} WRITE completions per QP{completion_suffix}",
                                     *app_marker, *serial_marker)
-        rx_app_log = expect_success(rx_app, f"Application verified {total} bytes", *app_marker)
+        target_marker = ("Application verified both registered destination buffers",) if multiple_targets else ()
+        rx_app_log = expect_success(rx_app, f"Application verified {total} bytes", *app_marker, *target_marker)
         if rdmacm:
             pattern = r"RoCEv2 CM established local_qpn=([0-9a-f]{6}) peer_qpn=([0-9a-f]{6})"
             tx_qps = re.search(pattern, tx_log)
@@ -145,8 +148,13 @@ def main():
                 check(cpus, 8195, 3, 1, 1, None, scatter_gather=gather, cm=True,
                       provider=args.verbs_provider, post_batch=1, native_queues=True, rdmacm=True,
                       source_option=option)
+        check(cpus, 8195, 3, 1, 1, None, scatter_gather=True, cm=True,
+              provider=args.verbs_provider, post_batch=1, native_queues=True, rdmacm=True,
+              source_option="--multi-mr-writes", multiple_targets=True)
         if len(cpus) >= 4:
             check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=1, native_queues=True)
+            check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=3,
+                  native_queues=True, multiple_targets=True)
         return
     check(cpus, 8195, 1, 1, 1, args.kernel_mr)
     check(cpus, 8195, 1, 1, 1, args.kernel_mr, scatter_gather=True)

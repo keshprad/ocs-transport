@@ -51,7 +51,7 @@ bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
 
 void roce_requester_write_packet(const struct roce_requester *r, uint32_t index,
                                  uint32_t segment, const uint8_t *payload,
-                                 uint64_t remote_address, uint32_t length,
+                                 uint64_t remote_address, uint32_t rkey, uint32_t length,
                                  struct roce_packet *packet)
 {
     size_t segment_offset = (size_t)segment * r->qp.pmtu;
@@ -69,7 +69,7 @@ void roce_requester_write_packet(const struct roce_requester *r, uint32_t index,
     packet->ack_requested = last || (index + 1) % ACK_INTERVAL == 0 ||
                             index + 1 - r->acked == r->window;
     packet->remote_address = remote_address;
-    packet->rkey = r->remote.rkey;
+        packet->rkey = rkey;
     packet->write_length = length;
 }
 
@@ -83,7 +83,7 @@ uint32_t roce_requester_stage(const struct roce_requester *r, uint32_t staged,
     uint32_t segment = index % r->packets_per_write;
     size_t offset = (size_t)write * r->remote.size;
     roce_requester_write_packet(r, index, segment, r->source + offset + (size_t)segment * r->qp.pmtu,
-                                r->remote.address + offset, (uint32_t)r->remote.size, packet);
+                                r->remote.address + offset, r->remote.rkey, (uint32_t)r->remote.size, packet);
     return write;
 }
 
@@ -179,11 +179,31 @@ static bool valid_region(const struct roce_region *region, const struct roce_pac
            offset <= region->size && packet->write_length <= region->size - offset;
 }
 
-bool roce_responder_can_establish(const struct roce_responder *r, const struct roce_packet *packet)
+static uint8_t *resolve_write(struct roce_responder *r, const struct roce_packet *packet)
 {
-    return !r->failed && !r->accepted && packet->psn == r->expected && for_qp(packet, &r->qp) &&
-           starts_write(packet) && valid_segment(r, packet, true, packet->write_length) &&
-           valid_region(&r->region, packet);
+    if (r->resolve)
+        return r->resolve(r->target_context, packet->rkey, packet->remote_address, packet->write_length);
+    return valid_region(&r->region, packet) ? r->buffer + (packet->remote_address - r->region.address) : NULL;
+}
+
+void roce_responder_release_target(struct roce_responder *r)
+{
+    if (r->target && r->release)
+        r->release(r->target_context);
+    r->target = NULL;
+}
+
+bool roce_responder_can_establish(struct roce_responder *r, const struct roce_packet *packet)
+{
+    if (r->failed || r->accepted || packet->psn != r->expected || !for_qp(packet, &r->qp) ||
+        !starts_write(packet) || !valid_segment(r, packet, true, packet->write_length))
+        return false;
+    if (!r->resolve)
+        return valid_region(&r->region, packet);
+    uint8_t *target = resolve_write(r, packet);
+    if (target && r->release)
+        r->release(r->target_context);
+    return target != NULL;
 }
 
 bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *packet,
@@ -210,28 +230,31 @@ bool roce_responder_receive(struct roce_responder *r, const struct roce_packet *
     bool last = packet->opcode == ROCE_WRITE_LAST || packet->opcode == ROCE_WRITE_ONLY;
     uint32_t remaining = first ? packet->write_length : r->remaining;
     if (!valid_segment(r, packet, first, remaining)) {
+        roce_responder_release_target(r);
         r->failed = true;
         return respond(r, feedback, ROCE_NAK_INVALID, r->expected);
     }
 
     if (first) {
-        if (!valid_region(&r->region, packet)) {
+        r->target = resolve_write(r, packet);
+        if (!r->target) {
             r->failed = true;
             return respond(r, feedback, ROCE_NAK_ACCESS, r->expected);
         }
-        r->offset = packet->remote_address - r->region.address;
     }
 
     size_t expected_length = packet->payload_length;
-    memcpy(r->buffer + r->offset, packet->payload, expected_length);
-    r->offset += (uint32_t)expected_length;
+    memcpy(r->target, packet->payload, expected_length);
+    r->target += expected_length;
     r->remaining = remaining - (uint32_t)expected_length;
     r->expected = (r->expected + 1) & ROCE_PSN_MASK;
     ++r->accepted;
     r->bytes_received += expected_length;
     r->reported_gap = false;
-    if (last)
+    if (last) {
+        roce_responder_release_target(r);
         r->msn = (r->msn + 1) & ROCE_PSN_MASK;
+    }
 
     if (packet->ack_requested)
         return respond(r, feedback, ROCE_ACK_NO_CREDIT, r->expected - 1);

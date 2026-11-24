@@ -150,6 +150,43 @@ static bool exchange_count(int fd, uint32_t count)
            transfer(fd, &value, sizeof(value), false) && ntohl(value) == count;
 }
 
+enum { AUXILIARY_MAGIC = 0x524d5232 };
+
+static bool valid_auxiliary(const struct roce_region *auxiliary, uint32_t primary_key,
+                            const struct roce_lab_options *options)
+{
+    uint64_t bytes = roce_lab_auxiliary_bytes(options->qps, options->writes, options->size);
+    return auxiliary->rkey && auxiliary->rkey != primary_key && bytes && auxiliary->size == bytes &&
+           bytes - 1 <= UINT64_MAX - auxiliary->address;
+}
+
+bool roce_lab_encode_auxiliary(uint8_t data[ROCE_LAB_AUXILIARY_SIZE], const struct roce_lab_offer *offer,
+                               const struct roce_lab_options *options)
+{
+    const struct roce_region *auxiliary = &offer->auxiliary;
+    if (!valid_auxiliary(auxiliary, offer->region.rkey, options))
+        return false;
+    const uint32_t words[] = {htonl(AUXILIARY_MAGIC), htonl(auxiliary->rkey),
+                              htonl((uint32_t)(auxiliary->address >> 32)), htonl((uint32_t)auxiliary->address)};
+    memcpy(data, words, sizeof(words));
+    return true;
+}
+
+bool roce_lab_decode_auxiliary(const uint8_t data[ROCE_LAB_AUXILIARY_SIZE], struct roce_lab_offer *offer,
+                               const struct roce_lab_options *options)
+{
+    uint32_t words[ROCE_LAB_AUXILIARY_SIZE / sizeof(uint32_t)];
+    memcpy(words, data, sizeof(words));
+    struct roce_region auxiliary = {
+        .rkey = ntohl(words[1]), .address = (uint64_t)ntohl(words[2]) << 32 | ntohl(words[3]),
+        .size = roce_lab_auxiliary_bytes(options->qps, options->writes, options->size),
+    };
+    if (ntohl(words[0]) != AUXILIARY_MAGIC || !valid_auxiliary(&auxiliary, offer->region.rkey, options))
+        return false;
+    offer->auxiliary = auxiliary;
+    return true;
+}
+
 bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
                        const struct roce_lab_offer *local, struct roce_lab_offer *peer)
 {
@@ -158,9 +195,11 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
     const uint32_t more_writes = UINT32_C(0x80000000);
     const uint32_t more_qps = UINT32_C(0x40000000);
     const uint32_t more_workers = UINT32_C(0x20000000);
+    const uint32_t multiple_targets = UINT32_C(0x10000000);
     uint32_t extension = (options->writes > 1 ? more_writes : 0) |
                          (options->qps > 1 ? more_qps : 0) |
-                         (options->workers > 1 ? more_workers : 0);
+                         (options->workers > 1 ? more_workers : 0) |
+                         (options->multi_mr_targets ? multiple_targets : 0);
     uint32_t values[WORDS] = {
         htonl(MAGIC), htonl(options->size), htonl(local->data.ipv4),
         htonl(local->qpn), htonl(local->psn), htonl(local->pmtu),
@@ -193,6 +232,12 @@ bool roce_lab_exchange(int fd, const struct roce_lab_options *options,
         .region = { .address = address, .rkey = values[6], .size = values[1] },
     };
     memcpy(peer->data.mac, record + sizeof(values), ROCE_MAC_LEN);
+    if (options->multi_mr_targets) {
+        uint8_t target[ROCE_LAB_AUXILIARY_SIZE];
+        if (options->sender)
+            return transfer(fd, target, sizeof(target), false) && roce_lab_decode_auxiliary(target, peer, options);
+        return roce_lab_encode_auxiliary(target, local, options) && transfer(fd, target, sizeof(target), true);
+    }
     return true;
 }
 
@@ -272,9 +317,10 @@ void roce_lab_fill(uint8_t *buffer, size_t size, bool sender)
     roce_lab_fill_range(buffer, size, 0, sender);
 }
 
-bool roce_lab_verify(const uint8_t *buffer, size_t size)
+bool roce_lab_verify_range(const uint8_t *buffer, size_t size, size_t logical_offset, bool written)
 {
     enum { VERIFY_BLOCK_BYTES = 4096 };
+    uint8_t mask = written ? 0 : UINT8_MAX;
     for (size_t offset = 0; offset < size;) {
         size_t length = size - offset;
         if (length > VERIFY_BLOCK_BYTES)
@@ -283,11 +329,11 @@ bool roce_lab_verify(const uint8_t *buffer, size_t size)
         /* Reduce every byte so the compiler can vectorize the successful path. */
         uint8_t difference = 0;
         for (size_t i = 0; i < length; ++i)
-            difference |= buffer[offset + i] ^ pattern(offset + i);
+            difference |= buffer[offset + i] ^ pattern(logical_offset + offset + i) ^ mask;
         if (difference) {
             for (size_t i = 0; i < length; ++i) {
-                if (buffer[offset + i] != pattern(offset + i)) {
-                    fprintf(stderr, "payload mismatch at byte %zu\n", offset + i);
+                if (buffer[offset + i] != (pattern(logical_offset + offset + i) ^ mask)) {
+                    fprintf(stderr, "payload mismatch at byte %zu\n", logical_offset + offset + i);
                     break;
                 }
             }
@@ -296,6 +342,11 @@ bool roce_lab_verify(const uint8_t *buffer, size_t size)
         offset += length;
     }
     return true;
+}
+
+bool roce_lab_verify(const uint8_t *buffer, size_t size)
+{
+    return roce_lab_verify_range(buffer, size, 0, true);
 }
 
 uint64_t roce_now_ns(void)
