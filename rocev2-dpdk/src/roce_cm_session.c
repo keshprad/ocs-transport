@@ -129,6 +129,11 @@ static void disconnect_complete(struct roce_cm_session *session, uint64_t now, i
 
 static bool retry_due(const struct roce_cm_session *session, uint64_t now)
 {
+    if (session->phase == ROCE_CM_PENDING && session->mra_service_ns) {
+        uint64_t elapsed = now - session->mra_received_at;
+        return elapsed >= session->mra_service_ns &&
+               elapsed - session->mra_service_ns >= session->config.packet_lifetime_ns;
+    }
     return session->sends && now - session->last_sent >= session->config.retry_ns;
 }
 
@@ -162,7 +167,7 @@ static enum roce_cm_type next_message(struct roce_cm_session *session, uint64_t 
 
     if (session->sends > session->config.max_retries)
         return 0;
-    if (!session->send_pending && !retry_due(session, now))
+    if ((!session->send_pending || session->mra_service_ns) && !retry_due(session, now))
         return 0;
     return session->config.initiator ? ROCE_CM_REQ : ROCE_CM_REP;
 }
@@ -259,6 +264,7 @@ void roce_cm_session_sent(struct roce_cm_session *session, uint64_t now)
     } else {
         ++session->sends;
         session->last_sent = now;
+        session->mra_service_ns = 0;
     }
     session->gsi_psn = (session->gsi_psn + 1) & ROCE_PSN_MASK;
     session->send_pending = false;
@@ -330,7 +336,8 @@ static bool receive_req(struct roce_cm_session *session, const struct roce_cm_me
 static bool receive_rep(struct roce_cm_session *session, const struct roce_cm_message *message)
 {
     if (!session->sends || message->tid != session->tid ||
-        message->remote_comm_id != session->config.local_comm_id)
+        message->remote_comm_id != session->config.local_comm_id ||
+        (session->peer_comm_id && message->local_comm_id != session->peer_comm_id))
         return false;
 
     if (session->received_peer) {
@@ -340,6 +347,26 @@ static bool receive_rep(struct roce_cm_session *session, const struct roce_cm_me
         cache_peer(session, message, message->private_data, message->private_length);
     }
     session->send_pending = true;
+    return true;
+}
+
+static bool receive_mra(struct roce_cm_session *session, uint64_t now,
+                        const struct roce_cm_message *message)
+{
+    bool initiator = session->config.initiator;
+    enum roce_cm_mra_message expected = initiator ? ROCE_CM_MRA_REQ : ROCE_CM_MRA_REP;
+    if (session->phase != ROCE_CM_PENDING || !session->sends || (initiator && session->received_peer) ||
+        message->mra.message != expected || message->tid != session->tid || !message->local_comm_id ||
+        message->remote_comm_id != session->config.local_comm_id ||
+        (session->peer_comm_id && message->local_comm_id != session->peer_comm_id))
+        return false;
+
+    /* While awaiting the reply, a duplicate MRA leaves the first deadline in effect. */
+    if (!session->mra_service_ns) {
+        session->peer_comm_id = message->local_comm_id;
+        session->mra_received_at = now;
+        session->mra_service_ns = UINT64_C(4096) << message->mra.service_timeout;
+    }
     return true;
 }
 
@@ -394,6 +421,8 @@ bool roce_cm_session_receive(struct roce_cm_session *session, uint64_t now,
         return receive_disconnect(session, now, &message);
     if (session->phase == ROCE_CM_DISCONNECTING || session->phase == ROCE_CM_DISCONNECTED)
         return false;
+    if (message.type == ROCE_CM_MRA)
+        return receive_mra(session, now, &message);
 
     if (session->config.initiator)
         return message.type == ROCE_CM_REP && receive_rep(session, &message);

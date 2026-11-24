@@ -29,6 +29,7 @@ to check implementation behavior and run independent interoperability tests.
 | §§9.7.1, 9.7.4–9.7.5, C9-105, C9-121–122 | PSN increments and wrap, gap NAK with expected PSN, duplicate ACK without replaying placement | **V** in `RC` and `PEER`. The live responder returns the missing PSN in its NAK and returns the same cumulative ACK and MSN for a duplicate after wrap. Byte verification detects any duplicate placement. |
 | §§9.7.2, 9.7.5.2, 9.7.6, 9.7.7.1, 9.9.2 | Cumulative ACK progress, MSN and error syndromes, timeout and bounded Go-Back-N retry | **P**. `RC` asserts cumulative progress, stale and unsent feedback rejection, MSN, access errors, and retry exhaustion. `PEER` confirms the live requester resumes from the missing PSN after a NAK, then retransmits from the same PSN when the final ACK is withheld. Only feedback applicable to plain WRITE with no receive credits is exercised. The endpoint defaults to a 32-packet window and 10 ms local timeout. `RC` also verifies that packet preparation and a partial TX burst advance only the PSNs accepted by the driver. |
 | §§9.7.4–9.7.5 | Validate the remote key, address range, and message geometry before placement | **V** for the configured host region. `RC` checks incorrect keys, below-base and overrun addresses, and inconsistent message lengths with no memory modification on first-packet rejection. |
+| §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5 | CM Message Receipt Acknowledgment (MRA) format and retry deferral | **P**. `CM` verifies pending REQ and REP deferral, transaction matching, and duplicate handling. The DPDK worker honors incoming MRA for those messages. Automatic MRA generation for slow application setup remains open. |
 | A17 and Chapter 9 end to end | DPDK-to-native and native-to-DPDK WRITEs with a stock ConnectX-7 endpoint | **V** for the tested one-QP IPv4 host-memory WRITE. Two runs verified 8,195 bytes in each direction at PMTU 1024 with raw Ethernet on the DPDK function and native RoCE on the verbs peer. |
 
 Zero-length WRITE, WRITE with Immediate, SEND, READ, atomics, IPv6 and
@@ -41,6 +42,7 @@ the supported RDMA CM and DPDK-side verbs provider profiles.
 | --- | --- | --- |
 | WIRE | `make check` → `tests/check_wire.py` | Independent BTH/RETH/AETH and iCRC vectors for five opcodes, plus negative decode cases |
 | RC | `make check` → `tests/test_roce` | Single- and multi-packet placement, PSN wrap, loss and duplicate recovery, cumulative ACK validation and retry limit |
+| CM | `make check` → `tests/test_roce_cm_wire` and `tests/test_roce_cm_session` | Fixed CM MAD vectors, QP1 encapsulation, establishment and teardown, replay, and REQ/REP retry timing with MRA |
 | MEMIF | `make check-memif` | Two production DPDK processes verified a WRITE Only, PMTU negotiation from 1024 and 512, and 65 consecutive 8,195-byte WRITEs on one QP. Separate tests verified WRITE Only and repeated 1,048,579-byte WRITEs across 16 independent QPs. With four available CPUs, a two-queue test verifies WRITEs on three QPs. |
 | PEER | `make check-peer` → `tests/check_peer.py` | Independent Python RC peer and production DPDK endpoint exchanged a 515-byte WRITE in each role at PMTU 256. The peer checked every WRITE segment and each response. The test injected a sequence gap, lost ACK, corrupted iCRC, and changed-payload duplicate. |
 | PEER-VERBS | `python3 tests/check_peer.py --verbs-provider "$PROVIDER_DIR/libroce_dpdk"` | On the exact Spark-04 kernel in QEMU, the independent peer sent a sequence NAK and withheld the final ACK. It verified both retransmissions from a native scatter/gather requester and checked the payload. The application received one libibverbs completion. Netlink handoff was required. |
@@ -250,6 +252,29 @@ receive and the peer's advertised Starting PSN for transmit, as specified
 by Volume 1 §12.7.31.
 [IBTA Volume 1](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
 [Linux CM field definitions](https://codebrowser.dev/linux/linux/include/rdma/ibta_vol1_c12.h.html)
+
+An incoming MRA for an outstanding REQ or REP starts a wait for
+`4096 ns × 2^ServiceTimeout` plus the configured packet lifetime. The
+direct-link lab uses a 1 ms packet lifetime and a 250 ms regular retry
+interval. The worker checks both communication IDs once known and
+matches the transaction and peer before deferring retries. Duplicate
+MRAs leave the current wait unchanged. An accepted retransmission starts
+the regular retry interval again. The worker timestamps CM sends after
+DPDK accepts the packet and rechecks the exchange deadline after waiting
+on the application.
+[IBTA Volume 1 §§12.6.6, 12.7.32, 12.9.7, 12.9.8.5](https://www.afs.enea.it/asantoro/V1r1_2_1.Release_12062007.pdf)
+
+In the exact Spark-04 kernel guest, a memif TX test shim delayed REP
+or RTU by 550 ms. With an injected MRA, the other endpoint sent the
+pending REQ or REP once. Each control with the same delay and no MRA
+sent it three times before the reply. All four trials used separate
+`librdmacm` applications, CM-owned QPs, Netlink MR handoff and
+scatter/gather TX. Each returned three successful libibverbs completions
+and verified 24,585 bytes with zero RC retries.
+The updated implementation also verified an 8,195-byte WRITE and clean
+in-band CM teardown in both directions against stock Linux RXE over TAP
+at PMTU 4096 in the same kernel guest. That interoperability run used a
+separate DPDK application with Netlink MR handoff.
 
 The kernel guest used QEMU TCG with networking disabled and the Ubuntu
 `6.17.0-1021.21-nvidia` image. Both `check_provider` and `check_mr`

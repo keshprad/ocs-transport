@@ -79,7 +79,7 @@ void roce_cm_transmit(uint16_t port, struct rte_mempool *pool, struct roce_cm_se
     if (packet) {
         memcpy(packet, storage, length);
         if (rte_eth_tx_burst(port, 0, &mbuf, 1) == 1) {
-            roce_cm_session_sent(session, now);
+            roce_cm_session_sent(session, roce_now_ns());
             return;
         }
     }
@@ -164,7 +164,8 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
         .service_id = ROCE_CMA_TCP_SERVICE_BASE | options->control_port,
         .cma_source_port = cma ? cma->local_port : source_port, .udp_source = source_port, .pkey = ROCE_PKEY,
         .mtu = mtu_code(local->pmtu), .private_data = private_data,
-        .private_length = private_length, .retry_ns = UINT64_C(250000000), .max_retries = 7,
+        .private_length = private_length, .retry_ns = UINT64_C(250000000),
+        .packet_lifetime_ns = UINT64_C(1000000), .max_retries = 7,
     };
     if (!roce_cm_session_init(session, &config))
         return false;
@@ -198,6 +199,10 @@ bool roce_cm_lab_exchange(uint16_t port, struct rte_mempool *pool,
                 };
             }
             valid_peer = true;
+            /* Application setup can block. Recheck the exchange deadline before TX. */
+            now = roce_now_ns();
+            if (now >= deadline)
+                return false;
         }
         roce_cm_transmit(port, pool, session, now);
         if (session->phase == ROCE_CM_ESTABLISHED) {

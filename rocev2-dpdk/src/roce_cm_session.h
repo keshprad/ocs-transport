@@ -28,6 +28,7 @@ struct roce_cm_session_config {
     const uint8_t *private_data;
     size_t private_length;
     uint64_t retry_ns;
+    uint64_t packet_lifetime_ns; /* Maximum one-way flight time added to an MRA service timeout. */
     uint8_t max_retries; /* Additional REQ, REP or DREQ sends, 0 through 15. */
 };
 
@@ -46,6 +47,8 @@ struct roce_cm_session {
     uint32_t peer_comm_id;
     uint64_t tid;
     uint64_t last_sent;
+    uint64_t mra_received_at;
+    uint64_t mra_service_ns;
     uint64_t disconnect_tid;
     uint64_t peer_dreq_tid;
     uint64_t disconnected_at;

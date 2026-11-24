@@ -311,6 +311,97 @@ static void check_retry_limit(void)
     assert(!roce_cm_session_init(&pair.passive, &passive));
 }
 
+static void check_mra_req(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    active.max_retries = 0;
+    active.packet_lifetime_ns = 20000;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+
+    uint8_t frame[ROCE_CM_FRAME_SIZE];
+    struct roce_cm_frame outer = {
+        .src = passive.local, .dst = active.local, .udp_source = passive.udp_source, .pkey = active.pkey,
+    };
+    struct roce_cm_message mra = {
+        .type = ROCE_CM_MRA, .tid = active.tid,
+        .local_comm_id = passive.local_comm_id, .remote_comm_id = active.local_comm_id,
+        .mra = {.message = ROCE_CM_MRA_REQ, .service_timeout = 9},
+    };
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 0, frame));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    send_at(&pair.passive, 0, pair.rep);
+
+    ++mra.tid;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 1, frame));
+    --mra.tid;
+    ++mra.remote_comm_id;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 2, frame));
+    --mra.remote_comm_id;
+    --outer.src.ipv4;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 3, frame));
+    ++outer.src.ipv4;
+    mra.mra.message = ROCE_CM_MRA_REP;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 4, frame));
+    mra.mra.message = ROCE_CM_MRA_REQ;
+    pack(frame, outer, &mra);
+    assert(receive_at(&pair.active, 100000, frame));
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, frame, sizeof(frame)));
+    assert(pair.active.phase == ROCE_CM_PENDING && pair.active.sends == 1);
+
+    struct roce_cm_message reply = unpack(pair.rep, &outer);
+    ++reply.local_comm_id;
+    pack(frame, outer, &reply);
+    uint64_t before_expiry = 100000 + 2097152 + active.packet_lifetime_ns - 1;
+    assert(!receive_at(&pair.active, before_expiry, frame));
+    assert(receive_at(&pair.active, before_expiry, pair.rep));
+    send_at(&pair.active, before_expiry, pair.rtu);
+    assert(pair.active.phase == ROCE_CM_ESTABLISHED);
+}
+
+static void check_mra_rep(void)
+{
+    struct test_pair pair;
+    init_pair(&pair);
+    pair.passive.config.max_retries = 1;
+    pair.passive.config.packet_lifetime_ns = 20000;
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+
+    struct roce_cm_frame outer;
+    struct roce_cm_message mra = unpack(pair.req, &outer);
+    mra.type = ROCE_CM_MRA;
+    mra.remote_comm_id = pair.passive.config.local_comm_id;
+    mra.mra.message = ROCE_CM_MRA_REP;
+    mra.mra.service_timeout = 9;
+    mra.private_length = 0;
+    uint8_t frame[ROCE_CM_FRAME_SIZE];
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.passive, 0, frame));
+    send_at(&pair.passive, 0, pair.rep);
+    assert(receive_at(&pair.passive, 100000, frame));
+
+    assert(receive_at(&pair.passive, RETRY_NS, pair.req));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(receive_at(&pair.passive, RETRY_NS + 1, frame));
+    uint64_t expiry = 100000 + 2097152 + pair.passive.config.packet_lifetime_ns;
+    assert(!roce_cm_session_prepare(&pair.passive, expiry - 1, pair.rep, sizeof(pair.rep)));
+    send_at(&pair.passive, expiry, pair.rep);
+    assert(pair.passive.sends == 2);
+    assert(!roce_cm_session_prepare(&pair.passive, expiry + RETRY_NS - 1, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_PENDING);
+    assert(!roce_cm_session_prepare(&pair.passive, expiry + RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_FAILED);
+}
+
 static void establish_pair(struct test_pair *pair, bool deliver_rtu)
 {
     init_pair(pair);
@@ -443,6 +534,8 @@ int main(void)
     check_loss();
     check_identity();
     check_retry_limit();
+    check_mra_req();
+    check_mra_rep();
     check_disconnect_replay();
     check_simultaneous_disconnect(false);
     check_simultaneous_disconnect(true);

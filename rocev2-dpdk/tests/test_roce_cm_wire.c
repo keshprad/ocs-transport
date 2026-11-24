@@ -40,6 +40,15 @@ static const uint8_t rep_fixture[256] = {
     [60] = 0xaa, 0x00, 0x55,
 };
 
+static const uint8_t mra_fixture[256] = {
+    [0] = 0x01, 0x07, 0x02, 0x03,
+    [8] = 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    [16] = 0x00, 0x11,
+    [24] = 0x10, 0x20, 0x30, 0x40, 0x80, 0x70, 0x60, 0x50,
+    [32] = 0x40, 0xf8, 0x06, 0xce,
+    [255] = 0x43,
+};
+
 static const uint8_t rtu_fixture[256] = {
     [0] = 0x01, 0x07, 0x02, 0x03,
     [8] = 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -213,6 +222,37 @@ static void check_lengths(void)
         assert(!roce_cm_decode(&message, mad, 255));
         assert(!roce_cm_decode(&message, mad, 257));
     }
+}
+
+static void check_mra(void)
+{
+    uint8_t private_data[ROCE_CM_MRA_PRIVATE_SIZE] = {0x06, 0xce, [221] = 0x43};
+    struct roce_cm_message message = {
+        .type = ROCE_CM_MRA, .tid = UINT64_C(0x1122334455667788),
+        .local_comm_id = 0x10203040, .remote_comm_id = 0x80706050,
+        .mra = {.message = ROCE_CM_MRA_REP, .service_timeout = 31},
+        .private_data = private_data, .private_length = sizeof(private_data),
+    };
+    check_fixture(&message, mra_fixture, 34, sizeof(private_data));
+
+    uint8_t mad[ROCE_CM_MAD_SIZE];
+    memcpy(mad, mra_fixture, sizeof(mad));
+    mad[32] |= 0x3f;
+    mad[33] |= 7;
+    struct roce_cm_message decoded;
+    assert(roce_cm_decode(&decoded, mad, sizeof(mad)));
+    assert(decoded.mra.message == ROCE_CM_MRA_REP && decoded.mra.service_timeout == 31);
+    mad[32] = 0xc0;
+    assert(!roce_cm_decode(&decoded, mad, sizeof(mad)));
+
+    message.mra.message = (enum roce_cm_mra_message)3;
+    assert(!roce_cm_encode(mad, sizeof(mad), &message));
+    message.mra.message = ROCE_CM_MRA_REQ;
+    message.mra.service_timeout = 32;
+    assert(!roce_cm_encode(mad, sizeof(mad), &message));
+    message.mra.service_timeout = 0;
+    ++message.private_length;
+    assert(!roce_cm_encode(mad, sizeof(mad), &message));
 }
 
 static void check_disconnect(void)
@@ -396,6 +436,7 @@ int main(void)
     check_req();
     check_rep_rtu();
     check_lengths();
+    check_mra();
     check_disconnect();
     check_invalid_fields();
     check_cm_frame();
