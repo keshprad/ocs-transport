@@ -67,8 +67,9 @@ bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
                          uint32_t psn, struct roce_region remote,
                          const uint8_t *source, unsigned int retry_limit,
                          uint32_t window, uint32_t writes);
-bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
-                         struct roce_packet *packet);
+/* Returns the zero-based WRITE index, or UINT32_MAX if no packet is sendable. */
+uint32_t roce_requester_stage(const struct roce_requester *r, uint32_t staged,
+                              struct roce_packet *packet);
 void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now);
 void roce_requester_feedback(struct roce_requester *r,
                              const struct roce_packet *packet, uint64_t now);

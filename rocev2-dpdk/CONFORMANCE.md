@@ -347,6 +347,24 @@ copy and scatter/gather with Netlink-backed MRs. It verified
 four-QP run, with 521 ordered completions per QP. The scalar and
 portable builds passed the same independent jumbo wire vectors.
 
+The RC requester now returns the WRITE index it used to build each
+packet. The scatter/gather worker uses that same index to hold the
+matching native SQ entry while the NIC owns a payload segment. The RC
+test verifies the returned index across WRITE boundaries and PSN wrap.
+The exact Spark-04 kernel guest verified 521 native completions per QP
+with one and four QPs. Injected WRITE and ACK loss recovered in one retry
+each. A short TX followed by a zero-accepted TX resumed at the first
+unsent PSN without an RC retry.
+
+Two TX mbuf batching experiments verified all bytes and returned
+slightly lower throughput in the Spark-04 memif comparison.
+The worker keeps the three-mbuf allocation per scatter/gather packet.
+With the shared WRITE index, nine alternating 128 MiB memif runs per
+build at PMTU 1024 gave 35.08 and 35.68 Gbit/s requester medians before
+and after the change. Both builds used PMULL and pinned their pollers
+to Cortex-X925 cores. Every run verified all bytes with zero RC retries.
+An isolated TX CPU test was effectively flat at PMTUs 1024 and 4096.
+
 Some DPDK 23.11.7 guest runs log `EAL: Error: Invalid memory` at
 memif port teardown. Backtraces located that diagnostic in
 `memif_free_regions()` during both port stop and EAL interrupt handling. The affected trials

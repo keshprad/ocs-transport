@@ -24,7 +24,7 @@ static struct roce_responder responder(uint8_t *destination, struct roce_region 
 static struct roce_packet transmit(struct roce_requester *tx, uint64_t now)
 {
     struct roce_packet packet;
-    assert(roce_requester_next(tx, 0, &packet));
+    assert(roce_requester_stage(tx, 0, &packet) != UINT32_MAX);
     roce_requester_sent(tx, 1, now);
     return packet;
 }
@@ -98,7 +98,7 @@ static void test_window_timeout_and_address_validation(void)
         assert(packet.ack_requested == (i == 31));
         assert(roce_responder_receive(&rx, &packet, &ack) == (i == 31));
     }
-    assert(!roce_requester_next(&tx, 0, &packet));
+    assert(roce_requester_stage(&tx, 0, &packet) == UINT32_MAX);
     struct roce_packet invalid = ack;
     invalid.qpn ^= 1;
     roce_requester_feedback(&tx, &invalid, 101);
@@ -188,7 +188,7 @@ static void test_fatal_nak_progress(void)
         assert(tx.failure == errors[i] && tx.acked == 3);
         assert(tx.acked / tx.packets_per_write == 1);
         struct roce_packet packet;
-        assert(!roce_requester_next(&tx, 0, &packet));
+        assert(roce_requester_stage(&tx, 0, &packet) == UINT32_MAX);
         feedback.psn = (start + tx.total - 1) & ROCE_PSN_MASK;
         feedback.syndrome = ROCE_ACK_NO_CREDIT;
         roce_requester_feedback(&tx, &feedback, 3);
@@ -203,13 +203,13 @@ static void test_short_tx_burst(void)
     struct roce_requester tx;
     assert(roce_requester_init(&tx, &send_qp, 5, region, source, 3, 64, 1));
     struct roce_packet packet;
-    assert(roce_requester_next(&tx, 31, &packet) && packet.ack_requested);
-    assert(roce_requester_next(&tx, 63, &packet) && packet.ack_requested);
-    assert(!roce_requester_next(&tx, 64, &packet));
+    assert(roce_requester_stage(&tx, 31, &packet) == 0 && packet.ack_requested);
+    assert(roce_requester_stage(&tx, 63, &packet) == 0 && packet.ack_requested);
+    assert(roce_requester_stage(&tx, 64, &packet) == UINT32_MAX);
     assert(tx.next == 0 && tx.sent == 0);
     roce_requester_sent(&tx, 16, 1);
     assert(tx.next == 16 && tx.sent == 16);
-    assert(roce_requester_next(&tx, 0, &packet));
+    assert(roce_requester_stage(&tx, 0, &packet) == 0);
     assert(packet.psn == 21 && packet.payload == source + 16 * 256);
     roce_requester_sent(&tx, 0, 2);
     assert(tx.next == 16 && tx.sent == 16 && tx.last_progress == 1);
@@ -231,7 +231,7 @@ static void test_pipelined_writes(void)
     struct roce_responder rx = responder(destination, region, start);
     struct roce_packet packets[2 * WRITES], feedback;
     for (unsigned int i = 0; i < 2 * WRITES; ++i) {
-        assert(roce_requester_next(&tx, i, &packets[i]));
+        assert(roce_requester_stage(&tx, i, &packets[i]) == i / 2);
         assert(packets[i].psn == ((start + i) & ROCE_PSN_MASK));
         assert(packets[i].opcode == (i % 2 ? ROCE_WRITE_LAST : ROCE_WRITE_FIRST));
         assert(packets[i].remote_address == region.address + (i / 2) * WRITE_SIZE);

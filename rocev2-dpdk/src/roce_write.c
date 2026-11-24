@@ -190,12 +190,14 @@ static bool send_requests(struct write_worker *worker,
     struct rte_mbuf *packets[MAX_TX_BURST];
     struct roce_packet packet;
     uint16_t count = 0;
-    while (count < limit && roce_requester_next(requester, count, &packet)) {
+    while (count < limit) {
+        uint32_t sequence = roce_requester_stage(requester, count, &packet);
+        if (sequence == UINT32_MAX)
+            break;
         /* A full queue window must still generate an ACK before another send. */
         if (run->options->queue_window && count + 1u == budget)
             packet.ack_requested = true;
         if (run->tx_refs && packet.payload_length) {
-            uint32_t sequence = (requester->next + count) / requester->packets_per_write;
             packets[count] = encode_gathered_packet(run->pool, write_tx_reference(worker, index, sequence), &packet);
         } else {
             packets[count] = encode_packet(run->pool, &packet);

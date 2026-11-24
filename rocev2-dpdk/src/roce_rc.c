@@ -49,15 +49,16 @@ bool roce_requester_init(struct roce_requester *r, const struct roce_qp *qp,
     return true;
 }
 
-bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
-                         struct roce_packet *packet)
+uint32_t roce_requester_stage(const struct roce_requester *r, uint32_t staged,
+                              struct roce_packet *packet)
 {
     if (r->failure || staged >= r->total - r->next)
-        return false;
+        return UINT32_MAX;
     uint32_t index = r->next + staged;
     if (index - r->acked >= r->window)
-        return false;
+        return UINT32_MAX;
 
+    uint32_t write = index / r->packets_per_write;
     uint32_t segment = index % r->packets_per_write;
     bool first = segment == 0;
     bool last = segment + 1 == r->packets_per_write;
@@ -68,7 +69,7 @@ bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
         opcode = last ? ROCE_WRITE_LAST : ROCE_WRITE_MIDDLE;
     *packet = outgoing(&r->qp, opcode, r->initial_psn + index);
     size_t segment_offset = (size_t)segment * r->qp.pmtu;
-    size_t write_offset = (size_t)(index / r->packets_per_write) * r->remote.size;
+    size_t write_offset = (size_t)write * r->remote.size;
     packet->payload = r->source + write_offset + segment_offset;
     packet->payload_length = last ? r->remote.size - segment_offset : r->qp.pmtu;
     packet->ack_requested = last || (index + 1) % ACK_INTERVAL == 0 ||
@@ -76,7 +77,7 @@ bool roce_requester_next(const struct roce_requester *r, uint32_t staged,
     packet->remote_address = r->remote.address + write_offset;
     packet->rkey = r->remote.rkey;
     packet->write_length = (uint32_t)r->remote.size;
-    return true;
+    return write;
 }
 
 void roce_requester_sent(struct roce_requester *r, uint32_t count, uint64_t now)
