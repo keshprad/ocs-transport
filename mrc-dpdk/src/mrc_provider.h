@@ -1,0 +1,298 @@
+#ifndef MRC_PROVIDER_H
+#define MRC_PROVIDER_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+struct mrc_provider_pd;
+struct mrc_provider_cq;
+struct mrc_provider_comp_channel;
+struct mrc_provider_qp;
+
+/*
+ * Create/destroy own an object's lifetime. Retain/release protect references
+ * held by a QP or other child object. Operations on live objects are thread
+ * safe. The owner must synchronize destroy with callers that lack a retained
+ * reference. Functions return zero or negative errno except CQ poll.
+ */
+
+int mrc_provider_pd_create(size_t region_capacity, struct mrc_provider_pd **pd);
+int mrc_provider_pd_retain(struct mrc_provider_pd *pd);
+int mrc_provider_pd_release(struct mrc_provider_pd *pd);
+int mrc_provider_pd_destroy(struct mrc_provider_pd *pd);
+
+enum mrc_provider_mr_flags {
+    MRC_PROVIDER_MR_LOCAL_WRITE = 1u << 0,
+    MRC_PROVIDER_MR_REMOTE_WRITE = 1u << 1,
+};
+
+struct mrc_provider_mr_keys {
+    uint32_t lkey;
+    uint32_t rkey;
+};
+
+/*
+ * The owner keeps host memory mapped and accessible until deregistration.
+ * Keys are process-local capability identifiers scoped to this PD. They do
+ * not provide cryptographic peer authentication. A zero rkey means the
+ * registration does not permit remote access.
+ */
+int mrc_provider_mr_register(struct mrc_provider_pd *pd, void *base, size_t length,
+                             uint64_t iova, unsigned int flags,
+                             struct mrc_provider_mr_keys *keys);
+/* Bind externally registered memory and preserve its keys. The owner keeps
+ * that registration live until deregister succeeds here. A nonzero rkey
+ * requires remote-write permission and must be unique in the software PD. */
+int mrc_provider_mr_bind(struct mrc_provider_pd *pd, void *base, size_t length,
+                         uint64_t iova, unsigned int flags,
+                         const struct mrc_provider_mr_keys *keys);
+int mrc_provider_mr_deregister(struct mrc_provider_pd *pd, uint32_t lkey);
+
+enum mrc_provider_mr_operation {
+    MRC_PROVIDER_MR_READ_LOCAL,
+    MRC_PROVIDER_MR_WRITE_LOCAL,
+    MRC_PROVIDER_MR_WRITE_REMOTE,
+};
+
+struct mrc_provider_mr_access {
+    uint64_t iova;
+    size_t length;
+    size_t alignment; /* Zero disables the optional power-of-two alignment check. */
+    uint32_t key;
+    enum mrc_provider_mr_operation operation;
+};
+
+/*
+ * Initialize a lease to zero before acquisition. A successful lease pins its
+ * registration and may not be copied. The address is valid until release.
+ */
+struct mrc_provider_mr_lease {
+    void *address;
+    size_t length;
+    uint64_t region_iova; /* Bounds of the pinned registration, in IOVA space. */
+    size_t region_length;
+    struct mrc_provider_pd *owner;
+    uint32_t lkey;
+};
+
+int mrc_provider_mr_acquire(struct mrc_provider_pd *pd,
+                            const struct mrc_provider_mr_access *access,
+                            struct mrc_provider_mr_lease *lease);
+int mrc_provider_mr_release(struct mrc_provider_mr_lease *lease);
+
+enum mrc_provider_wc_opcode {
+    MRC_PROVIDER_WC_WRITE,
+    MRC_PROVIDER_WC_RECV_WRITE_IMM,
+};
+
+enum mrc_provider_wc_status {
+    MRC_PROVIDER_WC_SUCCESS,
+    MRC_PROVIDER_WC_LOCAL_LENGTH,
+    MRC_PROVIDER_WC_LOCAL_PROTECTION,
+    MRC_PROVIDER_WC_LOCAL_OPERATION,
+    MRC_PROVIDER_WC_BAD_RESPONSE,
+    MRC_PROVIDER_WC_REMOTE_INVALID_REQUEST,
+    MRC_PROVIDER_WC_REMOTE_ACCESS,
+    MRC_PROVIDER_WC_REMOTE_OPERATION,
+    MRC_PROVIDER_WC_RETRY_EXCEEDED,
+    MRC_PROVIDER_WC_FLUSHED,
+};
+
+struct mrc_provider_wc {
+    uint64_t wr_id;
+    uint32_t qpn;
+    uint32_t byte_length;
+    uint32_t immediate; /* Host byte order. */
+    enum mrc_provider_wc_opcode opcode;
+    enum mrc_provider_wc_status status;
+    bool with_immediate;
+};
+
+enum mrc_provider_cq_event {
+    MRC_PROVIDER_CQ_COMPLETION,
+    MRC_PROVIDER_CQ_OVERFLOW,
+};
+
+/* The channel FD is borrowed for poll/select. Retrieve notifications with
+ * next rather than reading the FD directly. Next returns -EAGAIN when empty. */
+int mrc_provider_comp_channel_create(struct mrc_provider_comp_channel **channel);
+int mrc_provider_comp_channel_fd(const struct mrc_provider_comp_channel *channel);
+int mrc_provider_comp_channel_next(struct mrc_provider_comp_channel *channel,
+                                   struct mrc_provider_cq **cq, void **context);
+int mrc_provider_comp_channel_destroy(struct mrc_provider_comp_channel *channel);
+
+int mrc_provider_cq_create_on_channel(size_t capacity, struct mrc_provider_comp_channel *channel,
+                                      void *context, struct mrc_provider_cq **cq);
+int mrc_provider_cq_create(size_t capacity, struct mrc_provider_cq **cq);
+/* Install before sharing the CQ. The callback runs with the CQ locked and
+ * must not call back into provider queues. */
+void mrc_provider_cq_on_overrun(struct mrc_provider_cq *cq, void (*notify)(void *), void *context);
+bool mrc_provider_cq_failed(struct mrc_provider_cq *cq);
+int mrc_provider_cq_retain(struct mrc_provider_cq *cq);
+int mrc_provider_cq_release(struct mrc_provider_cq *cq);
+int mrc_provider_cq_destroy(struct mrc_provider_cq *cq);
+/* Discard unread completions and notifications, then wait for already read
+ * events to be acknowledged. Both destroy variants reject retained CQs. */
+int mrc_provider_cq_destroy_wait(struct mrc_provider_cq *cq);
+
+/*
+ * Push and poll use a bounded FIFO. An overrun invalidates pending entries
+ * and permanently makes both operations return -EOVERFLOW.
+ * Poll returns the number copied on success.
+ */
+int mrc_provider_cq_push(struct mrc_provider_cq *cq, const struct mrc_provider_wc *wc,
+                         bool solicited);
+int mrc_provider_cq_poll(struct mrc_provider_cq *cq, struct mrc_provider_wc *entries,
+                         size_t count);
+
+/*
+ * Arm one notification for a future completion. In solicited mode, successful
+ * completions only qualify when solicited is set. Errors always qualify.
+ * An overflow event is available even when notifications were not armed.
+ * Read completion events on the attached channel, or with next_event for
+ * a CQ without a channel. Overflow is available through next_event.
+ * Each event returned by either call must be acknowledged exactly once.
+ */
+int mrc_provider_cq_arm(struct mrc_provider_cq *cq, bool solicited_only);
+/* Signal an armed CQ whose entries are managed by its caller. */
+int mrc_provider_cq_signal(struct mrc_provider_cq *cq, bool solicited);
+int mrc_provider_cq_next_event(struct mrc_provider_cq *cq, enum mrc_provider_cq_event *event);
+int mrc_provider_cq_ack_events(struct mrc_provider_cq *cq, size_t count);
+
+enum mrc_provider_qp_state {
+    MRC_PROVIDER_QP_RESET,
+    MRC_PROVIDER_QP_INIT,
+    MRC_PROVIDER_QP_RTR,
+    MRC_PROVIDER_QP_RTS,
+    MRC_PROVIDER_QP_ERROR,
+};
+
+enum mrc_provider_qp_error {
+    MRC_PROVIDER_QP_FATAL_ERROR,
+    MRC_PROVIDER_QP_REQUEST_ERROR,
+    MRC_PROVIDER_QP_ACCESS_ERROR,
+};
+
+struct mrc_provider_qp_config {
+    struct mrc_provider_pd *pd;
+    struct mrc_provider_cq *send_cq;
+    struct mrc_provider_cq *recv_cq;
+    size_t send_capacity;
+    size_t recv_capacity;
+    uint32_t qpn;
+    bool sq_sig_all;
+    /* Called with the QP locked on provider-initiated ERROR.
+     * The callback must not call provider queue functions. */
+    void (*on_error)(void *context, enum mrc_provider_qp_error error);
+    void *error_context;
+};
+
+struct mrc_provider_qp_attr {
+    enum mrc_provider_qp_state state;
+    uint32_t qpn;
+    size_t send_pending;
+    uint64_t send_first_sequence;
+    size_t recv_pending;
+};
+
+/* The data plane owns wire state. The provider tracks posted work, pins
+ * registered send buffers, and retains CQ/PD handles until QP destruction. */
+int mrc_provider_qp_create(const struct mrc_provider_qp_config *config,
+                           struct mrc_provider_qp **qp);
+int mrc_provider_qp_query(struct mrc_provider_qp *qp, struct mrc_provider_qp_attr *attr);
+int mrc_provider_qp_check_cqs(struct mrc_provider_qp *qp);
+int mrc_provider_qp_transition(struct mrc_provider_qp *qp, enum mrc_provider_qp_state expected,
+                               enum mrc_provider_qp_state next);
+int mrc_provider_qp_destroy(struct mrc_provider_qp *qp);
+/* Begin an application-requested reset/destroy: enter ERROR and reject new
+ * work while retaining queued WRs and their MR leases until reset discards them.
+ * Unlike a fault/explicit ERROR transition, cancellation produces no CQEs. */
+int mrc_provider_qp_cancel(struct mrc_provider_qp *qp);
+/* Enter RESET, discarding outstanding WRs without producing completions.
+ * Already published CQEs and the monotonic send sequence are preserved. */
+int mrc_provider_qp_reset(struct mrc_provider_qp *qp);
+
+/* Send sequences start at one and are never reused during a QP's lifetime.
+ * wr_id belongs to the application and may be reused or zero. */
+int mrc_provider_qp_post_send(struct mrc_provider_qp *qp, uint64_t wr_id, uint32_t length,
+                              bool signaled, uint64_t *sequence);
+int mrc_provider_qp_post_recv(struct mrc_provider_qp *qp, uint64_t wr_id);
+
+struct mrc_provider_write {
+    uint64_t wr_id;
+    uint64_t local_iova;
+    const void *local_buffer; /* For a QP without a PD. */
+    uint64_t remote_address;
+    uint32_t length;
+    uint32_t lkey;
+    uint32_t rkey;
+    uint32_t immediate; /* Host byte order. */
+    bool with_immediate;
+    bool solicited;
+    bool signaled;
+};
+
+struct mrc_provider_sge {
+    uint64_t iova;
+    uint32_t length;
+    uint32_t lkey;
+};
+
+struct mrc_provider_inline_sge {
+    const void *data;
+    uint32_t length;
+};
+
+struct mrc_provider_write_segments;
+
+struct mrc_provider_write_view {
+    const uint8_t *data; /* Contiguous source, when available. */
+    const struct mrc_provider_write_segments *segments;
+    uint64_t remote_address;
+    uint32_t length;
+    uint32_t rkey;
+    uint32_t immediate;
+    bool with_immediate;
+    bool solicited;
+};
+
+/* A registered post acquires one MR lease until completion or flush. For a
+ * QP without a PD, the caller keeps the buffer valid over the same interval. */
+int mrc_provider_qp_post_write(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                               uint64_t *sequence);
+/* For a registered QP, use the SGE list in order and leave the local source
+ * fields of write zero. Its length must equal the sum of the SGE lengths.
+ * The QP pins the registrations and copies the SGE metadata during posting. */
+int mrc_provider_qp_post_writev(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                                const struct mrc_provider_sge *sges, size_t count, uint64_t *sequence);
+/* Copy the spans into the SQ before returning. No local registration is
+ * needed. Leave the local source fields of write zero and set its length
+ * to the sum of the span lengths. */
+int mrc_provider_qp_post_write_inline(struct mrc_provider_qp *qp, const struct mrc_provider_write *write,
+                                      const struct mrc_provider_inline_sge *sges, size_t count, uint64_t *sequence);
+/* A wire worker serializes use of this borrowed view with retiring the post,
+ * putting the QP into ERROR, and destroying the QP. */
+int mrc_provider_qp_get_write(struct mrc_provider_qp *qp, uint64_t sequence,
+                              struct mrc_provider_write_view *write);
+/* Borrow a contiguous subrange directly. For a subrange spanning multiple
+ * registrations, copy it into scratch, which must hold at least length bytes.
+ * Returns NULL for an empty or invalid subrange, or if scratch is needed
+ * but absent. Use the view only while the post is still outstanding. */
+const uint8_t *mrc_provider_write_slice(const struct mrc_provider_write_view *write,
+                                         uint32_t offset, uint32_t length, uint8_t *scratch);
+
+/* Retire sends through an inclusive sequence after semantic ACK. Receive
+ * completion consumes one posted WRITEIMM credit. */
+int mrc_provider_qp_complete_send(struct mrc_provider_qp *qp, uint64_t sequence);
+int mrc_provider_qp_complete_recv(struct mrc_provider_qp *qp, uint32_t length,
+                                  uint32_t immediate, bool solicited, uint64_t *wr_id);
+
+/* Enter ERROR and publish the selected send error plus flush completions in
+ * queue order. Sequence zero with status FLUSHED flushes both queues. */
+int mrc_provider_qp_fail(struct mrc_provider_qp *qp, uint64_t sequence,
+                         enum mrc_provider_wc_status status);
+/* A terminal receive error flushes work and reports why the QP entered ERROR. */
+int mrc_provider_qp_fail_recv(struct mrc_provider_qp *qp, enum mrc_provider_qp_error error);
+
+#endif

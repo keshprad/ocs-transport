@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Exercise the public OCP MRC API across two DPDK memif rails."""
+
+import argparse
+import json
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+from memif_pair import eal_args, require, run_pair
+
+
+def control(controller, operation, store):
+    result = subprocess.run(["unshare", "-Ur", str(controller), operation, store],
+                            capture_output=True, text=True, timeout=4)
+    require(result.returncode == 0,
+            f"Controller {operation} failed: {result.stdout}\n{result.stderr}")
+    return result.stdout.strip()
+
+
+def unblock_profile(controller, operation, store, sender):
+    ready = Path(store) / "rx.profile-blocked"
+    deadline = time.monotonic() + 4
+    while not ready.exists():
+        if sender.poll() is not None:
+            stdout, stderr = sender.communicate()
+            raise RuntimeError(f"Sender exited before both EVs were blocked: {stdout}\n{stderr}")
+        require(time.monotonic() < deadline,
+                "Timed out checking that denied EVs blocked completion and remote placement")
+        time.sleep(0.01)
+    control(controller, operation, store)
+
+
+def check_live_profile(binary, controller):
+    with tempfile.TemporaryDirectory(prefix="mrc-abi-ev-") as store:
+        profile_id = control(controller, "--seed-denied", store)
+        require(profile_id.isdecimal() and int(profile_id) > 0,
+                f"Invalid controller test profile ID: {profile_id!r}")
+
+        def command(role, cpu, directory):
+            return eal_args(binary, role, cpu, directory) + [
+                "--", role, str(directory), "ev_profile", store, profile_id,
+            ]
+
+        def unblock(sender):
+            unblock_profile(controller, "--unblock", store, sender)
+
+        tx, rx, _ = run_pair(command, sender_started=unblock)
+        require(tx["role"] == "tx" and rx["role"] == "rx" and tx["qpn"] != rx["qpn"]
+                and tx["bytes"] == rx["bytes"] == 1038
+                and tx["completions"] == rx["completions"] == 2,
+                f"Controller did not unblock the public QP: {tx}, {rx}")
+        print(json.dumps({"case": "public_qp_live_ev_update", "tx": tx, "rx": rx}))
+
+
+def check_endpoint_operations(binary, format_name):
+    rail_count = 8 if format_name == "counted" else 2
+    packets = 2 if format_name == "counted" else 7
+
+    def command(role, cpu, directory):
+        args = eal_args(binary, role, cpu, directory, rail_count=rail_count) + [
+            "--", role, str(directory), "endpoint_ops", format_name,
+        ]
+        if role == "tx":
+            # EAL treats the namespaced user as root and otherwise uses /var/run.
+            args = ["unshare", "-Ur", "env", f"RUNTIME_DIRECTORY={directory}", *args]
+        return args
+
+    tx, rx, _ = run_pair(command, rail_count=rail_count)
+    require(tx["role"] == "tx" and rx["role"] == "rx"
+            and tx["format"] == rx["format"] == format_name
+            and tx["endpoint_packets"] == rx["endpoint_packets"] == packets,
+            f"Unexpected connectionless endpoint operation batch: {tx}, {rx}")
+    print(json.dumps({"case": f"public_endpoint_ops_{format_name}", "tx": tx, "rx": rx}))
+
+
+def check_duplex(tx, rx, completions=3):
+    require(len(set(tx["qpns"] + rx["qpns"])) == 4,
+            f"The connected QPs need distinct QPNs: {tx}, {rx}")
+    for result in (tx, rx):
+        require(result["bytes"] == completions * 2049 and result["send_completions"] == completions
+                and result["recv_completions"] == completions and result["reset_qpn"] == result["qpns"][0],
+                f"Unexpected public bidirectional QP results: {result}")
+
+
+def check_shared_port_status(binary):
+    def command(role, cpu, directory):
+        args = eal_args(binary, role, cpu, directory) + [
+            "--", role, str(directory), "pkey_port_status",
+        ]
+        if role == "rx":
+            args = ["unshare", "-Ur", "env", f"RUNTIME_DIRECTORY={directory}", *args]
+        return args
+
+    tx, rx, _ = run_pair(command)
+    check_duplex(tx, rx)
+    require(tx["port_status_replies"] == rx["port_status_replies"] == 2,
+            f"Expected one reply to each shared Port Status report: {tx}, {rx}")
+    print(json.dumps({"case": "public_qp_shared_port_status", "tx": tx, "rx": rx}))
+
+
+def check_srv6(tx, rx, rx_decapped, rx_advanced):
+    require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+            and tx["completions"] == rx["completions"] == 2
+            and tx["srv6_probe_rails"] == rx["srv6_probe_rails"] == 2
+            and tx["srv6_decapped_rails"] == 1 and rx["srv6_decapped_rails"] == rx_decapped
+            and tx["srv6_advanced_rails"] == 0 and rx["srv6_advanced_rails"] == rx_advanced
+            and tx["srv6_wrong_sid_probes"] == 0 and rx["srv6_wrong_sid_probes"] == 1,
+            f"Unexpected public SRv6 QP results: {tx}, {rx}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--binary", type=Path,
+        default=Path(__file__).resolve().parent / "mrc_abi_application",
+    )
+    parser.add_argument("--controller", type=Path,
+                        help="Path to test_mrc_ctl_abi for privileged controller and endpoint cases")
+    focused = parser.add_mutually_exclusive_group()
+    focused.add_argument("--blackout-only", action="store_true", help="Run only the two-rail blackout cases")
+    focused.add_argument("--last-hop-trim-only", action="store_true", help="Run only the last-hop trim case")
+    focused.add_argument("--service-level-dscp-only", action="store_true", help="Run only the service-level DSCP case")
+    focused.add_argument("--dynamic-mpr-only", action="store_true", help="Run only the live MPR negotiation cases")
+    focused.add_argument("--pkey-port-status-only", action="store_true",
+                         help="Run only the shared connected P_Key Port Status case")
+    focused.add_argument("--pmtu-only", action="store_true", help="Run only the path MTU cases")
+    focused.add_argument("--counted-rails-only", action="store_true", help="Run only the eight-rail QP cases")
+    focused.add_argument("--mapped-evs-only", action="store_true", help="Run only the EV-to-rail mapping cases")
+    focused.add_argument("--boundaries-only", action="store_true",
+                         help="Run public WRITEIMM packet and MR boundary cases")
+    focused.add_argument("--capacity-only", action="store_true", help="Run 1024 outstanding WRITEIMM credit saturation")
+    focused.add_argument("--teardown-only", action="store_true", help="Run pending reset/destroy/ERROR cases")
+    focused.add_argument("--cc-capacity-only", action="store_true", help="Run simultaneous 32-profile traffic")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
+    require(binary.is_file(), f"Build tests/mrc_abi_application first: {binary}")
+
+    def run_case(mode, *options, sender_started=None):
+        def command(role, cpu, directory):
+            return eal_args(binary, role, cpu, directory) + ["--", role, str(directory), mode, *options]
+
+        tx, rx, _ = run_pair(command, sender_started=sender_started)
+        require(tx["role"] == "tx" and rx["role"] == "rx",
+                f"Unexpected endpoint roles: {tx}, {rx}")
+        return tx, rx
+
+    def check_boundaries():
+        for pmtu in (256, 512, 1024):
+            tx, rx = run_case(f"boundaries_{pmtu}")
+            require(tx["qpn"] != rx["qpn"] and tx["pmtu"] == rx["pmtu"] == pmtu
+                    and tx["completions"] == rx["completions"] == 10
+                    and tx["bytes"] == rx["bytes"] == 7 * pmtu + 11,
+                    f"Unexpected public boundary completions: {tx}, {rx}")
+            print(json.dumps({"case": "public_packet_boundaries", "tx": tx, "rx": rx}))
+
+    def check_wimm_capacity():
+        tx, rx = run_case("wimm_capacity")
+        require(tx["completions"] == rx["completions"] == 1025 and
+                tx["bytes"] == rx["bytes"] == 1025 and
+                rx["outstanding_before_ack"] == 1024 and rx["held_acks"] > 0,
+                f"Unexpected WRITEIMM saturation result: {tx}, {rx}")
+        print(json.dumps({"case": "public_1024_outstanding_writeimms", "tx": tx, "rx": rx}))
+
+    def check_pending_teardown():
+        for mode in ("reset_pending", "destroy_pending", "error_pending", "error_pending_overflow"):
+            tx, rx = run_case(mode)
+            require(tx["pending_cancelled"] and rx["pending_cancelled"] and
+                    tx["operation"] == rx["operation"] == mode,
+                    f"Unexpected pending teardown result: {tx}, {rx}")
+            print(json.dumps({"case": f"public_{mode}", "tx": tx, "rx": rx}))
+
+    def check_cc_capacity(controller):
+        with tempfile.TemporaryDirectory(prefix="mrc-cc-capacity-") as store:
+            first = control(controller, "--seed-capacity-cc", store)
+            def verify_leases(sender):
+                deadline = time.monotonic() + 4
+                while not (Path(store) / "capacity-live").exists():
+                    require(sender.poll() is None, "Requester exited before all 32 profiles were live")
+                    require(time.monotonic() < deadline, "Timed out waiting for 32-profile flight")
+                    time.sleep(0.01)
+                require(control(controller, "--check-capacity-cc-leases", store) == "32",
+                        "Controller did not verify all live profile leases")
+            tx, rx = run_case("cc_capacity", store, first, sender_started=verify_leases)
+            require(tx["profiles"] == rx["profiles"] == 32 and
+                    tx["completions"] == rx["completions"] == 32 and
+                    tx["bytes"] == rx["bytes"] == 32 * 2049,
+                    f"Unexpected CC profile capacity result: {tx}, {rx}")
+            print(json.dumps({"case": "public_32_cc_profiles_under_traffic", "tx": tx, "rx": rx}))
+
+    def check_blackouts():
+        for mode, completion, recovered in (
+            ("blackout_finite", "retry-exceeded", False),
+            ("blackout_infinite", "success", True),
+        ):
+            tx, rx = run_case(mode)
+            require(tx["qpn"] != rx["qpn"] and tx["completion"] == completion
+                    and rx["blocked_writes"] == [1, 1] and rx["failed_probe_rails"] == 3
+                    and rx["recovered"] == recovered,
+                    f"Unexpected requester or rail behavior during {mode}: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+    def check_last_hop_trim(service_level_dscp=False):
+        mode = "service_level_dscp" if service_level_dscp else "last_hop_trim"
+        tx, rx = run_case(mode)
+        require(tx["qpn"] != rx["qpn"] and tx["completions"] == rx["completions"] == 1
+                and tx["nack_reason"] == 2 and tx["original_udp_len"] == 64
+                and tx["nack_rail"] == rx["marked_rail"] and rx["marked_rail"] != rx["retry_rail"],
+                f"Unexpected last-hop trim recovery: {tx}, {rx}")
+        if service_level_dscp:
+            require(tx["control_dscp"] == 48 and rx["data_dscp"] == 26
+                    and rx["retry_dscp"] == 34 and rx["probe_rails"] == 3,
+                    f"Unexpected service-level traffic classes: {tx}, {rx}")
+        print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+    def check_mpr_updates():
+        for mode, queried, advertised in (
+            ("dynamic_mpr", [3, 1, 3], [3, 1, 3]),
+            ("dynamic_mpr_rts", [255, 1, 255], [255, 1, 255]),
+            ("static_mpr", [3, 3, 3], [0, 0, 0]),
+        ):
+            tx, rx = run_case(mode)
+            require(tx["qpn"] != rx["qpn"] and tx["completions"] == rx["completions"] == 3
+                    and tx["queried_mpr"] == rx["queried_mpr"] == queried
+                    and tx["advertised_mpr"] == advertised,
+                    f"Unexpected wire or application MPR during {mode}: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+    def check_pmtu():
+        for pmtu, fragments in ((256, 5), (512, 3)):
+            tx, rx = run_case(f"pmtu_{pmtu}")
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+                    and tx["completions"] == rx["completions"] == 2
+                    and tx["pmtu"] == rx["pmtu"] == pmtu and rx["writeimm_fragments"] == fragments,
+                    f"Unexpected WRITEIMM wire geometry or completion at PMTU {pmtu}: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_pmtu_{pmtu}", "tx": tx, "rx": rx}))
+
+    def check_counted_route():
+        for mode, rails, case, count in (("counted_route", 0xFF, "eight_rails", 8),
+                                  ("rail_backpressure", 0x60, "rail_backpressure", 8),
+                                  ("maximum_rails", 0xFFFFFFFF, "maximum_rails", 32)):
+            def command(role, cpu, directory):
+                return eal_args(binary, role, cpu, directory, rail_count=count) + [
+                    "--", role, str(directory), mode,
+                ]
+
+            tx, rx, _ = run_pair(command, rail_count=count)
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == count * 1024 + 1 and rx["observed_rails"] == rails,
+                    f"Unexpected counted-rail QP result: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{case}", "tx": tx, "rx": rx}))
+
+    def check_mapped_evs(controller):
+        for mode, endpoint in (("exp", "mapped_ev_udp"), ("gen", "mapped_ev_udp"),
+                               ("auto", "mapped_ev_auto"), ("srv6", "mapped_ev_srv6")):
+            with tempfile.TemporaryDirectory(prefix="mrc-abi-mapped-") as store:
+                profile_id = control(controller, f"--seed-mapped-{mode}", store)
+                require(profile_id.isdecimal() and int(profile_id) > 0,
+                        f"Invalid mapped EV profile ID: {profile_id!r}")
+                tx, rx = run_case(endpoint, store, profile_id)
+            if mode == "srv6":
+                check_srv6(tx, rx, rx_decapped=0, rx_advanced=2)
+                require(tx["probe_evs"] == rx["write_evs"] == rx["probe_evs"] == 0xB,
+                        f"Unexpected mapped SRv6 EVs: {tx}, {rx}")
+            else:
+                require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 8193
+                        and rx["observed_rails"] == 3 and rx["write_evs"] == rx["probe_evs"] == 0xB,
+                        f"Unexpected mapped {mode} EVs: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_mapped_{mode}_evs", "tx": tx, "rx": rx}))
+
+    if args.mapped_evs_only:
+        require(args.controller and args.controller.is_file(), "Supply the built --controller fixture")
+        check_mapped_evs(args.controller.resolve())
+        return
+
+    if args.last_hop_trim_only or args.service_level_dscp_only:
+        check_last_hop_trim(service_level_dscp=args.service_level_dscp_only)
+        return
+
+    if args.cc_capacity_only:
+        require(args.controller is not None, "CC capacity test needs --controller")
+        check_cc_capacity(args.controller.resolve())
+        return
+    if args.teardown_only:
+        check_pending_teardown()
+        return
+    if args.capacity_only:
+        check_wimm_capacity()
+        return
+    if args.boundaries_only:
+        check_boundaries()
+        return
+
+    if args.blackout_only:
+        check_blackouts()
+        return
+
+    if args.dynamic_mpr_only:
+        check_mpr_updates()
+        return
+
+    if args.pkey_port_status_only:
+        check_shared_port_status(binary)
+        return
+
+    if args.pmtu_only:
+        check_pmtu()
+        return
+
+    if args.counted_rails_only:
+        check_counted_route()
+        return
+
+    check_boundaries()
+    check_wimm_capacity()
+    check_pending_teardown()
+    tx, rx = run_case("simplex")
+    require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+            and tx["completions"] == rx["completions"] == 2,
+            f"Unexpected public unidirectional QP results: {tx}, {rx}")
+    print(json.dumps({"case": "public_qp_over_dpdk", "tx": tx, "rx": rx}))
+    check_pmtu()
+    check_counted_route()
+
+    tx, rx = run_case("inline")
+    require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+            and tx["completions"] == rx["completions"] == 2
+            and rx["inline_fragment_retransmitted"],
+            f"Unexpected public inline WRITE results: {tx}, {rx}")
+    print(json.dumps({"case": "public_inline_write_retransmission", "tx": tx, "rx": rx}))
+
+    for mode in ("srv6", "srv6_transit"):
+        tx, rx = run_case(mode)
+        check_srv6(tx, rx, rx_decapped=2 if mode == "srv6" else 0,
+                   rx_advanced=int(mode == "srv6_transit"))
+        print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+    tx, rx = run_case("duplex")
+    check_duplex(tx, rx)
+    print(json.dumps({"case": "public_bidirectional_qps_over_shared_dpdk_ports", "tx": tx, "rx": rx}))
+
+    tx, rx = run_case("rx_flow_control")
+    check_duplex(tx, rx, completions=8)
+    for result, unsupported_index in ((tx, 0), (rx, 1)):
+        require(result["service_time_dest_unsupported_qpn"] == result["qpns"][unsupported_index]
+                and result["service_time_data_qps"] == result["service_time_probe_qps"] == 2,
+                f"Missing directional service-time reports: {result}")
+    print(json.dumps({"case": "public_qp_receiver_flow_control", "tx": tx, "rx": rx}))
+
+    tx, rx = run_case("wire_error")
+    require(tx["qpn"] != rx["qpn"] and tx["qp_fatal"] and rx["qp_fatal"]
+            and not tx["cq_error"] and rx["cq_error"],
+            f"Unexpected public async events after receiver CQ overflow: {tx}, {rx}")
+    print(json.dumps({"case": "public_async_events_on_unexpected_wire_error", "tx": tx, "rx": rx}))
+
+    for mode, event, completion in (
+        ("wire_request_error", "QP_REQ_ERR", "REM_INV_REQ_ERR"),
+        ("wire_access_error", "QP_ACCESS_ERR", "REM_ACCESS_ERR"),
+    ):
+        tx, rx = run_case(mode)
+        require(tx["qpn"] != rx["qpn"] and tx["qp_event"] == "QP_FATAL"
+                and tx["completion"] == completion and tx["completions"] == 1
+                and rx["qp_event"] == event and rx["completion"] == "WR_FLUSH_ERR"
+                and rx["completions"] == 2,
+                f"Unexpected public async events or completions after {mode}: {tx}, {rx}")
+        print(json.dumps({"case": f"public_async_events_on_{mode}", "tx": tx, "rx": rx}))
+
+    check_blackouts()
+    check_last_hop_trim()
+    check_last_hop_trim(service_level_dscp=True)
+    check_mpr_updates()
+
+    if args.controller:
+        controller = args.controller.resolve()
+        require(controller.is_file(), f"Build tests/test_mrc_ctl_abi first: {controller}")
+        check_cc_capacity(controller)
+        for format_name in ("udp", "stev", "srv6", "shared", "counted"):
+            check_endpoint_operations(binary, format_name)
+        check_shared_port_status(binary)
+        check_live_profile(binary, controller)
+        check_mapped_evs(controller)
+        for mode, seed, expected in (
+            ("generated_ev_udp", "--seed-gen", [0xC405, 0xC410]),
+            ("generated_ev_stev", "--seed-gen-stev", [0x0A00E499, 0x0A20E499]),
+            ("generated_ev_custom_stev", "--seed-gen-custom-stev", [0x1AB28CC1, 0x1AB28CC2]),
+        ):
+            with tempfile.TemporaryDirectory(prefix="mrc-abi-gen-") as store:
+                profile_id = control(controller, seed, store)
+                require(profile_id.isdecimal() and int(profile_id) > 0,
+                        f"Invalid generated EV profile ID: {profile_id!r}")
+                tx, rx = run_case(mode, store, profile_id)
+            require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 1038
+                    and tx["completions"] == rx["completions"] == 2
+                    and tx["rail_entropy"] == rx["rail_entropy"] == expected,
+                    f"Unexpected generated EVs on the two rails: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+        for mode, seed in (
+            ("explicit_ev_srv6", "--seed-explicit-srv6"),
+            ("generated_ev_srv6_srh", "--seed-generated-srv6-srh"),
+        ):
+            with tempfile.TemporaryDirectory(prefix="mrc-abi-srv6-") as store:
+                profile_id = control(controller, seed, store)
+                require(profile_id.isdecimal() and int(profile_id) > 0,
+                        f"Invalid SRv6 EV profile ID: {profile_id!r}")
+
+                def unblock(sender):
+                    unblock_profile(controller, "--unblock-explicit-srv6", store, sender)
+
+                tx, rx = run_case(mode, store, profile_id,
+                                  sender_started=unblock if mode == "explicit_ev_srv6" else None)
+            check_srv6(tx, rx, rx_decapped=0, rx_advanced=2)
+            require(tx["rail_entropy"] == rx["rail_entropy"] == [0x0100C000, 0x0101C001],
+                    f"Unexpected reflected tokens for SRv6 profile: {tx}, {rx}")
+            print(json.dumps({"case": f"public_qp_{mode}", "tx": tx, "rx": rx}))
+
+        with tempfile.TemporaryDirectory(prefix="mrc-abi-cc-") as store:
+            profile_id = control(controller, "--seed-cc", store)
+            require(profile_id.isdecimal() and int(profile_id) > 0,
+                    f"Invalid controller test CC profile ID: {profile_id!r}")
+            tx, rx = run_case("cc_profile", store, profile_id)
+        check_duplex(tx, rx)
+        print(json.dumps({"case": "public_qp_nscc_window", "tx": tx, "rx": rx}))
+
+        with tempfile.TemporaryDirectory(prefix="mrc-abi-qa-") as store:
+            profile_id = control(controller, "--seed-qa", store)
+            require(profile_id.isdecimal() and int(profile_id) > 0,
+                    f"Invalid controller test QA profile ID: {profile_id!r}")
+            tx, rx = run_case("qa_profile", store, profile_id)
+        require(tx["qpn"] != rx["qpn"] and tx["bytes"] == rx["bytes"] == 4450
+                and tx["completions"] == rx["completions"] == 4
+                and tx["baseline_burst"] == 3 and tx["capped_burst"] == 1
+                and tx["delayed_sack_us"] >= 10000,
+                f"Unexpected public Quick Adapt results: {tx}, {rx}")
+        print(json.dumps({"case": "public_qp_nscc_quick_adapt", "tx": tx, "rx": rx}))
+
+
+if __name__ == "__main__":
+    main()

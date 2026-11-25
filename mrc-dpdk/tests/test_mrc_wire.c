@@ -1,0 +1,1048 @@
+#include "../src/mrc_wire.h"
+
+#include <assert.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+/*
+ * Independent known answers assembled with Python struct.pack and zlib.crc32,
+ * using OCP MRC 1.0 Tables 6-2 through 6-9 and 7-9 through 7-23.
+ * The iCRC input prepends eight 0xff bytes and masks IPv4 ToS, TTL, checksum,
+ * UDP checksum, and the BTH variant reserved byte per IBTA RoCEv2.
+ */
+static const uint8_t write_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x50, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x20, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0,
+    0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67,
+    0x80, 0x01, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x78, 0x9a,
+    0xbc, 0xde, 0x00, 0x00, 0x00, 0x05, 0xf0, 0x0d, 0xca, 0xfe, 0x4d, 0x52,
+    0x43, 0x21, 0x01, 0x00, 0x00, 0x00, 0x09, 0x78, 0x68, 0x3d,
+};
+
+static const uint8_t ack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x30, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x40, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x1c, 0x00, 0x00, 0xd1, 0x00, 0xab, 0xcd, 0x00, 0xc0,
+    0xff, 0xee, 0x00, 0x00, 0xff, 0x01, 0x1f, 0x01, 0xa2, 0xb3, 0xc7, 0x3f,
+    0x36, 0x36,
+};
+
+static const uint8_t sack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x50, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x20, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xdc, 0x00, 0xab, 0xcd, 0x00, 0xc0,
+    0xff, 0xee, 0x20, 0xff, 0xff, 0xfe, 0x00, 0x42, 0xff, 0x85, 0x12, 0x34,
+    0xc0, 0xff, 0x1a, 0x1b, 0x2a, 0x2b, 0x00, 0xff, 0xff, 0xfe, 0x00, 0xff,
+    0x00, 0x40, 0x80, 0x01, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x03, 0xfe, 0xdc,
+    0x5a, 0xa5, 0xd5, 0x09, 0x87, 0x65, 0x05, 0xee, 0x46, 0x5d,
+};
+
+static const uint8_t nack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x40, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x30, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x04, 0x2c, 0x00, 0x00, 0xdd, 0x00, 0xab, 0xcd, 0x00, 0xc0,
+    0xff, 0xee, 0x20, 0x00, 0x12, 0x34, 0x00, 0x00, 0x02, 0xe3, 0x00, 0x00,
+    0xc1, 0x23, 0x1a, 0x1b, 0x2a, 0x2b, 0x00, 0x00, 0x12, 0x34, 0x20, 0x00,
+    0x31, 0xa2, 0x51, 0xfd, 0x37, 0x9f,
+};
+
+static const uint8_t probe_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x3c, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x34, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x13, 0x6b, 0x00, 0x28, 0x00, 0x00, 0xde, 0x00, 0xab, 0xcd, 0x00, 0xc0,
+    0xff, 0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x26, 0x11, 0x19,
+    0x00, 0x00, 0x1a, 0x1b, 0x2a, 0x2b, 0x12, 0x34, 0x00, 0x01, 0x24, 0x6b,
+    0x27, 0x91,
+};
+
+static const uint8_t erth_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x3c, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x34, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x28, 0x00, 0x00, 0xd8, 0x00, 0xab, 0xcd, 0x00, 0x00,
+    0x00, 0x02, 0x00, 0x00, 0x72, 0x34, 0x00, 0x01, 0x00, 0x5a, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x67, 0x80, 0x01, 0x5b, 0x50,
+    0x92, 0xa1,
+};
+
+static const uint8_t eeth_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x50, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x20, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xd9, 0x00, 0xab, 0xcd, 0x00, 0x00,
+    0x00, 0x02, 0x00, 0x00, 0x72, 0x34, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x56, 0x78,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x67, 0x05, 0x92,
+};
+
+static const uint8_t trim_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0xbe, 0x00, 0x30, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6e, 0xc8, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0,
+    0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67,
+    0x80, 0x01,
+};
+
+static const uint8_t unknown_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x00, 0x45, 0x46, 0x00, 0x2c, 0x00, 0x00, 0x40, 0x00, 0x1f, 0x11,
+    0x6f, 0x44, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33, 0x64, 0x02, 0xc1, 0x23,
+    0x12, 0xb7, 0x00, 0x18, 0x00, 0x00, 0xc5, 0x00, 0xab, 0xcd, 0x00, 0xc0,
+    0xff, 0xee, 0x80, 0x01, 0x23, 0x45, 0x7f, 0x0c, 0x95, 0xde,
+};
+
+/*
+ * IPv6 fixtures use a separate Python struct/ipaddress/zlib construction.
+ * The iCRC masks the traffic class, 20-bit flow label, and hop limit.
+ */
+static const uint8_t ipv6_write_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x3c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x3c,
+    0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0, 0xff, 0xee, 0xb0, 0x00,
+    0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67, 0x80, 0x01, 0x11, 0x11,
+    0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x78, 0x9a, 0xbc, 0xde, 0x00, 0x00,
+    0x00, 0x05, 0xf0, 0x0d, 0xca, 0xfe, 0x4d, 0x52, 0x43, 0x21, 0x01, 0x00,
+    0x00, 0x00, 0x81, 0x74, 0x87, 0x5a,
+};
+
+static const uint8_t ipv6_ack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x1c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x13, 0x6b, 0x00, 0x1c,
+    0x00, 0x00, 0xd1, 0x00, 0xab, 0xcd, 0x00, 0xc0, 0xff, 0xee, 0x00, 0x00,
+    0xff, 0x01, 0x1f, 0x01, 0xa2, 0xb3, 0x6d, 0x4c, 0xe3, 0x64,
+};
+
+static const uint8_t ipv6_ev_probe_request[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x69, 0x4a, 0xbc, 0xde, 0x00, 0x28, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x13, 0x6b, 0x00, 0x28,
+    0x00, 0x00, 0xd8, 0x00, 0xab, 0xcd, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+    0xfe, 0xdc, 0x00, 0x01, 0x00, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1b, 0xcc, 0x6a, 0xb7,
+};
+
+static const uint8_t ipv6_ev_probe_response[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02,
+    0x86, 0xdd, 0x6c, 0x0d, 0x12, 0x34, 0x00, 0x3c, 0x11, 0x3f, 0x20, 0x01,
+    0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22,
+    0x11, 0x11, 0x20, 0x01, 0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xd0, 0xbe, 0x13, 0x6b, 0x00, 0x3c,
+    0x00, 0x00, 0xd9, 0x00, 0xab, 0xcd, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+    0xfe, 0xdc, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x69, 0xcb, 0x79, 0x5f,
+};
+
+static const uint8_t ipv6_nack_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x2c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x04, 0x2c,
+    0x00, 0x00, 0xdd, 0x00, 0xab, 0xcd, 0x00, 0xc0, 0xff, 0xee, 0x20, 0x00,
+    0x12, 0x34, 0x00, 0x00, 0x02, 0xe3, 0x00, 0x00, 0xc1, 0x23, 0x1a, 0x1b,
+    0x2a, 0x2b, 0x00, 0x00, 0x12, 0x34, 0x20, 0x00, 0x31, 0xa2, 0xe4, 0x58,
+    0x80, 0x2d,
+};
+
+static const uint8_t ipv6_unknown_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x18, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x18,
+    0x00, 0x00, 0xc5, 0x00, 0xab, 0xcd, 0x00, 0xc0, 0xff, 0xee, 0x80, 0x01,
+    0x23, 0x45, 0xec, 0x0b, 0xa4, 0x80,
+};
+
+static const uint8_t ipv6_trim_frame[] = {
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xfa, 0xbc, 0xde, 0x00, 0x1c, 0x11, 0x34, 0x20, 0x01,
+    0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78,
+    0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44,
+    0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x3c,
+    0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0, 0xff, 0xee, 0xb0, 0x00,
+    0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67, 0x80, 0x01,
+};
+
+/*
+ * Independently assembled RFC 8754/9800 outer headers prefixed to known
+ * IPv4 and IPv6 datagrams, preserving their original iCRC.
+ */
+static const uint8_t srv6_srh_frame[] = {
+    0x02, 0xaa, 0x00, 0x00, 0x00, 0x02, 0x02, 0xbb, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6a, 0x39, 0x87, 0x65, 0x00, 0x94, 0x2b, 0x33, 0xfc, 0xbb,
+    0xbb, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x05, 0x04, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x33, 0x00, 0x44, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x11,
+    0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+    0x01, 0xab, 0x04, 0x02, 0x00, 0x00, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x3c,
+    0x11, 0x34, 0x20, 0x01, 0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00,
+    0xca, 0xfe, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0,
+    0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67,
+    0x80, 0x01, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x78, 0x9a,
+    0xbc, 0xde, 0x00, 0x00, 0x00, 0x05, 0xf0, 0x0d, 0xca, 0xfe, 0x4d, 0x52,
+    0x43, 0x21, 0x01, 0x00, 0x00, 0x00, 0x81, 0x74, 0x87, 0x5a,
+};
+
+static const uint8_t srv6_usid_frame[] = {
+    0x02, 0xaa, 0x00, 0x00, 0x00, 0x02, 0x02, 0xbb, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6a, 0x39, 0x87, 0x65, 0x00, 0x64, 0x29, 0x33, 0xfc, 0xbb,
+    0xbb, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x3c,
+    0x11, 0x34, 0x20, 0x01, 0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00,
+    0xca, 0xfe, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0,
+    0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67,
+    0x80, 0x01, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x78, 0x9a,
+    0xbc, 0xde, 0x00, 0x00, 0x00, 0x05, 0xf0, 0x0d, 0xca, 0xfe, 0x4d, 0x52,
+    0x43, 0x21, 0x01, 0x00, 0x00, 0x00, 0x81, 0x74, 0x87, 0x5a,
+};
+
+static const uint8_t srv6_ipv4_frame[] = {
+    0x02, 0xaa, 0x00, 0x00, 0x00, 0x02, 0x02, 0xbb, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6a, 0x39, 0x87, 0x65, 0x00, 0x50, 0x04, 0x33, 0xfc, 0xbb,
+    0xbb, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x46, 0x00, 0x50, 0x00, 0x00,
+    0x40, 0x00, 0x1f, 0x11, 0x6f, 0x20, 0xc0, 0x00, 0x02, 0x01, 0xc6, 0x33,
+    0x64, 0x02, 0xc1, 0x23, 0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30,
+    0xff, 0xff, 0x00, 0xc0, 0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68,
+    0xac, 0xe0, 0x45, 0x67, 0x80, 0x01, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33,
+    0x44, 0x44, 0x78, 0x9a, 0xbc, 0xde, 0x00, 0x00, 0x00, 0x05, 0xf0, 0x0d,
+    0xca, 0xfe, 0x4d, 0x52, 0x43, 0x21, 0x01, 0x00, 0x00, 0x00, 0x09, 0x78,
+    0x68, 0x3d,
+};
+
+/*
+ * Outbound reduced SRH and switch trim fixtures assembled independently.
+ * The trim fixture changes outer DSCP and outer size while preserving inner
+ * DSCP and original UDP Length. It stops immediately after inner TSETH.
+ */
+static const uint8_t srv6_tx_srh_frame[] = {
+    0x02, 0xaa, 0x00, 0x00, 0x00, 0x02, 0x02, 0xbb, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6a, 0x39, 0x87, 0x65, 0x00, 0x8c, 0x2b, 0x33, 0xfc, 0xbb,
+    0xbb, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x55, 0x00, 0x66, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x04, 0x04, 0x02, 0x01, 0x00,
+    0x00, 0x00, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x33, 0x00, 0x44, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x11,
+    0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6b, 0xba,
+    0xbc, 0xde, 0x00, 0x3c, 0x11, 0x34, 0x20, 0x01, 0x0d, 0xb8, 0x11, 0x00,
+    0xde, 0xad, 0xbe, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x20, 0x01,
+    0x0d, 0xb8, 0x22, 0x00, 0xca, 0xfe, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22,
+    0x11, 0x11, 0xe7, 0x41, 0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30,
+    0xff, 0xff, 0x00, 0xc0, 0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68,
+    0xac, 0xe0, 0x45, 0x67, 0x80, 0x01, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33,
+    0x44, 0x44, 0x78, 0x9a, 0xbc, 0xde, 0x00, 0x00, 0x00, 0x05, 0xf0, 0x0d,
+    0xca, 0xfe, 0x4d, 0x52, 0x43, 0x21, 0x01, 0x00, 0x00, 0x00, 0x81, 0x74,
+    0x87, 0x5a,
+};
+
+static const uint8_t srv6_outer_trim_frame[] = {
+    0x02, 0xaa, 0x00, 0x00, 0x00, 0x02, 0x02, 0xbb, 0x00, 0x00, 0x00, 0x01,
+    0x86, 0xdd, 0x6b, 0xf9, 0x87, 0x65, 0x00, 0x74, 0x2b, 0x33, 0xfc, 0xbb,
+    0xbb, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x10, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x05, 0x04, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x33, 0x00, 0x44, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfc, 0xbb, 0xbb, 0x00, 0x00, 0x11,
+    0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+    0x01, 0xab, 0x04, 0x02, 0x00, 0x00, 0x6b, 0xba, 0xbc, 0xde, 0x00, 0x3c,
+    0x11, 0x34, 0x20, 0x01, 0x0d, 0xb8, 0x11, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0x20, 0x01, 0x0d, 0xb8, 0x22, 0x00,
+    0xca, 0xfe, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11, 0xe7, 0x41,
+    0x12, 0xb7, 0x00, 0x3c, 0x00, 0x00, 0xcb, 0x30, 0xff, 0xff, 0x00, 0xc0,
+    0xff, 0xee, 0xb0, 0x00, 0xff, 0x01, 0x24, 0x68, 0xac, 0xe0, 0x45, 0x67,
+    0x80, 0x01,
+};
+
+static struct mrc_wire_packet check_fixture(const uint8_t *frame, size_t len,
+                                            const struct mrc_wire_packet *expected)
+{
+    struct mrc_wire_packet decoded;
+    uint8_t encoded[128];
+    size_t encoded_len;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), expected, &encoded_len) == 0);
+    assert(encoded_len == len);
+    assert(memcmp(encoded, frame, len) == 0);
+    assert(mrc_wire_decode_ip(frame, len, &decoded) == 0);
+    assert(decoded.ip_version == (expected->ip_version == MRC_WIRE_IP6 ?
+                                  MRC_WIRE_IP6 : MRC_WIRE_IP4));
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &decoded, &encoded_len) == 0);
+    assert(encoded_len == len);
+    assert(memcmp(encoded, frame, len) == 0);
+    return decoded;
+}
+
+static struct mrc_wire_packet packet_for(uint8_t opcode)
+{
+    return (struct mrc_wire_packet) {
+        .ipv4 = {
+            .src_mac = {2, 0, 0, 0, 0, 1}, .dst_mac = {2, 0, 0, 0, 0, 2},
+            .src_ip = 0xc0000201, .dst_ip = 0xc6336402, .src_port = 0xc123, .dst_port = 4791,
+            .dscp = 17, .ecn = 2, .ttl = 31,
+        },
+        .bth = {.opcode = opcode, .p_key = 0xabcd, .dqp = 0xc0ffee},
+    };
+}
+
+static void test_write(void)
+{
+    const uint8_t data[] = {'M', 'R', 'C', '!', 1};
+    struct mrc_wire_packet packet = packet_for(MRC_WRITE_ONLY_IMM);
+    packet.bth.p_key = 0xffff;
+    packet.bth.psn = 0x00ff01;
+    packet.bth.ack_request = true;
+    packet.bth.retransmit = true;
+    packet.bth.timestamp = true;
+    packet.body.write = (struct mrc_wire_write) {
+        .rqmsn = 0x2468, .msn = 0xace0, .tx_timestamp = 0x4567, .tsr = true,
+        .va = UINT64_C(0x1111222233334444), .r_key = 0x789abcde, .dma_len = sizeof(data),
+        .imm_data = 0xf00dcafe, .data = data, .data_len = sizeof(data),
+    };
+    struct mrc_wire_packet decoded = check_fixture(write_frame, sizeof(write_frame), &packet);
+    assert(decoded.ipv4.dst_port == 4791);
+    assert(decoded.bth.ack_request && decoded.bth.retransmit && decoded.bth.timestamp);
+    assert(decoded.body.write.data == write_frame + 82);
+    assert(decoded.body.write.data_len == sizeof(data));
+    assert(decoded.body.write.dma_len == sizeof(data));
+    assert(decoded.body.write.imm_data == 0xf00dcafe);
+    assert(memcmp(decoded.body.write.data, data, sizeof(data)) == 0);
+
+    uint8_t encoded[128];
+    size_t len;
+    assert(!decoded.bth.solicited);
+    packet.bth.solicited = true;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == 0);
+    assert(encoded[MRC_WIRE_IPV4_HEADER_LEN + 1] ==
+           (write_frame[MRC_WIRE_IPV4_HEADER_LEN + 1] | 0x80));
+    assert(mrc_wire_decode(encoded, len, &decoded) == 0 && decoded.bth.solicited);
+    packet.bth.opcode = MRC_WRITE_ONLY;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == -EINVAL);
+    packet.bth.solicited = false;
+
+    packet.bth.opcode = MRC_WRITE_ONLY;
+    packet.bth.timestamp = false;
+    packet.body.write.data = NULL;
+    packet.body.write.data_len = 0;
+    packet.body.write.dma_len = 0;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == 0);
+    assert(len == MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN + MRC_METH_LEN +
+                  MRC_RETH_LEN + MRC_ICRC_LEN);
+    assert(mrc_wire_decode(encoded, len, &decoded) == 0);
+    assert(decoded.body.write.data_len == 0);
+}
+
+static void test_ack(void)
+{
+    struct mrc_wire_packet packet = packet_for(MRC_TRANSPORT_ACK);
+    packet.bth.psn = 0x00ff01;
+    packet.body.aeth = (struct mrc_wire_aeth){.syndrome = 0x1f, .msn = 0x01a2b3};
+    check_fixture(ack_frame, sizeof(ack_frame), &packet);
+}
+
+static void test_sack(void)
+{
+    struct mrc_wire_packet packet = packet_for(MRC_RELIABILITY_SACK);
+    packet.bth.psn = 0xfffffe;
+    packet.bth.retransmit = true;
+    packet.body.sack = (struct mrc_wire_sack) {
+        .mark = MRC_SACK_ALWAYS_SKIP, .probe_response = true, .ack_psn_offset = -123,
+        .entropy = 0x1234c0ff, .spdcid = 0x1a1b, .dpdcid = 0x2a2b, .cack_psn = 0xfffffe,
+        .mpr = 255, .sack_offset = 64, .bitmap = UINT64_C(0x8001deadbeef0003),
+        .tx_timestamp = 0xfedc, .ooo_count = 0x5aa5, .restore_cwnd = true,
+        .rcv_cwnd_pen = 0x55, .rcvd_bytes = 0x098765,
+    };
+    struct mrc_wire_packet decoded = check_fixture(sack_frame, sizeof(sack_frame), &packet);
+    assert(decoded.body.sack.ack_psn_offset == -123);
+    assert(decoded.body.sack.bitmap == UINT64_C(0x8001deadbeef0003));
+}
+
+static void test_nack(void)
+{
+    struct mrc_wire_packet packet = packet_for(MRC_RELIABILITY_NACK);
+    packet.bth.psn = 0x001234;
+    packet.bth.retransmit = true;
+    packet.body.nack = (struct mrc_wire_nack) {
+        .reason = MRC_NACK_TRIMMED_LASTHOP, .vendor_info = 0xe3, .entropy = 0xc123,
+        .spdcid = 0x1a1b, .dpdcid = 0x2a2b, .nack_psn = 0x001234, .tx_timestamp = 0x31a2,
+        .original_udp_len = 1068,
+    };
+    struct mrc_wire_packet decoded = check_fixture(nack_frame, sizeof(nack_frame), &packet);
+    assert(decoded.body.nack.original_udp_len == 1068);
+}
+
+static void test_probe(void)
+{
+    struct mrc_wire_packet packet = packet_for(MRC_RELIABILITY_PROBE);
+    packet.ipv4.dst_port = 0;
+    packet.body.probe = (struct mrc_wire_probe) {
+        .vendor_info = 0x26, .probe_id = 0x1119, .spdcid = 0x1a1b, .dpdcid = 0x2a2b,
+        .timestamp = true, .tx_timestamp = 0x1234,
+    };
+    struct mrc_wire_packet decoded = check_fixture(probe_frame, sizeof(probe_frame), &packet);
+    assert(decoded.ipv4.dst_port == 4971);
+    assert(decoded.body.probe.timestamp);
+}
+
+static void test_endpoint(void)
+{
+    struct mrc_wire_packet request = packet_for(MRC_ENDPOINT_REQUEST);
+    request.bth.dqp = MRC_ENDPOINT_QPN;
+    request.bth.psn = 0x7234;
+    request.body.endpoint_request = (struct mrc_wire_endpoint_request) {
+        .op = MRC_ENDPOINT_EV_PROBE, .vendor_info = 0x5a, .tx_timestamp = 0x4567,
+        .timestamp = true, .tsr = true,
+    };
+    check_fixture(erth_frame, sizeof(erth_frame), &request);
+
+    struct mrc_wire_packet response = packet_for(MRC_ENDPOINT_RESPONSE);
+    response.bth.dqp = MRC_ENDPOINT_QPN;
+    response.bth.psn = 0x7234;
+    response.body.endpoint_response = (struct mrc_wire_endpoint_response) {
+        .op = MRC_ENDPOINT_EV_PROBE, .tx_timestamp = 0x5678,
+    };
+    check_fixture(eeth_frame, sizeof(eeth_frame), &response);
+
+    request.body.endpoint_request.op = MRC_ENDPOINT_PORT_STATUS;
+    request.body.endpoint_request.port_status_mask = 0x80001001;
+    struct mrc_wire_packet decoded;
+    uint8_t frame[128];
+    size_t len;
+    assert(mrc_wire_encode(frame, sizeof(frame), &request, &len) == 0);
+    assert(frame[58] == 0x80 && frame[59] == 0 && frame[60] == 0x10 && frame[61] == 1);
+    assert(mrc_wire_decode(frame, len, &decoded) == 0);
+    assert(decoded.body.endpoint_request.port_status_mask == 0x80001001);
+
+    request.bth.dqp++;
+    assert(mrc_wire_encode(frame, sizeof(frame), &request, &len) == -EINVAL);
+}
+
+static void test_trimmed_request(void)
+{
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode(trim_frame, sizeof(trim_frame), &decoded) == -EBADMSG);
+
+    struct mrc_wire_trimmed trim;
+    assert(mrc_wire_decode_trimmed(trim_frame, sizeof(trim_frame), 46, &trim) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_trimmed(trim_frame, sizeof(trim_frame), 47, &trim) == 0);
+    assert(trim.ipv4.dscp == 47 && trim.ipv4.src_port == 0xc123);
+    assert(trim.bth.opcode == MRC_WRITE_ONLY_IMM);
+    assert(trim.bth.psn == 0x00ff01 && trim.bth.dqp == 0xc0ffee && trim.bth.retransmit);
+    assert(trim.original_udp_len == 60);
+    assert(trim.timestamp && trim.tsr && trim.tx_timestamp == 0x4567);
+
+    size_t prefix_len = MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN;
+    assert(mrc_wire_dispatch_header(trim_frame, prefix_len - 1, &decoded) == -EBADMSG);
+    assert(mrc_wire_dispatch_header(trim_frame, prefix_len, &decoded) == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP4 && decoded.bth.dqp == trim.bth.dqp);
+    assert(decoded.bth.opcode == trim.bth.opcode && decoded.ipv4.dst_port == trim.ipv4.dst_port);
+
+    /* Some switches leave the IPv4 total length untouched in a trim. */
+    assert(mrc_wire_decode_trimmed(trim_frame, prefix_len, 47, &trim) == 0);
+    assert(!trim.timestamp && trim.original_udp_len == 60);
+    assert(mrc_wire_decode_trimmed(trim_frame, prefix_len - 1, 47, &trim) == -EBADMSG);
+    assert(mrc_wire_decode_trimmed(ack_frame, sizeof(ack_frame), 17, &trim) == -EBADMSG);
+    /* A short packet may be marked even though it remains physically intact. */
+    assert(mrc_wire_decode_trimmed(write_frame, sizeof(write_frame), 17, &trim) == 0);
+}
+
+static void test_unknown_opcode(void)
+{
+    struct mrc_wire_packet decoded;
+    struct mrc_wire_ipv4 ipv4;
+    struct mrc_wire_bth bth;
+    assert(mrc_wire_decode(unknown_frame, sizeof(unknown_frame), &decoded) == -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_header(unknown_frame, sizeof(unknown_frame), &ipv4, &bth) == 0);
+    assert(ipv4.src_ip == 0xc0000201 && ipv4.dst_port == 4791);
+    assert(bth.opcode == 0xc5 && bth.psn == 0x012345 && bth.dqp == 0xc0ffee);
+    uint8_t corrupted[sizeof(unknown_frame)];
+    memcpy(corrupted, unknown_frame, sizeof(corrupted));
+    corrupted[sizeof(corrupted) - 1] ^= 1;
+    assert(mrc_wire_decode_header(corrupted, sizeof(corrupted), &ipv4, &bth) == -EBADMSG);
+    assert(mrc_wire_decode_header(nack_frame, sizeof(nack_frame), &ipv4, &bth) == -EBADMSG);
+}
+
+static void test_bad_frames(void)
+{
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode(write_frame, sizeof(write_frame) - 1, &decoded) == -EBADMSG);
+    assert(mrc_wire_decode(write_frame, 14, &decoded) == -EBADMSG);
+
+    uint8_t frame[sizeof(write_frame)];
+    memcpy(frame, write_frame, sizeof(frame));
+    frame[82] ^= 1; /* Corrupted payload. */
+    assert(mrc_wire_decode(frame, sizeof(frame), &decoded) == -EBADMSG);
+    memcpy(frame, write_frame, sizeof(frame));
+    frame[sizeof(frame) - 1] ^= 1; /* Corrupted RoCE iCRC trailer. */
+    assert(mrc_wire_decode(frame, sizeof(frame), &decoded) == -EBADMSG);
+
+    memcpy(frame, write_frame, sizeof(frame));
+    frame[22]--; /* Router decrements TTL and updates the IPv4 checksum. */
+    frame[24]++;
+    assert(mrc_wire_decode(frame, sizeof(frame), &decoded) == 0);
+    assert(decoded.ipv4.ttl == 30);
+    frame[24]--; /* Reject the same packet with an invalid IPv4 checksum. */
+    assert(mrc_wire_decode(frame, sizeof(frame), &decoded) == -EBADMSG);
+
+    struct mrc_wire_packet packet = packet_for(MRC_TRANSPORT_ACK);
+    size_t len;
+    assert(mrc_wire_encode(frame, 32, &packet, &len) == -EMSGSIZE);
+    packet.bth.dqp = MRC_WIRE_PSN_MASK + 1;
+    assert(mrc_wire_encode(frame, sizeof(frame), &packet, &len) == -EINVAL);
+    packet.bth.dqp = 1;
+    packet.bth.opcode = 0xff;
+    assert(mrc_wire_encode(frame, sizeof(frame), &packet, &len) == -EPROTONOSUPPORT);
+}
+
+static struct mrc_wire_packet ipv6_packet_for(uint8_t opcode)
+{
+    struct mrc_wire_packet packet = packet_for(opcode);
+    packet.ip_version = MRC_WIRE_IP6;
+    packet.ipv6 = (struct mrc_wire_ipv6) {
+        .src_mac = {2, 0, 0, 0, 0, 1}, .dst_mac = {2, 0, 0, 0, 0, 2},
+        .src_ip = {0x20, 1, 0x0d, 0xb8, 0x11, 0, 0xde, 0xad,
+                   0xbe, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc},
+        .dst_ip = {0x20, 1, 0x0d, 0xb8, 0x22, 0, 0xca, 0xfe,
+                   0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11, 0x11},
+        .flow_label = 0xabcde, .src_port = 0xe741, .dst_port = 4791, .dscp = 46, .ecn = 3,
+        .hop_limit = 52,
+    };
+    return packet;
+}
+
+static void test_ipv6_ev_probe(void)
+{
+    struct mrc_wire_packet request = ipv6_packet_for(MRC_ENDPOINT_REQUEST);
+    request.bth.dqp = MRC_ENDPOINT_QPN;
+    request.bth.psn = 0xfedc;
+    request.ipv6.dscp = 37;
+    request.ipv6.ecn = 0;
+    request.ipv6.dst_port = MRC_UDP_DEFAULT_PORT;
+    request.body.endpoint_request = (struct mrc_wire_endpoint_request){
+        .op = MRC_ENDPOINT_EV_PROBE, .vendor_info = 0x5a,
+    };
+    struct mrc_wire_packet decoded = check_fixture(ipv6_ev_probe_request, sizeof(ipv6_ev_probe_request), &request);
+    assert(decoded.bth.dqp == MRC_ENDPOINT_QPN && decoded.bth.psn == 0xfedc);
+    assert(decoded.ipv6.dscp == 37 && decoded.ipv6.flow_label == 0xabcde);
+    assert(decoded.body.endpoint_request.op == MRC_ENDPOINT_EV_PROBE &&
+           !decoded.body.endpoint_request.timestamp);
+
+    struct mrc_wire_packet response = request;
+    memcpy(response.ipv6.src_mac, request.ipv6.dst_mac, MRC_MAC_LEN);
+    memcpy(response.ipv6.dst_mac, request.ipv6.src_mac, MRC_MAC_LEN);
+    memcpy(response.ipv6.src_ip, request.ipv6.dst_ip, MRC_IPV6_ADDR_LEN);
+    memcpy(response.ipv6.dst_ip, request.ipv6.src_ip, MRC_IPV6_ADDR_LEN);
+    response.ipv6.dscp = 48;
+    response.ipv6.flow_label = 0xd1234;
+    response.ipv6.src_port = 0xd0be;
+    response.ipv6.hop_limit = 63;
+    response.bth.opcode = MRC_ENDPOINT_RESPONSE;
+    response.body.endpoint_response = (struct mrc_wire_endpoint_response){
+        .op = MRC_ENDPOINT_EV_PROBE, .tx_timestamp = 0x1234,
+    };
+    decoded = check_fixture(ipv6_ev_probe_response, sizeof(ipv6_ev_probe_response), &response);
+    assert(decoded.bth.dqp == MRC_ENDPOINT_QPN && decoded.bth.psn == request.bth.psn);
+    assert(decoded.ipv6.dscp == 48 && decoded.ipv6.flow_label == 0xd1234);
+    assert(decoded.body.endpoint_response.op == MRC_ENDPOINT_EV_PROBE &&
+           decoded.body.endpoint_response.tx_timestamp == 0x1234);
+}
+
+static void test_ipv6_write(void)
+{
+    const uint8_t data[] = {'M', 'R', 'C', '!', 1};
+    struct mrc_wire_packet packet = ipv6_packet_for(MRC_WRITE_ONLY_IMM);
+    packet.bth.p_key = 0xffff;
+    packet.bth.psn = 0x00ff01;
+    packet.bth.ack_request = true;
+    packet.bth.retransmit = true;
+    packet.bth.timestamp = true;
+    packet.body.write = (struct mrc_wire_write) {
+        .rqmsn = 0x2468, .msn = 0xace0, .tx_timestamp = 0x4567, .tsr = true,
+        .va = UINT64_C(0x1111222233334444), .r_key = 0x789abcde, .dma_len = sizeof(data),
+        .imm_data = 0xf00dcafe, .data = data, .data_len = sizeof(data),
+    };
+    struct mrc_wire_packet decoded =
+        check_fixture(ipv6_write_frame, sizeof(ipv6_write_frame), &packet);
+    assert(decoded.ipv6.src_port == 0xe741 && decoded.ipv6.dst_port == 4791);
+    assert(decoded.ipv6.flow_label == 0xabcde);
+    assert(decoded.ipv6.dscp == 46 && decoded.ipv6.ecn == 3 && decoded.ipv6.hop_limit == 52);
+    assert(decoded.body.write.data == ipv6_write_frame + 102);
+    assert(decoded.body.write.data_len == sizeof(data));
+    assert(memcmp(decoded.body.write.data, data, sizeof(data)) == 0);
+    assert(mrc_wire_decode(ipv6_write_frame, sizeof(ipv6_write_frame), &decoded) ==
+           -EPROTONOSUPPORT);
+
+    uint8_t encoded[128];
+    size_t len;
+    packet.ipv6.flow_label = MRC_IPV6_FLOW_LABEL_MASK + 1;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == -EINVAL);
+    packet.ipv6.flow_label = MRC_IPV6_FLOW_LABEL_MASK;
+    packet.ipv6.hop_limit = 0;
+    assert(mrc_wire_encode(encoded, sizeof(encoded), &packet, &len) == 0);
+    assert(mrc_wire_decode_ip(encoded, len, &decoded) == 0);
+    assert(decoded.ipv6.flow_label == MRC_IPV6_FLOW_LABEL_MASK && decoded.ipv6.hop_limit == 64);
+}
+
+static void test_ipv6_control(void)
+{
+    struct mrc_wire_packet packet = ipv6_packet_for(MRC_TRANSPORT_ACK);
+    packet.bth.psn = 0x00ff01;
+    packet.ipv6.dst_port = 0;
+    packet.body.aeth = (struct mrc_wire_aeth){.syndrome = 0x1f, .msn = 0x01a2b3};
+    check_fixture(ipv6_ack_frame, sizeof(ipv6_ack_frame), &packet);
+
+    packet = ipv6_packet_for(MRC_RELIABILITY_NACK);
+    packet.bth.psn = 0x001234;
+    packet.bth.retransmit = true;
+    packet.body.nack = (struct mrc_wire_nack) {
+        .reason = MRC_NACK_TRIMMED_LASTHOP, .vendor_info = 0xe3, .entropy = 0xc123,
+        .spdcid = 0x1a1b, .dpdcid = 0x2a2b, .nack_psn = 0x001234, .tx_timestamp = 0x31a2,
+        .original_udp_len = 1068,
+    };
+    check_fixture(ipv6_nack_frame, sizeof(ipv6_nack_frame), &packet);
+
+    struct mrc_wire_ipv6 ipv6;
+    struct mrc_wire_bth bth;
+    assert(mrc_wire_decode_ipv6_header(ipv6_nack_frame, sizeof(ipv6_nack_frame), &ipv6, &bth) ==
+           -EBADMSG);
+    assert(mrc_wire_decode_ipv6_header(ack_frame, sizeof(ack_frame), &ipv6, &bth) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_ipv6_header(ipv6_unknown_frame, sizeof(ipv6_unknown_frame), &ipv6,
+                                      &bth) == 0);
+    assert(bth.opcode == 0xc5 && bth.dqp == 0xc0ffee && bth.psn == 0x012345);
+    assert(ipv6.flow_label == 0xabcde);
+}
+
+static void test_ipv6_trimmed_request(void)
+{
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), &decoded) == -EBADMSG);
+    struct mrc_wire_trimmed trim;
+    assert(mrc_wire_decode_trimmed(ipv6_trim_frame, sizeof(ipv6_trim_frame), 47, &trim) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_trimmed_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), 46, &trim) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_trimmed_ip(ipv6_trim_frame, sizeof(ipv6_trim_frame), 47, &trim) == 0);
+    assert(trim.ip_version == MRC_WIRE_IP6 && trim.ipv6.flow_label == 0xabcde);
+    size_t prefix_len = MRC_WIRE_IPV6_HEADER_LEN + MRC_BTH_LEN;
+    assert(mrc_wire_dispatch_header(ipv6_trim_frame, prefix_len - 1, &decoded) == -EBADMSG);
+    assert(mrc_wire_dispatch_header(ipv6_trim_frame, prefix_len, &decoded) == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP6 && decoded.bth.dqp == trim.bth.dqp);
+    assert(decoded.bth.opcode == trim.bth.opcode && decoded.ipv6.dst_port == trim.ipv6.dst_port);
+    assert(trim.bth.dqp == 0xc0ffee && trim.bth.psn == 0x00ff01 && trim.bth.retransmit);
+    assert(trim.timestamp && trim.tsr && trim.tx_timestamp == 0x4567);
+    assert(trim.original_udp_len == 60);
+}
+
+static void test_ipv6_integrity(void)
+{
+    struct mrc_wire_packet decoded;
+    uint8_t encoded[sizeof(ipv6_write_frame)];
+    memcpy(encoded, ipv6_write_frame, sizeof(encoded));
+
+    struct mrc_wire_ipv4 ipv4;
+    struct mrc_wire_bth bth;
+    assert(mrc_wire_decode_header(encoded, sizeof(encoded), &ipv4, &bth) == -EPROTONOSUPPORT);
+    for (size_t len = 0; len < sizeof(encoded); ++len)
+        assert(mrc_wire_decode_ip(encoded, len, &decoded) == -EBADMSG);
+
+    /* The version stays 6 while all mutable IPv6 iCRC fields change. */
+    memcpy(encoded + 14, (uint8_t[]){0x6f, 0xdf, 0xff, 0xff}, 4);
+    encoded[21]--;
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == 0);
+    assert(decoded.ipv6.dscp == 63 && decoded.ipv6.ecn == 1 && decoded.ipv6.hop_limit == 51);
+    assert(decoded.ipv6.flow_label == MRC_IPV6_FLOW_LABEL_MASK);
+
+    encoded[22] ^= 1; /* Source IPv6 address is invariant. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EBADMSG);
+    encoded[22] ^= 1;
+    encoded[54] ^= 1; /* UDP source port is invariant. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EBADMSG);
+    encoded[54] ^= 1;
+    encoded[60] = 1; /* OCP specifically requires zero UDP checksum. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EBADMSG);
+    encoded[60] = 0;
+    encoded[20] = 43; /* Base IPv6 codec expects UDP without extension headers. */
+    assert(mrc_wire_decode_ip(encoded, sizeof(encoded), &decoded) == -EPROTONOSUPPORT);
+}
+
+static void test_srv6_receive(void)
+{
+    struct mrc_wire_packet decoded;
+    struct mrc_wire_srv6 routing;
+    assert(mrc_wire_decode_ip(srv6_srh_frame, sizeof(srv6_srh_frame), &decoded) ==
+           -EPROTONOSUPPORT);
+    assert(mrc_wire_decode_srv6(srv6_srh_frame, sizeof(srv6_srh_frame), &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 48);
+    assert(routing.outer_dscp == 40 && routing.outer_ecn == 3 && routing.outer_hop_limit == 51);
+    assert(memcmp(routing.outer_src_ip, srv6_srh_frame + 22, MRC_IPV6_ADDR_LEN) == 0);
+    assert(memcmp(routing.outer_dst_ip, srv6_srh_frame + 38, MRC_IPV6_ADDR_LEN) == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP6);
+    assert(decoded.ipv6.flow_label == 0xabcde && decoded.ipv6.dscp == 46);
+    assert(memcmp(decoded.ipv6.src_mac, srv6_srh_frame + MRC_MAC_LEN, MRC_MAC_LEN) == 0);
+    assert(memcmp(decoded.ipv6.dst_mac, srv6_srh_frame, MRC_MAC_LEN) == 0);
+    assert(decoded.body.write.data == srv6_srh_frame + 102 + 40 + 48);
+    assert(decoded.body.write.data_len == 5 && decoded.body.write.imm_data == 0xf00dcafe);
+
+    uint8_t reencoded[sizeof(ipv6_write_frame)];
+    size_t reencoded_len;
+    assert(mrc_wire_encode(reencoded, sizeof(reencoded), &decoded, &reencoded_len) == 0);
+    assert(reencoded_len == sizeof(ipv6_write_frame));
+    /* The decoded Ethernet addresses are the outer hop's. The datagram is identical. */
+    assert(memcmp(reencoded + 14, ipv6_write_frame + 14, reencoded_len - 14) == 0);
+
+    assert(mrc_wire_decode_srv6(srv6_usid_frame, sizeof(srv6_usid_frame), &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP6 && decoded.ipv6.flow_label == 0xabcde);
+    assert(decoded.body.write.data == srv6_usid_frame + 102 + 40);
+
+    assert(mrc_wire_decode_srv6(ipv6_write_frame, sizeof(ipv6_write_frame), &decoded, &routing) == 0);
+    assert(!routing.encapsulated && routing.srh_len == 0 && routing.outer_hop_limit == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP6 && decoded.body.write.data == ipv6_write_frame + 102);
+
+    assert(mrc_wire_decode_srv6(srv6_ipv4_frame, sizeof(srv6_ipv4_frame), &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 0);
+    assert(decoded.ip_version == MRC_WIRE_IP4 && decoded.ipv4.src_ip == 0xc0000201);
+    assert(decoded.body.write.data == srv6_ipv4_frame + 82 + 40);
+    assert(mrc_wire_decode_srv6(write_frame, sizeof(write_frame), &decoded, NULL) == 0);
+}
+
+static void test_srv6_dispatch(void)
+{
+    static const struct {
+        const uint8_t *frame;
+        enum mrc_wire_ip_version version;
+        bool encapsulated;
+        size_t srh_len;
+        uint8_t outer_dscp;
+    } cases[] = {
+        { write_frame, MRC_WIRE_IP4, false, 0, 0 },
+        { ipv6_write_frame, MRC_WIRE_IP6, false, 0, 0 },
+        { srv6_ipv4_frame, MRC_WIRE_IP4, true, 0, 40 },
+        { srv6_usid_frame, MRC_WIRE_IP6, true, 0, 40 },
+        { srv6_srh_frame, MRC_WIRE_IP6, true, 48, 40 },
+        { srv6_outer_trim_frame, MRC_WIRE_IP6, true, 48, 47 },
+        { trim_frame, MRC_WIRE_IP4, false, 0, 0 },
+        { ipv6_trim_frame, MRC_WIRE_IP6, false, 0, 0 },
+    };
+    struct mrc_wire_packet header;
+    struct mrc_wire_srv6 routing;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const uint8_t *frame = cases[i].frame;
+        size_t length = (cases[i].version == MRC_WIRE_IP4 ? MRC_WIRE_IPV4_HEADER_LEN :
+                         MRC_WIRE_IPV6_HEADER_LEN) + MRC_BTH_LEN;
+        if (cases[i].encapsulated)
+            length += 40 + cases[i].srh_len;
+        assert(mrc_wire_dispatch_srv6_header(frame, length - 1, &header, &routing) == -EBADMSG);
+        assert(mrc_wire_dispatch_srv6_header(frame, length, &header, &routing) == 0);
+        assert(mrc_wire_dispatch_srv6_header(frame, length, &header, NULL) == 0);
+        assert(header.ip_version == cases[i].version && header.bth.opcode == MRC_WRITE_ONLY_IMM);
+        assert(header.bth.dqp == 0xc0ffee && header.bth.psn == 0x00ff01 && header.bth.timestamp);
+        if (header.ip_version == MRC_WIRE_IP4) {
+            assert(header.ipv4.src_ip == 0xc0000201 && header.ipv4.src_port == 0xc123);
+            assert(header.ipv4.dst_port == 4791);
+            assert(memcmp(header.ipv4.src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN) == 0);
+        } else {
+            assert(header.ipv6.flow_label == 0xabcde && header.ipv6.src_port == 0xe741);
+            assert(header.ipv6.dst_port == 4791);
+            assert(memcmp(header.ipv6.src_mac, frame + MRC_MAC_LEN, MRC_MAC_LEN) == 0);
+        }
+        assert(routing.encapsulated == cases[i].encapsulated && routing.srh_len == cases[i].srh_len);
+        assert(routing.outer_dscp == cases[i].outer_dscp);
+        if (routing.encapsulated) {
+            assert(memcmp(routing.outer_src_ip, frame + 22, MRC_IPV6_ADDR_LEN) == 0);
+            assert(memcmp(routing.outer_dst_ip, frame + 38, MRC_IPV6_ADDR_LEN) == 0);
+            assert(routing.outer_hop_limit == frame[21] && routing.outer_ecn == ((frame[15] >> 4) & 3));
+        } else {
+            static const uint8_t zero[MRC_IPV6_ADDR_LEN] = {0};
+            assert(!routing.outer_ecn && !routing.outer_hop_limit);
+            assert(memcmp(routing.outer_src_ip, zero, sizeof(zero)) == 0);
+            assert(memcmp(routing.outer_dst_ip, zero, sizeof(zero)) == 0);
+        }
+    }
+
+    assert(mrc_wire_dispatch_header(srv6_srh_frame, sizeof(srv6_srh_frame), &header) == -EPROTONOSUPPORT);
+    uint8_t corrupted[sizeof(srv6_srh_frame)];
+    memcpy(corrupted, srv6_srh_frame, sizeof(corrupted));
+    corrupted[sizeof(corrupted) - 1] ^= 1;
+    assert(mrc_wire_dispatch_srv6_header(corrupted, sizeof(corrupted), &header, &routing) == 0);
+    assert(mrc_wire_decode_srv6(corrupted, sizeof(corrupted), &header, NULL) == -EBADMSG);
+
+    /* Pad a terminal SRH with Pad1 through its largest encoded length. */
+    uint8_t maximum[MRC_WIRE_SRV6_MAX_PREFIX_LEN] = {0};
+    memcpy(maximum, srv6_srh_frame, 54 + 8 + 2 * MRC_IPV6_ADDR_LEN);
+    maximum[18] = 0x08;
+    maximum[19] = 0x64;
+    maximum[55] = UINT8_MAX;
+    memcpy(maximum + 54 + 2048, ipv6_write_frame + 14, 40 + 8 + MRC_BTH_LEN);
+    assert(mrc_wire_dispatch_srv6_header(maximum, sizeof(maximum), &header, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 2048 && header.ip_version == MRC_WIRE_IP6);
+}
+
+static void test_bad_srv6(void)
+{
+    struct mrc_wire_packet decoded;
+    uint8_t frame[sizeof(srv6_srh_frame) + 1];
+    const size_t frame_len = sizeof(srv6_srh_frame);
+    memcpy(frame, srv6_srh_frame, frame_len);
+    for (size_t len = 0; len < frame_len; ++len)
+        assert(mrc_wire_decode_srv6(frame, len, &decoded, NULL) == -EBADMSG);
+
+    frame[19]++; /* Outer Payload Length exceeds the available bytes. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    frame[frame_len] = 0; /* A byte inside the outer payload is not Ethernet padding. */
+    assert(mrc_wire_decode_srv6(frame, frame_len + 1, &decoded, NULL) == -EBADMSG);
+    frame[19]--;
+
+    frame[55] = 255; /* SRH Hdr Ext Len overruns the outer payload. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    frame[55] = srv6_srh_frame[55];
+    frame[58] = 2; /* Last Entry would require another 128-bit container. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    frame[58] = srv6_srh_frame[58];
+    frame[57] = 3; /* Segments Left exceeds Last Entry + 1. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    frame[57] = 1; /* Valid SRH requiring transit forwarding. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    frame[57] = 0;
+    frame[96] = 255; /* TLV exceeds the SRH length. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EBADMSG);
+    frame[96] = srv6_srh_frame[96];
+    frame[56] = 5; /* A routing header other than type 4 is outside this codec. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    frame[56] = srv6_srh_frame[56];
+    frame[54] = 43; /* A second routing header is unsupported. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    assert(mrc_wire_dispatch_srv6_header(frame, frame_len, &decoded, NULL) == -EPROTONOSUPPORT);
+    frame[54] = srv6_srh_frame[54];
+
+    frame[21]--; /* Outer hop limit is outside the inner iCRC. */
+    frame[39] ^= 1; /* The outer destination is also outside it. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == 0);
+    frame[110] ^= 1; /* The inner IPv6 source address remains protected. */
+    assert(mrc_wire_decode_srv6(frame, frame_len, &decoded, NULL) == -EBADMSG);
+}
+
+static struct mrc_wire_srv6_tx srv6_route(void)
+{
+    return (struct mrc_wire_srv6_tx) {
+        .outer_src_ip = {0xfc, 0xbb, 0xbb, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10},
+        .outer_dst_ip = {0xfc, 0xbb, 0xbb, 0, 0, 0x44},
+        .flow_label = 0x98765, .dscp = 40, .ecn = 3, .hop_limit = 51,
+    };
+}
+
+static void prepare_wrap_frame(uint8_t *frame)
+{
+    memcpy(frame, ipv6_write_frame, sizeof(ipv6_write_frame));
+    memcpy(frame, srv6_usid_frame, 2 * MRC_MAC_LEN);
+}
+
+static void test_srv6_transmit(void)
+{
+    uint8_t frame[sizeof(srv6_tx_srh_frame)];
+    size_t len;
+    struct mrc_wire_srv6_tx route = srv6_route();
+    prepare_wrap_frame(frame);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) == 0);
+    assert(len == sizeof(srv6_usid_frame));
+    assert(memcmp(frame, srv6_usid_frame, len) == 0);
+
+    static const uint8_t segments[][MRC_IPV6_ADDR_LEN] = {
+        {0xfc, 0xbb, 0xbb, 0, 0, 0x33, 0, 0x44},
+        {0xfc, 0xbb, 0xbb, 0, 0, 0x11, 0, 0x22},
+    };
+    route.outer_dst_ip[5] = 0x55;
+    route.outer_dst_ip[7] = 0x66;
+    route.segment_list = segments;
+    route.segment_count = 2;
+    route.segments_left = 2;
+    prepare_wrap_frame(frame);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) == 0);
+    assert(len == sizeof(srv6_tx_srh_frame));
+    assert(memcmp(frame, srv6_tx_srh_frame, len) == 0);
+
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode_srv6(frame, len, &decoded, NULL) == -EPROTONOSUPPORT);
+    frame[57] = 0; /* At the terminal receiver after SRH transit. */
+    assert(mrc_wire_decode_srv6(frame, len, &decoded, NULL) == 0);
+    assert(decoded.body.write.data_len == 5 && decoded.body.write.imm_data == 0xf00dcafe);
+}
+
+static void test_srv6_ipv4_transmit(void)
+{
+    uint8_t frame[sizeof(write_frame) + 40 + 24];
+    size_t len;
+    struct mrc_wire_srv6_tx route = srv6_route();
+    memcpy(frame, write_frame, sizeof(write_frame));
+    memcpy(frame, srv6_ipv4_frame, 2 * MRC_MAC_LEN);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame), &route, &len) == 0);
+    assert(len == sizeof(srv6_ipv4_frame) && memcmp(frame, srv6_ipv4_frame, len) == 0);
+
+    static const uint8_t segments[][MRC_IPV6_ADDR_LEN] = {{0xfc, 0xbb, 0xbb, 0, 0, 0x44}};
+    route.segment_count = 1;
+    route.segment_list = segments;
+    memcpy(frame, write_frame, sizeof(write_frame));
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame), &route, &len) == 0);
+    assert(len == sizeof(frame));
+    assert(memcmp(frame, write_frame, 2 * MRC_MAC_LEN) == 0 && frame[12] == 0x86 && frame[13] == 0xdd);
+    assert(frame[20] == 43 && frame[54] == 4 && frame[55] == 2 && frame[56] == 4);
+    assert(!frame[57] && !frame[58]);
+    assert(memcmp(frame + 62, segments[0], MRC_IPV6_ADDR_LEN) == 0);
+    assert(memcmp(frame + 78, write_frame + 14, sizeof(write_frame) - 14) == 0);
+
+    struct mrc_wire_packet decoded;
+    struct mrc_wire_srv6 routing;
+    assert(mrc_wire_decode_srv6(frame, len, &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 24 && decoded.ip_version == MRC_WIRE_IP4);
+    assert(decoded.body.write.data_len == 5 && decoded.body.write.imm_data == 0xf00dcafe);
+    assert(mrc_wire_dispatch_srv6_header(frame, 40 + 24 + MRC_WIRE_IPV4_HEADER_LEN + MRC_BTH_LEN,
+                                         &decoded, &routing) == 0);
+    assert(routing.encapsulated && routing.srh_len == 24 && decoded.ip_version == MRC_WIRE_IP4);
+}
+
+static void test_bad_srv6_wrap(void)
+{
+    uint8_t frame[sizeof(srv6_tx_srh_frame)];
+    struct mrc_wire_srv6_tx route = srv6_route();
+    size_t len = 0;
+    prepare_wrap_frame(frame);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(ipv6_write_frame) - 1, sizeof(ipv6_write_frame),
+                              &route, &len) == -EMSGSIZE);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(srv6_usid_frame) - 1, sizeof(ipv6_write_frame),
+                              &route, &len) == -EMSGSIZE);
+    assert(len == 0);
+    assert(memcmp(frame + 14, ipv6_write_frame + 14, sizeof(ipv6_write_frame) - 14) == 0);
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame) - 1, &route, &len) ==
+           -EBADMSG);
+    route.segment_count = 1;
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) ==
+           -EINVAL); /* No segment list. */
+    route.segment_count = 128;
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) ==
+           -EINVAL); /* Hdr Ext Len would overflow. */
+    route.segment_count = 0;
+    route.segments_left = 1;
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) ==
+           -EINVAL); /* Active segment count requires an SRH. */
+    route.segments_left = 0;
+    route.flow_label = MRC_IPV6_FLOW_LABEL_MASK + 1;
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) ==
+           -EINVAL);
+    route.flow_label = 0x98765;
+
+    memcpy(frame, write_frame, sizeof(write_frame));
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame) - 1, &route, &len) == -EBADMSG);
+    frame[13] = 6; /* ARP EtherType. */
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(write_frame), &route, &len) ==
+           -EPROTONOSUPPORT);
+
+    prepare_wrap_frame(frame);
+    frame[sizeof(ipv6_write_frame) - 1] ^= 1;
+    assert(mrc_wire_wrap_srv6(frame, sizeof(frame), sizeof(ipv6_write_frame), &route, &len) == 0);
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode_srv6(frame, len, &decoded, NULL) == -EBADMSG);
+}
+
+static void test_srv6_outer_trimmed_request(void)
+{
+    struct mrc_wire_trimmed trim;
+    struct mrc_wire_srv6 routing;
+    size_t len = sizeof(srv6_outer_trim_frame);
+    assert(mrc_wire_decode_trimmed_srv6(srv6_outer_trim_frame, len, 46, &trim, &routing) ==
+           -EPROTONOSUPPORT); /* Only outer DSCP can classify this packet. */
+    assert(mrc_wire_decode_trimmed_srv6(srv6_outer_trim_frame, len, 47, &trim, &routing) == 0);
+    assert(routing.encapsulated && routing.outer_dscp == 47 && routing.srh_len == 48);
+    assert(trim.ip_version == MRC_WIRE_IP6 && trim.ipv6.dscp == 46 && trim.ipv6.flow_label == 0xabcde);
+    assert(trim.bth.dqp == 0xc0ffee && trim.bth.psn == 0x00ff01 && trim.bth.retransmit);
+    assert(trim.timestamp && trim.tsr && trim.tx_timestamp == 0x4567);
+    assert(trim.original_udp_len == 60);
+
+    struct mrc_wire_packet decoded;
+    assert(mrc_wire_decode_srv6(srv6_outer_trim_frame, len, &decoded, NULL) == -EBADMSG);
+    uint8_t frame[sizeof(srv6_outer_trim_frame)];
+    memcpy(frame, srv6_outer_trim_frame, len);
+    memcpy(frame + 18, srv6_srh_frame + 18, 2); /* Retain the untrimmed outer length. */
+    assert(mrc_wire_decode_trimmed_srv6(frame, len, 47, &trim, NULL) == 0);
+    assert(trim.original_udp_len == 60 && trim.timestamp);
+
+    size_t bth_end = 54 + 48 + 40 + 8 + MRC_BTH_LEN;
+    assert(mrc_wire_decode_trimmed_srv6(frame, bth_end, 47, &trim, NULL) == 0);
+    assert(trim.original_udp_len == 60 && !trim.timestamp);
+    assert(mrc_wire_decode_trimmed_srv6(frame, bth_end - 1, 47, &trim, NULL) == -EBADMSG);
+    frame[55] = 255;
+    assert(mrc_wire_decode_trimmed_srv6(frame, len, 47, &trim, NULL) == -EBADMSG);
+
+    uint8_t intact[sizeof(srv6_srh_frame)];
+    memcpy(intact, srv6_srh_frame, sizeof(intact));
+    memcpy(intact + 14, srv6_outer_trim_frame + 14, 4);
+    /* A marked packet can retain the payload, and must use the metadata-only API. */
+    assert(mrc_wire_decode_trimmed_srv6(intact, sizeof(intact), 47, &trim, NULL) == 0);
+    assert(trim.original_udp_len == 60 && trim.timestamp);
+
+    assert(mrc_wire_decode_trimmed_srv6(ipv6_trim_frame, sizeof(ipv6_trim_frame), 47, &trim,
+                                       &routing) == 0);
+    assert(!routing.encapsulated && trim.ip_version == MRC_WIRE_IP6 && trim.original_udp_len == 60);
+    assert(mrc_wire_decode_trimmed_srv6(trim_frame, sizeof(trim_frame), 47, &trim, &routing) == 0);
+    assert(!routing.encapsulated && trim.ip_version == MRC_WIRE_IP4 && trim.original_udp_len == 60);
+}
+
+int main(void)
+{
+    test_write();
+    test_ack();
+    test_sack();
+    test_nack();
+    test_probe();
+    test_endpoint();
+    test_ipv6_ev_probe();
+    test_trimmed_request();
+    test_unknown_opcode();
+    test_bad_frames();
+    test_ipv6_write();
+    test_ipv6_control();
+    test_ipv6_trimmed_request();
+    test_ipv6_integrity();
+    test_srv6_receive();
+    test_srv6_dispatch();
+    test_bad_srv6();
+    test_srv6_transmit();
+    test_srv6_ipv4_transmit();
+    test_bad_srv6_wrap();
+    test_srv6_outer_trimmed_request();
+    puts("MRC wire codec tests passed");
+    return 0;
+}
