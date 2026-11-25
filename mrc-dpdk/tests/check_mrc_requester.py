@@ -408,6 +408,38 @@ class LateNackResponder(ReferenceResponder):
             self.pending_ack = None
 
 
+class CrossRailSackResponder(ReferenceResponder):
+    write_lengths = (7, 9)
+    opcodes = (0xCB, 0xCB)
+
+    def __init__(self, wire, mode):
+        super().__init__(wire, mode, None)
+        self.first_rail = None
+        self.first_packet = None
+
+    def acknowledge_write(self, rail, packet, index):
+        if index == 0:
+            self.first_rail = rail
+            self.first_packet = packet
+        else:
+            require(rail != self.first_rail, "Cross-rail SACK did not disable the forward EV")
+            super().acknowledge_write(rail, packet, index)
+
+    def receive(self, message):
+        super().receive(message)
+        if self.first_packet is None or self.rails_observed != 3:
+            return
+        packet, self.first_packet = self.first_packet, None
+        other_rail = 1 - self.first_rail
+        other_entropy = packet.entropy ^ (0x10001 if self.ipv6 else 1)
+        # The next WRITE still needs a receive credit, so its trigger is unsent.
+        self.sack(other_rail, packet, index=1, mark=2, entropy=other_entropy)
+        # The valid mark affects the original forward EV, even on the other rail.
+        self.sack(other_rail, packet, index=0, mark=2)
+        self.transport_ack(other_rail, 1)
+        self.first_write_acked = True
+
+
 class FastLossResponder(ReferenceResponder):
     packets = 24
     write_lengths = (packets * 1024,)
@@ -757,7 +789,7 @@ def stop_relay(wire, relay):
 def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                   port_status=None, flow_control=False, probe_correlation=False, retry_timer=None,
                   late_nack=False, fast_loss=None, sack_trigger=False, trim_disabled=False,
-                  retry_nack_reason=NO_PKT_BUFFER):
+                  retry_nack_reason=NO_PKT_BUFFER, cross_rail_sack=False):
     cpus = sorted(os.sched_getaffinity(0))
     require(len(cpus) >= 2, "The requester fixture needs two polling cores")
     with tempfile.TemporaryDirectory(prefix="mrc-peer-") as temporary, \
@@ -794,6 +826,8 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                 wire.settimeout(0.005)
             elif sack_trigger:
                 responder = SackTriggerResponder(wire, mode)
+            elif cross_rail_sack:
+                responder = CrossRailSackResponder(wire, mode)
             elif probe_correlation:
                 responder = ProbeCorrelationResponder(wire, mode)
             elif flow_control:
@@ -897,6 +931,10 @@ def run_requester(binary, relay_binary, mode, nack_reason=None, *,
                         f"Unexpected Port Status counters: {counters}")
                 counters["status_report_interval_ms"] = round(1000 * responder.report_interval)
                 counters["status_resume_delay_ms"] = round(1000 * responder.resume_delay)
+            elif cross_rail_sack:
+                require(counters["ev_failed_mask"] == 1 << responder.first_rail and
+                        counters["sacks"] == responder.sacks_sent - 1 and not any(counters["retries"]),
+                        f"Unexpected cross-rail SACK observations: {counters}")
             elif flow_control or sack_trigger:
                 if sack_trigger:
                     require(responder.invalid_sacks == 2 and responder.cross_rail_sacks > 0
@@ -941,6 +979,8 @@ def main():
     focused.add_argument("--fast-loss-only", action="store_true", help="Run only SACK fast-loss cases")
     focused.add_argument("--sack-trigger-only", action="store_true",
                          help="Run unsent SACK trigger and cross-rail feedback cases")
+    focused.add_argument("--cross-rail-sack-only", action="store_true",
+                         help="Run only the cross-rail SACK marking case")
     focused.add_argument("--trim-disabled-only", action="store_true",
                          help="Inject NACKs with optional local trim generation disabled")
     args = parser.parse_args()
@@ -948,7 +988,7 @@ def main():
     binary, relay = args.binary.resolve(), args.relay.resolve()
     normal_suite = not (args.port_status_only or args.flow_control_only or args.probe_correlation_only
                         or args.retry_timer_only or args.late_nack_only or args.fast_loss_only
-                        or args.sack_trigger_only or args.trim_disabled_only)
+                        or args.sack_trigger_only or args.cross_rail_sack_only or args.trim_disabled_only)
     if normal_suite:
         for mode in args.mode or MODES:
             for reason, label in ((NO_PKT_BUFFER, "no_packet_buffer"), (TRIM, "trim"),
@@ -977,6 +1017,10 @@ def main():
         for mode in args.mode or MODES:
             counters = run_requester(binary, relay, mode, sack_trigger=True)
             print(json.dumps({"mode": mode, "sack_trigger": True, **counters}))
+    if normal_suite or args.cross_rail_sack_only:
+        for mode in args.mode or MODES:
+            counters = run_requester(binary, relay, mode, cross_rail_sack=True)
+            print(json.dumps({"mode": mode, "cross_rail_sack": True, **counters}))
     mode = (args.mode or ("ipv6",))[0]
     if normal_suite or args.port_status_only:
         for case in ("replace", "expire"):

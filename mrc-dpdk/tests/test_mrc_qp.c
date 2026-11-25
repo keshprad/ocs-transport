@@ -196,6 +196,17 @@ static void test_delivery_and_transport_ack(void)
         .sack_offset = 2,
         .bitmap = 1,
     };
+    /* A future trigger and a future set bit must both leave the QP untouched. */
+    struct mrc_sack invalid = { .cack_psn = 0, .ack_psn_offset = 3 };
+    assert(!mrc_tx_apply_sack(&tx, &invalid, false));
+    invalid.ack_psn_offset = 0;
+    invalid.sack_offset = 1;
+    invalid.bitmap = UINT64_C(1) << 2;
+    assert(!mrc_tx_apply_sack(&tx, &invalid, false));
+    assert(tx.delivery_cack_psn == MRC_PSN_MASK - 1);
+    assert(!mrc_tx_packet(&tx, MRC_PSN_MASK)->received);
+    assert(!mrc_tx_packet(&tx, 0)->received);
+
     assert(mrc_tx_apply_sack(&tx, &sack, true));
     assert(mrc_tx_packet(&tx, 0)->received);
     assert(!mrc_tx_packet(&tx, 2)->received);

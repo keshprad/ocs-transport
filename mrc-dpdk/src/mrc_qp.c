@@ -243,6 +243,12 @@ bool mrc_tx_apply_sack(struct mrc_tx_qp *qp, const struct mrc_sack *sack,
             return false;
     }
 
+    /* Reject acknowledgment of unsent data before applying any of the SACK. */
+    int32_t first_unsent_bit = cack_age - sack->sack_offset;
+    if (sack->bitmap && (first_unsent_bit <= 0 ||
+        (first_unsent_bit < (int32_t)MRC_SACK_BITS && (sack->bitmap >> first_unsent_bit))))
+        return false;
+
     if (mrc_psn_delta(sack->cack_psn, qp->delivery_cack_psn) > 0) {
         int32_t last = mrc_psn_delta(sack->cack_psn, qp->first_psn);
         int32_t previous = mrc_psn_delta(qp->delivery_cack_psn, qp->first_psn);
