@@ -253,6 +253,8 @@ def unit_argv(endpoint, destination, runtime):
 def unit_environment(endpoint, destination, runtime):
     profile = endpoint.settings
     environment = {"LD_LIBRARY_PATH": str(runtime), "XDG_RUNTIME_DIR": str(profile.runtime_dir)}
+    if profile.app_mode == "mr-copy" and endpoint.role == "tx":
+        environment["ROCE_DPDK_TX_MODE"] = "copy"
     if profile.native_mr:
         environment.update(RDMAV_DRIVERS=str(destination / "provider/libroce_dpdk"),
                            ROCE_DPDK_MR_SOCKET=str(profile.runtime_dir / "registration.sock"),
@@ -617,6 +619,8 @@ def parse_result(endpoint, messages):
     }
     if endpoint.role == "tx":
         expected.update(send_window=str(SEND_WINDOW), tx_burst=str(profile.tx_burst))
+        if "tx_mode" in fields:
+            expected["tx_mode"] = "scatter-gather" if profile.scatter_gather else "copy"
     require(all(fields.get(key) == value for key, value in expected.items()),
             f"{endpoint.label}: unexpected bandwidth profile: {lines[0]}")
 

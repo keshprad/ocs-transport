@@ -49,7 +49,14 @@ def expect_success(child, *markers):
 
 def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=False,
           provider=None, post_batch=None, native_queues=False, rdmacm=False, external_qp=False,
-          source_option=None, multiple_targets=False):
+          source_option=None, multiple_targets=False, tx_mode_args=None, tx_mode_env=None):
+    tx_mode = "scatter-gather" if scatter_gather else "copy"
+    worker_env = os.environ.copy()
+    worker_env.pop("ROCE_DPDK_TX_MODE", None)
+    if tx_mode_env is not None:
+        worker_env["ROCE_DPDK_TX_MODE"] = tx_mode_env
+    if tx_mode_args is None:
+        tx_mode_args = ["--scatter-gather"] if scatter_gather else ["--tx-mode", "copy"]
     with tempfile.TemporaryDirectory(prefix="roce-app-memif-") as directory, ExitStack() as stack:
         with socket.socket() as unused:
             unused.bind(("127.0.0.1", 0))
@@ -70,7 +77,7 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
 
         rx_path = directory / "rx.sock"
         rx = process(stack, command(cpus[:workers], directory, "rx", size, port, "192.0.2.2", 1024, mac=rx_mac)
-                     + options + rx_cm + rx_mr + rx_cma + ["--app-socket", str(rx_path)])
+                     + options + rx_cm + rx_mr + rx_cma + ["--app-socket", str(rx_path)], env=worker_env)
         expect_ready(rx, "application listener ready")
         rx_env = {**os.environ, "ROCE_DPDK_MR_SOCKET": rx_mr[1], "RDMAV_DRIVERS": provider} if provider else None
         if rdmacm:
@@ -80,7 +87,7 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         expect_ready(rx, "control listener ready")
 
         tx_path = directory / "tx.sock"
-        tx_options = options + (["--scatter-gather"] if scatter_gather else [])
+        tx_options = options + tx_mode_args
         if post_batch:
             tx_options += ["--app-post-batch", str(post_batch)]
         if native_queues:
@@ -88,7 +95,7 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
         if source_option:
             tx_options.append(source_option)
         tx = process(stack, command(cpus[workers:2 * workers], directory, "tx", size, port, "192.0.2.1", 1024, mac=tx_mac)
-                     + tx_options + tx_cm + tx_mr + tx_cma + ["--app-socket", str(tx_path)])
+                     + tx_options + tx_cm + tx_mr + tx_cma + ["--app-socket", str(tx_path)], env=worker_env)
         expect_ready(tx, "application listener ready")
         tx_env = {**os.environ, "ROCE_DPDK_MR_SOCKET": tx_mr[1], "RDMAV_DRIVERS": provider} if provider else None
         if rdmacm:
@@ -98,7 +105,7 @@ def check(cpus, size, writes, qps, workers, device, *, scatter_gather=False, cm=
 
         total = size * writes * qps
         cm_marker = ("RoCEv2 CM established", "RoCEv2 CM disconnected") if cm else ()
-        tx_log = expect_success(tx, f"WRITE complete: {total} bytes", *cm_marker)
+        tx_log = expect_success(tx, f"WRITE complete: {total} bytes", f" tx_mode={tx_mode}\n", *cm_marker)
         rx_log = expect_success(rx, f"WRITE verified: {total} bytes", *cm_marker)
         app_marker = ("Application CM established",) if cm else ()
         if rdmacm:
@@ -156,8 +163,9 @@ def main():
             check(cpus, 8195, 3, 4, 2, None, provider=args.verbs_provider, post_batch=3,
                   native_queues=True, multiple_targets=True)
         return
-    check(cpus, 8195, 1, 1, 1, args.kernel_mr)
-    check(cpus, 8195, 1, 1, 1, args.kernel_mr, scatter_gather=True)
+    check(cpus, 8195, 1, 1, 1, args.kernel_mr, scatter_gather=True, tx_mode_args=[])
+    check(cpus, 8195, 1, 1, 1, args.kernel_mr, tx_mode_args=[], tx_mode_env="copy")
+    check(cpus, 8195, 1, 1, 1, args.kernel_mr, tx_mode_env="scatter-gather")
     check(cpus, 8195, 3, 1, 1, args.kernel_mr, scatter_gather=True, cm=True, post_batch=1)
     if len(cpus) >= 4:
         check(cpus, 262147, 3, 4, 2, args.kernel_mr, post_batch=1)

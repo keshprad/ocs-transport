@@ -50,11 +50,21 @@ With the registration module loaded and accessible to the client, use
 page-aligned application allocation. The [kernel test](kernel/README.md)
 covers the descriptor and pin lifetime independently.
 
-For scatter/gather transmit, add `--scatter-gather` to the application-backed
-requester. The worker builds the headers, padding and iCRC in its own buffers
-and references the application payload as a separate TX segment. The CPU still
-reads the payload to compute the iCRC. The receiving worker copies into the
-application mapping before acknowledging the WRITE.
+Application-backed senders default to scatter/gather. Standalone senders
+default to copy mode. Set `ROCE_DPDK_TX_MODE=copy` or
+`ROCE_DPDK_TX_MODE=scatter-gather` in the sender worker's environment to
+choose the transmit mode at startup. Copy mode copies the payload into the
+packet buffer. The sender can override the environment with `--tx-mode copy`
+or `--tx-mode scatter-gather` after the EAL arguments. The existing
+`--scatter-gather` flag also selects scatter/gather. The receiver ignores the
+environment variable. With `--report-bw`, the sender reports its selection as
+`tx_mode`.
+
+Scatter/gather requires an application-backed requester. The worker builds
+the headers, padding and iCRC in its own buffers and references the application
+payload as a separate TX segment. The CPU still reads the payload to compute
+the iCRC. The receiving worker copies into the application mapping before
+acknowledging the WRITE.
 
 For software jumbo tests, connect two DPDK `net_tap` interfaces with a
 private Linux bridge. Pass `--tap-mtu 4200` and PMTU `4096` on each worker.

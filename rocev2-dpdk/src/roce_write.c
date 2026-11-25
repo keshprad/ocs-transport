@@ -364,10 +364,12 @@ static void report_bandwidth(bool sender, uint64_t bytes, uint64_t started, uint
     if (usage->has_faults)
         printf(" poll_minor_faults=%" PRIu64 " poll_major_faults=%" PRIu64,
                usage->minor_faults, usage->major_faults);
-    if (sender)
+    if (sender) {
         printf(" send_window=%u tx_burst=%u", options->send_window, options->tx_burst);
-    if (sender && options->queue_window)
-        printf(" queue_window=%u", options->queue_window);
+        if (options->queue_window)
+            printf(" queue_window=%u", options->queue_window);
+        printf(" tx_mode=%s", options->scatter_gather ? "scatter-gather" : "copy");
+    }
     putchar('\n');
 }
 
@@ -1127,7 +1129,7 @@ cleanup_flows:
     return result;
 }
 
-static bool parse_datapath_options(int argc, char **argv, struct datapath_options *options)
+static bool parse_datapath_options(int argc, char **argv, bool sender, struct datapath_options *options)
 {
     *options = (struct datapath_options) {
         .send_window = ROCE_SEND_WINDOW_DEFAULT,
@@ -1136,13 +1138,18 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
         .qps = 1,
         .workers = 1,
     };
+    const char *tx_mode = NULL;
     for (int i = 0; i < argc; ++i) {
         if (strcmp(argv[i], "--report-bw") == 0) {
             options->report_bandwidth = true;
         } else if (strcmp(argv[i], "--prefault-app") == 0) {
             options->prefault_app = true;
         } else if (strcmp(argv[i], "--scatter-gather") == 0) {
-            options->scatter_gather = true;
+            tx_mode = "scatter-gather";
+        } else if (strcmp(argv[i], "--tx-mode") == 0) {
+            if (++i == argc)
+                return false;
+            tx_mode = argv[i];
         } else if (strcmp(argv[i], "--verbs-queues") == 0) {
             options->native_queues = true;
         } else if (strcmp(argv[i], "--two-sge-writes") == 0) {
@@ -1215,6 +1222,16 @@ static bool parse_datapath_options(int argc, char **argv, struct datapath_option
             return false;
         }
     }
+    if (!tx_mode && sender)
+        tx_mode = getenv("ROCE_DPDK_TX_MODE");
+    if (!tx_mode) {
+        options->scatter_gather = sender && options->app_socket;
+    } else if (strcmp(tx_mode, "scatter-gather") == 0) {
+        options->scatter_gather = true;
+    } else if (strcmp(tx_mode, "copy") != 0) {
+        fprintf(stderr, "TX mode must be copy or scatter-gather (--tx-mode or ROCE_DPDK_TX_MODE)\n");
+        return false;
+    }
     return true;
 }
 
@@ -1242,14 +1259,15 @@ int main(int argc, char **argv)
     int result = 1;
     uint16_t port = RTE_MAX_ETHPORTS;
     if (argc < 8 || !roce_lab_parse(argv, &options) ||
-        !parse_datapath_options(argc - 8, argv + 8, &datapath)) {
+        !parse_datapath_options(argc - 8, argv + 8, options.sender, &datapath)) {
         fprintf(stderr, "usage: roce_write EAL_ARGS -- tx|rx BYTES CONTROL_IP TCP_PORT DATA_IP PMTU DPDK_PORT"
                         " [--report-bw] [--tx-burst N] [--send-window N] [--writes N] [--qps N]"
                         " [--workers N] [--queue-window N] [--start-gate PORT] [--app-socket PATH]"
                         " [--mr-socket PATH] [--app-post-batch N] [--verbs-queues] [--two-sge-writes] [--multi-mr-writes]"
                         " [--multi-mr-targets]"
                         " [--prefault-app]"
-                        " [--scatter-gather] [--tap-mtu N] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
+                        " [--tx-mode copy|scatter-gather] [--scatter-gather]"
+                        " [--tap-mtu N] [--cm-peer IPV4 MAC] [--rdmacm-socket PATH]\n");
         goto cleanup_eal;
     }
     if (datapath.start_gate && !options.sender) {
