@@ -739,6 +739,74 @@ invocations `8f031631d0b24338956b20155257f6cc` and
 `3e826d0d1ac04ad190f50222e9282d4d` and
 `e78f4698b3224bf596890d423624076d` at MTU 4200.
 
+### Spark-04 application bandwidth over two physical QSFP ports
+
+On November 24, 2026, Spark-04 sent concurrent one-way RoCEv2 WRITEs
+over two active 100 Gbit/s links. Its left QSFP port used PCIe domain
+`0000` to Spark-02 and its right QSFP port used domain `0002` to
+Spark-01. Each path used the pinned `8c5058a` application build with
+prefaulted memfd scatter/gather, four workers, 16 QPs, and 1 MiB WRITEs.
+Each receiver verified 16 GiB per trial. Aggregate payload goodput is
+32 GiB divided by the interval from the earliest TX start to the latest
+TX finish, expressed in decimal Gbit/s.
+
+| Ethernet MTU | RoCE PMTU | Packet-pool pages | Aggregate trials (Gbit/s) | Median (Gbit/s) | TX retries |
+| ---: | ---: | ---: | --- | ---: | --- |
+| 1500 | 1024 | 4 KiB | 162.137, 162.749, 166.925 | 162.749 | 18, 1, 1 |
+| 4200 | 4096 | 2 MiB | 195.999, 196.034, 196.029 | 196.029 | 0, 0, 0 |
+
+The jumbo configuration improved median goodput by **20.45%** and
+reached **98.0%** of the combined line rate. At MTU 1500, the separate
+one-port controls reached 85.162 Gbit/s to Spark-02 and 88.813 Gbit/s to
+Spark-01, compared with 81.374 and 88.291 Gbit/s median per-port rates
+during concurrent sends. The jumbo per-port medians were 98.024 and
+98.020 Gbit/s. Sender intervals overlapped for at least 99.96% of the
+jumbo transfer window. All jumbo endpoints recorded zero NIC errors or
+misses. Afterward all four test interfaces returned to MTU 1500, and
+temporary hugepages were released on all three hosts.
+
+The earlier one-cable application test used both PCIe functions on the
+same 100 Gbit/s Spark-04 to Spark-02 QSFP connection and reached
+92.185 Gbit/s median. The earlier [single-port jumbo comparison](#spark-04-to-spark-02-jumbo-page-backing)
+held the MTU and workload constant and found mlx5 local protection
+errors with 4 KiB pages. Using 2 MiB pages cleared the errors. The
+specific receive descriptor or memory registration that failed remains
+unverified.
+
+[Same-cable trials](results/spark-04-two-qsfp/same-cable-mtu1500.json),
+[MTU 1500 aggregate](results/spark-04-two-qsfp/mtu1500.json),
+[MTU 1500 isolation](results/spark-04-two-qsfp/mtu1500-isolation.json),
+[jumbo aggregate](results/spark-04-two-qsfp/mtu4200-hugepages.json),
+[reproduction commands](README.md#application-bandwidth-over-two-physical-qsfp-ports).
+
+### Native MR registration latency in QEMU
+
+The Spark-04 kernel (`6.17.0-1021-nvidia`) ran in a two-vCPU QEMU TCG
+guest with no attached NIC. Three paired trials compared our DPDK
+provider (`roce_dpdk0`) with stock Linux Soft-RoCE (`rxe_bench`). Both
+providers used prefaulted shared anonymous buffers backed by 4 KiB
+pages and registered one region at a time with local-write and
+remote-write access. The DPDK provider used protection-domain-scoped
+registrations and the Generic Netlink ticket path to its separate
+registration broker.
+
+Each provider completed 1,140 `ibv_reg_mr()` / `ibv_dereg_mr()` pairs.
+The table shows the median of each percentile across the three trials.
+
+| Region size | Our registration p50 / p95 | RXE registration p50 | Our deregistration p50 |
+| --- | ---: | ---: | ---: |
+| 4 KiB | 4.59 / 5.06 ms | 0.32 ms | 1.49 ms |
+| 1 MiB | 4.83 / 5.37 ms | 0.66 ms | 1.55 ms |
+| 16 MiB | 7.47 / 8.03 ms | 4.47 ms | 2.70 ms |
+| 64 MiB | 14.92 / 15.52 ms | 16.56 ms | 5.85 ms |
+| 256 MiB | 45.03 / 45.86 ms | 63.83 ms | 18.29 ms |
+
+The measured setup cost is acceptable for buffers registered once and
+reused across many WRITEs. For frequent small-region registration, the
+4 KiB case took about 14 times as long as RXE in the same guest. The
+measurement covers the verbs calls in emulation. Physical Spark
+registration latency and mlx5 DMA-BUF mapping latency remain unmeasured.
+
 ### Additional datapath measurements
 
 On the four-worker MTU 1500 profile, one prefaulted trial measured

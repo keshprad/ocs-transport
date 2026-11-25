@@ -729,6 +729,96 @@ The sender windows overlapped by at least 99.97%, with at most
 two, two, and zero. The last run verified exactly 16,777,216 data
 packets per rail with zero DPDK misses or packet errors.
 
+### Application bandwidth over both PCIe paths
+
+The aggregate application profile runs prefaulted memfd scatter/gather
+on the two PCIe functions of the same Spark-04 to Spark-02 QSFP
+connection. Each function has four polling workers, 16 QPs and a
+separate worker/application socket. The senders start together and the
+runner validates 16 GiB on each path before reporting aggregate goodput
+from the first sender start to the last sender completion.
+
+Use both interfaces on each host at Ethernet MTU 1500. The preflight
+checks the two existing lab subnets, the PCIe mappings and raw Ethernet
+mode on the selected functions. The profile works at the link's
+negotiated speed and records it in the report.
+
+~~~sh
+python3 tests/stage_spark_app_bandwidth.py "$REVISION" --inputs "$INPUTS" \
+  --profile app-aggregate-1 --profile app-aggregate-2
+~~~
+
+Install each generated package on its target Spark. From Spark-04, run
+the benchmark with the path returned by the staging command.
+
+~~~sh
+python3 tests/check_spark_bandwidth.py --app-aggregate \
+  --destination "/opt/ocs-roce-app-bw/$REVISION-aggregate" --app-bundle "$BUNDLE"
+~~~
+
+The same-cable application run reached **92.185 Gbit/s** median at
+MTU 1500. Both PCIe functions shared one active 100 Gbit/s QSFP link.
+
+### Application bandwidth over two physical QSFP ports
+
+Spark-04 sends from PCI function `0000:01:00.0` to Spark-02 on the left
+QSFP port and from `0002:01:00.1` to Spark-01 on the right QSFP port.
+Both physical links reported 100 Gbit/s. With the `8c5058a` build,
+median one-way application WRITE goodput improved from **162.749 Gbit/s**
+at MTU 1500 to **196.029 Gbit/s** at MTU 4200 with 2 MiB packet-pool
+pages. Both receivers verified 16 GiB per trial. The three jumbo trials
+had zero retries, NIC errors, or missed packets.
+[Trial details](CONFORMANCE.md#spark-04-application-bandwidth-over-two-physical-qsfp-ports)
+
+With the three Sparks in raw Ethernet mode, stage both MTU profiles using
+the same pinned application inputs used for the paired sweep.
+
+~~~sh
+bundle=$(python3 tests/stage_spark_app_bandwidth.py "$REVISION" --inputs "$INPUTS" --two-qsfp)
+~~~
+
+Copy each generated host directory to its named Spark and run its
+`install.sh` with sudo. From Spark-04, run the two profiles against the
+installed release and the original bundle manifest.
+
+~~~sh
+for mtu in 1500 4200; do
+  python3 tests/check_spark_bandwidth.py --two-qsfp --mtu "$mtu" \
+    --destination "/opt/ocs-roce-app-bw/$REVISION-two-qsfp" --app-bundle "$bundle"
+done
+~~~
+
+The jumbo run temporarily sets the four selected interfaces to MTU 4200
+and reserves 128 MiB of 2 MiB pages per DPDK process for packet pools.
+The pool service restores MTU 1500 and releases that reservation at exit.
+The benchmark uses management SSH for setup and puts the exchanged wire
+IP and MAC addresses directly into DPDK packets.
+
+### Switch the three-Spark ring to raw Ethernet
+
+Run the helper from the RoCEv2 directory on Spark-01, Spark-02, and
+Spark-04 over management SSH. It checks the four QSFP-facing interface
+names and PCI functions on each host. Driver reloads can briefly
+interrupt both data ports.
+
+~~~sh
+python3 tests/spark_roce_ethernet.py status
+sudo /usr/bin/python3 -I tests/spark_roce_ethernet.py raw
+~~~
+
+The raw setup saves each interface's RoCE mode, MTU, administrative
+state, and IPv4 addresses under /var/lib/ocs-roce-ethernet/. It switches
+the four functions to raw Ethernet, sets the interfaces to MTU 1500,
+and reapplies the saved addresses and any missing DPDK test addresses.
+Rerun the same command to resume a partial setup.
+
+After the tests finish, restore the saved settings on each host. This
+also removes the temporary DPDK addresses that the helper added.
+
+~~~sh
+sudo /usr/bin/python3 -I tests/spark_roce_ethernet.py restore
+~~~
+
 ### Three-Spark ring sweep
 
 Once the two-Spark target is verified, install the pinned ring services

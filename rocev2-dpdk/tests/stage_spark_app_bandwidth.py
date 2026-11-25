@@ -10,14 +10,16 @@ import shutil
 import tempfile
 
 from check_spark_bandwidth import (
-    APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER, APP_MLX5_FILES, APP_PROFILES, DMA_PROOF_MARKERS,
+    APP_AGGREGATE_PROFILES, APP_AGGREGATE_SUFFIX, APP_DESTINATION_ROOT, APP_FILES, APP_HUGEPAGE_HELPER,
+    APP_MLX5_FILES, APP_PROFILES, APP_TWO_QSFP_HELPER, APP_TWO_QSFP_POOL, APP_TWO_QSFP_PROFILES,
+    APP_TWO_QSFP_SUFFIX, DMA_PROOF_MARKERS,
     DMA_PROOF_PROFILES, DMA_PROOF_SUFFIX, HUGEPAGE_PROFILES, PREFAULT_PROFILES, SHORT_WRITE_PROFILES,
     Endpoint, unit_argv, unit_environment,
 )
 from stage_spark_cm import APP_LAUNCHER
 
 
-HOSTS = {"spark-04": "spark-7e64", "spark-02": "spark-4ed9"}
+HOSTS = {"spark-04": "spark-7e64", "spark-02": "spark-4ed9", "spark-01": "spark-28a3"}
 ACCOUNT = "ocs-roce-native"
 RULES = "99-ocs-roce-native.rules"
 SUDOERS = "ocs-roce-app-bw.sudoers"
@@ -106,14 +108,17 @@ def render_unit(endpoint, destination):
     runtime = destination / "lib"
     environment = "\n".join(f"Environment={shlex.quote(f'{key}={value}')}"
                             for key, value in unit_environment(endpoint, destination, runtime).items())
+    dependencies = ""
     hugepage_hooks = ""
-    if endpoint.settings.hugepages:
+    if endpoint.shared_hugepages:
+        dependencies = f"BindsTo={APP_TWO_QSFP_POOL}\nAfter={APP_TWO_QSFP_POOL}\n"
+    elif endpoint.settings.hugepages:
         helper = destination / APP_HUGEPAGE_HELPER
         hugepage_hooks = f"ExecStartPre=+/bin/bash {helper} prepare\nExecStopPost=+/bin/bash {helper} cleanup\n"
     return f"""[Unit]
 Description=RoCEv2 Spark application bandwidth ({endpoint.profile}, {endpoint.role})
 ConditionHost={HOSTS[endpoint.host]}
-
+{dependencies}
 [Service]
 Type=exec
 User={ACCOUNT}
@@ -135,6 +140,26 @@ RuntimeMaxSec=120
 """
 
 
+def render_two_qsfp_pool(host, destination):
+    helper = destination / APP_TWO_QSFP_HELPER
+    return f"""[Unit]
+Description=Reserve DPDK packet pages and set MTU 4200 for the dual-QSFP benchmark
+ConditionHost={HOSTS[host]}
+
+[Service]
+Type=exec
+User={ACCOUNT}
+Group={ACCOUNT}
+NoNewPrivileges=yes
+RuntimeMaxSec=480
+TimeoutStartSec=40
+TimeoutStopSec=25
+ExecStartPre=+/bin/bash {helper} prepare
+ExecStart=/usr/bin/sleep infinity
+ExecStopPost=+/bin/bash {helper} cleanup
+"""
+
+
 def render_permissions(units):
     rules = []
     for unit in units:
@@ -145,9 +170,15 @@ def render_permissions(units):
     return "\n".join(rules) + "\n"
 
 
-def render_install(host, destination, units, payload, manifest_hash, dma_proof=False):
-    managed = (*units, RULES, SUDOERS)
-    sudoers = "ocs-roce-app-bw-proof" if dma_proof else "ocs-roce-app-bw"
+def render_install(host, destination, units, payload, manifest_hash, sudoers_suffix, *, native_rules=True):
+    managed = (*units, *((RULES,) if native_rules else ()), SUDOERS)
+    sudoers = f"ocs-roce-app-bw{sudoers_suffix}"
+    verify_rules = f'udevadm verify --resolve-names=never "$stage/{RULES}"\n' if native_rules else ""
+    install_rules = f"""install -o root -g root -m 0644 -- "$stage/{RULES}" /etc/udev/rules.d/{RULES}
+udevadm control --reload-rules
+udevadm trigger --action=change --settle --subsystem-match=misc --sysname-match=roce_mr
+udevadm trigger --action=change --settle --subsystem-match=infiniband_verbs --attr-match=ibdev=roce_dpdk0
+""" if native_rules else ""
     return f"""#!/bin/bash
 set -euo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -180,8 +211,7 @@ done
 printf '%s  %s\\n' '{manifest_hash}' "$stage/SHA256SUMS" | sha256sum --check --strict --status
 (cd -- "$stage" && sha256sum --check --strict SHA256SUMS)
 visudo -cf "$stage/{SUDOERS}"
-udevadm verify --resolve-names=never "$stage/{RULES}"
-units=({shlex.join(units)})
+{verify_rules}units=({shlex.join(units)})
 unit_paths=("${{units[@]/#/$stage/}}")
 systemd-analyze verify --man=no --generators=no --recursive-errors=no "${{unit_paths[@]}}"
 
@@ -217,11 +247,7 @@ fi
 for unit in "${{units[@]}}"; do
     install -o root -g root -m 0644 -- "$stage/$unit" "/etc/systemd/system/$unit"
 done
-install -o root -g root -m 0644 -- "$stage/{RULES}" /etc/udev/rules.d/{RULES}
-udevadm control --reload-rules
-udevadm trigger --action=change --settle --subsystem-match=misc --sysname-match=roce_mr
-udevadm trigger --action=change --settle --subsystem-match=infiniband_verbs --attr-match=ibdev=roce_dpdk0
-systemctl daemon-reload
+{install_rules}systemctl daemon-reload
 install -o root -g root -m 0440 -- "$stage/{SUDOERS}" /etc/sudoers.d/{sudoers}
 echo '{host} RoCEv2 application bandwidth services installed.'
 """
@@ -236,52 +262,82 @@ def check_mlx5_trace(directory, dma_proof):
             raise ValueError(f"{library}: throughput profiles require the regular mlx5 build")
 
 
-def stage_host(bundle, inputs, revision, destination, endpoints, dma_proof):
+def stage_host(bundle, inputs, revision, destination, endpoints, sudoers_suffix):
     host = endpoints[0].host
     directory = bundle / host
     directory.mkdir(mode=0o700)
-    libraries = stage_inputs(inputs / host, directory, revision)
-    check_mlx5_trace(directory, dma_proof)
+    # The aarch64 application bundle used on Spark-04 also ran on Spark-01.
+    source_host = "spark-04" if host == "spark-01" else host
+    libraries = stage_inputs(inputs / source_host, directory, revision)
+    check_mlx5_trace(directory, endpoints[0].settings.dma_proof)
     launcher = directory / "run_app"
     launcher.write_text(render_launcher())
     launcher.chmod(0o700)
     units = [endpoint.unit for endpoint in endpoints]
     for endpoint in endpoints:
         (directory / endpoint.unit).write_text(render_unit(endpoint, destination))
-    (directory / SUDOERS).write_text(render_permissions(units))
-    (directory / RULES).write_text(
-        f'SUBSYSTEM=="misc", KERNEL=="roce_mr", OWNER:="root", GROUP:="{ACCOUNT}", MODE:="0660"\n'
-        f'SUBSYSTEM=="infiniband_verbs", KERNEL=="uverbs[0-9]*", ATTR{{ibdev}}=="roce_dpdk0", '
-        f'OWNER:="root", GROUP:="{ACCOUNT}", MODE:="0660"\n'
-    )
+    shared_pool = any(endpoint.shared_hugepages for endpoint in endpoints)
     payload = (*APP_FILES, *libraries)
-    if any(endpoint.settings.hugepages for endpoint in endpoints):
+    if shared_pool:
+        units.append(APP_TWO_QSFP_POOL)
+        (directory / APP_TWO_QSFP_POOL).write_text(render_two_qsfp_pool(host, destination))
+        source = Path(__file__).with_name("manage_spark_two_qsfp_pool.sh")
+        shutil.copyfile(source, directory / APP_TWO_QSFP_HELPER)
+        payload += (APP_TWO_QSFP_HELPER,)
+    else:
+        (directory / RULES).write_text(
+            f'SUBSYSTEM=="misc", KERNEL=="roce_mr", OWNER:="root", GROUP:="{ACCOUNT}", MODE:="0660"\n'
+            f'SUBSYSTEM=="infiniband_verbs", KERNEL=="uverbs[0-9]*", ATTR{{ibdev}}=="roce_dpdk0", '
+            f'OWNER:="root", GROUP:="{ACCOUNT}", MODE:="0660"\n'
+        )
+    (directory / SUDOERS).write_text(render_permissions(units))
+    if any(endpoint.settings.hugepages and not endpoint.shared_hugepages for endpoint in endpoints):
         source = Path(__file__).with_name("manage_spark_app_hugepages.sh")
         shutil.copyfile(source, directory / APP_HUGEPAGE_HELPER)
         payload += (APP_HUGEPAGE_HELPER,)
     manifest = directory / "SHA256SUMS"
-    manifest.write_text(manifest_text(directory, (*payload, *units, RULES, SUDOERS)))
+    rules = () if shared_pool else (RULES,)
+    manifest.write_text(manifest_text(directory, (*payload, *units, *rules, SUDOERS)))
     installer = directory / "install.sh"
-    installer.write_text(render_install(host, destination, units, payload, digest(manifest), dma_proof))
+    installer.write_text(render_install(host, destination, units, payload, digest(manifest), sudoers_suffix,
+                                        native_rules=not shared_pool))
     installer.chmod(0o700)
     return manifest_text(directory, payload)
 
 
 def stage(revision, inputs, profiles):
+    two_qsfp = any(name in APP_TWO_QSFP_PROFILES for name in profiles)
+    if two_qsfp and set(profiles) != set(APP_TWO_QSFP_PROFILES):
+        raise ValueError("Stage both dual-QSFP MTUs together in a separate release")
     dma_proof = any(name in DMA_PROOF_PROFILES for name in profiles)
     if dma_proof and not all(name in DMA_PROOF_PROFILES for name in profiles):
         raise ValueError("Stage DMA proof and throughput profiles in separate releases")
-    destination = APP_DESTINATION_ROOT / (revision + DMA_PROOF_SUFFIX if dma_proof else revision)
+    app_aggregate = any(name in APP_AGGREGATE_PROFILES for name in profiles)
+    if app_aggregate and set(profiles) != set(APP_AGGREGATE_PROFILES):
+        raise ValueError("Stage both aggregate application paths together in a separate release")
+    release_suffix = DMA_PROOF_SUFFIX if dma_proof else ""
+    if two_qsfp:
+        release_suffix = APP_TWO_QSFP_SUFFIX
+    elif app_aggregate:
+        release_suffix = APP_AGGREGATE_SUFFIX
+    sudoers_suffix = "-proof" if dma_proof else release_suffix
+    destination = APP_DESTINATION_ROOT / (revision + release_suffix)
     bundle = Path(tempfile.mkdtemp(prefix="ocs-roce-app-bw-"))
     try:
-        tx, rx = (stage_host(bundle, inputs, revision, destination, [Endpoint(role, profile) for profile in profiles],
-                             dma_proof)
-                  for role in ("tx", "rx"))
-        if tx != rx:
+        endpoints = {}
+        for role in ("tx", "rx"):
+            for profile in profiles:
+                endpoint = Endpoint(role, profile)
+                endpoints.setdefault(endpoint.host, []).append(endpoint)
+        manifests = {stage_host(bundle, inputs, revision, destination, per_host, sudoers_suffix)
+                     for per_host in endpoints.values()}
+        if len(manifests) != 1:
             raise ValueError("The pinned application artifacts differ between Spark hosts")
         app_files = APP_FILES
-        if dma_proof or any(name in SHORT_WRITE_PROFILES for name in profiles):
+        if dma_proof or app_aggregate or two_qsfp or any(name in SHORT_WRITE_PROFILES for name in profiles):
             app_files += APP_MLX5_FILES
+        if two_qsfp:
+            app_files += (APP_TWO_QSFP_HELPER,)
         if any(name in HUGEPAGE_PROFILES for name in profiles):
             app_files += (APP_HUGEPAGE_HELPER,)
         (bundle / "APP_SHA256SUMS").write_text(manifest_text(bundle / "spark-04", app_files))
@@ -295,8 +351,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("revision", help="revision of the pinned RoCEv2 application and worker")
     parser.add_argument("--inputs", type=Path, required=True, help="directory with spark-02 and spark-04 inputs")
-    parser.add_argument("--profile", action="append",
-                        choices=APP_PROFILES | PREFAULT_PROFILES | SHORT_WRITE_PROFILES | DMA_PROOF_PROFILES,
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--two-qsfp", action="store_true",
+                           help="stage both MTUs for the two physical Spark-04 QSFP ports")
+    selection.add_argument("--profile", action="append",
+                        choices=(APP_PROFILES | PREFAULT_PROFILES | SHORT_WRITE_PROFILES |
+                                 DMA_PROOF_PROFILES | APP_AGGREGATE_PROFILES),
                         help="profile to stage (default: all profiles without prefaulting)")
     parser.add_argument("--include-prefault", action="store_true",
                         help="also stage prefault variants of the selected profiles")
@@ -305,7 +365,10 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{7,40}", args.revision):
         parser.error("revision must be a 7- to 40-character Git commit ID")
-    profiles = tuple(args.profile or (APP_PROFILES | SHORT_WRITE_PROFILES))
+    if args.two_qsfp and (args.include_prefault or args.include_hugepages):
+        parser.error("--two-qsfp already stages prefaulted and jumbo variants")
+    profiles = tuple(APP_TWO_QSFP_PROFILES if args.two_qsfp else
+                     args.profile or (APP_PROFILES | SHORT_WRITE_PROFILES))
     if args.include_prefault:
         profiles += tuple(f"{name}-prefault" for name in profiles if name in APP_PROFILES)
     if args.include_hugepages:

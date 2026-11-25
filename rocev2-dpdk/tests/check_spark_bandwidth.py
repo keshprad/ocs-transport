@@ -36,6 +36,12 @@ DMA_PROOF_MARKERS = {
     APP_MLX5_FILES[1]: (b"MLX5_DMABUF_DSEG ", b"MLX5_DMABUF_CQE ", b"MLX5_DMABUF_CQ_ERROR "),
 }
 DMA_PROOF_SUFFIX = "-dmabuf-proof"
+APP_AGGREGATE_SUFFIX = "-aggregate"
+APP_TWO_QSFP_SUFFIX = "-two-qsfp"
+APP_TWO_QSFP_POOL = "ocs-roce-bw-two-qsfp-pool.service"
+APP_TWO_QSFP_HELPER = "manage_two_qsfp_pool"
+APP_TWO_QSFP_HUGE_DIR = "/dev/hugepages/ocs-roce-two-qsfp"
+HUGEPAGE_COUNT = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
 APP_HUGEPAGE_HELPER = "manage_hugepages"
 APP_HUGEPAGE_DIR = "/dev/hugepages/ocs-roce-app-bw"
 APP_HUGEPAGES_RELEASED = "DPDK_HUGEPAGES restored=0 page_kib=2048"
@@ -52,6 +58,10 @@ PORTS = {
 SECOND_RAIL = {
     "tx": ("spark-04", "0002:01:00.0", "enP2p1s0f0np0", "10.61.0.14"),
     "rx": ("spark-02", "0002:01:00.1", "enP2p1s0f1np1", "10.61.0.13"),
+}
+SECOND_QSFP = {
+    "tx": ("spark-04", "0002:01:00.1", "enP2p1s0f1np1", "10.61.0.17"),
+    "rx": ("spark-01", "0002:01:00.0", "enP2p1s0f0np0", "10.61.0.18"),
 }
 
 
@@ -96,7 +106,7 @@ class Profile:
     @property
     def runtime_dir(self):
         if self.app_mode:
-            return Path("/run/ocs-roce-app-bw")
+            return Path("/run/ocs-roce-app-bw" if self.rail == 1 else "/run/ocs-roce-app-bw-2")
         return Path("/run/ocs-roce-bw" if self.rail == 1 else "/run/ocs-roce-bw-2")
 
     @property
@@ -117,6 +127,20 @@ PROFILES = {
 AGGREGATE_PROFILES = {
     "aggregate-1": Profile(28870, 16, 4, rail=1, aggregate=True),
     "aggregate-2": Profile(28871, 16, 4, rail=2, aggregate=True),
+}
+APP_AGGREGATE_PROFILES = {
+    f"app-aggregate-{profile.rail}": replace(
+        profile, port=29024 + profile.rail, ethernet_mtu=1500, app_mode="memfd-gather", prefault_app=True,
+    )
+    for profile in AGGREGATE_PROFILES.values()
+}
+APP_TWO_QSFP_PROFILES = {
+    f"app-two-qsfp-mtu-{mtu}-{profile.rail}": replace(
+        profile, port=29030 + 2 * index + profile.rail, pmtu=pmtu,
+        ethernet_mtu=mtu, hugepages=mtu == 4200,
+    )
+    for index, (mtu, pmtu) in enumerate(((1500, 1024), (4200, 4096)))
+    for profile in APP_AGGREGATE_PROFILES.values()
 }
 BURST_STYLE_PROFILES = {
     f"mtu-{mtu}-{name}": Profile(base + i, profile.qps, profile.workers, pmtu=pmtu, ethernet_mtu=mtu)
@@ -153,7 +177,8 @@ DMA_PROOF_PROFILES = {
     for name, profile in SHORT_WRITE_PROFILES.items()
 }
 ALL_PROFILES = (PROFILES | AGGREGATE_PROFILES | BURST_STYLE_PROFILES | APP_PROFILES |
-                PREFAULT_PROFILES | HUGEPAGE_PROFILES | SHORT_WRITE_PROFILES | DMA_PROOF_PROFILES)
+                PREFAULT_PROFILES | HUGEPAGE_PROFILES | SHORT_WRITE_PROFILES | DMA_PROOF_PROFILES |
+                APP_AGGREGATE_PROFILES | APP_TWO_QSFP_PROFILES)
 
 
 @dataclass(frozen=True)
@@ -167,7 +192,13 @@ class Endpoint:
 
     @property
     def link(self):
-        return (PORTS if self.settings.rail == 1 else SECOND_RAIL)[self.role]
+        if self.settings.rail == 1:
+            return PORTS[self.role]
+        return (SECOND_QSFP if self.profile in APP_TWO_QSFP_PROFILES else SECOND_RAIL)[self.role]
+
+    @property
+    def shared_hugepages(self):
+        return self.profile in APP_TWO_QSFP_PROFILES and self.settings.hugepages
 
     @property
     def host(self):
@@ -189,7 +220,9 @@ def unit_argv(endpoint, destination, runtime):
     lock = profile.runtime_dir / "function.lock"
     control_ip = LOOPBACK if profile.uses_tunnel else CONTROL_IP
     device = f"{pci},max_dump_files_num=1" if profile.app_mode else pci
-    backing = ([f"--huge-dir={APP_HUGEPAGE_DIR}", "--socket-mem=128", "--huge-unlink=always"]
+    huge_directory = (f"{APP_TWO_QSFP_HUGE_DIR}/{profile.rail}"
+                      if endpoint.shared_hugepages else APP_HUGEPAGE_DIR)
+    backing = ([f"--huge-dir={huge_directory}", "--socket-mem=128", "--huge-unlink=always"]
                if profile.hugepages else ["--no-huge"])
     argv = [
         "/usr/bin/flock", "--exclusive", "--nonblock", str(lock),
@@ -230,7 +263,7 @@ def unit_environment(endpoint, destination, runtime):
 def verify_unit(commands, endpoint, destination):
     props = commands.properties(
         endpoint, "LoadState", "ActiveState", "WorkingDirectory", "ExecStart",
-        "Environment", "UnsetEnvironment", "ExecStartPre", "ExecStopPost",
+        "Environment", "UnsetEnvironment", "ExecStartPre", "ExecStopPost", "BindsTo", "After",
     )
     require(props.get("LoadState") == "loaded", f"{endpoint.label}: benchmark unit is missing")
     require(props.get("ActiveState") in ("inactive", "failed"), f"{endpoint.label}: already running")
@@ -254,12 +287,19 @@ def verify_unit(commands, endpoint, destination):
     installed = re.findall(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
     require(len(installed) == 1 and shlex.split(installed[0]) == expected,
             f"{endpoint.label}: installed ExecStart differs from the expected benchmark profile")
-    if endpoint.settings.hugepages:
+    if endpoint.shared_hugepages:
+        require(all(APP_TWO_QSFP_POOL in props.get(prop, "").split() for prop in ("BindsTo", "After")),
+                f"{endpoint.label}: missing the shared hugepage service dependency")
+    elif endpoint.settings.hugepages:
         for prop, action in (("ExecStartPre", "prepare"), ("ExecStopPost", "cleanup")):
             hook = re.findall(r"argv\[\]=(.*?) ;", props.get(prop, ""))
             expected_hook = ["/bin/bash", str(destination / APP_HUGEPAGE_HELPER), action]
             require(len(hook) == 1 and shlex.split(hook[0]) == expected_hook,
                     f"{endpoint.label}: invalid hugepage {prop}")
+    verify_service_access(commands, endpoint)
+
+
+def verify_service_access(commands, endpoint):
     for operation in ("start", "stop"):
         commands.run(endpoint.host, "sudo", "-n", "-l", "/usr/bin/systemctl", operation, endpoint.unit)
     # A personal journal can be readable even when the unit's records are hidden.
@@ -267,19 +307,26 @@ def verify_unit(commands, endpoint, destination):
     commands.journal(endpoint)
 
 
-def verify_link(commands, link):
+def verify_link(commands, link, *, require_data_ip=True):
     host, pci, interface, data_ip = link
     param = commands.run(host, "devlink", "dev", "param", "show", f"pci/{pci}", "name", "enable_roce")
     require("cmode driverinit value false" in param, f"{host} {pci}: native RoCE still enabled")
     addr = commands.run(host, "ip", "-br", "-4", "address", "show", "dev", interface).split()
-    require("UP" in addr and f"{data_ip}/30" in addr, f"{host} {interface}: link or address not ready")
+    configured = "UP" in addr and f"{data_ip}/30" in addr
     sysfs = Path("/sys/class/net") / interface
+    if require_data_ip:
+        require(configured, f"{host} {interface}: link or address not ready")
+    else:
+        # The benchmark exchanges wire addresses over the management SSH tunnel.
+        require(commands.run(host, "cat", sysfs / "carrier").strip() == "1",
+                f"{host} {interface}: link has no carrier")
     device = Path(commands.run(host, "readlink", "-f", "--", sysfs / "device").strip()).name
     require(device == pci, f"{host} {interface}: expected PCI function {pci}, found {device}")
     return {
         "host": host, "device": pci, "interface": interface, "data_ip": data_ip,
         "ethernet_mtu": int(commands.run(host, "cat", sysfs / "mtu")),
         "link_mbps": int(commands.run(host, "cat", sysfs / "speed")),
+        "kernel_ipv4_configured": configured,
     }
 
 
@@ -291,7 +338,7 @@ def require_idle(commands, host):
 
 def app_digests(bundle):
     digests = {}
-    supported = (*APP_FILES, *APP_MLX5_FILES, APP_HUGEPAGE_HELPER)
+    supported = (*APP_FILES, *APP_MLX5_FILES, APP_HUGEPAGE_HELPER, APP_TWO_QSFP_HELPER)
     for line in (bundle / "APP_SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([a-f0-9]{64})  (\S+)", line)
         require(match and match[2] in supported and match[2] not in digests,
@@ -309,13 +356,26 @@ def verify_deployed_file(commands, host, path):
             f"{host}: {path} must be writable only by root")
 
 
+def verify_release(commands, host, destination, digests, app_mode):
+    verify_deployed_file(commands, host, destination)
+    if app_mode:
+        for directory in ("lib", "provider"):
+            verify_deployed_file(commands, host, destination / directory)
+    for file, digest in digests.items():
+        path = destination / file
+        verify_deployed_file(commands, host, path)
+        actual = commands.run(host, "sha256sum", "--", path).split()[0]
+        require(actual == digest, f"{host}: installed file {file} does not match the expected SHA-256")
+
+
 def preflight(commands, profiles, destination, digests):
     settings = [ALL_PROFILES[name] for name in profiles]
     aggregate = settings[0].aggregate
     app_mode = settings[0].app_mode
     native_mr = any(profile.native_mr for profile in settings)
-    if any(name in SHORT_WRITE_PROFILES or name in DMA_PROOF_PROFILES for name in profiles):
-        require(set(APP_MLX5_FILES) <= digests.keys(), "short WRITE and DMA proof profiles require pinned mlx5 libraries")
+    if any(name in SHORT_WRITE_PROFILES or name in DMA_PROOF_PROFILES or name in APP_AGGREGATE_PROFILES
+           for name in profiles):
+        require(set(APP_MLX5_FILES) <= digests.keys(), "benchmark profile requires pinned mlx5 libraries")
     if any(profile.hugepages for profile in settings):
         require(APP_HUGEPAGE_HELPER in digests, "application bundle lacks the hugepage helper")
     links = {name: {} for name in profiles} if aggregate else {}
@@ -324,9 +384,11 @@ def preflight(commands, profiles, destination, digests):
         if aggregate:
             for name in profiles:
                 endpoint = Endpoint(role, name)
-                links[name][role] = {
-                    **verify_link(commands, endpoint.link), "cpu_ids": list(endpoint.settings.cpus),
-                }
+                link = verify_link(commands, endpoint.link)
+                expected_mtu = endpoint.settings.ethernet_mtu
+                require(expected_mtu is None or link["ethernet_mtu"] == expected_mtu,
+                        f"{endpoint.label}: expected Ethernet MTU {expected_mtu}")
+                links[name][role] = {**link, "cpu_ids": list(endpoint.settings.cpus)}
         else:
             links[role] = verify_link(commands, PORTS[role])
 
@@ -334,15 +396,7 @@ def preflight(commands, profiles, destination, digests):
             commands.run(host, "test", "-c", "/dev/roce_mr")
             description = commands.run(host, "cat", "/sys/class/infiniband/roce_dpdk0/node_desc")
             require(description.strip() == "RoCEv2 DPDK", f"{host}: provider device is missing")
-        verify_deployed_file(commands, host, destination)
-        if app_mode:
-            for directory in ("lib", "provider"):
-                verify_deployed_file(commands, host, destination / directory)
-        for file, digest in digests.items():
-            path = destination / file
-            verify_deployed_file(commands, host, path)
-            actual = commands.run(host, "sha256sum", "--", path).split()[0]
-            require(actual == digest, f"{host}: installed file {file} does not match the expected SHA-256")
+        verify_release(commands, host, destination, digests, app_mode)
         for profile in profiles:
             verify_unit(commands, Endpoint(role, profile), destination)
     return links
@@ -356,23 +410,34 @@ def verify_loopback_listener(commands, host, port):
 
 
 @contextmanager
-def control_tunnel(commands, socket_dir, profiles):
-    host = PORTS["rx"][0]
-    control = Path(socket_dir) / "bandwidth-forward"
+def control_tunnels(commands, socket_dir, profiles):
+    ports_by_host = {}
+    for name in profiles:
+        receiver = Endpoint("rx", name)
+        ports_by_host.setdefault(receiver.host, []).append(receiver.settings.port)
+    with ExitStack() as stack:
+        for host, ports in ports_by_host.items():
+            stack.enter_context(control_tunnel(commands, socket_dir, host, ports))
+        yield
+
+
+@contextmanager
+def control_tunnel(commands, socket_dir, host, ports):
+    control = Path(socket_dir) / f"{host}.forward"
     ssh = ["ssh", "-S", str(control), "-o", "BatchMode=yes"]
     argv = [
         *ssh, "-fNT", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5",
         "-o", "ServerAliveCountMax=2", "-o", "ControlMaster=yes",
         "-o", "ControlPersist=no", "-o", "ExitOnForwardFailure=yes",
     ]
-    for profile in profiles:
-        argv += ["-L", f"{LOOPBACK}:{profile.port}:{LOOPBACK}:{profile.port}"]
+    for port in ports:
+        argv += ["-L", f"{LOOPBACK}:{port}:{LOOPBACK}:{port}"]
     try:
         result = subprocess.run([*argv, host], capture_output=True, text=True, timeout=15,
                                 stdin=subprocess.DEVNULL)
         require(result.returncode == 0, f"{host}: could not open benchmark tunnel: {result.stderr.strip()}")
-        for profile in profiles:
-            verify_loopback_listener(commands, PORTS["tx"][0], profile.port)
+        for port in ports:
+            verify_loopback_listener(commands, PORTS["tx"][0], port)
         yield
     except subprocess.TimeoutExpired as error:
         raise CycleError(f"{host}: timed out opening benchmark tunnel") from error
@@ -459,7 +524,8 @@ def wait_endpoint(commands, endpoint, invocation, deadline, *, ready=False):
             )
             # Read after observing the terminal state so journal records can settle.
             app_finished = not endpoint.settings.app_mode or app_completion_marker(endpoint) in messages
-            restored = not endpoint.settings.hugepages or APP_HUGEPAGES_RELEASED in messages
+            restored = (not endpoint.settings.hugepages or endpoint.shared_hugepages or
+                        APP_HUGEPAGES_RELEASED in messages)
             if app_finished and restored and any(line.startswith("BANDWIDTH ") for line in messages):
                 return messages
         time.sleep(0.2)
@@ -652,7 +718,7 @@ def run_endpoints(commands, profiles, output, sample):
         with ExitStack() as gates:
             if aggregate:
                 listener = gates.enter_context(socket.create_server((LOOPBACK, GATE_PORT)))
-                gate_deadline = time.monotonic() + GATE_TIMEOUT
+                gate_deadline = time.monotonic() + (60 if settings.app_mode else GATE_TIMEOUT)
             for endpoint in senders:
                 invocations[endpoint] = start(commands, endpoint)
             if aggregate:
@@ -805,6 +871,77 @@ def run_profiles(commands, profiles, output, samples, report, *, keep_going=Fals
     return failures
 
 
+@dataclass(frozen=True)
+class PoolService:
+    host: str
+    unit: str = APP_TWO_QSFP_POOL
+
+    @property
+    def label(self):
+        return f"{self.host} {self.unit}"
+
+
+def two_qsfp_links(commands, profiles, mtu):
+    links = {}
+    for name in profiles:
+        links[name] = {}
+        for role in ("tx", "rx"):
+            endpoint = Endpoint(role, name)
+            link = verify_link(commands, endpoint.link, require_data_ip=False)
+            require(link["ethernet_mtu"] == mtu, f"{endpoint.label}: expected Ethernet MTU {mtu}")
+            links[name][role] = {**link, "cpu_ids": list(endpoint.settings.cpus)}
+    return links
+
+
+def preflight_two_qsfp(commands, profiles, destination, digests):
+    require(set(APP_MLX5_FILES) <= digests.keys() and APP_TWO_QSFP_HELPER in digests,
+            "two-port application runs require the staged mlx5 libraries and pool helper")
+    endpoints = [Endpoint(role, name) for name in profiles for role in ("tx", "rx")]
+    jumbo = endpoints[0].shared_hugepages
+    for host in dict.fromkeys(endpoint.host for endpoint in endpoints):
+        require_idle(commands, host)
+        verify_release(commands, host, destination, digests, True)
+        if jumbo:
+            pool = PoolService(host)
+            state = commands.properties(pool, "LoadState", "ActiveState", "ExecStartPre", "ExecStopPost")
+            require(state.get("LoadState") == "loaded" and state.get("ActiveState") in ("inactive", "failed"),
+                    f"{pool.label}: expected an idle hugepage service")
+            for property_name, action in (("ExecStartPre", "prepare"), ("ExecStopPost", "cleanup")):
+                hook = re.findall(r"argv\[\]=(.*?) ;", state.get(property_name, ""))
+                expected = ["/bin/bash", str(destination / APP_TWO_QSFP_HELPER), action]
+                require(len(hook) == 1 and shlex.split(hook[0]) == expected,
+                        f"{pool.label}: unexpected {property_name}")
+            verify_service_access(commands, pool)
+    for endpoint in endpoints:
+        verify_unit(commands, endpoint, destination)
+    return two_qsfp_links(commands, profiles, 1500)
+
+
+def stop_pool(commands, pool, invocation):
+    stop_owned(commands, pool, invocation)
+    state = commands.properties(pool, "ActiveState", "Result")
+    require(state.get("ActiveState") == "inactive" and state.get("Result") == "success" and
+            int(commands.run(pool.host, "cat", HUGEPAGE_COUNT)) == 0,
+            f"{pool.label}: temporary hugepage cleanup failed")
+
+
+@contextmanager
+def aggregate_links(commands, profiles, links):
+    if not all(name in APP_TWO_QSFP_PROFILES for name in profiles) or not ALL_PROFILES[profiles[0]].hugepages:
+        yield links
+        return
+
+    hosts = dict.fromkeys(link["host"] for pair in links.values() for link in pair.values())
+    mtu = ALL_PROFILES[profiles[0]].ethernet_mtu
+    with ExitStack() as stack:
+        for host in hosts:
+            pool = PoolService(host)
+            invocation = start(commands, pool)
+            stack.callback(stop_pool, commands, pool, invocation)
+        yield two_qsfp_links(commands, profiles, mtu)
+    two_qsfp_links(commands, profiles, 1500)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", required=True, type=Path, help="pinned installed snapshot directory")
@@ -813,6 +950,10 @@ def main():
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--aggregate", action="store_true",
                            help="run four-worker 16-QP transfers concurrently on both logical paths")
+    selection.add_argument("--app-aggregate", action="store_true",
+                           help="run synchronized prefaulted memfd scatter/gather on both paths at MTU 1500")
+    selection.add_argument("--two-qsfp", action="store_true",
+                           help="measure concurrent application WRITEs on two physical QSFP ports")
     selection.add_argument("--burst-style-bench", action="store_true",
                            help="compare the same WRITE profiles at Ethernet MTUs 1500 and 4200")
     selection.add_argument("--app-bench", action="append", choices=APP_MODES,
@@ -834,12 +975,14 @@ def main():
     parser.add_argument("--samples", type=int, default=3, help="trials per profile (default 3)")
     parser.add_argument("--output", type=Path, help="new directory for logs and results")
     args = parser.parse_args()
-    root = APP_DESTINATION_ROOT if args.app_bench else DESTINATION_ROOT
+    aggregate = args.aggregate or args.app_aggregate or args.two_qsfp
+    application_run = args.app_bench is not None or args.app_aggregate or args.two_qsfp
+    root = APP_DESTINATION_ROOT if application_run else DESTINATION_ROOT
     if args.destination.parent != root or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.destination.name):
         parser.error(f"--destination must name a snapshot directly under {root}")
-    if args.app_bench:
+    if application_run:
         if args.sha256 or not args.app_bundle:
-            parser.error("--app-bench requires --app-bundle in place of --sha256")
+            parser.error("application runs require --app-bundle in place of --sha256")
         digests = app_digests(args.app_bundle)
     else:
         if not args.sha256 or not re.fullmatch(r"[a-f0-9]{64}", args.sha256.lower()) or args.app_bundle:
@@ -847,11 +990,11 @@ def main():
         digests = {"roce_write": args.sha256.lower()}
     if args.samples <= 0:
         parser.error("--samples must be positive")
-    if args.aggregate and args.profile:
-        parser.error("--aggregate cannot be combined with --profile")
+    if aggregate and args.profile:
+        parser.error("aggregate runs cannot be combined with --profile")
     paired_mtu = args.burst_style_bench or args.app_bench
-    if args.mtu is not None and not paired_mtu:
-        parser.error("--mtu requires --burst-style-bench or --app-bench")
+    if args.mtu is not None and not (paired_mtu or args.two_qsfp):
+        parser.error("--mtu requires --burst-style-bench, --app-bench, or --two-qsfp")
     selected = tuple(dict.fromkeys(args.profile or PROFILES))
     if "smoke" in selected and not args.app_bench:
         parser.error("--profile smoke requires --app-bench")
@@ -871,7 +1014,12 @@ def main():
     mtus = (args.mtu,) if args.mtu is not None else (1500, 4200)
     if hugepages:
         mtus = (4200,)
-    if args.aggregate:
+    if args.two_qsfp:
+        mtu = args.mtu or 1500
+        profiles = tuple(name for name, profile in APP_TWO_QSFP_PROFILES.items() if profile.ethernet_mtu == mtu)
+    elif args.app_aggregate:
+        profiles = tuple(APP_AGGREGATE_PROFILES)
+    elif args.aggregate:
         profiles = tuple(AGGREGATE_PROFILES)
     elif args.app_bench:
         variants = ("-prefault",) if args.prefault_only else ("",)
@@ -891,18 +1039,21 @@ def main():
     require(socket.gethostname().split(".")[0] == "spark-7e64", "run the benchmark from Spark-04")
     with tempfile.TemporaryDirectory(prefix="roce-bw-control-") as sockets:
         commands = Commands(sockets)
-        links = preflight(commands, profiles, args.destination, digests)
+        verify = preflight_two_qsfp if args.two_qsfp else preflight
+        links = verify(commands, profiles, args.destination, digests)
         output = args.output or Path(tempfile.mkdtemp(prefix="roce-bw-results-"))
         if args.output:
             output.mkdir()
         print(f"Benchmark output {output}", flush=True)
         report = {"sha256": digests["roce_write"], "destination": str(args.destination), "links": links}
-        if args.app_bench:
+        if application_run:
             report["files_sha256"] = digests
-        if args.aggregate:
+        if aggregate:
             trials = []
             report["aggregate"] = {"trials": trials}
-            with control_tunnel(commands, sockets, AGGREGATE_PROFILES.values()):
+            with (control_tunnels(commands, sockets, profiles),
+                  aggregate_links(commands, profiles, links) as active_links):
+                report["links"] = active_links
                 for sample in range(1, args.samples + 1):
                     rails, release_ns = run_endpoints(commands, profiles, output, sample)
                     trial = aggregate_result(rails, release_ns)
@@ -919,7 +1070,7 @@ def main():
         report["profiles"] = {}
         if paired_mtu:
             failures = []
-            with control_tunnel(commands, sockets, [ALL_PROFILES[name] for name in profiles]):
+            with control_tunnels(commands, sockets, profiles):
                 for mtu in mtus:
                     batch = [name for name in profiles if ALL_PROFILES[name].ethernet_mtu == mtu]
                     with temporary_mtu(commands, links, mtu):
