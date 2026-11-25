@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """Independent Ethernet, IP, UDP, BTH, RETH, AETH and ICRC vectors."""
 
-import binascii
 import ipaddress
 import struct
 import subprocess
 from pathlib import Path
 
+from roce_wire_reference import ipv4_checksum, ipv4_icrc
+
 CLI = Path(__file__).with_name("roce_wire_cli")
 PAYLOAD = bytes.fromhex("2435465768")
 OPCODES = (0x0A, 0x06, 0x07, 0x08, 0x11)
-
-
-def checksum(header):
-    values = struct.unpack(f"!{len(header) // 2}H", header)
-    total = sum(values)
-    while total >> 16:
-        total = (total & 0xFFFF) + (total >> 16)
-    return ~total & 0xFFFF
 
 
 def fixture(opcode, *, tos=0, ttl=64, payload=PAYLOAD):
@@ -40,12 +33,9 @@ def fixture(opcode, *, tos=0, ttl=64, payload=PAYLOAD):
         + ipaddress.ip_address("192.0.2.1").packed
         + ipaddress.ip_address("192.0.2.2").packed
     )
-    struct.pack_into("!H", ip, 10, checksum(ip))
-    invariant = bytearray(ip + udp + bth + tail)
-    for offset in (1, 8, 10, 11, 26, 27, 32):
-        invariant[offset] = 0xFF
-    crc = struct.pack("<I", binascii.crc32(b"\xff" * 8 + invariant))
-    return bytes.fromhex("0200000000020200000000010800") + ip + udp + bth + tail + crc
+    struct.pack_into("!H", ip, 10, ipv4_checksum(ip))
+    protected = ip + udp + bth + tail
+    return bytes.fromhex("0200000000020200000000010800") + protected + ipv4_icrc(protected)
 
 
 def decode(frame):

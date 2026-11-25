@@ -19,8 +19,7 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mrc-dpdk" / "tests"))
-from check_spark_cycle import Commands, CycleError, require
+from spark_services import Commands, CycleError, require
 
 
 LOCAL = "spark-04"

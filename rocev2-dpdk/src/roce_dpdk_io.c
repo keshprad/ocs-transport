@@ -1,4 +1,4 @@
-#include "dpdk_io.h"
+#include "roce_dpdk_io.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -14,23 +14,8 @@ enum {
     RX_DESCRIPTORS = 1024,
 };
 
-struct rte_mempool *mrc_dpdk_packet_pool(void)
-{
-    return mrc_dpdk_packet_pool_for_frame(0);
-}
-
-struct rte_mempool *mrc_dpdk_packet_pool_for_frame(uint16_t frame_length)
-{
-    return mrc_dpdk_packet_pool_for_ports(frame_length, DEFAULT_RX_QUEUES);
-}
-
-struct rte_mempool *mrc_dpdk_packet_pool_for_ports(uint16_t frame_length, unsigned int port_count)
-{
-    return mrc_dpdk_packet_pool_with_cache(frame_length, port_count, 0);
-}
-
-struct rte_mempool *mrc_dpdk_packet_pool_with_cache(uint16_t frame_length, unsigned int rx_queues,
-                                                  unsigned int cache_size)
+struct rte_mempool *roce_dpdk_packet_pool(uint16_t frame_length, unsigned int rx_queues,
+                                          unsigned int cache_size)
 {
     /* mlx5 includes the Ethernet FCS in its single-segment RX size check. */
     unsigned int room = frame_length + RTE_ETHER_CRC_LEN + RTE_PKTMBUF_HEADROOM;
@@ -45,29 +30,12 @@ struct rte_mempool *mrc_dpdk_packet_pool_with_cache(uint16_t frame_length, unsig
             return NULL;
         packets += extra_queues * RX_DESCRIPTORS;
     }
-    return rte_pktmbuf_pool_create("mrc_packets", packets, cache_size, 0, (uint16_t)room, SOCKET_ID_ANY);
+    return rte_pktmbuf_pool_create("roce_packets", packets, cache_size, 0, (uint16_t)room, SOCKET_ID_ANY);
 }
 
-int mrc_dpdk_open_port(uint16_t port, struct rte_mempool *pool, struct rte_ether_addr *mac)
-{
-    return mrc_dpdk_open_port_with_mtu(port, pool, mac, 0);
-}
-
-int mrc_dpdk_open_port_with_mtu(uint16_t port, struct rte_mempool *pool,
-                               struct rte_ether_addr *mac, uint16_t mtu)
-{
-    return mrc_dpdk_open_port_queues(port, pool, mac, mtu, 1);
-}
-
-int mrc_dpdk_open_port_queues(uint16_t port, struct rte_mempool *pool,
-                             struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues)
-{
-    return mrc_dpdk_open_port_with_offloads(port, pool, mac, mtu, queues, 0);
-}
-
-int mrc_dpdk_open_port_with_offloads(uint16_t port, struct rte_mempool *pool,
-                                    struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues,
-                                    uint64_t tx_offloads)
+int roce_dpdk_open_port(uint16_t port, struct rte_mempool *pool,
+                        struct rte_ether_addr *mac, uint16_t mtu, uint16_t queues,
+                        uint64_t tx_offloads)
 {
     if (!rte_eth_dev_is_valid_port(port))
         return -ENODEV;
@@ -99,17 +67,8 @@ int mrc_dpdk_open_port_with_offloads(uint16_t port, struct rte_mempool *pool,
     return 0;
 }
 
-void mrc_dpdk_close_port(uint16_t port)
+void roce_dpdk_close_port(uint16_t port)
 {
     rte_eth_dev_stop(port);
     rte_eth_dev_close(port);
-}
-
-bool mrc_dpdk_transmit(uint16_t port, struct rte_mbuf *packet)
-{
-    if (rte_eth_tx_burst(port, 0, &packet, 1) == 1)
-        return true;
-
-    rte_pktmbuf_free(packet);
-    return false;
 }

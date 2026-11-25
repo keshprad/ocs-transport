@@ -1,4 +1,6 @@
-#include "dpdk_io.h"
+#include "roce_dpdk_io.h"
+
+#include <stdbool.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -68,8 +70,10 @@ static int poll_fixture(int fd, struct rte_mempool *pool)
             quiesced = true;
             quiesce_deadline = rte_get_timer_cycles() + 5 * rte_get_timer_hz();
         }
-        if (!mrc_dpdk_transmit(port, packet))
+        if (rte_eth_tx_burst(port, 0, &packet, 1) != 1) {
+            rte_pktmbuf_free(packet);
             return -EIO;
+        }
         if (terminal)
             quiesce_ack_pending = true;
     }
@@ -181,14 +185,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "Usage: %s [two EAL ports] -- RELAY_SOCKET FIXTURE_SOCKET\n", argv[0]);
         goto done;
     }
-    pool = mrc_dpdk_packet_pool();
+    pool = roce_dpdk_packet_pool(0, PORTS, 0);
     if (!pool) {
         result = -ENOMEM;
         goto done;
     }
     for (; opened < PORTS; opened++) {
         struct rte_ether_addr mac;
-        result = mrc_dpdk_open_port((uint16_t)opened, pool, &mac);
+        result = roce_dpdk_open_port((uint16_t)opened, pool, &mac, 0, 1, 0);
         if (result)
             goto done;
     }
@@ -217,7 +221,7 @@ done:
     if (bound)
         unlink(local.sun_path);
     for (unsigned int i = 0; i < opened; i++)
-        mrc_dpdk_close_port((uint16_t)i);
+        roce_dpdk_close_port((uint16_t)i);
     if (pool)
         rte_mempool_free(pool);
     rte_eal_cleanup();

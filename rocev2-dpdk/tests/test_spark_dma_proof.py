@@ -1,7 +1,7 @@
 import unittest
 
 from check_spark_bandwidth import DMA_PROOF_PROFILES, Endpoint, parse_result
-from check_spark_cycle import CycleError
+from spark_services import CycleError
 
 
 def sender_journal(endpoint):

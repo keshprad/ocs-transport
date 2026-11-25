@@ -2,9 +2,9 @@
 #include "roce_app.h"
 #include "roce_cm_dpdk.h"
 #include "roce_doorbell.h"
+#include "roce_dpdk_io.h"
 #include "roce_lab.h"
 #include "roce_mr_ipc.h"
-#include "../../mrc-dpdk/src/dpdk_io.h"
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
@@ -1380,7 +1380,7 @@ int main(int argc, char **argv)
         goto cleanup_eal;
 
     uint16_t frame = mtu + RTE_ETHER_HDR_LEN;
-    struct rte_mempool *pool = mrc_dpdk_packet_pool_with_cache(frame, options.workers, MBUF_CACHE_SIZE);
+    struct rte_mempool *pool = roce_dpdk_packet_pool(frame, options.workers, MBUF_CACHE_SIZE);
     struct roce_app_memory application = { .socket = -1 };
     struct tx_regions extra_regions = { .mutex = PTHREAD_MUTEX_INITIALIZER, .port = port,
                                         .anchor = &application.mr };
@@ -1414,7 +1414,7 @@ int main(int argc, char **argv)
     mlx5_dmabuf_map_fn dmabuf_map = NULL;
     mlx5_dmabuf_unmap_fn dmabuf_unmap = NULL;
     uint64_t offloads = datapath.scatter_gather ? RTE_ETH_TX_OFFLOAD_MULTI_SEGS : 0;
-    int err = mrc_dpdk_open_port_with_offloads(port, pool, &mac, mtu, (uint16_t)options.workers, offloads);
+    int err = roce_dpdk_open_port(port, pool, &mac, mtu, (uint16_t)options.workers, offloads);
     if (err) {
         fprintf(stderr, "could not open DPDK port %u: %s\n", port, strerror(-err));
         goto cleanup_buffers;
@@ -1669,7 +1669,7 @@ cleanup_port:
             result = 1;
         }
     } else {
-        mrc_dpdk_close_port(port);
+        roce_dpdk_close_port(port);
     }
     if (!result && application.socket >= 0 && !roce_app_complete(&application, &options)) {
         perror("application WRITE completion");

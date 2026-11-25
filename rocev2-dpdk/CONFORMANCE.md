@@ -644,7 +644,7 @@ same `0x04` errors twice by switching packet backing to 2 MiB pages
 while holding scalar RX and the workload fixed. The RoCEv2 stager
 provides the corresponding page-backing comparison and logs the actual
 DPDK RX mode and pool chunk count.
-[MRC jumbo hardware evidence](../mrc-dpdk/CONFORMANCE.md#spark-04-to-spark-02-link-recovery-and-jumbo-mtu)
+[MRC jumbo hardware evidence](https://github.com/keshprad/ocs-transport/blob/a604432bcf2e5e6b5e67fd6e0b679c216b0f20fa/mrc-dpdk/CONFORMANCE.md#spark-04-to-spark-02-link-recovery-and-jumbo-mtu)
 
 An isolated Spark-04 kernel guest verified the hugepage service helper.
 DPDK EAL used 128 MiB as the service account and allocated the production

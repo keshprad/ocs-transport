@@ -9,17 +9,14 @@ import select
 import socket
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
-MRC_TESTS = ROOT / "mrc-dpdk" / "tests"
-sys.path.insert(0, str(MRC_TESTS))
-from memif_pair import eal_args
-from mrc_wire_reference import Bth, IPPeer, decode_ipv4, encode_ipv4
+from roce_wire_reference import Bth, IPPeer, decode_ipv4, encode_ipv4
 
-BINARY = ROOT / "rocev2-dpdk" / "roce_write"
+TESTS = Path(__file__).resolve().parent
+BINARY = TESTS.parent / "roce_write"
+RELAY = TESTS / "memif_relay"
 OFFER = struct.Struct("!10I6s")
 SIZE = 515
 PMTU = 256
@@ -32,6 +29,17 @@ RKEY = 0x8192A3B4
 PEER = IPPeer(bytes.fromhex("0200000000c1"), socket.inet_aton("192.0.2.2"))
 DATA = bytes(((i * 2654435761) >> 24) & 0xFF for i in range(SIZE))
 OPCODES = (0x06, 0x07, 0x08)
+
+
+def eal_args(binary, role, cpu, directory, *, rail_count):
+    memif_role, mac_base = ("server", 0x10) if role == "rx" else ("client", 0x20)
+    args = [str(binary), f"--lcores=0@{cpu}", "--no-huge", "--no-pci",
+            "--no-telemetry", f"--file-prefix={directory.name}-{role}", "-m", "64"]
+    for port in range(rail_count):
+        args.append(f"--vdev=net_memif{port},role={memif_role},"
+                    f"socket={directory / f'path{port}.sock'},socket-abstract=no,"
+                    f"mac=02:00:00:00:00:{mac_base + port:02x}")
+    return args
 
 
 @contextmanager
@@ -156,7 +164,7 @@ def check(role, cpus, *, scatter_gather=False, provider=None):
                 listener.settimeout(5)
             else:
                 listener.close()
-            relay_args = eal_args(MRC_TESTS / "mrc_memif_relay", "rx", cpus[0], directory)
+            relay_args = eal_args(RELAY, "rx", cpus[0], directory, rail_count=2)
             relay_args += ["--", str(relay_path), str(fixture_path)]
             with process(relay_args, directory) as relay:
                 deadline = time.monotonic() + 5

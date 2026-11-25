@@ -8,3 +8,4 @@
 /tests/test_roce_cma_ipc
 /tests/roce_wire_cli
 /tests/test_doorbell
+/tests/memif_relay

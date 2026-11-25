@@ -17,8 +17,7 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mrc-dpdk" / "tests"))
-from check_spark_cycle import ACTIVE_STATES, Commands, CycleError, require, start, stop_owned
+from spark_services import ACTIVE_STATES, Commands, CycleError, require, start, stop_owned
 
 
 WRITE_BYTES = 1048576
