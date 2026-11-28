@@ -110,6 +110,43 @@ Trial 2 had the median aggregate. Forward follows each row from left to right ar
 | Spark-03 ↔ Spark-04 | 91.61 | 87.05 | 178.66 |
 | Spark-04 ↔ Spark-01 | 92.13 | 87.08 | 179.21 |
 
+## Reproduce the measurements
+
+From the repository root, run the following commands with Python 3.12 or later. The replay uses the archived controller's parser, the original endpoint journals and the gate timestamps. It checks every reconstructed trial against its published JSON. The four-Spark replay also recalculates the eight directed rates from five timestamped physical-port counter reads per port per trial. [Replay script](ring/replay_memfd.py) · [Four-Spark endpoint and counter logs][four-sg-logs] · [Three-Spark endpoint logs][log-duplex-sg-peer]
+
+```sh
+python3 rocev2-dpdk/results/ring/replay_memfd.py
+python3 rocev2-dpdk/results/ring/replay_memfd.py --three-spark
+```
+
+The four-Spark output reports forward, reverse and aggregate payload rates per trial. The whole-batch value is the midpoint of the upper and lower goodput bounds obtained by translating sender-local times through their controller gate exchanges. The three-Spark output reports the midpoint of the median bounds and both median sender times. Both commands run offline.
+
+| Measurement | Archived inputs |
+|---|---|
+| Four-Spark full duplex | [48 sender/receiver journals, 12 counter logs, three gate timing files and three per-trial counter summaries][four-sg-logs] · [Trial records][four-sg-raw] · [Published throughput][four-sg-rates] · [Final host state](ring/2026-11-28/full-duplex-four-spark-sg/idle-state.json) |
+| Spark-03 power-cycle controls | [Before](ring/2026-11-28/spark03-power-cycle/before.tar.gz) · [After](ring/2026-11-28/spark03-power-cycle/after.tar.gz). Each archive groups the memfd ring attempts under `ring/`, Spark-03's single- and dual-port local transfers under `loopback/`, and the iperf3 client/server outputs and socket-counter snapshots under `tcp/`. The pre-cycle archive includes the incomplete ring attempts. |
+| One-link DPDK, page backing and native hardware | [Worker logs, page-backing trials and native perftest output and traces](spark-04-to-02/endpoint-logs.tar.gz). Directories match the corresponding JSON filenames. The fixed-MTU 4 KiB and 2 MiB attempts are under `page-backing/`. |
+| Two-port DPDK and same-cable MTU 1500 | [Worker logs by configuration](spark-04-two-qsfp/endpoint-logs.tar.gz) · [Same-cable jumbo logs](spark-04-to-02/same-cable-jumbo/endpoints.tar.gz) · [Two-port hardware logs](spark-04-two-qsfp/hardware/mtu1500-logs.tar.gz) |
+| Three-Spark native hardware at MTU 1500 | [Before Spark-01's power cycle](ring/2026-11-24/hardware/perftest-before.tar.gz) · [After](ring/2026-11-24/hardware/perftest-after.tar.gz). Each archive includes the 72 directional CSV rows with their original source paths, measured perftest output, commands and NIC counters. For Spark-01's unavailable client directories, the archives contain the matching server records from Spark-02 under the same run IDs. |
+
+### Repeat the four-Spark measurement on hardware
+
+On Spark-04, use the four configured benchmark hosts, with each right QSFP connected to the next Spark's left QSFP in ring order 01 → 02 → 03 → 04 → 01. The archived controller checks the pinned worker and application hashes, service configuration, and link MTU. Its standard VF profile uses the same peer-facing port for TX and RX. The Spark-03 deployment archive preserves the service units, launchers, libraries, binaries and SHA-256 manifest used for this run. [Controller and collector][four-sg-controller] · [Spark-03 service profile](ring/2026-11-28/full-duplex-four-spark-sg/spark03-memfd-services.tar.gz)
+
+From the repository root on the provisioned controller host, save each run to a new directory in the results worktree. The commands check the setup, collect three trials, replay them and package the entire output for Git, including endpoint logs and any incomplete attempts.
+
+```sh
+results_dir="$PWD/rocev2-dpdk/results/ring"
+tools_dir=$(mktemp -d)
+run_dir=$(mktemp -d "$results_dir/$(date -u +%F)-four-spark.XXXXXXXX")
+tar -xzf "$results_dir/2026-11-28/full-duplex-four-spark-sg/controller.tar.gz" -C "$tools_dir"
+python3 "$tools_dir/controller/ring4.py" "$run_dir/trials" --check
+python3 "$tools_dir/controller/ring4.py" "$run_dir/trials" --samples 3
+python3 "$results_dir/replay_memfd.py" --run "$run_dir/trials"
+tar -czf "$run_dir/raw-trials.tar.gz" -C "$run_dir" trials
+git add -- "$run_dir/raw-trials.tar.gz" "$run_dir/trials/results.json"
+```
+
 ## Hardware controls and other measurements
 
 - **One-way hardware to two peers.** Spark-04 issued concurrent 1 MiB RC WRITEs to Spark-02 and Spark-01 on separate 100 Gb/s ports. At Ethernet MTU 1500 (RoCE PMTU 1024), the aggregate trials were 184.66, 184.65 and 184.67 Gb/s. Both links had a median of 92.33 Gb/s. Perftest 6.30 used 16 QPs per path. Its two four-second sample windows overlapped by at least 3.985 seconds in each trial. The MTU 4200 preflight stopped before measurement. [Native trial records][hw-two] · [Perftest logs and timer traces](spark-04-two-qsfp/hardware/mtu1500-logs.tar.gz)
@@ -119,6 +156,8 @@ Trial 2 had the median aggregate. Forward follows each row from left to right ar
 - **Interoperability and local tests.** The conformance ledger records the ConnectX-7 WRITE and connection-management tests, guest-only memory registration timings, and local datapath measurements. [Hardware interoperability](../CONFORMANCE.md#spark-hardware-verification) · [Registration latency](../CONFORMANCE.md#native-mr-registration-latency-in-qemu) · [Datapath measurements](../CONFORMANCE.md#additional-datapath-measurements)
 
 [four-sg-raw]: ring/2026-11-28/full-duplex-four-spark-sg/results.json
+[four-sg-logs]: ring/2026-11-28/full-duplex-four-spark-sg/endpoints.tar.gz
+[four-sg-controller]: ring/2026-11-28/full-duplex-four-spark-sg/controller.tar.gz
 [four-sg-rates]: ring/2026-11-28/full-duplex-four-spark-sg/throughput.json
 [copy-one]: spark-04-to-02/standalone-copy-one-path-mtu1500.json
 [sg-standard]: spark-04-to-02/app-sg-one-path-mtu1500.json
