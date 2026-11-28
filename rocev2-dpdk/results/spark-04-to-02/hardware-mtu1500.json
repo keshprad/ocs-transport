@@ -1,0 +1,382 @@
+{
+  "perftest_version": "Version: 6.30",
+  "sha256": "a0ab25e647a9eede797390161949b196a1e541dfd28b9bdda2e437a3a2305bb3",
+  "ports": {
+    "first": {
+      "tx": {
+        "pci": "0000:01:00.0",
+        "interface": "enp1s0f0np0",
+        "data_ip": "10.61.0.2",
+        "device": "rocep1s0f0",
+        "port": 1,
+        "gid_index": 3,
+        "speed_mbps": 100000,
+        "mtu": 1500
+      },
+      "rx": {
+        "pci": "0000:01:00.1",
+        "interface": "enp1s0f1np1",
+        "data_ip": "10.61.0.1",
+        "device": "rocep1s0f1",
+        "port": 1,
+        "gid_index": 3,
+        "speed_mbps": 100000,
+        "mtu": 1500
+      }
+    },
+    "second": {
+      "tx": {
+        "pci": "0002:01:00.0",
+        "interface": "enP2p1s0f0np0",
+        "data_ip": "10.61.0.14",
+        "device": "roceP2p1s0f0",
+        "port": 1,
+        "gid_index": 3,
+        "speed_mbps": 100000,
+        "mtu": 1500
+      },
+      "rx": {
+        "pci": "0002:01:00.1",
+        "interface": "enP2p1s0f1np1",
+        "data_ip": "10.61.0.13",
+        "device": "roceP2p1s0f1",
+        "port": 1,
+        "gid_index": 3,
+        "speed_mbps": 100000,
+        "mtu": 1500
+      }
+    }
+  },
+  "results": {
+    "first-single": {
+      "trials": [
+        {
+          "sample_overlap_us": 4005328,
+          "payload_gbps": 92.7,
+          "rails": {
+            "first": {
+              "iterations": 44208,
+              "payload_gbps": 92.7,
+              "load_start_us": 1795470791529049,
+              "sample_start_us": 1795470793529955,
+              "sample_end_us": 1795470797535283,
+              "load_end_us": 1795470799539326
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4001325,
+          "payload_gbps": 92.6,
+          "rails": {
+            "first": {
+              "iterations": 44160,
+              "payload_gbps": 92.6,
+              "load_start_us": 1795470801080660,
+              "sample_start_us": 1795470803080902,
+              "sample_end_us": 1795470807082227,
+              "load_end_us": 1795470809082863
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4001040,
+          "payload_gbps": 92.6,
+          "rails": {
+            "first": {
+              "iterations": 44160,
+              "payload_gbps": 92.6,
+              "load_start_us": 1795470810635630,
+              "sample_start_us": 1795470812635883,
+              "sample_end_us": 1795470816636923,
+              "load_end_us": 1795470818640112
+            }
+          }
+        }
+      ],
+      "median_payload_gbps": 92.6
+    },
+    "first-multi": {
+      "trials": [
+        {
+          "sample_overlap_us": 4004892,
+          "payload_gbps": 92.31,
+          "rails": {
+            "first": {
+              "iterations": 44032,
+              "payload_gbps": 92.31,
+              "load_start_us": 1795470820404696,
+              "sample_start_us": 1795470822405365,
+              "sample_end_us": 1795470826410257,
+              "load_end_us": 1795470828413475
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4001549,
+          "payload_gbps": 92.33,
+          "rails": {
+            "first": {
+              "iterations": 44032,
+              "payload_gbps": 92.33,
+              "load_start_us": 1795470830204845,
+              "sample_start_us": 1795470832205127,
+              "sample_end_us": 1795470836206676,
+              "load_end_us": 1795470838209507
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4001850,
+          "payload_gbps": 92.32,
+          "rails": {
+            "first": {
+              "iterations": 44032,
+              "payload_gbps": 92.32,
+              "load_start_us": 1795470840049261,
+              "sample_start_us": 1795470842049673,
+              "sample_end_us": 1795470846051523,
+              "load_end_us": 1795470848053107
+            }
+          }
+        }
+      ],
+      "median_payload_gbps": 92.32
+    },
+    "second-single": {
+      "trials": [
+        {
+          "sample_overlap_us": 4001757,
+          "payload_gbps": 92.6,
+          "rails": {
+            "second": {
+              "iterations": 44160,
+              "payload_gbps": 92.6,
+              "load_start_us": 1795470849648878,
+              "sample_start_us": 1795470851649274,
+              "sample_end_us": 1795470855651031,
+              "load_end_us": 1795470857652180
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4002284,
+          "payload_gbps": 92.64,
+          "rails": {
+            "second": {
+              "iterations": 44176,
+              "payload_gbps": 92.64,
+              "load_start_us": 1795470859210179,
+              "sample_start_us": 1795470861210554,
+              "sample_end_us": 1795470865212838,
+              "load_end_us": 1795470867214619
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4002070,
+          "payload_gbps": 92.64,
+          "rails": {
+            "second": {
+              "iterations": 44176,
+              "payload_gbps": 92.64,
+              "load_start_us": 1795470868773568,
+              "sample_start_us": 1795470870773945,
+              "sample_end_us": 1795470874776015,
+              "load_end_us": 1795470876777349
+            }
+          }
+        }
+      ],
+      "median_payload_gbps": 92.64
+    },
+    "second-multi": {
+      "trials": [
+        {
+          "sample_overlap_us": 4002264,
+          "payload_gbps": 92.33,
+          "rails": {
+            "second": {
+              "iterations": 44032,
+              "payload_gbps": 92.33,
+              "load_start_us": 1795470878520443,
+              "sample_start_us": 1795470880521318,
+              "sample_end_us": 1795470884523582,
+              "load_end_us": 1795470886525575
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4001150,
+          "payload_gbps": 92.33,
+          "rails": {
+            "second": {
+              "iterations": 44032,
+              "payload_gbps": 92.33,
+              "load_start_us": 1795470888276812,
+              "sample_start_us": 1795470890277038,
+              "sample_end_us": 1795470894278188,
+              "load_end_us": 1795470896281332
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 4000816,
+          "payload_gbps": 92.34,
+          "rails": {
+            "second": {
+              "iterations": 44032,
+              "payload_gbps": 92.34,
+              "load_start_us": 1795470898103344,
+              "sample_start_us": 1795470900103528,
+              "sample_end_us": 1795470904104344,
+              "load_end_us": 1795470906105696
+            }
+          }
+        }
+      ],
+      "median_payload_gbps": 92.33
+    },
+    "aggregate-single": {
+      "trials": [
+        {
+          "sample_overlap_us": 3948569,
+          "payload_gbps": 92.66,
+          "rails": {
+            "first": {
+              "iterations": 22096,
+              "payload_gbps": 46.33,
+              "load_start_us": 1795470907610582,
+              "sample_start_us": 1795470909610986,
+              "sample_end_us": 1795470913613180,
+              "load_end_us": 1795470915614204
+            },
+            "second": {
+              "iterations": 22096,
+              "payload_gbps": 46.33,
+              "load_start_us": 1795470907663848,
+              "sample_start_us": 1795470909664611,
+              "sample_end_us": 1795470913666653,
+              "load_end_us": 1795470915668328
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 3952881,
+          "payload_gbps": 92.64,
+          "rails": {
+            "first": {
+              "iterations": 22080,
+              "payload_gbps": 46.3,
+              "load_start_us": 1795470917162110,
+              "sample_start_us": 1795470919162531,
+              "sample_end_us": 1795470923163852,
+              "load_end_us": 1795470925166239
+            },
+            "second": {
+              "iterations": 22096,
+              "payload_gbps": 46.34,
+              "load_start_us": 1795470917110866,
+              "sample_start_us": 1795470919111842,
+              "sample_end_us": 1795470923115412,
+              "load_end_us": 1795470925116248
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 3947532,
+          "payload_gbps": 92.63,
+          "rails": {
+            "first": {
+              "iterations": 22096,
+              "payload_gbps": 46.33,
+              "load_start_us": 1795470926694478,
+              "sample_start_us": 1795470928695037,
+              "sample_end_us": 1795470932698717,
+              "load_end_us": 1795470934702159
+            },
+            "second": {
+              "iterations": 22080,
+              "payload_gbps": 46.3,
+              "load_start_us": 1795470926640046,
+              "sample_start_us": 1795470928640680,
+              "sample_end_us": 1795470932642569,
+              "load_end_us": 1795470934644651
+            }
+          }
+        }
+      ],
+      "median_payload_gbps": 92.64
+    },
+    "aggregate-multi": {
+      "trials": [
+        {
+          "sample_overlap_us": 3682907,
+          "payload_gbps": 92.77000000000001,
+          "rails": {
+            "first": {
+              "iterations": 22224,
+              "payload_gbps": 46.6,
+              "load_start_us": 1795470936368197,
+              "sample_start_us": 1795470938368552,
+              "sample_end_us": 1795470942370446,
+              "load_end_us": 1795470944372450
+            },
+            "second": {
+              "iterations": 22016,
+              "payload_gbps": 46.17,
+              "load_start_us": 1795470936686980,
+              "sample_start_us": 1795470938687539,
+              "sample_end_us": 1795470942688503,
+              "load_end_us": 1795470944690095
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 3650609,
+          "payload_gbps": 92.34,
+          "rails": {
+            "first": {
+              "iterations": 22016,
+              "payload_gbps": 46.17,
+              "load_start_us": 1795470946336862,
+              "sample_start_us": 1795470948337520,
+              "sample_end_us": 1795470952339465,
+              "load_end_us": 1795470954341212
+            },
+            "second": {
+              "iterations": 22016,
+              "payload_gbps": 46.17,
+              "load_start_us": 1795470946688519,
+              "sample_start_us": 1795470948688856,
+              "sample_end_us": 1795470952690601,
+              "load_end_us": 1795470954692054
+            }
+          }
+        },
+        {
+          "sample_overlap_us": 3671745,
+          "payload_gbps": 92.33,
+          "rails": {
+            "first": {
+              "iterations": 22016,
+              "payload_gbps": 46.16,
+              "load_start_us": 1795470956393862,
+              "sample_start_us": 1795470958394511,
+              "sample_end_us": 1795470962397789,
+              "load_end_us": 1795470964401203
+            },
+            "second": {
+              "iterations": 22016,
+              "payload_gbps": 46.17,
+              "load_start_us": 1795470956725751,
+              "sample_start_us": 1795470958726044,
+              "sample_end_us": 1795470962726805,
+              "load_end_us": 1795470964728224
+            }
+          }
+        }
+      ],
+      "median_payload_gbps": 92.34
+    }
+  }
+}

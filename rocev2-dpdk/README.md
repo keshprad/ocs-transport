@@ -6,6 +6,10 @@ same test with a native verbs QP. By default each process transfers one
 message on one QP. The sender reports success after its transport completion
 and the receiver's byte-for-byte verification.
 
+The [Spark benchmark results](results/README.md) compare DPDK copy,
+application-backed scatter/gather, and hardware RoCEv2 across physical links
+and the three-Spark ring.
+
 The test uses one directly connected Ethernet path, the default P_Key, an
 untagged IPv4 data path, and nonempty plain RDMA WRITEs. Both peers exchange
 QP numbers, initial PSNs, PMTU, and buffer attributes over a private TCP
@@ -804,7 +808,7 @@ The pool service restores MTU 1500 and releases that reservation at exit.
 The benchmark uses management SSH for setup and puts the exchanged wire
 IP and MAC addresses directly into DPDK packets.
 
-### Switch the three-Spark ring to raw Ethernet
+### Switch the three-Spark ring between raw Ethernet and hardware RoCE
 
 Run the helper from the RoCEv2 directory on Spark-01, Spark-02, and
 Spark-04 over management SSH. It checks the four QSFP-facing interface
@@ -822,14 +826,44 @@ the four functions to raw Ethernet, sets the interfaces to MTU 1500,
 and reapplies the saved addresses and any missing DPDK test addresses.
 Rerun the same command to resume a partial setup.
 
-After the tests finish, restore the saved settings on each host. This
-also removes the temporary DPDK addresses that the helper added.
+After the tests finish, use `rocev2` to enable hardware RoCE on all four
+functions. It reapplies the saved MTU, link state, and IPv4 settings and
+removes the temporary DPDK addresses. With no snapshot, it preserves the
+current MTU, link state, and IPv4 settings across the reload.
 
 ~~~sh
-sudo /usr/bin/python3 -I tests/spark_roce_ethernet.py restore
+sudo /usr/bin/python3 -I tests/spark_roce_ethernet.py rocev2
 ~~~
 
+Use `restore` to restore the exact snapshot, including any differences
+in hardware RoCE settings between functions. Either action consumes
+the snapshot after it completes successfully.
+
+### Full-duplex ring with one PCIe path per peer
+
+On Spark-04, install the receiver overrides on Spark-04, Spark-02 and Spark-01,
+then run the full-duplex scatter/gather profile.
+
+```bash
+bash tests/deploy_spark_peer_ring.sh install
+python3 tests/check_spark_peer_ring.py --samples 3
+```
+
+Each Spark sends to one neighbor on `0000:01:00.0` and the other on
+`0002:01:00.1`. Each receiver opens a temporary SR-IOV virtual function on
+the same physical function used to send to that peer. The benchmark checks the
+receiver’s PCI parent and the device opened by DPDK on all six transfers.
+It uses Ethernet MTU 4200, RoCE PMTU 4096, 2 MiB packet-pool pages and four
+pinned polling threads for each of the two senders and two receivers per Spark.
+The receiver releases its VF on exit. The ring pool restores the idle MTU and
+hugepage count. Use `bash tests/deploy_spark_peer_ring.sh uninstall` to restore
+the original service definitions. The previously published ring results used
+the earlier per-direction placement.
+
 ### Three-Spark ring sweep
+
+The [ring results](results/README.md#ring-trials) include the MTU 1500 repeat,
+jumbo one-way runs, and full-duplex runs with both transmit modes.
 
 Once the two-Spark target is verified, install the pinned ring services
 on Spark-04, Spark-02, and Spark-01. The ring uses the first PCIe path

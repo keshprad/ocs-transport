@@ -66,7 +66,7 @@ class Commands:
         return self.run(endpoint.host, *args, *filters)
 
 
-def start(commands, endpoint):
+def start(commands, endpoint, *, timeout=15):
     host_script = """set -eu
 active=$(systemctl show --property=ActiveState --value "$1")
 case "$active" in
@@ -79,7 +79,7 @@ invocation=$(systemctl show --property=InvocationID --value "$1")
 printf '%s\\n%s\\n' "$since" "$invocation"
 """
     output = commands.run(
-        endpoint.host, "bash", "-c", host_script, "spark-service", endpoint.unit,
+        endpoint.host, "bash", "-c", host_script, "spark-service", endpoint.unit, timeout=timeout,
     ).splitlines()
     require(bool(output), f"{endpoint.label}: missing start confirmation")
     since, *invocations = output

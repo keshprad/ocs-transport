@@ -2,6 +2,7 @@
 """Measure concurrent, verified RoCEv2 WRITEs on the three-Spark ring."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import os
@@ -33,6 +34,10 @@ class Endpoint:
     role: str
     port: int
     data_ip: str
+
+    @property
+    def name(self):
+        return self.role
 
     @property
     def settings(self):
@@ -92,7 +97,8 @@ def unit_argv(endpoint, destination, runtime):
     return argv
 
 
-def verify_unit(commands, endpoint, destination):
+def verify_unit(commands, endpoint, destination, *, build_argv=None):
+    build_argv = build_argv or unit_argv
     props = commands.properties(
         endpoint, "LoadState", "ActiveState", "WorkingDirectory", "ExecStart",
         "Environment", "UnsetEnvironment",
@@ -108,7 +114,7 @@ def verify_unit(commands, endpoint, destination):
     require(len(paths) == 1 and paths[0].is_absolute() and ":" not in str(paths[0]),
             f"{endpoint.label}: expected one absolute DPDK runtime library path")
     installed = re.findall(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
-    require(len(installed) == 1 and shlex.split(installed[0]) == unit_argv(endpoint, destination, paths[0]),
+    require(len(installed) == 1 and shlex.split(installed[0]) == build_argv(endpoint, destination, paths[0]),
             f"{endpoint.label}: installed ExecStart differs from the expected ring profile")
     for operation in ("start", "stop"):
         commands.run(endpoint.host, "sudo", "-n", "-l", "/usr/bin/systemctl", operation, endpoint.unit)
@@ -165,12 +171,16 @@ def forward(port):
 
 
 @contextmanager
-def control_tunnels(commands, socket_dir):
+def control_tunnels(commands, socket_dir, edges=None):
     # The 02→01 loopback connection traverses both management sessions via 04.
-    sessions = {
-        "spark-02": ("-L", forward(28873), "-R", forward(28874)),
-        "spark-01": ("-L", forward(28874), "-R", forward(28875)),
-    }
+    edges = EDGES if edges is None else edges
+    controller = HOSTS[0]
+    sessions = {host: [] for host in HOSTS[1:]}
+    for tx, rx in edges:
+        if tx.host != controller:
+            sessions[tx.host].extend(("-R", forward(tx.port)))
+        if rx.host != controller:
+            sessions[rx.host].extend(("-L", forward(rx.port)))
     opened = []
     try:
         for host, forwards in sessions.items():
@@ -184,9 +194,10 @@ def control_tunnels(commands, socket_dir):
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
             )
             require(result.returncode == 0, f"{host}: could not open ring tunnel: {result.stderr.strip()}")
-        verify_loopback_listener(commands, "spark-04", 28874)
-        for endpoint in SENDERS:
-            verify_loopback_listener(commands, endpoint.host, endpoint.port)
+        for tx, rx in edges:
+            if controller not in (tx.host, rx.host):
+                verify_loopback_listener(commands, controller, tx.port)
+            verify_loopback_listener(commands, tx.host, tx.port)
         yield
     except subprocess.TimeoutExpired as error:
         raise CycleError(f"ring control tunnel timed out: {error}") from error
@@ -218,45 +229,47 @@ import socket
 import struct
 import sys
 import time
+from contextlib import ExitStack
 
-loopback, gate, port, timeout, lead = sys.argv[1:]
+loopback, gate, ports, timeout, lead = sys.argv[1:]
+pending = {int(port) for port in ports.split(",")}
 deadline = time.monotonic() + int(timeout)
-
-def wait(desired, cancel):
-    readable, _, _ = select.select([desired, cancel], [], [], max(0, deadline - time.monotonic()))
-    if desired not in readable or cancel in readable:
-        raise RuntimeError("ring gate timed out or a peer closed")
-
-with socket.create_server((loopback, int(gate))) as listener:
+with ExitStack() as stack:
+    listener = stack.enter_context(socket.create_server((loopback, int(gate))))
+    connections = []
     print("LISTENING", flush=True)
-    wait(listener, 0)
-    conn, _ = listener.accept()
-with conn:
-    identity = bytearray()
-    while len(identity) < 2:
-        wait(conn, 0)
-        data = conn.recv(2 - len(identity))
-        if not data:
-            raise RuntimeError("sender disconnected before identifying itself")
-        identity.extend(data)
-    if struct.unpack("!H", identity)[0] != int(port):
-        raise RuntimeError("unexpected sender identity")
+    while pending:
+        active, _, _ = select.select([listener, 0], [], [], max(0, deadline - time.monotonic()))
+        if listener not in active or 0 in active:
+            raise RuntimeError("Ring sender gate expired or was canceled")
+        conn, _ = listener.accept()
+        stack.enter_context(conn)
+        conn.settimeout(max(0.001, deadline - time.monotonic()))
+        header = conn.recv(2, socket.MSG_WAITALL)
+        if len(header) != 2:
+            raise RuntimeError("Incomplete sender identity")
+        port = struct.unpack("!H", header)[0]
+        if port not in pending:
+            raise RuntimeError(f"Unexpected sender identity {port}")
+        pending.remove(port)
+        connections.append(conn)
     print("READY", flush=True)
-    wait(0, conn)
-    if os.read(0, 1) != b"G":
-        raise RuntimeError("controller canceled the gate")
+    readable, _, _ = select.select([0, *connections], [], [], max(0, deadline - time.monotonic()))
+    if readable != [0] or os.read(0, 1) != b"G":
+        raise RuntimeError("Ring sender left the gate or the run was canceled")
     release = time.monotonic_ns() + int(lead)
-    conn.settimeout(0.25)
-    conn.sendall(struct.pack("!Q", release))
+    for conn in connections:
+        conn.settimeout(0.25)
+        conn.sendall(struct.pack("!Q", release))
     print(f"RELEASED {release}", flush=True)
 """
 
 
 @contextmanager
-def coordinator(commands, endpoint, log):
+def coordinator(commands, endpoint, log, *, ports=None, timeout=None):
     argv = [
         sys.executable if endpoint.host == HOSTS[0] else "python3", "-u", "-c", GATE_PROGRAM,
-        LOOPBACK, str(GATE_PORT), str(endpoint.port), str(GATE_TIMEOUT), str(GATE_LEAD_NS),
+        LOOPBACK, str(GATE_PORT), ports or str(endpoint.port), str(timeout or GATE_TIMEOUT), str(GATE_LEAD_NS),
     ]
     if endpoint.host != HOSTS[0]:
         argv = [
@@ -300,18 +313,37 @@ def read_gate_event(child, host, marker, deadline):
     return int(match[1]) if marker == "RELEASED" else None
 
 
-def release_ring(commands, output, sample, invocations):
+def start_group(commands, endpoints, invocations, *, timeout=15):
+    # Capture every successfully started invocation, including those finishing
+    # after another host fails, so the caller can stop all workers it owns.
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
+        jobs = [(endpoint, pool.submit(start, commands, endpoint, timeout=timeout))
+                for endpoint in endpoints]
+        for endpoint, job in jobs:
+            try:
+                invocations[endpoint] = job.result()
+            except Exception as error:
+                errors.append(f"{endpoint.label}: {error}")
+    if errors:
+        raise CycleError("\n".join(errors))
+
+
+def release_ring(commands, output, sample, invocations, *, senders=None, timeout=None):
+    senders = SENDERS if senders is None else senders
+    timeout = GATE_TIMEOUT if timeout is None else timeout
     with ExitStack() as gates:
-        deadline = time.monotonic() + GATE_TIMEOUT
-        children = {
-            endpoint.host: gates.enter_context(coordinator(commands, endpoint,
-                                                           output / f"{sample}-{endpoint.host}-gate.log"))
-            for endpoint in SENDERS
-        }
+        deadline = time.monotonic() + timeout
+        children = {}
+        for host in dict.fromkeys(tx.host for tx in senders):
+            local = [tx for tx in senders if tx.host == host]
+            ports = ",".join(str(tx.port) for tx in local)
+            children[host] = gates.enter_context(coordinator(
+                commands, local[0], output / f"{sample}-{host}-gate.log", ports=ports, timeout=timeout,
+            ))
         for host, child in children.items():
             read_gate_event(child, host, "LISTENING", deadline)
-        for endpoint in SENDERS:
-            invocations[endpoint] = start(commands, endpoint)
+        start_group(commands, senders, invocations)
         for host, child in children.items():
             read_gate_event(child, host, "READY", deadline)
 
@@ -327,7 +359,7 @@ def release_ring(commands, output, sample, invocations):
 
 
 def log_path(output, sample, endpoint):
-    return output / f"{sample}-{endpoint.host}-{endpoint.role}.txt"
+    return output / f"{sample}-{endpoint.host}-{endpoint.name}.txt"
 
 
 def cleanup_invocations(commands, output, sample, invocations):
@@ -351,9 +383,10 @@ def cleanup_invocations(commands, output, sample, invocations):
         print("\n".join(errors), file=sys.stderr)
 
 
-def summarize(timing, results):
+def summarize(timing, results, edges=None):
+    edges = EDGES if edges is None else edges
     links, earliest_finishes, latest_starts = {}, [], []
-    for tx, rx in EDGES:
+    for tx, rx in edges:
         tx_result = results[tx]
         gate = timing[tx.host]
         delay = int(tx_result["start_ns"]) - gate["sender_gate_ns"]
@@ -370,7 +403,7 @@ def summarize(timing, results):
         "controller_release_span_ns": max(event["controller_write_done_ns"] for event in timing.values()) -
                                       min(event["controller_sent_ns"] for event in timing.values()),
         "overlap_lower_bound_ns": max(0, min(earliest_finishes) - max(latest_starts)),
-        "verified_payload_bytes": len(EDGES) * PAYLOAD,
+        "verified_payload_bytes": len(edges) * PAYLOAD,
         "gate": timing,
         "links": links,
     }

@@ -84,7 +84,7 @@ def set_mode(state, entry, target):
     save(state)
 
 
-def update_link(entry, raw):
+def update_link(entry, raw, target):
     interface, pci, dpdk_address = (entry[key] for key in ("interface", "pci", "dpdk_address"))
     deadline = time.monotonic() + 10
     while not Path(f"/sys/class/net/{interface}/device").exists() and time.monotonic() < deadline:
@@ -118,7 +118,6 @@ def update_link(entry, raw):
     updated = interface_state(interface, pci, dpdk_address)
     expected = {item["cidr"] for item in desired}
     active = {item["cidr"] for item in updated["addresses"]}
-    target = "false" if raw else entry["roce"]
     if updated["roce"] != target or not expected <= active or updated["mtu"] != mtu or updated["up"] != up:
         raise ValueError(f"{interface} did not reach the requested Ethernet configuration")
     if not raw and dpdk_address not in original and dpdk_address in active:
@@ -128,7 +127,11 @@ def update_link(entry, raw):
 
 def main():
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("status", "raw", "restore"))
+    parser.add_argument(
+        "action", choices=("status", "raw", "rocev2", "restore"),
+        help="raw configures raw Ethernet for DPDK, rocev2 enables hardware RoCE, "
+             "restore reapplies the exact saved settings",
+    )
     args = parser.parse_args()
     host = socket.gethostname().split(".")[0]
     if host not in ADDRESS_SUFFIXES:
@@ -154,18 +157,19 @@ def main():
                            for entry in state["interfaces"]]
             if state["host"] != host or saved_ports != ports:
                 raise ValueError(f"Saved settings in {STATE} do not match this host")
-        elif args.action == "raw":
+        elif args.action in ("raw", "rocev2"):
             state = {"host": host, "interfaces": [interface_state(*port) for port in ports]}
             save(state)
         else:
             raise ValueError(f"No saved state in {STATE}")
 
         raw = args.action == "raw"
+        requested_mode = {"raw": "false", "rocev2": "true"}.get(args.action)
         for entry in state["interfaces"]:
-            set_mode(state, entry, "false" if raw else entry["roce"])
+            set_mode(state, entry, requested_mode or entry["roce"])
         # A function reload can also clear its sibling interface's addresses.
         for entry in state["interfaces"]:
-            update_link(entry, raw)
+            update_link(entry, raw, requested_mode or entry["roce"])
         if not raw:
             STATE.unlink()
 

@@ -1,0 +1,921 @@
+{
+  "sha256": "056343221b7230fc177fd139ca581a1fd6c99f31aaea097028f4955b7b58d738",
+  "destination": "/opt/ocs-roce-bw/a2c307f",
+  "ethernet_mtu": 4200,
+  "roce_pmtu": 4096,
+  "packet_page_bytes": 2097152,
+  "trials": [
+    {
+      "controller_release_span_ns": 23008,
+      "overlap_lower_bound_ns": 1401412606,
+      "verified_payload_bytes": 51539607552,
+      "gate": {
+        "spark-04": {
+          "controller_sent_ns": 625213946405406,
+          "controller_write_done_ns": 625213946418478,
+          "sender_gate_ns": 625213996438334,
+          "controller_received_ns": 625213946598318
+        },
+        "spark-02": {
+          "controller_sent_ns": 625213946419838,
+          "controller_write_done_ns": 625213946424142,
+          "sender_gate_ns": 624922785431704,
+          "controller_received_ns": 625213946793166
+        },
+        "spark-01": {
+          "controller_sent_ns": 625213946424622,
+          "controller_write_done_ns": 625213946428414,
+          "sender_gate_ns": 276459395460170,
+          "controller_received_ns": 625213947037055
+        }
+      },
+      "links": {
+        "spark-04-to-spark-02": {
+          "tx": {
+            "invocation": "329505ad8b6d4d58adad7108ae5fd8b5",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402215612",
+            "thread_cpu_ns": "5608200160",
+            "payload_gbps": "98.016",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "625213996509651",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "db924c155fed4bd7a1d810ca72c11460",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401084580",
+            "thread_cpu_ns": "5604252752",
+            "payload_gbps": "98.095",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "624922786425644",
+            "poll_minor_faults": 6,
+            "poll_major_faults": 0,
+            "worker_pid": 1084772,
+            "app_pid": 1084781,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 5707540353
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 347818249
+              }
+            },
+            "application_transfer": {
+              "start_ns": 624914884269320,
+              "elapsed_ns": 16124566403,
+              "process_cpu_ns": 6736058576
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 71317
+        },
+        "spark-02-to-spark-01": {
+          "tx": {
+            "invocation": "89a55812bb224fe9bff59fb3f41e4fc1",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402402252",
+            "thread_cpu_ns": "5608834720",
+            "payload_gbps": "98.003",
+            "poll_cores": "3.999",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "624922785604817",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "2b4079ea27d540b4adb2f02e78bf4295",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1400922692",
+            "thread_cpu_ns": "5603315568",
+            "payload_gbps": "98.106",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "276459396947866",
+            "poll_minor_faults": 8,
+            "poll_major_faults": 0,
+            "worker_pid": 604673,
+            "app_pid": 604680,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 6015955344
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 359860367
+              }
+            },
+            "application_transfer": {
+              "start_ns": 276451958046271,
+              "elapsed_ns": 15474799430,
+              "process_cpu_ns": 6518556832
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 173113
+        },
+        "spark-01-to-spark-04": {
+          "tx": {
+            "invocation": "2aa342d780e940db9cfbdf7d66d08d76",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402025039",
+            "thread_cpu_ns": "5607514528",
+            "payload_gbps": "98.029",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "276459395524412",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "7c494df9bd9e4792b5cef27691fda5e2",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401357114",
+            "thread_cpu_ns": "5605297424",
+            "payload_gbps": "98.076",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "625213997532261",
+            "poll_minor_faults": 8,
+            "poll_major_faults": 0,
+            "worker_pid": 1329997,
+            "app_pid": 1330012,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 6023919693
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 367011632
+              }
+            },
+            "application_transfer": {
+              "start_ns": 625206584083879,
+              "elapsed_ns": 15479762907,
+              "process_cpu_ns": 6595008304
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 64242
+        }
+      },
+      "aggregate_payload_gbps_bounds": [
+        293.90495978717695,
+        294.0075572668148
+      ],
+      "sum_link_tx_gbps": 294.048
+    },
+    {
+      "controller_release_span_ns": 21184,
+      "overlap_lower_bound_ns": 1401423207,
+      "verified_payload_bytes": 51539607552,
+      "gate": {
+        "spark-04": {
+          "controller_sent_ns": 625239610025336,
+          "controller_write_done_ns": 625239610037672,
+          "sender_gate_ns": 625239660069048,
+          "controller_received_ns": 625239610179144
+        },
+        "spark-02": {
+          "controller_sent_ns": 625239610038344,
+          "controller_write_done_ns": 625239610042520,
+          "sender_gate_ns": 624948448957847,
+          "controller_received_ns": 625239610458889
+        },
+        "spark-01": {
+          "controller_sent_ns": 625239610042744,
+          "controller_write_done_ns": 625239610046520,
+          "sender_gate_ns": 276485058940206,
+          "controller_received_ns": 625239610465193
+        }
+      },
+      "links": {
+        "spark-04-to-spark-02": {
+          "tx": {
+            "invocation": "64c9ead1a59743b5bd382013ed742eeb",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402165787",
+            "thread_cpu_ns": "5607799616",
+            "payload_gbps": "98.019",
+            "poll_cores": "3.999",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "625239660233953",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "1f993991d292425f87e931632470e33e",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401581324",
+            "thread_cpu_ns": "5606215712",
+            "payload_gbps": "98.060",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "624948449498411",
+            "poll_minor_faults": 7,
+            "poll_major_faults": 0,
+            "worker_pid": 1085099,
+            "app_pid": 1085108,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 5676917491
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 347576389
+              }
+            },
+            "application_transfer": {
+              "start_ns": 624940330701826,
+              "elapsed_ns": 16338380016,
+              "process_cpu_ns": 6733724800
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 164905
+        },
+        "spark-02-to-spark-01": {
+          "tx": {
+            "invocation": "59e9066e6c4c44a39e976693a9e8e883",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402072985",
+            "thread_cpu_ns": "5607553520",
+            "payload_gbps": "98.026",
+            "poll_cores": "3.999",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "624948449372268",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "65806f06e8574063a031cde67415c208",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401556325",
+            "thread_cpu_ns": "5605933584",
+            "payload_gbps": "98.062",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "276485059929945",
+            "poll_minor_faults": 6,
+            "poll_major_faults": 0,
+            "worker_pid": 604939,
+            "app_pid": 604945,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 5846238925
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 364948475
+              }
+            },
+            "application_transfer": {
+              "start_ns": 276477261968462,
+              "elapsed_ns": 15818090338,
+              "process_cpu_ns": 6526137552
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 414421
+        },
+        "spark-01-to-spark-04": {
+          "tx": {
+            "invocation": "a5e1518e3eb4472a849c13b1d98f33a0",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402085434",
+            "thread_cpu_ns": "5607757040",
+            "payload_gbps": "98.025",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "276485059108545",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "9796dff558a841a693fcf95cf9b48129",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401719722",
+            "thread_cpu_ns": "5606748272",
+            "payload_gbps": "98.050",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "625239660743314",
+            "poll_minor_faults": 6,
+            "poll_major_faults": 0,
+            "worker_pid": 1330276,
+            "app_pid": 1330284,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 6058312023
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 367805068
+              }
+            },
+            "application_transfer": {
+              "start_ns": 625232098409262,
+              "elapsed_ns": 15690498665,
+              "process_cpu_ns": 6593175728
+            },
+            "port_stats": {
+              "rx_packets": 4194305,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 168339
+        }
+      },
+      "aggregate_payload_gbps_bounds": [
+        293.9334029179674,
+        294.0538021013583
+      ],
+      "sum_link_tx_gbps": 294.07
+    },
+    {
+      "controller_release_span_ns": 12880,
+      "overlap_lower_bound_ns": 1400856991,
+      "verified_payload_bytes": 51539607552,
+      "gate": {
+        "spark-04": {
+          "controller_sent_ns": 625265214515176,
+          "controller_write_done_ns": 625265214521672,
+          "sender_gate_ns": 625265264627320,
+          "controller_received_ns": 625265214793433
+        },
+        "spark-02": {
+          "controller_sent_ns": 625265214522232,
+          "controller_write_done_ns": 625265214525608,
+          "sender_gate_ns": 624974053693600,
+          "controller_received_ns": 625265215583866
+        },
+        "spark-01": {
+          "controller_sent_ns": 625265214525752,
+          "controller_write_done_ns": 625265214528056,
+          "sender_gate_ns": 276510663601924,
+          "controller_received_ns": 625265215593754
+        }
+      },
+      "links": {
+        "spark-04-to-spark-02": {
+          "tx": {
+            "invocation": "a81d4f5916b244beb72413131c10b9ba",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402030374",
+            "thread_cpu_ns": "5607675696",
+            "payload_gbps": "98.029",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "625265264707413",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "ee14206692f84d7ea2be6f20c8954a6a",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401238120",
+            "thread_cpu_ns": "5604894144",
+            "payload_gbps": "98.084",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "624974054077969",
+            "poll_minor_faults": 5,
+            "poll_major_faults": 0,
+            "worker_pid": 1085433,
+            "app_pid": 1085443,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 5680131070
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 348331209
+              }
+            },
+            "application_transfer": {
+              "start_ns": 624966072110123,
+              "elapsed_ns": 16198612714,
+              "process_cpu_ns": 6733308032
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 80093
+        },
+        "spark-02-to-spark-01": {
+          "tx": {
+            "invocation": "c3f0c01e827f43928d06f615e215681b",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402056467",
+            "thread_cpu_ns": "5607795456",
+            "payload_gbps": "98.027",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "624974053786291",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "9fb3b66f6fc34b079f12fafcff1dcbf9",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1400785530",
+            "thread_cpu_ns": "5602948400",
+            "payload_gbps": "98.116",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "276510665267605",
+            "poll_minor_faults": 5,
+            "poll_major_faults": 0,
+            "worker_pid": 605228,
+            "app_pid": 605234,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 5984873592
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 367793091
+              }
+            },
+            "application_transfer": {
+              "start_ns": 276503055547318,
+              "elapsed_ns": 15651214489,
+              "process_cpu_ns": 6521194752
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 92691
+        },
+        "spark-01-to-spark-04": {
+          "tx": {
+            "invocation": "12ed92a6ec9240e6a9ef53a97bda82c4",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1402179720",
+            "thread_cpu_ns": "5607176576",
+            "payload_gbps": "98.018",
+            "poll_cores": "3.999",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "276510663776822",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "port_stats": {
+              "rx_packets": 131072,
+              "tx_packets": 4194304,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            }
+          },
+          "rx": {
+            "invocation": "6ec5140476b542a9abe176b46752e72f",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1401371557",
+            "thread_cpu_ns": "5605400400",
+            "payload_gbps": "98.075",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "625265265785431",
+            "poll_minor_faults": 6,
+            "poll_major_faults": 0,
+            "worker_pid": 1330585,
+            "app_pid": 1330609,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 6064358217
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 366386384
+              }
+            },
+            "application_transfer": {
+              "start_ns": 625257821460367,
+              "elapsed_ns": 15540021572,
+              "process_cpu_ns": 6596259408
+            },
+            "port_stats": {
+              "rx_packets": 4194304,
+              "tx_packets": 131072,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": true,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "local_start_after_gate_ns": 174898
+        }
+      },
+      "aggregate_payload_gbps_bounds": [
+        293.8083505388451,
+        294.05421754067305
+      ],
+      "sum_link_tx_gbps": 294.074
+    }
+  ],
+  "links": {
+    "spark-04-to-spark-02": {
+      "tx": {
+        "host": "spark-04",
+        "device": "0000:01:00.0",
+        "interface": "enp1s0f0np0",
+        "data_ip": "10.61.0.2",
+        "ethernet_mtu": 4200,
+        "link_mbps": 100000,
+        "cpu_ids": [
+          5,
+          6,
+          7,
+          8
+        ]
+      },
+      "rx": {
+        "host": "spark-02",
+        "device": "0000:01:00.1",
+        "interface": "enp1s0f1np1",
+        "data_ip": "10.61.0.1",
+        "ethernet_mtu": 4200,
+        "link_mbps": 100000,
+        "cpu_ids": [
+          15,
+          16,
+          17,
+          18
+        ]
+      }
+    },
+    "spark-02-to-spark-01": {
+      "tx": {
+        "host": "spark-02",
+        "device": "0000:01:00.0",
+        "interface": "enp1s0f0np0",
+        "data_ip": "10.61.0.10",
+        "ethernet_mtu": 4200,
+        "link_mbps": 100000,
+        "cpu_ids": [
+          5,
+          6,
+          7,
+          8
+        ]
+      },
+      "rx": {
+        "host": "spark-01",
+        "device": "0000:01:00.1",
+        "interface": "enp1s0f1np1",
+        "data_ip": "10.61.0.9",
+        "ethernet_mtu": 4200,
+        "link_mbps": 100000,
+        "cpu_ids": [
+          15,
+          16,
+          17,
+          18
+        ]
+      }
+    },
+    "spark-01-to-spark-04": {
+      "tx": {
+        "host": "spark-01",
+        "device": "0000:01:00.0",
+        "interface": "enp1s0f0np0",
+        "data_ip": "10.61.0.6",
+        "ethernet_mtu": 4200,
+        "link_mbps": 100000,
+        "cpu_ids": [
+          5,
+          6,
+          7,
+          8
+        ]
+      },
+      "rx": {
+        "host": "spark-04",
+        "device": "0000:01:00.1",
+        "interface": "enp1s0f1np1",
+        "data_ip": "10.61.0.5",
+        "ethernet_mtu": 4200,
+        "link_mbps": 100000,
+        "cpu_ids": [
+          15,
+          16,
+          17,
+          18
+        ]
+      }
+    }
+  },
+  "median_ring_payload_gbps_lower": 293.90495978717695,
+  "median_ring_payload_gbps_upper": 294.0538021013583,
+  "median_per_link_tx_gbps": {
+    "spark-04-to-spark-02": 98.019,
+    "spark-02-to-spark-01": 98.026,
+    "spark-01-to-spark-04": 98.025
+  },
+  "endpoints": {
+    "tx": {
+      "mode": "standalone copy",
+      "build": "a2c307f",
+      "sha256": "056343221b7230fc177fd139ca581a1fd6c99f31aaea097028f4955b7b58d738",
+      "service": "ocs-roce-ring-two-way-forward-tx.service"
+    },
+    "rx": {
+      "mode": "application-backed memfd, prefaulted",
+      "build": "8c5058a",
+      "sha256": "bcb390549d7d69a0a04f829eb3a28b74d6f228963601f50db7b40aa898e42c5b",
+      "destination": "/opt/ocs-roce-app-bw/8c5058a-aggregate",
+      "service": "ocs-roce-ring-gather-forward-rx.service"
+    }
+  }
+}
