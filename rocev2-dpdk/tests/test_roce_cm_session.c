@@ -1,0 +1,672 @@
+#include "roce_cm_session.h"
+#include "roce_cm_lab_offer.h"
+
+#include <assert.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+enum { RETRY_NS = 1000000 };
+
+static void check_lab_offer(void)
+{
+    const uint8_t private[] = {0x1, 0, 0x2};
+    struct roce_lab_options sender = { .sender = true, .size = 8195, .writes = 3 };
+    struct roce_lab_options receiver = { .size = sender.size, .writes = sender.writes };
+    const struct roce_lab_offer local = {
+        .pmtu = 1024, .region = { .address = UINT64_C(0x1234567876543210), .rkey = 0x81828384 },
+    };
+    /* Linux returns the fixed-width CM area, padded after the transmitted bytes. */
+    uint8_t buffer[ROCE_CM_REP_PRIVATE_SIZE] = {0};
+    struct roce_lab_offer peer = { .qpn = 37 };
+    const uint8_t *extra;
+    uint8_t extra_length;
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &sender, &local, private, sizeof(private)) ==
+           ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private));
+    assert(!roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE + sizeof(private), &receiver, &peer, NULL, NULL));
+    assert(!roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, NULL, NULL));
+    assert(roce_cm_lab_offer_decode(buffer, sizeof(buffer), &receiver, &peer, &extra, &extra_length));
+    assert(extra_length == sizeof(private) && !memcmp(extra, private, sizeof(private)));
+    assert(peer.qpn == 37 && peer.pmtu == local.pmtu && peer.region.address == local.region.address &&
+           peer.region.rkey == local.region.rkey && peer.region.size == sender.size);
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &sender, &local, NULL, 0) == ROCE_CM_LAB_OFFER_SIZE);
+    assert(roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE, &receiver, &peer, &extra, &extra_length));
+    assert(!extra && !extra_length);
+
+    sender.multi_mr_targets = receiver.multi_mr_targets = true;
+    sender.qps = receiver.qps = 1;
+    struct roce_lab_offer reply = local;
+    reply.auxiliary = (struct roce_region) {.address = 0x47480000, .rkey = 0x12134567, .size = sender.size};
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &receiver, &reply, private, sizeof(private)) ==
+           ROCE_CM_LAB_REPLY_SIZE);
+    assert(roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, &extra, &extra_length));
+    assert(extra_length == sizeof(private) && !memcmp(extra, private, sizeof(private)));
+    assert(peer.auxiliary.address == reply.auxiliary.address && peer.auxiliary.rkey == reply.auxiliary.rkey &&
+           peer.auxiliary.size == reply.auxiliary.size);
+    assert(!roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_REPLY_SIZE - 1, &sender, &peer, NULL, NULL));
+    buffer[ROCE_CM_LAB_PRIVATE_SIZE] = 0;
+    assert(!roce_cm_lab_offer_decode(buffer, sizeof(buffer), &sender, &peer, NULL, NULL));
+    assert(roce_cm_lab_offer_encode(buffer, sizeof(buffer), &sender, &local, private, sizeof(private)) ==
+           ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private));
+    assert(roce_cm_lab_offer_decode(buffer, ROCE_CM_LAB_OFFER_SIZE + 1 + sizeof(private), &receiver, &peer, NULL, NULL));
+}
+
+struct test_pair {
+    struct roce_cm_session active;
+    struct roce_cm_session passive;
+    uint8_t req[ROCE_CM_FRAME_SIZE];
+    uint8_t rep[ROCE_CM_FRAME_SIZE];
+    uint8_t rtu[ROCE_CM_FRAME_SIZE];
+};
+
+static void test_configs(struct roce_cm_session_config *active,
+                         struct roce_cm_session_config *passive)
+{
+    static const uint8_t request[] = {0x14, 0, 0x27};
+    static const uint8_t reply[] = {0xa2, 0, 0x81};
+    *active = (struct roce_cm_session_config) {
+        .initiator = true,
+        .tid = UINT64_C(0x0102030405060708),
+        .local_comm_id = 0x12345678,
+        .local = {.mac = {2, 0, 0, 0, 0, 1}, .ipv4 = 0xc0000201},
+        .peer = {.mac = {2, 0, 0, 0, 0, 2}, .ipv4 = 0xc0000202},
+        .connection = {.local_ca_guid = 2, .local_qpn = 0x80401, .starting_psn = 0xffffff},
+        .service_id = ROCE_CMA_TCP_SERVICE_BASE | 18515,
+        .cma_source_port = 30001,
+        .udp_source = 0xc001,
+        .pkey = ROCE_PKEY,
+        .mtu = 3,
+        .private_data = request,
+        .private_length = sizeof(request),
+        .retry_ns = RETRY_NS,
+        .max_retries = 4,
+    };
+    *passive = *active;
+    passive->initiator = false;
+    passive->tid = 0;
+    passive->local_comm_id = 0x96325874;
+    passive->local = active->peer;
+    passive->peer = active->local;
+    passive->connection = (struct roce_cm_connection) {
+        .local_ca_guid = 1, .local_qpn = 0x80402, .starting_psn = 0x123456,
+    };
+    passive->udp_source = 0xc002;
+    passive->cma_source_port = 0;
+    passive->private_data = reply;
+    passive->private_length = sizeof(reply);
+    passive->mtu = 4;
+}
+
+static void init_pair(struct test_pair *pair)
+{
+    struct roce_cm_session_config active;
+    struct roce_cm_session_config passive;
+    test_configs(&active, &passive);
+    assert(roce_cm_session_init(&pair->active, &active));
+    assert(roce_cm_session_init(&pair->passive, &passive));
+}
+
+static void send_at(struct roce_cm_session *session, uint64_t now, uint8_t *frame)
+{
+    assert(roce_cm_session_prepare(session, now, frame, ROCE_CM_FRAME_SIZE) == ROCE_CM_FRAME_SIZE);
+    roce_cm_session_sent(session, now);
+}
+
+static struct roce_cm_message unpack(const uint8_t *frame, struct roce_cm_frame *outer)
+{
+    struct roce_cm_message message;
+    assert(roce_cm_frame_decode(outer, frame, ROCE_CM_FRAME_SIZE));
+    assert(roce_cm_decode(&message, outer->mad, ROCE_CM_MAD_SIZE));
+    return message;
+}
+
+static void pack(uint8_t *frame, struct roce_cm_frame outer, const struct roce_cm_message *message)
+{
+    uint8_t mad[ROCE_CM_MAD_SIZE];
+    assert(roce_cm_encode(mad, sizeof(mad), message) == sizeof(mad));
+    outer.mad = mad;
+    assert(roce_cm_frame_encode(frame, ROCE_CM_FRAME_SIZE, &outer) == ROCE_CM_FRAME_SIZE);
+}
+
+static bool receive_at(struct roce_cm_session *session, uint64_t now, const uint8_t *frame)
+{
+    return roce_cm_session_receive(session, now, frame, ROCE_CM_FRAME_SIZE);
+}
+
+static void check_explicit_establishment(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    active.manual_establish = true;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    assert(!roce_cm_session_establish(&pair.active));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    send_at(&pair.passive, 0, pair.rep);
+    assert(receive_at(&pair.active, 0, pair.rep));
+    assert(!roce_cm_session_prepare(&pair.active, 0, pair.rtu, sizeof(pair.rtu)));
+
+    send_at(&pair.passive, RETRY_NS, pair.rep);
+    assert(receive_at(&pair.active, RETRY_NS, pair.rep));
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, pair.rtu, sizeof(pair.rtu)));
+    assert(pair.active.phase == ROCE_CM_PENDING && pair.passive.phase == ROCE_CM_PENDING);
+    assert(roce_cm_session_establish(&pair.active));
+    send_at(&pair.active, RETRY_NS, pair.rtu);
+    assert(receive_at(&pair.passive, RETRY_NS, pair.rtu));
+    assert(pair.active.phase == ROCE_CM_ESTABLISHED && pair.passive.phase == ROCE_CM_ESTABLISHED);
+}
+
+static void check_deferred_passive_qpn(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    const uint32_t qpn = passive.connection.local_qpn;
+    passive.connection.local_qpn = 0;
+    assert(!roce_cm_session_init(&pair.passive, &passive));
+    passive.defer_local_qpn = true;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    assert(!roce_cm_session_set_local_qpn(&pair.passive, qpn));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    assert(!roce_cm_session_prepare(&pair.passive, 0, pair.rep, sizeof(pair.rep)));
+    assert(!roce_cm_session_set_local_qpn(&pair.passive, 1));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(roce_cm_session_set_local_qpn(&pair.passive, qpn));
+    assert(!roce_cm_session_set_local_qpn(&pair.passive, qpn + 1));
+    send_at(&pair.passive, RETRY_NS, pair.rep);
+    assert(receive_at(&pair.active, RETRY_NS, pair.rep));
+    assert(pair.active.peer_qpn == qpn);
+    send_at(&pair.active, RETRY_NS, pair.rtu);
+    assert(receive_at(&pair.passive, RETRY_NS, pair.rtu));
+    assert(pair.passive.phase == ROCE_CM_ESTABLISHED);
+}
+
+static void check_loss(void)
+{
+    struct test_pair pair;
+    struct roce_cm_frame outer;
+    struct roce_cm_message request;
+    struct roce_cma_ipv4 cma;
+    uint8_t queued[ROCE_CM_FRAME_SIZE];
+    init_pair(&pair);
+
+    assert(!roce_cm_session_prepare(&pair.passive, 0, pair.rep, sizeof(pair.rep)));
+    assert(!roce_cm_session_prepare(&pair.active, 0, pair.req, sizeof(pair.req) - 1));
+    assert(roce_cm_session_prepare(&pair.active, 0, queued, sizeof(queued)) == sizeof(queued));
+    assert(roce_cm_session_prepare(&pair.active, RETRY_NS / 2, pair.req, sizeof(pair.req)) == sizeof(pair.req));
+    assert(!memcmp(queued, pair.req, sizeof(queued)));
+    roce_cm_session_sent(&pair.active, RETRY_NS / 2);
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, pair.req, sizeof(pair.req)));
+
+    /* The first REQ and first REP were accepted by TX and dropped on the link. */
+    uint64_t now = RETRY_NS + RETRY_NS / 2;
+    send_at(&pair.active, now, pair.req);
+    request = unpack(pair.req, &outer);
+    assert(outer.psn == 0 && request.type == ROCE_CM_REQ && request.req.mtu == 3);
+    assert(!request.req.primary.local_lid && !request.req.primary.remote_lid);
+    assert(roce_cma_decode_ipv4(&cma, request.private_data, request.private_length));
+    assert(cma.source_port == 30001 && cma.source_ipv4 == 0xc0000201 && cma.destination_ipv4 == 0xc0000202);
+    assert(receive_at(&pair.passive, now, pair.req));
+    assert(pair.passive.peer_qpn == 0x80401 && pair.passive.send_psn == 0xffffff);
+    assert(pair.passive.mtu == 3 && pair.passive.peer_private_length == 56);
+    assert(!memcmp(pair.passive.peer_private_data, "\x14\0\x27", 3));
+    assert(!pair.passive.peer_private_data[3] && !pair.passive.peer_private_data[55]);
+    send_at(&pair.passive, now, pair.rep);
+
+    now += RETRY_NS;
+    send_at(&pair.active, now, pair.req);
+    assert(receive_at(&pair.passive, now, pair.req));
+    send_at(&pair.passive, now, pair.rep);
+    assert(receive_at(&pair.active, now, pair.rep));
+    assert(pair.active.peer_qpn == 0x80402 && pair.active.send_psn == 0x123456);
+    assert(pair.active.mtu == 3 && pair.active.peer_private_length == 196);
+    assert(!memcmp(pair.active.peer_private_data, "\xa2\0\x81", 3));
+    assert(pair.active.phase == ROCE_CM_PENDING && pair.passive.phase == ROCE_CM_PENDING);
+
+    /* The active QP gets ready only after TX accepts RTU. Drop that RTU. */
+    assert(roce_cm_session_prepare(&pair.active, now, pair.rtu, sizeof(pair.rtu)) == sizeof(pair.rtu));
+    assert(pair.active.phase == ROCE_CM_PENDING);
+    assert(!roce_cm_session_prepare(&pair.passive, now, pair.rep, sizeof(pair.rep)));
+    roce_cm_session_sent(&pair.active, now);
+    assert(pair.active.phase == ROCE_CM_ESTABLISHED && pair.passive.phase == ROCE_CM_PENDING);
+
+    now += RETRY_NS;
+    send_at(&pair.passive, now, pair.rep);
+    assert(receive_at(&pair.active, now, pair.rep));
+    send_at(&pair.active, now, pair.rtu);
+    assert(receive_at(&pair.passive, now, pair.rtu));
+    assert(pair.passive.phase == ROCE_CM_ESTABLISHED);
+    assert(receive_at(&pair.passive, now, pair.rtu));
+    assert(!roce_cm_session_prepare(&pair.passive, now, pair.rep, sizeof(pair.rep)));
+    assert(!roce_cm_session_prepare(&pair.active, now, pair.rtu, sizeof(pair.rtu)));
+}
+
+static void check_identity(void)
+{
+    struct test_pair pair;
+    struct roce_cm_frame outer;
+    uint8_t wrong[ROCE_CM_FRAME_SIZE];
+    init_pair(&pair);
+    send_at(&pair.active, 0, pair.req);
+    struct roce_cm_message request = unpack(pair.req, &outer);
+    ++request.req.service_id;
+    pack(wrong, outer, &request);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    --request.req.service_id;
+    request.req.mtu = 5;
+    pack(wrong, outer, &request);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    request.req.mtu = 3;
+    ++request.req.primary.remote_gid[15];
+    pack(wrong, outer, &request);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    --request.req.primary.remote_gid[15];
+    ++outer.src.mac[5];
+    pack(wrong, outer, &request);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    assert(!pair.passive.peer_qpn);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    send_at(&pair.passive, 0, pair.rep);
+
+    struct roce_cm_message reply = unpack(pair.rep, &outer);
+    ++reply.tid;
+    pack(wrong, outer, &reply);
+    assert(!receive_at(&pair.active, 0, wrong));
+    --reply.tid;
+    ++reply.remote_comm_id;
+    pack(wrong, outer, &reply);
+    assert(!receive_at(&pair.active, 0, wrong));
+    --reply.remote_comm_id;
+    assert(!pair.active.peer_qpn);
+    assert(receive_at(&pair.active, 0, pair.rep));
+    send_at(&pair.active, 0, pair.rtu);
+    ++reply.connection.local_qpn;
+    pack(wrong, outer, &reply);
+    assert(!receive_at(&pair.active, 0, wrong));
+    assert(!roce_cm_session_prepare(&pair.active, 0, wrong, sizeof(wrong)));
+
+    struct roce_cm_message rtu = unpack(pair.rtu, &outer);
+    ++rtu.local_comm_id;
+    pack(wrong, outer, &rtu);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    --rtu.local_comm_id;
+    ++rtu.remote_comm_id;
+    pack(wrong, outer, &rtu);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    assert(pair.passive.phase == ROCE_CM_PENDING);
+    assert(receive_at(&pair.passive, 0, pair.rtu));
+}
+
+static void check_retry_limit(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active;
+    struct roce_cm_session_config passive;
+    test_configs(&active, &passive);
+    active.max_retries = 1;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    send_at(&pair.passive, 0, pair.rep);
+    send_at(&pair.active, RETRY_NS, pair.req);
+    send_at(&pair.passive, RETRY_NS, pair.rep);
+    assert(!roce_cm_session_prepare(&pair.active, 2 * RETRY_NS - 1, pair.req, sizeof(pair.req)));
+    assert(pair.active.phase == ROCE_CM_PENDING);
+    assert(!roce_cm_session_prepare(&pair.active, 2 * RETRY_NS, pair.req, sizeof(pair.req)));
+    assert(!roce_cm_session_prepare(&pair.passive, 2 * RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(pair.active.phase == ROCE_CM_FAILED && pair.passive.phase == ROCE_CM_FAILED);
+    assert(!receive_at(&pair.active, 2 * RETRY_NS, pair.rep));
+
+    active.private_length = ROCE_CMA_IPV4_REQ_USER_SIZE + 1;
+    assert(!roce_cm_session_init(&pair.active, &active));
+    passive.private_length = ROCE_CM_REP_PRIVATE_SIZE + 1;
+    assert(!roce_cm_session_init(&pair.passive, &passive));
+}
+
+static void check_mra_req(void)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    active.max_retries = 0;
+    active.packet_lifetime_ns = 20000;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+
+    uint8_t frame[ROCE_CM_FRAME_SIZE];
+    struct roce_cm_frame outer = {
+        .src = passive.local, .dst = active.local, .udp_source = passive.udp_source, .pkey = active.pkey,
+    };
+    struct roce_cm_message mra = {
+        .type = ROCE_CM_MRA, .tid = active.tid,
+        .local_comm_id = passive.local_comm_id, .remote_comm_id = active.local_comm_id,
+        .mra = {.message = ROCE_CM_MRA_REQ, .service_timeout = 9},
+    };
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 0, frame));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    send_at(&pair.passive, 0, pair.rep);
+
+    ++mra.tid;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 1, frame));
+    --mra.tid;
+    ++mra.remote_comm_id;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 2, frame));
+    --mra.remote_comm_id;
+    --outer.src.ipv4;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 3, frame));
+    ++outer.src.ipv4;
+    mra.mra.message = ROCE_CM_MRA_REP;
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.active, 4, frame));
+    mra.mra.message = ROCE_CM_MRA_REQ;
+    pack(frame, outer, &mra);
+    assert(receive_at(&pair.active, 100000, frame));
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, frame, sizeof(frame)));
+    assert(pair.active.phase == ROCE_CM_PENDING && pair.active.sends == 1);
+
+    struct roce_cm_message reply = unpack(pair.rep, &outer);
+    ++reply.local_comm_id;
+    pack(frame, outer, &reply);
+    uint64_t before_expiry = 100000 + 2097152 + active.packet_lifetime_ns - 1;
+    assert(!receive_at(&pair.active, before_expiry, frame));
+    assert(receive_at(&pair.active, before_expiry, pair.rep));
+    send_at(&pair.active, before_expiry, pair.rtu);
+    assert(pair.active.phase == ROCE_CM_ESTABLISHED);
+}
+
+static void check_mra_rep(void)
+{
+    struct test_pair pair;
+    init_pair(&pair);
+    pair.passive.config.max_retries = 1;
+    pair.passive.config.packet_lifetime_ns = 20000;
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+
+    struct roce_cm_frame outer;
+    struct roce_cm_message mra = unpack(pair.req, &outer);
+    mra.type = ROCE_CM_MRA;
+    mra.remote_comm_id = pair.passive.config.local_comm_id;
+    mra.mra.message = ROCE_CM_MRA_REP;
+    mra.mra.service_timeout = 9;
+    mra.private_length = 0;
+    uint8_t frame[ROCE_CM_FRAME_SIZE];
+    pack(frame, outer, &mra);
+    assert(!receive_at(&pair.passive, 0, frame));
+    send_at(&pair.passive, 0, pair.rep);
+    assert(receive_at(&pair.passive, 100000, frame));
+
+    assert(receive_at(&pair.passive, RETRY_NS, pair.req));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(receive_at(&pair.passive, RETRY_NS + 1, frame));
+    uint64_t expiry = 100000 + 2097152 + pair.passive.config.packet_lifetime_ns;
+    assert(!roce_cm_session_prepare(&pair.passive, expiry - 1, pair.rep, sizeof(pair.rep)));
+    send_at(&pair.passive, expiry, pair.rep);
+    assert(pair.passive.sends == 2);
+    assert(!roce_cm_session_prepare(&pair.passive, expiry + RETRY_NS - 1, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_PENDING);
+    assert(!roce_cm_session_prepare(&pair.passive, expiry + RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_FAILED);
+}
+
+static void check_mra_send(bool initiator)
+{
+    struct test_pair pair;
+    struct roce_cm_session_config active, passive;
+    test_configs(&active, &passive);
+    active.retry_ns = 4000000;
+    active.manual_establish = true;
+    uint32_t passive_qpn = passive.connection.local_qpn;
+    passive.defer_local_qpn = true;
+    passive.connection.local_qpn = 0;
+    assert(roce_cm_session_init(&pair.active, &active));
+    assert(roce_cm_session_init(&pair.passive, &passive));
+    assert(!roce_cm_session_hold_response(&pair.passive, 0, 5000000));
+    send_at(&pair.active, 0, pair.req);
+    assert(receive_at(&pair.passive, 0, pair.req));
+
+    if (initiator) {
+        assert(roce_cm_session_set_local_qpn(&pair.passive, passive_qpn));
+        send_at(&pair.passive, 0, pair.rep);
+        assert(receive_at(&pair.active, 0, pair.rep));
+    }
+    struct roce_cm_session *held = initiator ? &pair.active : &pair.passive;
+    const uint8_t *original = initiator ? pair.rep : pair.req;
+    const uint64_t due = 2097152;
+    const uint64_t deadline = 5000000;
+    unsigned sends = held->sends;
+    uint32_t psn = held->gsi_psn;
+    assert(roce_cm_session_hold_response(held, 0, deadline));
+    uint8_t frame[ROCE_CM_FRAME_SIZE];
+    assert(!roce_cm_session_prepare(held, due - 1, frame, sizeof(frame)));
+
+    /* The first attempt is prepared but rejected by TX. */
+    assert(roce_cm_session_prepare(held, due, frame, sizeof(frame)) == sizeof(frame));
+    assert(held->gsi_psn == psn);
+    send_at(held, due + 1, frame);
+    struct roce_cm_frame outer;
+    struct roce_cm_message mra = unpack(frame, &outer);
+    assert(mra.type == ROCE_CM_MRA && mra.tid == active.tid);
+    assert(mra.mra.message == (initiator ? ROCE_CM_MRA_REP : ROCE_CM_MRA_REQ));
+    assert(mra.local_comm_id == held->config.local_comm_id && mra.remote_comm_id == held->peer_comm_id);
+    assert((UINT64_C(4096) << mra.mra.service_timeout) >= deadline - (due + 1));
+    assert(outer.psn == psn && held->sends == sends && held->send_pending);
+    assert(!roce_cm_session_prepare(held, due + 2, frame, sizeof(frame)));
+
+    assert(receive_at(held, due + 3, original));
+    send_at(held, due + 3, frame);
+    mra = unpack(frame, &outer);
+    assert(mra.type == ROCE_CM_MRA && mra.tid == active.tid);
+    assert(outer.psn == ((psn + 1) & ROCE_PSN_MASK) && held->sends == sends);
+
+    if (initiator)
+        assert(roce_cm_session_establish(held));
+    else
+        assert(roce_cm_session_set_local_qpn(held, passive_qpn));
+    assert(!roce_cm_session_prepare(held, due + 4, frame, sizeof(frame)));
+    roce_cm_session_resume_response(held);
+    send_at(held, due + 4, frame);
+    assert(unpack(frame, &outer).type == (initiator ? ROCE_CM_RTU : ROCE_CM_REP));
+}
+
+static void establish_pair(struct test_pair *pair, bool deliver_rtu)
+{
+    init_pair(pair);
+    assert(!roce_cm_session_disconnect(&pair->active, 1));
+    send_at(&pair->active, 0, pair->req);
+    assert(receive_at(&pair->passive, 0, pair->req));
+    send_at(&pair->passive, 0, pair->rep);
+    assert(receive_at(&pair->active, 0, pair->rep));
+    send_at(&pair->active, 0, pair->rtu);
+    if (deliver_rtu)
+        assert(receive_at(&pair->passive, 0, pair->rtu));
+}
+
+static void check_reject_replay(void)
+{
+    struct test_pair pair;
+    init_pair(&pair);
+    const uint8_t data[ROCE_CM_REJ_PRIVATE_SIZE] = {0xa1, 0, 0xa2, [147] = 0xa3};
+    uint8_t rejected[ROCE_CM_FRAME_SIZE];
+    assert(!roce_cm_session_reject_request(&pair.passive, data, sizeof(data)));
+    send_at(&pair.active, 1, pair.req);
+    assert(receive_at(&pair.passive, 1, pair.req));
+    assert(!roce_cm_session_reject_request(&pair.active, data, sizeof(data)));
+    assert(!roce_cm_session_reject_request(&pair.passive, data, sizeof(data) + 1));
+    assert(roce_cm_session_reject_request(&pair.passive, data, sizeof(data)));
+    assert(roce_cm_session_prepare(&pair.passive, 2, rejected, sizeof(rejected)) == sizeof(rejected));
+    assert(pair.passive.sends == 0);
+    send_at(&pair.passive, 3, rejected);
+    assert(!roce_cm_session_prepare(&pair.passive, 4, pair.rep, sizeof(pair.rep)));
+
+    struct roce_cm_frame outer;
+    struct roce_cm_message bad = unpack(rejected, &outer);
+    assert(bad.type == ROCE_CM_REJ && bad.rej.reason == ROCE_CM_REJ_CONSUMER_DEFINED);
+    ++bad.remote_comm_id;
+    pack(pair.rep, outer, &bad);
+    assert(!receive_at(&pair.active, 4, pair.rep));
+    --bad.remote_comm_id;
+    ++bad.tid;
+    pack(pair.rep, outer, &bad);
+    assert(!receive_at(&pair.active, 4, pair.rep));
+    --bad.tid;
+    bad.rej.message = ROCE_CM_REJ_REP;
+    pack(pair.rep, outer, &bad);
+    assert(!receive_at(&pair.active, 4, pair.rep));
+
+    send_at(&pair.active, 1 + RETRY_NS, pair.req);
+    assert(receive_at(&pair.passive, 1 + RETRY_NS, pair.req));
+    send_at(&pair.passive, 2 + RETRY_NS, pair.rep);
+    const struct roce_cm_message replay = unpack(pair.rep, &outer);
+    assert(replay.type == ROCE_CM_REJ && replay.tid == bad.tid && replay.private_length == sizeof(data));
+    assert(!memcmp(replay.private_data, data, sizeof(data)));
+    assert(receive_at(&pair.active, 2 + RETRY_NS, pair.rep));
+    assert(pair.active.phase == ROCE_CM_REJECTED && pair.active.reject_reason == 28);
+    assert(pair.active.peer_private_length == sizeof(data));
+    assert(!memcmp(pair.active.peer_private_data, data, sizeof(data)));
+    assert(!roce_cm_session_prepare(&pair.active, 3 + RETRY_NS, pair.rtu, sizeof(pair.rtu)));
+    assert(!receive_at(&pair.active, 3 + RETRY_NS, pair.rep));
+    assert(!receive_at(&pair.passive, 3 + 100 * RETRY_NS, pair.req));
+}
+
+static void check_disconnect_replay(void)
+{
+    struct test_pair pair;
+    struct roce_cm_frame outer;
+    uint8_t dreq[ROCE_CM_FRAME_SIZE], drep[ROCE_CM_FRAME_SIZE], wrong[ROCE_CM_FRAME_SIZE];
+    establish_pair(&pair, false);
+
+    assert(roce_cm_session_disconnect(&pair.active, 0x12345678));
+    assert(roce_cm_session_disconnect(&pair.active, 2));
+    send_at(&pair.active, 0, dreq);
+    struct roce_cm_message message = unpack(dreq, &outer);
+    assert(message.type == ROCE_CM_DREQ && message.tid == 0x12345678);
+    assert(message.local_comm_id == 0x12345678 && message.remote_comm_id == 0x96325874);
+    assert(message.dreq.remote_qpn == 0x80402);
+    ++message.dreq.remote_qpn;
+    pack(wrong, outer, &message);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    --message.dreq.remote_qpn;
+    ++message.remote_comm_id;
+    pack(wrong, outer, &message);
+    assert(!receive_at(&pair.passive, 0, wrong));
+    assert(pair.passive.phase == ROCE_CM_PENDING);
+    assert(receive_at(&pair.passive, 0, dreq));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+    assert(!receive_at(&pair.passive, 0, pair.rtu));
+    assert(receive_at(&pair.passive, 0, dreq));
+    assert(roce_cm_session_prepare(&pair.passive, 0, drep, sizeof(drep)) == sizeof(drep));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+
+    /* Drop the first DREP and confirm the next duplicate DREQ receives a reply. */
+    roce_cm_session_sent(&pair.passive, 0);
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTED && !pair.passive.disconnect_error);
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS - 1, dreq, sizeof(dreq)));
+    send_at(&pair.active, RETRY_NS, dreq);
+    assert(receive_at(&pair.passive, RETRY_NS, dreq));
+    send_at(&pair.passive, RETRY_NS, drep);
+    message = unpack(drep, &outer);
+    assert(message.type == ROCE_CM_DREP && message.tid == 0x12345678);
+    assert(message.local_comm_id == 0x96325874 && message.remote_comm_id == 0x12345678);
+    ++message.tid;
+    pack(wrong, outer, &message);
+    assert(!receive_at(&pair.active, RETRY_NS, wrong));
+    assert(pair.active.phase == ROCE_CM_DISCONNECTING);
+    assert(receive_at(&pair.active, RETRY_NS, drep));
+    assert(pair.active.phase == ROCE_CM_DISCONNECTED && !pair.active.disconnect_error);
+    assert(receive_at(&pair.active, RETRY_NS, drep));
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, wrong, sizeof(wrong)));
+
+    for (unsigned i = 2; i <= pair.passive.config.max_retries; ++i) {
+        assert(receive_at(&pair.passive, RETRY_NS + 1, dreq));
+        send_at(&pair.passive, RETRY_NS + 1, drep);
+    }
+    assert(receive_at(&pair.passive, RETRY_NS + 1, dreq));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS + 1, wrong, sizeof(wrong)));
+    assert(roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS - 1));
+    assert(!roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS));
+    assert(!receive_at(&pair.passive, 5 * RETRY_NS, dreq));
+    assert(!roce_cm_session_prepare(&pair.passive, 5 * RETRY_NS, wrong, sizeof(wrong)));
+}
+
+static void check_simultaneous_disconnect(bool reordered)
+{
+    struct test_pair pair;
+    struct roce_cm_frame outer;
+    uint8_t passive_dreq[ROCE_CM_FRAME_SIZE];
+    establish_pair(&pair, true);
+    assert(roce_cm_session_disconnect(&pair.active, pair.active.tid));
+    assert(roce_cm_session_disconnect(&pair.passive, 0x87654321));
+    send_at(&pair.active, 0, pair.req);
+    send_at(&pair.passive, 0, passive_dreq);
+    assert(receive_at(&pair.passive, 0, pair.req));
+    if (!reordered)
+        assert(receive_at(&pair.active, 0, passive_dreq));
+
+    send_at(&pair.passive, 0, pair.rep);
+    struct roce_cm_message message = unpack(pair.rep, &outer);
+    assert(message.type == ROCE_CM_DREP && message.tid == pair.active.tid);
+    assert(receive_at(&pair.active, 0, pair.rep));
+    if (reordered) {
+        assert(pair.active.phase == ROCE_CM_DISCONNECTED);
+        assert(receive_at(&pair.active, 0, passive_dreq));
+    } else {
+        assert(pair.active.phase == ROCE_CM_DISCONNECTING);
+    }
+
+    send_at(&pair.active, 0, pair.rtu);
+    message = unpack(pair.rtu, &outer);
+    assert(message.type == ROCE_CM_DREP && message.tid == 0x87654321);
+    assert(receive_at(&pair.passive, 0, pair.rtu));
+    assert(pair.active.phase == ROCE_CM_DISCONNECTED && !pair.active.disconnect_error);
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTED && !pair.passive.disconnect_error);
+    assert(!roce_cm_session_prepare(&pair.active, RETRY_NS, pair.req, sizeof(pair.req)));
+    assert(!roce_cm_session_prepare(&pair.passive, RETRY_NS, pair.rep, sizeof(pair.rep)));
+}
+
+static void check_disconnect_timeout(void)
+{
+    struct test_pair pair;
+    establish_pair(&pair, true);
+    assert(roce_cm_session_disconnect(&pair.passive, 7));
+    for (uint64_t retry = 0; retry <= 4; ++retry) {
+        send_at(&pair.passive, retry * RETRY_NS, pair.req);
+        assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+    }
+    assert(!roce_cm_session_prepare(&pair.passive, 5 * RETRY_NS - 1, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTING);
+    assert(!roce_cm_session_prepare(&pair.passive, 5 * RETRY_NS, pair.rep, sizeof(pair.rep)));
+    assert(pair.passive.phase == ROCE_CM_DISCONNECTED && pair.passive.disconnect_error == ETIMEDOUT);
+    assert(roce_cm_session_in_timewait(&pair.passive, 5 * RETRY_NS));
+}
+
+int main(void)
+{
+    check_lab_offer();
+    check_explicit_establishment();
+    check_deferred_passive_qpn();
+    check_loss();
+    check_identity();
+    check_retry_limit();
+    check_mra_req();
+    check_mra_rep();
+    check_mra_send(false);
+    check_mra_send(true);
+    check_reject_replay();
+    check_disconnect_replay();
+    check_simultaneous_disconnect(false);
+    check_simultaneous_disconnect(true);
+    check_disconnect_timeout();
+    puts("RoCEv2 CM session tests passed");
+    return 0;
+}

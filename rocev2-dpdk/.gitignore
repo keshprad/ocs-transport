@@ -1,0 +1,11 @@
+/roce_write
+/roce_verbs_write
+/roce_app_write
+/libroce_rdmacm.so
+/tests/test_roce
+/tests/test_roce_cm_wire
+/tests/test_roce_cm_session
+/tests/test_roce_cma_ipc
+/tests/roce_wire_cli
+/tests/test_doorbell
+/tests/memif_relay

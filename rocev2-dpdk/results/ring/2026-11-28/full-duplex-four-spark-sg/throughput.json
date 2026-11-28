@@ -1,0 +1,156 @@
+{
+  "trials": [
+    {
+      "attempt": 1,
+      "verified_gib": 128,
+      "active_gbps": 715.1774502070576,
+      "whole_gbps": 691.7705188443829,
+      "whole_bounds": [
+        691.536850744561,
+        692.0041869442047
+      ],
+      "unique_floor_gbps": 698.5411658643104,
+      "directed_gbps": {
+        "spark-04-to-spark-01": 92.42633249341873,
+        "spark-02-to-spark-01": 86.0097450113318,
+        "spark-01-to-spark-02": 92.06067032421234,
+        "spark-03-to-spark-02": 88.88699053419222,
+        "spark-02-to-spark-03": 90.64354827409848,
+        "spark-04-to-spark-03": 87.50894897204013,
+        "spark-03-to-spark-04": 91.10297639248881,
+        "spark-01-to-spark-04": 86.5382382052751
+      },
+      "retries": {
+        "spark-01-to-spark-02": 0,
+        "spark-02-to-spark-03": 0,
+        "spark-03-to-spark-04": 0,
+        "spark-04-to-spark-01": 0,
+        "spark-02-to-spark-01": 0,
+        "spark-03-to-spark-02": 0,
+        "spark-04-to-spark-03": 0,
+        "spark-01-to-spark-04": 0
+      },
+      "rx_missed": {
+        "spark-01-to-spark-02": 0,
+        "spark-02-to-spark-03": 0,
+        "spark-03-to-spark-04": 0,
+        "spark-04-to-spark-01": 0,
+        "spark-02-to-spark-01": 0,
+        "spark-03-to-spark-02": 0,
+        "spark-04-to-spark-03": 0,
+        "spark-01-to-spark-04": 0
+      },
+      "overlap_s": 1.485792408,
+      "forward_gbps": 366.23352748421837,
+      "reverse_gbps": 348.94392272283926
+    },
+    {
+      "attempt": 2,
+      "verified_gib": 128,
+      "active_gbps": 715.5257460085654,
+      "whole_gbps": 697.4298141387595,
+      "whole_bounds": [
+        697.1943235706829,
+        697.6653047068362
+      ],
+      "unique_floor_gbps": 699.1606993601861,
+      "directed_gbps": {
+        "spark-04-to-spark-01": 92.12665573798508,
+        "spark-02-to-spark-01": 87.81021806055107,
+        "spark-01-to-spark-02": 92.19873902062216,
+        "spark-03-to-spark-02": 86.7668058856755,
+        "spark-02-to-spark-03": 90.88389595175619,
+        "spark-04-to-spark-03": 87.04731691404102,
+        "spark-03-to-spark-04": 91.61297470552384,
+        "spark-01-to-spark-04": 87.07913973241052
+      },
+      "retries": {
+        "spark-01-to-spark-02": 0,
+        "spark-02-to-spark-03": 0,
+        "spark-03-to-spark-04": 0,
+        "spark-04-to-spark-01": 0,
+        "spark-02-to-spark-01": 0,
+        "spark-03-to-spark-02": 0,
+        "spark-04-to-spark-03": 0,
+        "spark-01-to-spark-04": 0
+      },
+      "rx_missed": {
+        "spark-01-to-spark-02": 0,
+        "spark-02-to-spark-03": 0,
+        "spark-03-to-spark-04": 0,
+        "spark-04-to-spark-01": 0,
+        "spark-02-to-spark-01": 0,
+        "spark-03-to-spark-02": 0,
+        "spark-04-to-spark-03": 0,
+        "spark-01-to-spark-04": 0
+      },
+      "overlap_s": 1.489431082,
+      "forward_gbps": 366.8222654158873,
+      "reverse_gbps": 348.7034805926781
+    },
+    {
+      "attempt": 3,
+      "verified_gib": 128,
+      "active_gbps": 716.5705781726566,
+      "whole_gbps": 703.1269118426562,
+      "whole_bounds": [
+        702.9306686432191,
+        703.3231550420933
+      ],
+      "unique_floor_gbps": 698.9938398991054,
+      "directed_gbps": {
+        "spark-04-to-spark-01": 92.8599591910324,
+        "spark-02-to-spark-01": 87.95434903006573,
+        "spark-01-to-spark-02": 91.39277034104964,
+        "spark-03-to-spark-02": 88.08441353256953,
+        "spark-02-to-spark-03": 90.55474735577464,
+        "spark-04-to-spark-03": 87.82493093078365,
+        "spark-03-to-spark-04": 90.55565114880287,
+        "spark-01-to-spark-04": 87.34375664257811
+      },
+      "retries": {
+        "spark-01-to-spark-02": 0,
+        "spark-02-to-spark-03": 0,
+        "spark-03-to-spark-04": 0,
+        "spark-04-to-spark-01": 0,
+        "spark-02-to-spark-01": 0,
+        "spark-03-to-spark-02": 0,
+        "spark-04-to-spark-03": 0,
+        "spark-01-to-spark-04": 0
+      },
+      "rx_missed": {
+        "spark-01-to-spark-02": 0,
+        "spark-02-to-spark-03": 0,
+        "spark-03-to-spark-04": 0,
+        "spark-04-to-spark-01": 0,
+        "spark-02-to-spark-01": 0,
+        "spark-03-to-spark-02": 0,
+        "spark-04-to-spark-03": 0,
+        "spark-01-to-spark-04": 0
+      },
+      "overlap_s": 1.481043936,
+      "forward_gbps": 365.36312803665953,
+      "reverse_gbps": 351.207450135997
+    }
+  ],
+  "failures": [],
+  "active_gbps": 715.5257460085654,
+  "whole_gbps": 697.4298141387595,
+  "unique_floor_gbps": 698.9938398991054,
+  "forward_gbps": 366.23352748421837,
+  "reverse_gbps": 348.94392272283926,
+  "directed_gbps": {
+    "spark-04-to-spark-01": 92.42633249341873,
+    "spark-02-to-spark-01": 87.81021806055107,
+    "spark-01-to-spark-02": 92.06067032421234,
+    "spark-03-to-spark-02": 88.08441353256953,
+    "spark-02-to-spark-03": 90.64354827409848,
+    "spark-04-to-spark-03": 87.50894897204013,
+    "spark-03-to-spark-04": 91.10297639248881,
+    "spark-01-to-spark-04": 87.07913973241052
+  },
+  "verified_gib": 384,
+  "median_aggregate_trial": 2,
+  "previous_active_gbps": 715.6009030594322,
+  "previous_whole_gbps": 695.3479375425221
+}

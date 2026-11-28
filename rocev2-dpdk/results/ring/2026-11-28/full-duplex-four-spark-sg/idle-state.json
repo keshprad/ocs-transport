@@ -1,0 +1,158 @@
+{
+  "spark-01": {
+    "ports": {
+      "enp1s0f0np0": {
+        "pci": "0000:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f0np0": {
+        "pci": "0002:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enp1s0f1np1": {
+        "pci": "0000:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f1np1": {
+        "pci": "0002:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      }
+    },
+    "pages": 0,
+    "running": "",
+    "pool_result": "success"
+  },
+  "spark-02": {
+    "ports": {
+      "enp1s0f0np0": {
+        "pci": "0000:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f0np0": {
+        "pci": "0002:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enp1s0f1np1": {
+        "pci": "0000:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f1np1": {
+        "pci": "0002:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      }
+    },
+    "pages": 0,
+    "running": "",
+    "pool_result": "success"
+  },
+  "spark-03": {
+    "ports": {
+      "enp1s0f0np0": {
+        "pci": "0000:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f0np0": {
+        "pci": "0002:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enp1s0f1np1": {
+        "pci": "0000:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f1np1": {
+        "pci": "0002:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      }
+    },
+    "pages": 0,
+    "running": "",
+    "pool_result": "success"
+  },
+  "spark-04": {
+    "ports": {
+      "enp1s0f0np0": {
+        "pci": "0000:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f0np0": {
+        "pci": "0002:01:00.0",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enp1s0f1np1": {
+        "pci": "0000:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      },
+      "enP2p1s0f1np1": {
+        "pci": "0002:01:00.1",
+        "carrier": "1",
+        "speed": 100000,
+        "mtu": 1500,
+        "vfs": 0,
+        "native_roce": "false"
+      }
+    },
+    "pages": 0,
+    "running": "",
+    "pool_result": "success"
+  }
+}

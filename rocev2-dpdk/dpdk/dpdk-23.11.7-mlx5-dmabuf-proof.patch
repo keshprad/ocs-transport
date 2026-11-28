@@ -1,0 +1,112 @@
+Subject: [PATCH] mlx5: trace one-packet DMA-BUF send verification
+
+Apply after dpdk-23.11.7-mlx5-dmabuf.patch for the diagnostic PMD build.
+Record the imported lkey, actual external mbuf data segments, and the
+WQE index from each normal hardware TX completion. The proof profiles
+send one packet per burst and request a completion for each doorbell.
+Sustained throughput profiles use the base PMD without these hooks.
+
+diff --git a/drivers/common/mlx5/mlx5_common.c b/drivers/common/mlx5/mlx5_common.c
+--- a/drivers/common/mlx5/mlx5_common.c
++++ b/drivers/common/mlx5/mlx5_common.c
+@@ -2,6 +2,7 @@
+  * Copyright 2019 Mellanox Technologies, Ltd
+  */
+ 
++#include <inttypes.h>
+ #include <unistd.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -1236,6 +1237,7 @@
+ {
+ 	const struct rte_memseg_list *msl;
+ 	struct mlx5_mr *mr;
++	uint32_t lkey;
+ 	int ret;
+ 
+ 	if (addr == NULL || !len || len > UINTPTR_MAX - (uintptr_t)addr ||
+@@ -1251,11 +1253,15 @@
+ 	mr = mlx5_create_mr_dmabuf(dev->pd, addr, len, fd, offset);
+ 	if (mr == NULL)
+ 		return -rte_errno;
++	lkey = mr->pmd_mr.lkey;
+ 	ret = mlx5_external_mr_insert(dev, mr);
+ 	if (ret < 0) {
+ 		mlx5_mr_free(mr, dev->mr_scache.dereg_mr_cb);
+ 		rte_errno = -ret;
+ 	}
++	if (ret == 0)
++		fprintf(stderr, "MLX5_DMABUF_MAP device=%s address=%p bytes=%zu lkey=0x%08x offset=%" PRIu64 "\n",
++			dev->dev->name, addr, len, lkey, offset);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/mlx5/mlx5_tx.h b/drivers/net/mlx5/mlx5_tx.h
+--- a/drivers/net/mlx5/mlx5_tx.h
++++ b/drivers/net/mlx5/mlx5_tx.h
+@@ -6,7 +6,9 @@
+ #ifndef RTE_PMD_MLX5_TX_H_
+ #define RTE_PMD_MLX5_TX_H_
+ 
++#include <inttypes.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <sys/queue.h>
+ 
+ #include <rte_mbuf.h>
+@@ -1380,6 +1382,18 @@
+ 	} while (true);
+ }
+ 
++static __rte_always_inline void
++mlx5_tx_trace_dmabuf_dseg(const struct mlx5_txq_data *txq,
++			 const struct mlx5_txq_local *loc,
++			 const struct mlx5_wqe_dseg *dseg)
++{
++	if (RTE_MBUF_HAS_EXTBUF(loc->mbuf))
++		fprintf(stderr, "MLX5_DMABUF_DSEG port=%u queue=%u wqe=%u address=0x%" PRIx64 " bytes=%u lkey=0x%08x\n",
++			txq->port_id, txq->idx, txq->wqe_ci,
++			rte_be_to_cpu_64(dseg->pbuf), rte_be_to_cpu_32(dseg->bcount),
++			rte_be_to_cpu_32(dseg->lkey));
++}
++
+ /**
+  * Build the Data Segment of pointer type.
+  *
+@@ -1410,6 +1424,7 @@
+ 	dseg->bcount = rte_cpu_to_be_32(len);
+ 	dseg->lkey = mlx5_mr_mb2mr(&txq->mr_ctrl, loc->mbuf);
+ 	dseg->pbuf = rte_cpu_to_be_64((uintptr_t)buf);
++	mlx5_tx_trace_dmabuf_dseg(txq, loc, dseg);
+ }
+ 
+ /**
+@@ -1446,6 +1461,7 @@
+ 		dseg->bcount = rte_cpu_to_be_32(len);
+ 		dseg->lkey = mlx5_mr_mb2mr(&txq->mr_ctrl, loc->mbuf);
+ 		dseg->pbuf = rte_cpu_to_be_64((uintptr_t)buf);
++		mlx5_tx_trace_dmabuf_dseg(txq, loc, dseg);
+ 
+ 		return;
+ 	}
+diff --git a/drivers/net/mlx5/mlx5_tx.c b/drivers/net/mlx5/mlx5_tx.c
+--- a/drivers/net/mlx5/mlx5_tx.c
++++ b/drivers/net/mlx5/mlx5_tx.c
+@@ -204,6 +204,8 @@
+ 			 * written, make sure all writes are completed
+ 			 * here, before we might perform SQ reset.
+ 			 */
++			fprintf(stderr, "MLX5_DMABUF_CQ_ERROR port=%u queue=%u\n",
++				txq->port_id, txq->idx);
+ 			rte_wmb();
+ 			ret = mlx5_tx_error_cqe_handle
+ 				(txq, (volatile struct mlx5_error_cqe *)cqe);
+@@ -227,6 +229,8 @@
+ 			continue;
+ 		}
+ 		/* Normal transmit completion. */
++		fprintf(stderr, "MLX5_DMABUF_CQE port=%u queue=%u wqe=%u\n",
++			txq->port_id, txq->idx, rte_be_to_cpu_16(cqe->wqe_counter));
+ 		MLX5_ASSERT(txq->cq_ci != txq->cq_pi);
+ #ifdef RTE_LIBRTE_MLX5_DEBUG
+ 		MLX5_ASSERT((txq->fcqs[txq->cq_ci & txq->cqe_m] >> 16) ==

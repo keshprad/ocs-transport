@@ -1,0 +1,404 @@
+{
+  "sha256": "d09d65ec67d4f77f13c8b1a3db8bc0ce0a96af9d37940084a630625d2f0841b3",
+  "destination": "/opt/ocs-roce-bw/3a6a1ca",
+  "links": {
+    "tx": {
+      "host": "spark-04",
+      "device": "0000:01:00.0",
+      "interface": "enp1s0f0np0",
+      "data_ip": "10.61.0.2",
+      "ethernet_mtu": 1500,
+      "link_mbps": 100000
+    },
+    "rx": {
+      "host": "spark-02",
+      "device": "0000:01:00.1",
+      "interface": "enp1s0f1np1",
+      "data_ip": "10.61.0.1",
+      "ethernet_mtu": 1500,
+      "link_mbps": 100000
+    }
+  },
+  "profiles": {
+    "single": {
+      "trials": [
+        {
+          "tx": {
+            "invocation": "55e4fd63b1e148758b218c9adba834db",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "4712634851",
+            "thread_cpu_ns": "4711694784",
+            "payload_gbps": "29.164",
+            "poll_cores": "1.000",
+            "writes": "16384",
+            "qps": "1",
+            "workers": "1",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0"
+          },
+          "rx": {
+            "invocation": "917c58122a1b4faca2e4562e6e6d0718",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "4712635839",
+            "thread_cpu_ns": "4711805552",
+            "payload_gbps": "29.164",
+            "poll_cores": "1.000",
+            "writes": "16384",
+            "qps": "1",
+            "workers": "1"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "83de9db625594134b776b3dd759a5e2c",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "4708637756",
+            "thread_cpu_ns": "4707575584",
+            "payload_gbps": "29.189",
+            "poll_cores": "1.000",
+            "writes": "16384",
+            "qps": "1",
+            "workers": "1",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0"
+          },
+          "rx": {
+            "invocation": "8ca2051d3b8847319b0863c55a0a697e",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "4708405857",
+            "thread_cpu_ns": "4707787184",
+            "payload_gbps": "29.190",
+            "poll_cores": "1.000",
+            "writes": "16384",
+            "qps": "1",
+            "workers": "1"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "83d827e60746419fbbe404188e35fcfa",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "4648668609",
+            "thread_cpu_ns": "4647797616",
+            "payload_gbps": "29.565",
+            "poll_cores": "1.000",
+            "writes": "16384",
+            "qps": "1",
+            "workers": "1",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0"
+          },
+          "rx": {
+            "invocation": "2c577fb2e8d84ceab8afcfd439a3043b",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "4648616093",
+            "thread_cpu_ns": "4648007824",
+            "payload_gbps": "29.566",
+            "poll_cores": "1.000",
+            "writes": "16384",
+            "qps": "1",
+            "workers": "1"
+          }
+        }
+      ],
+      "median_payload_gbps": {
+        "tx": 29.189,
+        "rx": 29.19
+      }
+    },
+    "multi-1": {
+      "trials": [
+        {
+          "tx": {
+            "invocation": "4a6138ecd5f642ca87828582a538a85e",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "5884600391",
+            "thread_cpu_ns": "5883454592",
+            "payload_gbps": "23.356",
+            "poll_cores": "1.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "1",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "30899"
+          },
+          "rx": {
+            "invocation": "df0d3cf95db24178a0ecf7893381e39a",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "5884562458",
+            "thread_cpu_ns": "5883589568",
+            "payload_gbps": "23.356",
+            "poll_cores": "1.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "1"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "49818d16ad7b45e79d4e2553cf63f290",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "5950875654",
+            "thread_cpu_ns": "5949371664",
+            "payload_gbps": "23.096",
+            "poll_cores": "1.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "1",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "32424"
+          },
+          "rx": {
+            "invocation": "cee4d9d231564a0c817cee7c23d639af",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "5950867843",
+            "thread_cpu_ns": "5949898112",
+            "payload_gbps": "23.096",
+            "poll_cores": "1.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "1"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "fae2cf89f34b4165aeccdadf8b5a2194",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "6064357931",
+            "thread_cpu_ns": "6062854496",
+            "payload_gbps": "22.663",
+            "poll_cores": "1.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "1",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "35889"
+          },
+          "rx": {
+            "invocation": "c055f776b1d8485f9c5ca441e020eb12",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "6064343129",
+            "thread_cpu_ns": "6063471824",
+            "payload_gbps": "22.663",
+            "poll_cores": "1.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "1"
+          }
+        }
+      ],
+      "median_payload_gbps": {
+        "tx": 23.096,
+        "rx": 23.096
+      }
+    },
+    "multi-2": {
+      "trials": [
+        {
+          "tx": {
+            "invocation": "bea3b9135e164a83a72127d35e93eb97",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "3333819328",
+            "thread_cpu_ns": "6666911632",
+            "payload_gbps": "41.226",
+            "poll_cores": "2.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "2",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "39942"
+          },
+          "rx": {
+            "invocation": "c34ce5fc73844abd9a2fe30219eaffea",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "3333908854",
+            "thread_cpu_ns": "6667166688",
+            "payload_gbps": "41.225",
+            "poll_cores": "2.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "2"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "b3c133a8a2114756a27527363ba234c6",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "3256437125",
+            "thread_cpu_ns": "6512188240",
+            "payload_gbps": "42.205",
+            "poll_cores": "2.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "2",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "35759"
+          },
+          "rx": {
+            "invocation": "1f6c45b877194441813cc2bb74c319be",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "3257197877",
+            "thread_cpu_ns": "6513858912",
+            "payload_gbps": "42.195",
+            "poll_cores": "2.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "2"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "318b26f4c44e4af99df03548fa327924",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "3144195839",
+            "thread_cpu_ns": "6287628272",
+            "payload_gbps": "43.712",
+            "poll_cores": "2.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "2",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "34747"
+          },
+          "rx": {
+            "invocation": "2da92e78b239450694cd87d46660a519",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "3144291385",
+            "thread_cpu_ns": "6288061264",
+            "payload_gbps": "43.711",
+            "poll_cores": "2.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "2"
+          }
+        }
+      ],
+      "median_payload_gbps": {
+        "tx": 42.205,
+        "rx": 42.195
+      }
+    },
+    "multi-4": {
+      "trials": [
+        {
+          "tx": {
+            "invocation": "9bf2eaf0c60b42f6814d0264ef5e5a41",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1518559926",
+            "thread_cpu_ns": "6040287168",
+            "payload_gbps": "90.506",
+            "poll_cores": "3.978",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "61"
+          },
+          "rx": {
+            "invocation": "5988fd39a3c9489b983a9bd35ed60a40",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1518413874",
+            "thread_cpu_ns": "6073484464",
+            "payload_gbps": "90.515",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "271858388aa84968a74662a050da09a0",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1521100368",
+            "thread_cpu_ns": "6037362128",
+            "payload_gbps": "90.355",
+            "poll_cores": "3.969",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "73"
+          },
+          "rx": {
+            "invocation": "4f15812c580e4633b16190cb0652145f",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1521236362",
+            "thread_cpu_ns": "6084557328",
+            "payload_gbps": "90.347",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4"
+          }
+        },
+        {
+          "tx": {
+            "invocation": "2f7e93815ba54623b62281c10ef7f4a2",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1517340995",
+            "thread_cpu_ns": "6042137520",
+            "payload_gbps": "90.579",
+            "poll_cores": "3.982",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "147"
+          },
+          "rx": {
+            "invocation": "75da357383ae41f7bb1e9f866583e67d",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1517322152",
+            "thread_cpu_ns": "6069000112",
+            "payload_gbps": "90.580",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4"
+          }
+        }
+      ],
+      "median_payload_gbps": {
+        "tx": 90.506,
+        "rx": 90.515
+      }
+    }
+  }
+}

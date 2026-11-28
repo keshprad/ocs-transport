@@ -1,0 +1,27 @@
+{
+  "ethernet_mtu": 4200,
+  "roce_path_mtu": 4096,
+  "planes": [
+    "PCIe0",
+    "PCIe2"
+  ],
+  "workload": "bidirectional RC WRITE",
+  "write_bytes": 1048576,
+  "qps_per_path": 1,
+  "sampling_seconds": 10,
+  "aggregate_trials_gbps": [
+    588.12,
+    588.12,
+    588.12
+  ],
+  "median_aggregate_gbps": 588.12,
+  "median_per_direction_gbps": {
+    "spark-01-to-spark-02": 98.02,
+    "spark-01-to-spark-04": 98.02,
+    "spark-02-to-spark-01": 98.02,
+    "spark-02-to-spark-04": 98.02,
+    "spark-04-to-spark-01": 98.02,
+    "spark-04-to-spark-02": 98.02
+  },
+  "counter_alerts": []
+}

@@ -1,0 +1,10 @@
+.*.cmd
+*.ko
+*.mod
+*.mod.c
+*.o
+Module.symvers
+modules.order
+check_mr
+check_mr_dmabuf
+check_mr_ticket

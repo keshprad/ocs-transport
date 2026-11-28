@@ -1,0 +1,273 @@
+#define _GNU_SOURCE
+#include "roce_cma_service.h"
+#include "roce_lab.h"
+#include "roce_mr_ipc.h"
+
+#include <errno.h>
+#include <poll.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+bool roce_cma_service_listen(struct roce_cma_service *service, const char *path)
+{
+    service->listener = roce_mr_ipc_listen(path);
+    if (service->listener < 0)
+        return false;
+    service->path = path;
+    return true;
+}
+
+static bool same_peer(int cm_socket, int app_socket)
+{
+    struct ucred cm, app;
+    socklen_t cm_size = sizeof(cm), app_size = sizeof(app);
+    if (getsockopt(cm_socket, SOL_SOCKET, SO_PEERCRED, &cm, &cm_size) ||
+        getsockopt(app_socket, SOL_SOCKET, SO_PEERCRED, &app, &app_size))
+        return false;
+    if (cm_size != sizeof(cm) || app_size != sizeof(app) || cm.pid <= 0 ||
+        cm.pid != app.pid || cm.uid != app.uid || cm.uid != geteuid()) {
+        errno = EACCES;
+        return false;
+    }
+    return true;
+}
+
+bool roce_cma_service_attach(struct roce_cma_service *service, int app_socket,
+                             const struct roce_cma_lab_address *address, uint32_t local_qpn, bool sender)
+{
+    if (send(app_socket, address, sizeof(*address), MSG_NOSIGNAL) != sizeof(*address))
+        return false;
+    struct pollfd wait = { .fd = service->listener, .events = POLLIN };
+    int ready;
+    do {
+        ready = poll(&wait, 1, ROCE_LAB_TIMEOUT * 1000);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0) {
+        if (!ready)
+            errno = ETIMEDOUT;
+        return false;
+    }
+    service->socket = accept4(service->listener, NULL, NULL, SOCK_CLOEXEC);
+    if (service->socket < 0 || !same_peer(service->socket, app_socket))
+        return false;
+    const struct timeval timeout = { .tv_sec = ROCE_LAB_TIMEOUT };
+    if (setsockopt(service->socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
+        setsockopt(service->socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)))
+        return false;
+
+    service->address = *address;
+    service->sender = sender;
+    service->owned_qp = local_qpn == 0;
+    service->local_qpn = local_qpn;
+    uint32_t source = local_qpn;
+    if (sender && service->owned_qp && !roce_lab_random(&source))
+        return false;
+    service->local_port = sender ? UINT16_C(0xc000) | (source & UINT16_C(0x3fff)) : address->service_port;
+    service->peer_port = sender ? address->service_port : 0;
+    return true;
+}
+
+static bool send_event(const struct roce_cma_service *service, enum roce_cma_message_type type,
+                       int status, const uint8_t *private_data, uint8_t private_length, int fd)
+{
+    size_t private_max = roce_cma_is_rejection(type) ? ROCE_CM_REJ_PRIVATE_SIZE : ROCE_CMA_PRIVATE_MAX;
+    if (private_length > private_max || (private_length && !private_data)) {
+        errno = EINVAL;
+        return false;
+    }
+    struct roce_cma_message message = {
+        .version = ROCE_CMA_IPC_VERSION, .type = type, .status = status,
+        .local_ipv4 = service->address.local_ipv4, .peer_ipv4 = service->address.peer_ipv4,
+        .local_port = service->local_port, .peer_port = service->peer_port,
+        .qp_num = service->peer_qpn, .private_length = private_length,
+    };
+    if (private_length)
+        memcpy(message.private_data, private_data, private_length);
+    int error = fd >= 0 ? roce_cma_send_fd(service->socket, &message, fd) :
+                          roce_cma_send(service->socket, &message);
+    if (error)
+        errno = error;
+    return !error;
+}
+
+bool roce_cma_service_event(const struct roce_cma_service *service, enum roce_cma_message_type type,
+                            int status, const uint8_t *private_data, uint8_t private_length)
+{
+    return send_event(service, type, status, private_data, private_length, -1);
+}
+
+static int receive_command(int socket, struct roce_cma_message *message, const struct roce_cma_wait *wait)
+{
+    if (!wait)
+        return roce_cma_receive(socket, message, false);
+
+    struct pollfd ready = { .fd = socket, .events = POLLIN };
+    for (;;) {
+        uint64_t now = roce_now_ns();
+        if (now >= wait->deadline)
+            return -ETIMEDOUT;
+        int received = roce_cma_receive(socket, message, true);
+        if (received)
+            return received;
+
+        wait->progress(wait->context, now);
+        const uint64_t interval = UINT64_C(1000000);
+        uint64_t remaining = wait->deadline - now;
+        struct timespec timeout = { .tv_nsec = remaining < interval ? remaining : interval };
+        if (ppoll(&ready, 1, &timeout, NULL) < 0 && errno != EINTR)
+            return -errno;
+    }
+}
+
+static bool command(const struct roce_cma_service *service, struct roce_cma_message *message,
+                    enum roce_cma_message_type expected, const struct roce_cma_wait *wait)
+{
+    int received = receive_command(service->socket, message, wait);
+    if (received != 1) {
+        errno = received < 0 ? -received : ETIMEDOUT;
+        return false;
+    }
+    if ((message->type != (uint32_t)expected &&
+         !(expected == ROCE_CMA_ACCEPT && message->type == ROCE_CMA_REJECT)) || message->status) {
+        errno = EPROTO;
+        return false;
+    }
+    return true;
+}
+
+static bool matches_peer(const struct roce_cma_service *service, const struct roce_cma_message *message)
+{
+    return message->local_ipv4 == service->address.local_ipv4 && message->local_port == service->local_port &&
+           message->peer_ipv4 == service->address.peer_ipv4 && message->peer_port == service->peer_port;
+}
+
+static bool accept_local_qp(struct roce_cma_service *service, const struct roce_cma_message *message)
+{
+    uint8_t expected_flags = service->owned_qp ? ROCE_CMA_QP_OWNED : 0;
+    if (!matches_peer(service, message) || message->flags != expected_flags ||
+        message->qp_num <= 1 || message->qp_num >= ROCE_PSN_MASK ||
+        (!service->owned_qp && message->qp_num != service->local_qpn)) {
+        errno = EINVAL;
+        return false;
+    }
+    service->local_qpn = message->qp_num;
+    service->app_parameters = *message;
+    return true;
+}
+
+bool roce_cma_service_prepare(struct roce_cma_service *service)
+{
+    struct roce_cma_message message;
+    if (!service->sender) {
+        if (!command(service, &message, ROCE_CMA_LISTEN, NULL))
+            return false;
+        if (message.local_ipv4 == service->address.local_ipv4 && message.local_port == service->local_port)
+            return true;
+        errno = EADDRNOTAVAIL;
+        return false;
+    }
+
+    if (!command(service, &message, ROCE_CMA_RESOLVE_ADDR, NULL))
+        return false;
+    if ((message.local_ipv4 && message.local_ipv4 != service->address.local_ipv4) ||
+        message.peer_ipv4 != service->address.peer_ipv4 || message.peer_port != service->peer_port) {
+        roce_cma_service_event(service, ROCE_CMA_ADDR_ERROR, EHOSTUNREACH, NULL, 0);
+        errno = EHOSTUNREACH;
+        return false;
+    }
+    if (message.local_port)
+        service->local_port = message.local_port;
+    if (!roce_cma_service_event(service, ROCE_CMA_ADDR_RESOLVED, 0, NULL, 0) ||
+        !command(service, &message, ROCE_CMA_RESOLVE_ROUTE, NULL))
+        return false;
+    if (!matches_peer(service, &message)) {
+        roce_cma_service_event(service, ROCE_CMA_ROUTE_ERROR, EHOSTUNREACH, NULL, 0);
+        errno = EHOSTUNREACH;
+        return false;
+    }
+    if (!roce_cma_service_event(service, ROCE_CMA_ROUTE_RESOLVED, 0, NULL, 0) ||
+        !command(service, &message, ROCE_CMA_CONNECT, NULL))
+        return false;
+    return accept_local_qp(service, &message);
+}
+
+bool roce_cma_service_request(struct roce_cma_service *service, uint16_t peer_port, uint32_t peer_qpn,
+                              const uint8_t *private_data, uint8_t private_length,
+                              const struct roce_cma_wait *wait)
+{
+    service->peer_port = peer_port;
+    service->peer_qpn = peer_qpn;
+    struct roce_cma_message message;
+    if (!roce_cma_service_event(service, ROCE_CMA_CONNECT_REQUEST, 0, private_data, private_length) ||
+        !command(service, &message, ROCE_CMA_ACCEPT, wait))
+        return false;
+    if (message.type == ROCE_CMA_REJECT) {
+        if (!matches_peer(service, &message) || message.qp_num) {
+            errno = EINVAL;
+            return false;
+        }
+        service->app_parameters = message;
+        return true;
+    }
+    return accept_local_qp(service, &message);
+}
+
+bool roce_cma_service_configure_qp(const struct roce_cma_service *service, int queue_fd,
+                                  const struct roce_cma_wait *wait)
+{
+    if (!service->owned_qp || service->sender || queue_fd < 0) {
+        errno = EINVAL;
+        return false;
+    }
+    struct roce_cma_message message;
+    if (!send_event(service, ROCE_CMA_CONFIGURE_QP, 0, NULL, 0, queue_fd) ||
+        !command(service, &message, ROCE_CMA_QP_READY, wait))
+        return false;
+    if (matches_peer(service, &message) && message.qp_num == service->local_qpn)
+        return true;
+    errno = EINVAL;
+    return false;
+}
+
+bool roce_cma_service_response(const struct roce_cma_service *service,
+                               const uint8_t *private_data, uint8_t private_length, int queue_fd,
+                               const struct roce_cma_wait *wait)
+{
+    if (service->owned_qp != (queue_fd >= 0)) {
+        errno = EINVAL;
+        return false;
+    }
+    struct roce_cma_message message;
+    if (!send_event(service, ROCE_CMA_CONNECT_RESPONSE, 0, private_data, private_length, queue_fd) ||
+        !command(service, &message, ROCE_CMA_ESTABLISH, wait))
+        return false;
+    if (matches_peer(service, &message))
+        return true;
+    errno = EINVAL;
+    return false;
+}
+
+bool roce_cma_service_wait_disconnect(const struct roce_cma_service *service)
+{
+    if (!service->sender)
+        return true;
+    struct roce_cma_message message;
+    if (!command(service, &message, ROCE_CMA_DISCONNECT, NULL))
+        return false;
+    if (matches_peer(service, &message))
+        return true;
+    errno = EINVAL;
+    return false;
+}
+
+void roce_cma_service_close(struct roce_cma_service *service)
+{
+    if (service->socket >= 0)
+        close(service->socket);
+    if (service->listener >= 0)
+        close(service->listener);
+    if (service->path)
+        unlink(service->path);
+}

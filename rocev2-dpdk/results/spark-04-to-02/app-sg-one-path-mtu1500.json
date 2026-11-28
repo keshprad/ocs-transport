@@ -1,0 +1,382 @@
+{
+  "sha256": "bcb390549d7d69a0a04f829eb3a28b74d6f228963601f50db7b40aa898e42c5b",
+  "destination": "/opt/ocs-roce-app-bw/8c5058a",
+  "links": {
+    "tx": {
+      "host": "spark-04",
+      "device": "0000:01:00.0",
+      "interface": "enp1s0f0np0",
+      "data_ip": "10.61.0.2",
+      "ethernet_mtu": 1500,
+      "link_mbps": 100000
+    },
+    "rx": {
+      "host": "spark-02",
+      "device": "0000:01:00.1",
+      "interface": "enp1s0f1np1",
+      "data_ip": "10.61.0.1",
+      "ethernet_mtu": 1500,
+      "link_mbps": 100000
+    }
+  },
+  "files_sha256": {
+    "roce_write": "bcb390549d7d69a0a04f829eb3a28b74d6f228963601f50db7b40aa898e42c5b",
+    "roce_app_write": "ac24500cbf6bedecf3e83d62fc0db1889a463eedd54d4e2ddd87c97753cd5e78",
+    "run_app": "50e856debf64e5ed49aedddfc62d70a840ba6b8739898f02f0459d0b9312b698",
+    "provider/libroce_dpdk-rdmav34.so": "ea6191914507aba007a6aedd38745ffe98445d57daa84c02848fcd1b95b7ae91",
+    "lib/librte_common_mlx5.so.24": "24cf2a09a2df841bda11d95746770a6249587475c6b51be69943add684aacf4f",
+    "lib/librte_net_mlx5.so.24": "731eeb39bf9cdfc603dbcf81f82e403383b1154f51e27c4dd76a4b23d4650ea7",
+    "manage_hugepages": "22e990737b041f89b161d60f367eb1b2d2a9b36cf4a56ac0a6a5537d014108b1"
+  },
+  "profiles": {
+    "app-memfd-gather-mtu-1500-multi-4-prefault": {
+      "trials": [
+        {
+          "tx": {
+            "invocation": "8f031631d0b24338956b20155257f6cc",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1618040303",
+            "thread_cpu_ns": "6463403520",
+            "payload_gbps": "84.942",
+            "poll_cores": "3.995",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "314954818498612",
+            "poll_minor_faults": 22,
+            "poll_major_faults": 0,
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "worker_pid": 764911,
+            "app_pid": 764920,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 11988912044
+              },
+              "dma": {
+                "bytes": 17179869184,
+                "elapsed_ns": 1229019516
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 30355952
+              }
+            },
+            "application_transfer": {
+              "start_ns": 314953517924229,
+              "elapsed_ns": 19738321140,
+              "process_cpu_ns": 50656208
+            },
+            "port_stats": {
+              "rx_packets": 524288,
+              "tx_packets": 16777216,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": false,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "rx": {
+            "invocation": "0fb30ab974cd405fb158d931bd1c6158",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1618420083",
+            "thread_cpu_ns": "6473352000",
+            "payload_gbps": "84.922",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "314663607750971",
+            "poll_minor_faults": 7,
+            "poll_major_faults": 0,
+            "worker_pid": 553155,
+            "app_pid": 553229,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 10812079374
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 350033224
+              }
+            },
+            "application_transfer": {
+              "start_ns": 314649379357528,
+              "elapsed_ns": 32572712090,
+              "process_cpu_ns": 16600065632
+            },
+            "port_stats": {
+              "rx_packets": 16777216,
+              "tx_packets": 524288,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": false,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          }
+        },
+        {
+          "tx": {
+            "invocation": "913dcfe2c8cd493dbef6eae219541c95",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1629460401",
+            "thread_cpu_ns": "6512363824",
+            "payload_gbps": "84.346",
+            "poll_cores": "3.997",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "315000708323014",
+            "poll_minor_faults": 21,
+            "poll_major_faults": 0,
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "worker_pid": 765588,
+            "app_pid": 765597,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 11442404247
+              },
+              "dma": {
+                "bytes": 17179869184,
+                "elapsed_ns": 1228876705
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 30344993
+              }
+            },
+            "application_transfer": {
+              "start_ns": 314999410114360,
+              "elapsed_ns": 19747046220,
+              "process_cpu_ns": 46382048
+            },
+            "port_stats": {
+              "rx_packets": 524288,
+              "tx_packets": 16777216,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": false,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "rx": {
+            "invocation": "23b57b9a3bac4a05ae3034ede33e2476",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1629860560",
+            "thread_cpu_ns": "6519023664",
+            "payload_gbps": "84.326",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "314709497555673",
+            "poll_minor_faults": 8,
+            "poll_major_faults": 0,
+            "worker_pid": 553611,
+            "app_pid": 553622,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 10864251045
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 350022860
+              }
+            },
+            "application_transfer": {
+              "start_ns": 314695956428928,
+              "elapsed_ns": 31891064890,
+              "process_cpu_ns": 16603063792
+            },
+            "port_stats": {
+              "rx_packets": 16777216,
+              "tx_packets": 524288,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": false,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          }
+        },
+        {
+          "tx": {
+            "invocation": "a46e860d84484a5da8c6bcc1a5bae4f1",
+            "role": "tx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1608334711",
+            "thread_cpu_ns": "6421571728",
+            "payload_gbps": "85.454",
+            "poll_cores": "3.993",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "315047498253679",
+            "poll_minor_faults": 23,
+            "poll_major_faults": 0,
+            "send_window": "256",
+            "tx_burst": "16",
+            "retries": "0",
+            "worker_pid": 766414,
+            "app_pid": 766429,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 12823810126
+              },
+              "dma": {
+                "bytes": 17179869184,
+                "elapsed_ns": 1172674289
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 30541010
+              }
+            },
+            "application_transfer": {
+              "start_ns": 315046254092824,
+              "elapsed_ns": 19671289047,
+              "process_cpu_ns": 40909184
+            },
+            "port_stats": {
+              "rx_packets": 524288,
+              "tx_packets": 16777216,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": false,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          },
+          "rx": {
+            "invocation": "3d83bbed457a4ac0a5d3718e93523f01",
+            "role": "rx",
+            "payload_bytes": "17179869184",
+            "elapsed_ns": "1608720557",
+            "thread_cpu_ns": "6434621856",
+            "payload_gbps": "85.434",
+            "poll_cores": "4.000",
+            "writes": "1024",
+            "qps": "16",
+            "workers": "4",
+            "start_ns": "314756287501273",
+            "poll_minor_faults": 7,
+            "poll_major_faults": 0,
+            "worker_pid": 554183,
+            "app_pid": 554195,
+            "memory_setup": {
+              "attach": {
+                "bytes": 17179869184,
+                "elapsed_ns": 10811638388
+              },
+              "prefault": {
+                "bytes": 17179869184,
+                "pages": 4194304,
+                "elapsed_ns": 350283376
+              }
+            },
+            "application_transfer": {
+              "start_ns": 314741462888036,
+              "elapsed_ns": 33164508780,
+              "process_cpu_ns": 16605837680
+            },
+            "port_stats": {
+              "rx_packets": 16777216,
+              "tx_packets": 524288,
+              "missed": 0,
+              "rx_errors": 0,
+              "tx_errors": 0,
+              "rx_nombuf": 0
+            },
+            "packet_pool": {
+              "hugepages": false,
+              "chunks": 1
+            },
+            "rx_modes": [
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon",
+              "Vector Neon"
+            ]
+          }
+        }
+      ],
+      "ethernet_mtu": 1500,
+      "pmtu": 1024,
+      "app_mode": "memfd-gather",
+      "payload_bytes": 17179869184,
+      "write_bytes": 1048576,
+      "app_post_batch": 32,
+      "prefault_app": true,
+      "hugepages": false,
+      "median_payload_gbps": {
+        "tx": 84.942,
+        "rx": 84.922
+      }
+    }
+  }
+}
